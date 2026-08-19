@@ -155,6 +155,13 @@ static int run_ownall(const char *path, int argc, char **argv, char **envp) {
             libc_obj = scope->mods[mi]->base_addr;
     g_libc_base = (uintptr_t)libc_obj;
     g_exe_base = (uintptr_t)obj->base_addr;
+    {
+        unsigned char *mp = (unsigned char *)g_libc_base + 0x1b6760;
+        fprintf(stderr, "[dbg] libc mp_ @ %p: ", (void *)mp);
+        for (int bi = 0; bi < 0x20; bi++)
+            fprintf(stderr, "%02x", mp[bi]);
+        fprintf(stderr, "\n");
+    }
     elf_install_fault_handlers();
     elf_tls_ctx_t tls = elf_setup_own_tls(obj, scope);
     int ret = elf_run(obj, argc, argv, envp);

@@ -58,6 +58,22 @@ static int is_ld_linux(const char *name) {
 #define SYSTEM_LIBDIRS "/usr/lib/aarch64-linux-gnu:/lib/aarch64-linux-gnu" \
                        ":/usr/lib:/lib"
 
+static const char *sys_libdirs(void) {
+    static char buf[512];
+    static int done = 0;
+    if (!done) {
+        const char *root = getenv("ELF_ROOTFS");
+        if (root && root[0]) {
+            snprintf(buf, sizeof buf, "%s/usr/lib/aarch64-linux-gnu:%s/lib/aarch64-linux-gnu:%s/usr/lib:%s/lib",
+                     root, root, root, root);
+        } else {
+            snprintf(buf, sizeof buf, "%s", SYSTEM_LIBDIRS);
+        }
+        done = 1;
+    }
+    return buf;
+}
+
 static size_t map_base_vaddr(const elf_object_t *obj);
 static void *va(const elf_object_t *obj, size_t vaddr);
 static void apply_segment_prots(elf_object_t *obj);
@@ -87,6 +103,118 @@ static void *call_ifunc_resolver(void *resolver) {
     args.auxv[1].a_type = AT_NULL;
     args.auxv[1].a_un.a_val = 0;
     return ((void *(*)(struct ifunc_arg_t *))resolver)(&args);
+}
+
+/* ---- emulation of glibc's ld.so-private runtime state ---- */
+
+#define LDSO_RO_SIZE 0x200
+
+static unsigned char ldso_ro[LDSO_RO_SIZE];
+static unsigned char ldso_global[0x200];
+static unsigned int ldso_enable_secure;
+static uintptr_t ldso_pointer_chk_guard;
+static char ldso_platform[] = "aarch64";
+static char *ldso_argv_copy[8];
+static Elf64_auxv_t ldso_auxv[64];
+static int ldso_setup_done;
+
+static void ldso_setup(void) {
+    if (ldso_setup_done)
+        return;
+    ldso_setup_done = 1;
+
+    memset(ldso_ro, 0, sizeof ldso_ro);
+    memset(ldso_global, 0, sizeof ldso_global);
+    memset(ldso_argv_copy, 0, sizeof ldso_argv_copy);
+
+    if (elf_init_argv) {
+        for (int i = 0; i < 7 && elf_init_argv[i]; i++)
+            ldso_argv_copy[i] = elf_init_argv[i];
+    }
+
+    memset(ldso_auxv, 0, sizeof ldso_auxv);
+    int n = 0;
+    if (elf_init_envp) {
+        char **e = elf_init_envp;
+        while (*e)
+            e++;
+        Elf64_auxv_t *av = (Elf64_auxv_t *)(e + 1);
+        for (; n < 62 && av[n].a_type != AT_NULL; n++)
+            ldso_auxv[n] = av[n];
+        ldso_auxv[n].a_type = AT_NULL;
+        ldso_auxv[n].a_un.a_val = 0;
+    }
+
+    uint64_t *ro = (uint64_t *)ldso_ro;
+    ro[1]  = (uintptr_t)ldso_platform;           /* +0x08 _dl_platform */
+    ro[2]  = strlen(ldso_platform);              /* +0x10 _dl_platformlen */
+    ro[3]  = PAGE_SIZE;                          /* +0x18 _dl_pagesize */
+    ro[4]  = 0x1400;                             /* +0x20 _dl_minsigstacksize */
+    ro[8]  = 100;                                /* +0x40 _dl_clktck */
+    ro[12] = getauxval(AT_HWCAP);                /* +0x60 _dl_hwcap */
+    ro[13] = (uintptr_t)ldso_auxv;               /* +0x68 _dl_auxv */
+    /* +0x70 midr_el1: 0 -> generic ifunc variants */
+}
+
+typedef struct { int64_t numval; } ldso_tunable_val_t;
+
+static int tunable_is_initialized(int id) {
+    (void)id;
+    return 0;
+}
+
+static void tunable_get_default(int id, void *valp) {
+    (void)id;
+    *(int32_t *)valp = 0;
+}
+
+static void tunable_get_val(int id, void *valp, void (*cb)(void *)) {
+    (void)id;
+    ldso_tunable_val_t v;
+    v.numval = 0;
+    if (cb)
+        cb(&v);
+    *(int32_t *)valp = 0;
+}
+
+static void ldso_signal_error(void) {
+    abort();
+}
+
+static void *ldso_lookup(const char *name) {
+    if (!name)
+        return NULL;
+    if (strcmp(name, "_rtld_global_ro") == 0)
+        return ldso_ro;
+    if (strcmp(name, "_rtld_global") == 0)
+        return ldso_global;
+    if (strcmp(name, "_dl_argv") == 0)
+        return ldso_argv_copy;
+    if (strcmp(name, "__libc_enable_secure") == 0)
+        return &ldso_enable_secure;
+    if (strcmp(name, "__pointer_chk_guard") == 0)
+        return &ldso_pointer_chk_guard;
+    if (strcmp(name, "__tunable_get_val") == 0)
+        return (void *)tunable_get_val;
+    if (strcmp(name, "__tunable_get_default") == 0)
+        return (void *)tunable_get_default;
+    if (strcmp(name, "__tunable_is_initialized") == 0)
+        return (void *)tunable_is_initialized;
+    if (strcmp(name, "_dl_signal_error") == 0 ||
+        strcmp(name, "_dl_signal_exception") == 0 ||
+        strcmp(name, "_dl_catch_exception") == 0 ||
+        strcmp(name, "_dl_allocate_tls") == 0 ||
+        strcmp(name, "_dl_allocate_tls_init") == 0 ||
+        strcmp(name, "_dl_deallocate_tls") == 0 ||
+        strcmp(name, "_dl_find_dso_for_object") == 0 ||
+        strcmp(name, "_dl_rtld_di_serinfo") == 0)
+        return (void *)ldso_signal_error;
+    return NULL;
+}
+
+static void *resolve_import_ldso(const char *name) {
+    ldso_setup();
+    return ldso_lookup(name);
 }
 
 static void *resolve_jmp_symbol(elf_object_t *obj, Elf64_Rela *r) {
@@ -411,8 +539,8 @@ static int load_needed(elf_object_t *obj) {
 
     int n = 0;
     if (elf_own_deps && obj->scope) {
-        char *osearch = malloc(strlen(search) + sizeof(SYSTEM_LIBDIRS) + 8);
-        sprintf(osearch, "%s:%s", search, SYSTEM_LIBDIRS);
+        char *osearch = malloc(strlen(search) + strlen(sys_libdirs()) + 8);
+        sprintf(osearch, "%s:%s", search, sys_libdirs());
         for (Elf64_Dyn *d = dyn; d->d_tag != DT_NULL; d++) {
             if (d->d_tag != DT_NEEDED)
                 continue;
@@ -681,8 +809,8 @@ static int load_module_needed(elf_object_t *m, elf_scope_t *scope) {
 
     char *search = build_search(m->origin_dir ? m->origin_dir : ".");
     if (elf_own_deps) {
-        char *osearch = malloc(strlen(search) + sizeof(SYSTEM_LIBDIRS) + 8);
-        sprintf(osearch, "%s:%s", search, SYSTEM_LIBDIRS);
+        char *osearch = malloc(strlen(search) + strlen(sys_libdirs()) + 8);
+        sprintf(osearch, "%s:%s", search, sys_libdirs());
         for (Elf64_Dyn *d = dyn; d->d_tag != DT_NULL; d++) {
             if (d->d_tag != DT_NEEDED)
                 continue;
@@ -898,6 +1026,14 @@ elf_object_t *elf_load_shared(const char *path, elf_scope_t *scope) {
     elf_scope_add(scope, m);
     elf_relocate(m);
 
+    if (strstr(path, "libc.so.6")) {
+        fprintf(stderr, "[dbg] libc pre-init mp_ bytes: ");
+        unsigned char *mpp = (unsigned char *)base + 0x1b6760;
+        for (int bi = 0; bi < 0x18; bi++)
+            fprintf(stderr, "%02x", mpp[bi]);
+        fprintf(stderr, "\n");
+    }
+
     run_module_init(m);
 
     fprintf(stderr, "[dbg] post-init %s\n", path);
@@ -965,7 +1101,10 @@ static sym_status_t lookup_table(const Elf64_Sym *symtab, const char *strtab,
 }
 
 void *elf_resolve_import(elf_object_t *obj, const char *name) {
-    void *sym = override_lookup(name);
+    void *sym = resolve_import_ldso(name);
+    if (sym)
+        return sym;
+    sym = override_lookup(name);
     if (sym)
         return sym;
     if (obj && obj->scope) {
@@ -1190,8 +1329,9 @@ int elf_relocate(elf_object_t *obj) {
         if (ELF64_R_TYPE(r->r_info) != R_AARCH64_IRELATIVE)
             continue;
         uint64_t *where = (uint64_t *)(base + (r->r_offset - mbv));
-        void *(*resolver)(void) = (void *(*)(void))va(obj, r->r_addend);
-        *where = (uint64_t)resolver();
+        if (getenv("ELF_LOADER_DBG_IREL"))
+            printf("[irel] %s addend=%#lx off=%#lx\n", obj->soname, (unsigned long)r->r_addend, (unsigned long)r->r_offset);
+        *where = (uint64_t)call_ifunc_resolver(va(obj, r->r_addend));
         count++;
     }
     for (size_t off = 0; jmp_rela && off < jmp_size; off += sizeof(Elf64_Rela)) {
@@ -1199,8 +1339,7 @@ int elf_relocate(elf_object_t *obj) {
         if (ELF64_R_TYPE(r->r_info) != R_AARCH64_IRELATIVE)
             continue;
         uint64_t *where = (uint64_t *)(base + (r->r_offset - mbv));
-        void *(*resolver)(void) = (void *(*)(void))va(obj, r->r_addend);
-        *where = (uint64_t)resolver();
+        *where = (uint64_t)call_ifunc_resolver(va(obj, r->r_addend));
         count++;
     }
 
@@ -1292,17 +1431,11 @@ elf_tls_ctx_t elf_setup_own_tls(elf_object_t *exe, elf_scope_t *scope) {
     memset(region, 0, size);
 
     uintptr_t new_tp = (uintptr_t)region + TLS_PRE_TCB_SIZE;
-    size_t copy_len = TLS_PRE_TCB_SIZE + TLS_TCB_HEAD_SIZE;
-    memcpy(region, (void *)(host_tp - TLS_PRE_TCB_SIZE), copy_len);
+    /* region was zeroed above: struct pthread occupies [region, new_tp) */
 
-    uintptr_t old_lo = host_tp - TLS_PRE_TCB_SIZE;
-    uintptr_t old_hi = host_tp + TLS_TCB_HEAD_SIZE;
-    for (size_t off = 0; off < copy_len; off += 8) {
-        uintptr_t v = *(uintptr_t *)((char *)region + off);
-        if (v >= old_lo && v < old_hi)
-            *(uintptr_t *)((char *)region + off) = (uintptr_t)region + (v - old_lo);
-    }
-    *(uintptr_t *)(new_tp + 8) = 0;
+    /* tcbhead_t at new_tp: { dtv, private } -- dtv filled below */
+    *(uintptr_t *)(new_tp + 0x00) = 0;
+    *(uintptr_t *)(new_tp + 0x08) = 0;
 
     for (size_t i = 0; scope && i < scope->count; i++) {
         elf_object_t *m = scope->mods[i];
@@ -1320,6 +1453,28 @@ elf_tls_ctx_t elf_setup_own_tls(elf_object_t *exe, elf_scope_t *scope) {
             break;
         }
     }
+
+    /* Build a glibc-shaped DTV so __tls_get_addr (GD/LD TLS) works.
+       dtv_t layout: u[0]=counter | {val,to_free}, 16 bytes per entry. */
+    typedef struct { uintptr_t u[2]; } ldso_dtv_t;
+    size_t tls_mods = (exe && exe->has_tls) ? 1 : 0;
+    for (size_t i = 0; scope && i < scope->count; i++)
+        if (scope->mods[i] && scope->mods[i]->has_tls)
+            tls_mods++;
+    ldso_dtv_t *dtv = (ldso_dtv_t *)((uintptr_t)region + TLS_PRE_TCB_SIZE +
+                                     max_end + 0x800);
+    memset(dtv, 0, sizeof(ldso_dtv_t) * (tls_mods + 2));
+    dtv[0].u[0] = tls_mods + 1;          /* dtv length */
+    dtv[1].u[0] = 1;                     /* TLS generation counter */
+    size_t slot = 2;
+    if (exe && exe->has_tls)
+        dtv[slot++].u[0] = new_tp + TLS_EXE_BASE_OFF;
+    for (size_t i = 0; scope && i < scope->count; i++) {
+        elf_object_t *m = scope->mods[i];
+        if (m && m->has_tls)
+            dtv[slot++].u[0] = new_tp + m->tls_offset;
+    }
+    *(uintptr_t *)new_tp = (uintptr_t)&dtv[1]; /* tcbhead.dtv -> generation slot */
 
     g_tls_new_tp = new_tp;
     g_tls_old_tp = host_tp;
@@ -1363,6 +1518,14 @@ static void fault_handler(int sig, siginfo_t *si, void *ctx) {
         HX(uc->uc_mcontext.regs[i]); RAW(' ');
     }
     RAW('\n');
+    {
+        RAW('M'); RAW('P'); RAW(':');
+        volatile unsigned char *mbase =
+            (volatile unsigned char *)uc->uc_mcontext.regs[23];
+        for (int bi = 0; bi < 0x30; bi++)
+            HX(mbase[bi] & 0xff);
+        RAW('\n');
+    }
     #undef RAW
     #undef HX
     {
