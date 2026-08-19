@@ -1,0 +1,1549 @@
+#define _GNU_SOURCE
+#include "../include/elf_loader.h"
+
+#include <stdio.h>
+#include <stdlib.h>
+#include <string.h>
+#include <fcntl.h>
+#include <unistd.h>
+extern char **environ;
+#include <signal.h>
+#include <dlfcn.h>
+#define _GNU_SOURCE
+#include <sys/mman.h>
+#include <sys/auxv.h>
+#include <sys/stat.h>
+#include <limits.h>
+
+#define PAGE_SIZE 4096
+#define ALIGN_UP(x, align) (((x) + (align) - 1) & ~((align) - 1))
+#define ALIGN_DOWN(x, align) ((x) & ~((align) - 1))
+
+#define MAX_OVERRIDES 64
+
+typedef struct {
+    const char *name;
+    void *fn;
+} override_t;
+
+static override_t overrides[MAX_OVERRIDES];
+static size_t override_count = 0;
+
+static int lazy_binding = 0;
+static elf_object_t *lazy_current = NULL;
+#define MAX_LAZY_OBJS 64
+static elf_object_t *lazy_objs[MAX_LAZY_OBJS];
+static size_t lazy_obj_count = 0;
+
+int elf_own_deps = 0;
+elf_scope_t *elf_own_scope = NULL;
+
+int elf_init_argc = 0;
+char **elf_init_argv = NULL;
+char **elf_init_envp = NULL;
+
+const char *loader_phase = "start";
+uintptr_t g_libc_base = 0;
+uintptr_t g_exe_base = 0;
+
+static int is_ld_linux(const char *name) {
+    return strncmp(name, "ld-linux", 8) == 0 || strcmp(name, "ld.so.1") == 0;
+}
+
+#define SYSTEM_LIBDIRS "/usr/lib/aarch64-linux-gnu:/lib/aarch64-linux-gnu" \
+                       ":/usr/lib:/lib"
+
+static size_t map_base_vaddr(const elf_object_t *obj);
+static void *va(const elf_object_t *obj, size_t vaddr);
+static void apply_segment_prots(elf_object_t *obj);
+static char *find_in_paths(const char *soname, const char *search);
+
+void elf_set_lazy(int on) {
+    lazy_binding = on;
+}
+
+extern void lazy_plt_stub(void);
+
+struct ifunc_arg_t {
+    unsigned long size;
+    unsigned long hwcap;
+    unsigned long hwcap2;
+    Elf64_auxv_t auxv[2];
+};
+
+static void *call_ifunc_resolver(void *resolver) {
+    struct ifunc_arg_t args;
+    args.size = sizeof(args);
+    args.hwcap = getauxval(AT_HWCAP);
+    args.hwcap2 = getauxval(AT_HWCAP2);
+    args.auxv[0].a_type = AT_NULL;
+    args.auxv[0].a_un.a_val = 0;
+    args.auxv[1].a_type = AT_NULL;
+    args.auxv[1].a_un.a_val = 0;
+    return ((void *(*)(struct ifunc_arg_t *))resolver)(&args);
+}
+
+static void *resolve_jmp_symbol(elf_object_t *obj, Elf64_Rela *r) {
+    void *addr = NULL;
+    size_t sym_idx = ELF64_R_SYM(r->r_info);
+    if (sym_idx < obj->dynsym_count) {
+        const Elf64_Sym *s = &obj->dynsym[sym_idx];
+        const char *name = obj->dynstr + s->st_name;
+        int is_ifunc = 0;
+        if (s->st_shndx == SHN_UNDEF) {
+            if (obj && obj->scope) {
+                const Elf64_Sym *fs = NULL;
+                elf_object_t *m = elf_scope_find(obj->scope, name, &fs);
+                if (m && fs) {
+                    if (ELF64_ST_TYPE(fs->st_info) == STT_GNU_IFUNC)
+                        is_ifunc = 1;
+                    addr = (char *)m->base_addr + (fs->st_value - map_base_vaddr(m));
+                }
+            }
+            if (!addr)
+                addr = elf_resolve_import(obj, name);
+        } else {
+            addr = va(obj, s->st_value);
+        }
+        if (addr && is_ifunc)
+            addr = call_ifunc_resolver(addr);
+    }
+    return addr;
+}
+
+void *elf_lazy_resolve(uintptr_t got_slot) {
+    elf_object_t *obj = NULL;
+    for (size_t k = 0; k < lazy_obj_count; k++) {
+        elf_object_t *cand = lazy_objs[k];
+        if (!cand)
+            continue;
+        uintptr_t lo = (uintptr_t)cand->base_addr;
+        uintptr_t hi = lo + cand->total_size;
+        if (got_slot >= lo && got_slot < hi) {
+            obj = cand;
+            break;
+        }
+    }
+    if (!obj)
+        obj = lazy_current;
+    if (!obj)
+        return 0;
+    size_t mbv = map_base_vaddr(obj);
+    for (size_t off = 0; obj->jmp_rela && off < obj->jmp_size;
+         off += sizeof(Elf64_Rela)) {
+        Elf64_Rela *r = (Elf64_Rela *)((char *)obj->jmp_rela + off);
+        if ((uintptr_t)((char *)obj->base_addr + (r->r_offset - mbv)) != got_slot)
+            continue;
+        void *addr = resolve_jmp_symbol(obj, r);
+        if (addr)
+            *(uintptr_t *)got_slot = (uintptr_t)addr;
+        return addr;
+    }
+    return 0;
+}
+
+void elf_register_override(const char *name, void *fn) {
+    if (!name || !fn || override_count >= MAX_OVERRIDES)
+        return;
+    for (size_t i = 0; i < override_count; i++) {
+        if (strcmp(overrides[i].name, name) == 0) {
+            overrides[i].fn = fn;
+            return;
+        }
+    }
+    overrides[override_count].name = name;
+    overrides[override_count].fn = fn;
+    override_count++;
+}
+
+static void *override_lookup(const char *name) {
+    for (size_t i = 0; i < override_count; i++) {
+        if (strcmp(overrides[i].name, name) == 0)
+            return overrides[i].fn;
+    }
+    return NULL;
+}
+
+static size_t map_base_vaddr(const elf_object_t *obj) {
+    size_t min_vaddr = SIZE_MAX;
+    for (int i = 0; i < obj->phdr_count; i++) {
+        if (obj->phdr[i].p_type == PT_LOAD && obj->phdr[i].p_vaddr < min_vaddr)
+            min_vaddr = obj->phdr[i].p_vaddr;
+    }
+    return ALIGN_DOWN(min_vaddr, PAGE_SIZE);
+}
+
+static void *va(const elf_object_t *obj, size_t vaddr) {
+    return (char *)obj->base_addr + (vaddr - map_base_vaddr(obj));
+}
+
+static uintptr_t read_tp(void) {
+    uintptr_t tp;
+    __asm__ volatile("mrs %0, tpidr_el0" : "=r"(tp));
+    return tp;
+}
+
+uintptr_t elf_read_tp(void) { return read_tp(); }
+
+extern void tlsdesc_return(void);
+
+static void *map_elf_segments(void *file_map, Elf64_Ehdr *ehdr, size_t *out_total,
+                              size_t *out_min_vaddr) {
+    Elf64_Phdr *fp = (Elf64_Phdr *)((char *)file_map + ehdr->e_phoff);
+    size_t min_vaddr = SIZE_MAX;
+    size_t max_vaddr = 0;
+    for (int i = 0; i < ehdr->e_phnum; i++) {
+        if (fp[i].p_type == PT_LOAD) {
+            if (fp[i].p_vaddr < min_vaddr)
+                min_vaddr = fp[i].p_vaddr;
+            size_t end = fp[i].p_vaddr + fp[i].p_memsz;
+            if (end > max_vaddr)
+                max_vaddr = end;
+        }
+    }
+    if (min_vaddr == SIZE_MAX)
+        return NULL;
+
+    size_t mbv = ALIGN_DOWN(min_vaddr, PAGE_SIZE);
+    size_t total = ALIGN_UP(max_vaddr, PAGE_SIZE) - mbv;
+    fprintf(stderr, "[dbg] map_elf_segments: e_type=%d mbv=%#zx total=%#zx\n",
+            ehdr->e_type, mbv, total);
+    void *base;
+    if (ehdr->e_type == ET_EXEC) {
+        base = mmap((void *)mbv, total, PROT_READ | PROT_WRITE,
+                    MAP_PRIVATE | MAP_ANONYMOUS | MAP_FIXED_NOREPLACE, -1, 0);
+        if (base == MAP_FAILED)
+            return NULL;
+    } else {
+        base = mmap(NULL, total, PROT_READ | PROT_WRITE,
+                    MAP_PRIVATE | MAP_ANONYMOUS, -1, 0);
+        if (base == MAP_FAILED)
+            return NULL;
+    }
+
+    for (int i = 0; i < ehdr->e_phnum; i++) {
+        if (fp[i].p_type == PT_LOAD) {
+            memcpy((char *)base + (fp[i].p_vaddr - mbv),
+                   (char *)file_map + fp[i].p_offset, fp[i].p_filesz);
+        }
+    }
+    if (out_total)
+        *out_total = total;
+    if (out_min_vaddr)
+        *out_min_vaddr = mbv;
+    return base;
+}
+
+static int load_table(const char *file_map, const Elf64_Ehdr *ehdr,
+                      Elf64_Sym **sym_out, char **str_out, size_t *count_out, unsigned want) {
+    Elf64_Shdr *file_shdr = (Elf64_Shdr *)((char *)file_map + ehdr->e_shoff);
+
+    for (int i = 0; i < ehdr->e_shnum; i++) {
+        if (file_shdr[i].sh_type != want)
+            continue;
+
+        size_t count = file_shdr[i].sh_size / sizeof(Elf64_Sym);
+        Elf64_Sym *sym = (Elf64_Sym *)malloc(file_shdr[i].sh_size);
+        if (!sym)
+            return -1;
+        memcpy(sym, (char *)file_map + file_shdr[i].sh_offset, file_shdr[i].sh_size);
+
+        int strtab_idx = file_shdr[i].sh_link;
+        size_t strtab_size = file_shdr[strtab_idx].sh_size;
+        char *str = (char *)malloc(strtab_size);
+        if (!str) {
+            free(sym);
+            return -1;
+        }
+        memcpy(str, (char *)file_map + file_shdr[strtab_idx].sh_offset, strtab_size);
+
+        *sym_out = sym;
+        *str_out = str;
+        *count_out = count;
+        return 0;
+    }
+    return 1;
+}
+
+static Elf64_Dyn *find_dynamic(const elf_object_t *obj) {
+    for (int i = 0; i < obj->phdr_count; i++) {
+        if (obj->phdr[i].p_type == PT_DYNAMIC)
+            return (Elf64_Dyn *)va(obj, obj->phdr[i].p_vaddr);
+    }
+    return NULL;
+}
+
+static char *expand_dirs(const char *list, const char *origin_dir) {
+    size_t cap = strlen(list) + 1024;
+    char *out = calloc(1, cap);
+    size_t o = 0;
+    while (*list) {
+        const char *semi = strchr(list, ':');
+        size_t len = semi ? (size_t)(semi - list) : strlen(list);
+        char *item = strndup(list, len);
+        char *p = item;
+        while (*p) {
+            if (strncmp(p, "$ORIGIN", 7) == 0) {
+                size_t d = strlen(origin_dir);
+                if (o + d + 2 > cap) break;
+                memcpy(out + o, origin_dir, d);
+                o += d;
+                p += 7;
+            } else if (strncmp(p, "${ORIGIN}", 9) == 0) {
+                size_t d = strlen(origin_dir);
+                if (o + d + 2 > cap) break;
+                memcpy(out + o, origin_dir, d);
+                o += d;
+                p += 9;
+            } else if (strncmp(p, "$LIB", 4) == 0) {
+                if (o + 4 > cap) break;
+                memcpy(out + o, "lib", 3);
+                o += 3;
+                p += 4;
+            } else if (strncmp(p, "$PLATFORM", 9) == 0) {
+                if (o + 8 > cap) break;
+                memcpy(out + o, "aarch64", 7);
+                o += 7;
+                p += 9;
+            } else {
+                if (o + 1 >= cap) break;
+                out[o++] = *p++;
+            }
+        }
+        free(item);
+        if (o + 1 < cap)
+            out[o++] = ':';
+        if (semi)
+            list = semi + 1;
+        else
+            break;
+    }
+    if (o > 0)
+        out[o - 1] = '\0';
+    return out;
+}
+
+static void *dlopen_search(const char *soname, const char *paths) {
+    void *h;
+    const char *p = paths;
+    while (p && *p) {
+        const char *semi = strchr(p, ':');
+        size_t len = semi ? (size_t)(semi - p) : strlen(p);
+        if (len > 0) {
+            char *cand = malloc(len + strlen(soname) + 2);
+            memcpy(cand, p, len);
+            cand[len] = '/';
+            strcpy(cand + len + 1, soname);
+            h = dlopen(cand, RTLD_NOW | RTLD_GLOBAL);
+            free(cand);
+            if (h)
+                return h;
+        }
+        if (semi)
+            p = semi + 1;
+        else
+            break;
+    }
+    return NULL;
+}
+
+static int load_needed(elf_object_t *obj) {
+    Elf64_Dyn *dyn = find_dynamic(obj);
+    if (!dyn)
+        return 0;
+
+    char *dynstr = NULL;
+    int count = 0;
+
+    for (Elf64_Dyn *d = dyn; d->d_tag != DT_NULL; d++) {
+        if (d->d_tag == DT_STRTAB)
+            dynstr = va(obj, d->d_un.d_ptr);
+        else if (d->d_tag == DT_NEEDED)
+            count++;
+    }
+    if (!dynstr || count == 0)
+        return 0;
+
+    char *runpath = NULL;
+    char *rpath = NULL;
+    for (Elf64_Dyn *d = dyn; d->d_tag != DT_NULL; d++) {
+        if (d->d_tag == DT_RUNPATH)
+            runpath = dynstr + d->d_un.d_val;
+        else if (d->d_tag == DT_RPATH)
+            rpath = dynstr + d->d_un.d_val;
+    }
+
+    char *exp = NULL;
+    if (runpath)
+        exp = expand_dirs(runpath, obj->origin_dir);
+    else if (rpath)
+        exp = expand_dirs(rpath, obj->origin_dir);
+
+    char *env_paths = getenv("LD_LIBRARY_PATH");
+    size_t exp_len = exp ? strlen(exp) : 0;
+    size_t env_len = env_paths ? strlen(env_paths) : 0;
+    size_t bin_len = strlen(obj->origin_dir);
+    char *search = malloc(exp_len + env_len + bin_len + 32);
+    search[0] = '\0';
+    if (exp && exp_len)
+        memcpy(search, exp, exp_len);
+    if (env_paths && env_len) {
+        if (search[0])
+            strcat(search, ":");
+        strcat(search, env_paths);
+    }
+    if (search[0])
+        strcat(search, ":");
+    strcat(search, obj->origin_dir);
+
+    void **handles = calloc(count, sizeof(void *));
+    if (!handles) {
+        free(search);
+        free(exp);
+        return -1;
+    }
+
+    int n = 0;
+    if (elf_own_deps && obj->scope) {
+        char *osearch = malloc(strlen(search) + sizeof(SYSTEM_LIBDIRS) + 8);
+        sprintf(osearch, "%s:%s", search, SYSTEM_LIBDIRS);
+        for (Elf64_Dyn *d = dyn; d->d_tag != DT_NULL; d++) {
+            if (d->d_tag != DT_NEEDED)
+                continue;
+            const char *soname = dynstr + d->d_un.d_val;
+            if (is_ld_linux(soname)) {
+                printf("[+] dep %s: host ld-linux fallback\n", soname);
+                continue;
+            }
+            char *cand = find_in_paths(soname, osearch);
+            if (cand) {
+                printf("[+] own-loading dependency: %s\n", cand);
+                elf_load_shared(cand, obj->scope);
+                free(cand);
+            } else {
+                fprintf(stderr, "[-] dep %s not found\n", soname);
+            }
+        }
+        free(osearch);
+        free(search);
+        free(exp);
+        return 0;
+    }
+
+    for (Elf64_Dyn *d = dyn; d->d_tag != DT_NULL; d++) {
+        if (d->d_tag != DT_NEEDED)
+            continue;
+        const char *soname = dynstr + d->d_un.d_val;
+        void *h = dlopen_search(soname, search);
+        if (!h)
+            h = dlopen(soname, RTLD_NOW | RTLD_GLOBAL);
+        if (!h)
+            return 0;
+        printf("[+] loaded dependency: %s\n", soname);
+        handles[n++] = h;
+    }
+
+    free(search);
+    free(exp);
+    obj->handles = handles;
+    obj->handle_count = count;
+    return 0;
+}
+
+elf_object_t *elf_load(const char *path) {
+    int fd = open(path, O_RDONLY);
+    if (fd < 0) {
+        perror("open");
+        return NULL;
+    }
+
+    struct stat st;
+    if (fstat(fd, &st) < 0) {
+        perror("fstat");
+        close(fd);
+        return NULL;
+    }
+
+    void *file_map = mmap(NULL, st.st_size, PROT_READ, MAP_PRIVATE, fd, 0);
+    if (file_map == MAP_FAILED) {
+        perror("mmap file");
+        close(fd);
+        return NULL;
+    }
+
+    Elf64_Ehdr *ehdr = (Elf64_Ehdr *)file_map;
+
+    if (memcmp(ehdr->e_ident, ELFMAG, SELFMAG) != 0) {
+        fprintf(stderr, "[-] Not an ELF file\n");
+        goto cleanup;
+    }
+    if (ehdr->e_ident[EI_CLASS] != ELFCLASS64) {
+        fprintf(stderr, "[-] Only ELF64 supported\n");
+        goto cleanup;
+    }
+
+    Elf64_Phdr *file_phdr = (Elf64_Phdr *)((char *)file_map + ehdr->e_phoff);
+
+    size_t total_size = 0, map_base_vaddr_ = 0;
+    void *base = map_elf_segments(file_map, ehdr, &total_size, &map_base_vaddr_);
+    fprintf(stderr, "[dbg] mapped EXE %s -> %p (total %#zx)\n", path, base, total_size);
+    if (!base) {
+        fprintf(stderr, "[-] No LOAD segments\n");
+        goto cleanup;
+    }
+
+    elf_object_t *obj = calloc(1, sizeof(elf_object_t));
+    if (!obj) {
+        munmap(base, total_size);
+        goto cleanup;
+    }
+
+    obj->base_addr = base;
+    obj->total_size = total_size;
+    obj->phdr_count = ehdr->e_phnum;
+    obj->entry_point = (void *)((char *)base + (ehdr->e_entry - map_base_vaddr_));
+
+    {
+        const char *slash = strrchr(path, '/');
+        if (slash)
+            obj->origin_dir = strndup(path, slash - path);
+        else
+            obj->origin_dir = strdup(".");
+    }
+
+    obj->ehdr = (Elf64_Ehdr *)malloc(sizeof(Elf64_Ehdr));
+    memcpy(obj->ehdr, ehdr, sizeof(Elf64_Ehdr));
+
+    if (elf_own_deps && elf_own_scope)
+        obj->scope = elf_own_scope;
+
+    obj->phdr = (Elf64_Phdr *)malloc(sizeof(Elf64_Phdr) * ehdr->e_phnum);
+    memcpy(obj->phdr, file_phdr, sizeof(Elf64_Phdr) * ehdr->e_phnum);
+
+    for (int i = 0; i < obj->phdr_count; i++) {
+        if (obj->phdr[i].p_type != PT_TLS)
+            continue;
+        obj->tls_offset = 0x10;
+        obj->tls_memsz = obj->phdr[i].p_memsz;
+        obj->has_tls = 1;
+        break;
+    }
+
+    if (load_table(file_map, ehdr, &obj->symtab, &obj->strtab,
+                   &obj->symtab_count, SHT_SYMTAB) < 0)
+        goto cleanup_obj;
+    if (load_table(file_map, ehdr, &obj->dynsym, &obj->dynstr,
+                   &obj->dynsym_count, SHT_DYNSYM) < 0)
+        goto cleanup_obj;
+
+    munmap(file_map, st.st_size);
+    close(fd);
+
+    if (load_needed(obj) < 0) {
+        elf_unload(obj);
+        return NULL;
+    }
+    return obj;
+
+cleanup_obj:
+    free(obj->symtab);
+    free(obj->strtab);
+    free(obj->dynsym);
+    free(obj->dynstr);
+    free(obj->ehdr);
+    free(obj->phdr);
+    free(obj);
+cleanup:
+    munmap(file_map, st.st_size);
+    close(fd);
+    return NULL;
+}
+
+/* ---- in-process ELF shared-object loader + private scope ---- */
+
+elf_scope_t *elf_scope_create(void) {
+    return calloc(1, sizeof(elf_scope_t));
+}
+
+void elf_scope_destroy(elf_scope_t *s) {
+    if (!s)
+        return;
+    for (size_t i = 0; i < s->count; i++)
+        if (s->mods[i])
+            elf_unload(s->mods[i]);
+    free(s->mods);
+    free(s);
+}
+
+void elf_scope_add(elf_scope_t *s, elf_object_t *m) {
+    if (!s || !m)
+        return;
+    if (s->count == s->cap) {
+        size_t ncap = s->cap ? s->cap * 2 : 8;
+        elf_object_t **nmods = realloc(s->mods, ncap * sizeof(*nmods));
+        if (!nmods)
+            return;
+        s->mods = nmods;
+        s->cap = ncap;
+    }
+    s->mods[s->count++] = m;
+}
+
+void *elf_scope_lookup(const elf_scope_t *s, const char *name) {
+    const Elf64_Sym *sym = NULL;
+    elf_object_t *m = elf_scope_find(s, name, &sym);
+    if (m && sym)
+        return (char *)m->base_addr + (sym->st_value - map_base_vaddr(m));
+    return NULL;
+}
+
+elf_object_t *elf_scope_find(const elf_scope_t *s, const char *name,
+                             const Elf64_Sym **out_sym) {
+    if (!s || !name)
+        return NULL;
+    for (size_t i = 0; i < s->count; i++) {
+        elf_object_t *m = s->mods[i];
+        if (!m || !m->dynsym || !m->dynstr)
+            continue;
+        for (size_t j = 0; j < m->dynsym_count; j++) {
+            const Elf64_Sym *sym = &m->dynsym[j];
+            if (sym->st_name == 0 || sym->st_shndx == SHN_UNDEF)
+                continue;
+            if (ELF64_ST_BIND(sym->st_info) == STB_LOCAL)
+                continue;
+            if (strcmp(m->dynstr + sym->st_name, name) != 0)
+                continue;
+            if (out_sym)
+                *out_sym = sym;
+            return m;
+        }
+    }
+    if (out_sym)
+        *out_sym = NULL;
+    return NULL;
+}
+
+static char *build_search(const char *origin_dir) {
+    char *env_paths = getenv("LD_LIBRARY_PATH");
+    size_t env_len = env_paths ? strlen(env_paths) : 0;
+    size_t bin_len = strlen(origin_dir);
+    char *search = malloc(bin_len + env_len + 32);
+    search[0] = '\0';
+    if (env_paths && env_len) {
+        memcpy(search, env_paths, env_len);
+        strcat(search, ":");
+    }
+    strcat(search, origin_dir);
+    return search;
+}
+
+static char *find_in_paths(const char *soname, const char *search) {
+    const char *p = search;
+    while (p && *p) {
+        const char *semi = strchr(p, ':');
+        size_t len = semi ? (size_t)(semi - p) : strlen(p);
+        if (len > 0) {
+            char *cand = malloc(len + strlen(soname) + 2);
+            memcpy(cand, p, len);
+            cand[len] = '/';
+            strcpy(cand + len + 1, soname);
+            if (access(cand, R_OK) == 0)
+                return cand;
+            free(cand);
+        }
+        if (semi)
+            p = semi + 1;
+        else
+            break;
+    }
+    return NULL;
+}
+
+static int load_module_needed(elf_object_t *m, elf_scope_t *scope) {
+    Elf64_Dyn *dyn = find_dynamic(m);
+    if (!dyn)
+        return 0;
+
+    char *dynstr = NULL;
+    for (Elf64_Dyn *d = dyn; d->d_tag != DT_NULL; d++)
+        if (d->d_tag == DT_STRTAB)
+            dynstr = va(m, d->d_un.d_ptr);
+    if (!dynstr)
+        return 0;
+
+    char *search = build_search(m->origin_dir ? m->origin_dir : ".");
+    if (elf_own_deps) {
+        char *osearch = malloc(strlen(search) + sizeof(SYSTEM_LIBDIRS) + 8);
+        sprintf(osearch, "%s:%s", search, SYSTEM_LIBDIRS);
+        for (Elf64_Dyn *d = dyn; d->d_tag != DT_NULL; d++) {
+            if (d->d_tag != DT_NEEDED)
+                continue;
+            const char *soname = dynstr + d->d_un.d_val;
+            if (is_ld_linux(soname))
+                continue;
+            char *cand = find_in_paths(soname, osearch);
+            if (cand) {
+                printf("[+] own-loading dependency: %s\n", cand);
+                elf_load_shared(cand, scope);
+                free(cand);
+            } else {
+                fprintf(stderr, "[-] module dep %s: not found\n", soname);
+            }
+        }
+        free(osearch);
+        free(search);
+        return 0;
+    }
+    for (Elf64_Dyn *d = dyn; d->d_tag != DT_NULL; d++) {
+        if (d->d_tag != DT_NEEDED)
+            continue;
+        const char *soname = dynstr + d->d_un.d_val;
+        void *h = dlopen_search(soname, search);
+        if (!h)
+            h = dlopen(soname, RTLD_NOW | RTLD_LOCAL);
+        if (h)
+            continue;
+        char *cand = find_in_paths(soname, search);
+        if (cand) {
+            printf("[+] own-loading dependency: %s\n", cand);
+            elf_object_t *dep = elf_load_shared(cand, scope);
+            free(cand);
+            if (dep)
+                continue;
+        }
+        fprintf(stderr, "[-] module dep %s: not found\n", soname);
+    }
+    free(search);
+    return 0;
+}
+
+static void run_module_init(elf_object_t *m) {
+    Elf64_Dyn *dyn = find_dynamic(m);
+    if (!dyn)
+        return;
+    /* glibc's __libc_early_init() (normally called by ld.so at exec with
+     * arg=1) sets the flag byte at libc+0x1be009; strerror_l reads its bit 0
+     * to pick the "Unknown error %d" (asprintf) path vs. the plain static
+     * string. Our loader never runs the real early-init, so we set the flag
+     * ourselves to keep strerror/perror output identical to host glibc. */
+    if (m->soname && strcmp(m->soname, "libc.so.6") == 0)
+        *(char *)va(m, 0x1be009) = 1;
+    uint64_t init = 0, init_array = 0, init_arraysz = 0;
+    for (Elf64_Dyn *d = dyn; d->d_tag != DT_NULL; d++) {
+        if (d->d_tag == DT_INIT)
+            init = d->d_un.d_ptr;
+        else if (d->d_tag == DT_INIT_ARRAY)
+            init_array = d->d_un.d_ptr;
+        else if (d->d_tag == DT_INIT_ARRAYSZ)
+            init_arraysz = d->d_un.d_val;
+    }
+    typedef void (*init_fn_t)(int, char **, char **);
+    if (init) {
+        init_fn_t fn = (init_fn_t)va(m, init);
+        fprintf(stderr, "[+] running %s DT_INIT\n", m->soname);
+        fn(elf_init_argc, elf_init_argv, elf_init_envp);
+    }
+    if (init_array && init_arraysz) {
+        uint64_t *arr = (uint64_t *)va(m, init_array);
+        size_t n = init_arraysz / sizeof(uint64_t);
+        for (size_t i = 0; i < n; i++) {
+            init_fn_t fn = (init_fn_t)arr[i];
+            fprintf(stderr, "[+] running %s init_array[%zu] @ %p\n", m->soname, i, (void *)arr[i]);
+            fn(elf_init_argc, elf_init_argv, elf_init_envp);
+            fprintf(stderr, "[+] init_array[%zu] returned\n", i);
+        }
+    }
+}
+
+elf_object_t *elf_load_shared(const char *path, elf_scope_t *scope) {
+    int fd = open(path, O_RDONLY);
+    if (fd < 0) {
+        perror("open");
+        return NULL;
+    }
+    struct stat st;
+    if (fstat(fd, &st) < 0) {
+        perror("fstat");
+        close(fd);
+        return NULL;
+    }
+    void *file_map = mmap(NULL, st.st_size, PROT_READ, MAP_PRIVATE, fd, 0);
+    if (file_map == MAP_FAILED) {
+        perror("mmap file");
+        close(fd);
+        return NULL;
+    }
+
+    Elf64_Ehdr *ehdr = (Elf64_Ehdr *)file_map;
+    if (memcmp(ehdr->e_ident, ELFMAG, SELFMAG) != 0 ||
+        ehdr->e_ident[EI_CLASS] != ELFCLASS64 || ehdr->e_type != ET_DYN) {
+        fprintf(stderr, "[-] %s: not an ELF64 shared object\n", path);
+        munmap(file_map, st.st_size);
+        close(fd);
+        return NULL;
+    }
+
+    const char *slash = strrchr(path, '/');
+    const char *base_name = slash ? slash + 1 : path;
+    char *soname = NULL;
+    {
+        Elf64_Phdr *fph = (Elf64_Phdr *)((char *)file_map + ehdr->e_phoff);
+        Elf64_Phdr *dynph = NULL;
+        for (int i = 0; i < ehdr->e_phnum; i++)
+            if (fph[i].p_type == PT_DYNAMIC)
+                dynph = &fph[i];
+        if (dynph) {
+            Elf64_Dyn *dyn = (Elf64_Dyn *)((char *)file_map +
+                                           dynph->p_offset);
+            const char *dynstr = NULL;
+            size_t strtab_vaddr = 0;
+            for (Elf64_Dyn *d = dyn; d->d_tag != DT_NULL; d++) {
+                if (d->d_tag == DT_STRTAB)
+                    strtab_vaddr = d->d_un.d_ptr;
+                else if (d->d_tag == DT_SONAME && strtab_vaddr) {
+                    for (int i = 0; i < ehdr->e_phnum; i++) {
+                        if (fph[i].p_type == PT_LOAD &&
+                            strtab_vaddr >= fph[i].p_vaddr &&
+                            strtab_vaddr < fph[i].p_vaddr + fph[i].p_memsz) {
+                            dynstr = (char *)file_map + strtab_vaddr -
+                                     (fph[i].p_vaddr - fph[i].p_offset);
+                            break;
+                        }
+                    }
+                    if (dynstr)
+                        soname = strdup(dynstr + d->d_un.d_val);
+                    break;
+                }
+            }
+        }
+    }
+    if (!soname)
+        soname = strdup(base_name);
+
+    for (size_t i = 0; i < scope->count; i++) {
+        if (scope->mods[i]->soname &&
+            strcmp(scope->mods[i]->soname, soname) == 0) {
+            free(soname);
+            munmap(file_map, st.st_size);
+            close(fd);
+            return scope->mods[i];
+        }
+    }
+
+    size_t total_size = 0, mbv = 0;
+    void *base = map_elf_segments(file_map, ehdr, &total_size, &mbv);
+    fprintf(stderr, "[dbg] mapped %s -> %p (total %#zx)\n", path, base, total_size);
+    loader_phase = "loading";
+    if (!base) {
+        fprintf(stderr, "[-] %s: no LOAD segments\n", path);
+        munmap(file_map, st.st_size);
+        close(fd);
+        return NULL;
+    }
+
+    elf_object_t *m = calloc(1, sizeof(elf_object_t));
+    if (!m) {
+        munmap(base, total_size);
+        munmap(file_map, st.st_size);
+        close(fd);
+        return NULL;
+    }
+    m->base_addr = base;
+    m->total_size = total_size;
+    m->phdr_count = ehdr->e_phnum;
+    m->scope = scope;
+    m->soname = soname;
+    {
+        const char *slash = strrchr(path, '/');
+        m->origin_dir = slash ? strndup(path, slash - path) : strdup(".");
+    }
+    m->ehdr = malloc(sizeof(Elf64_Ehdr));
+    memcpy(m->ehdr, ehdr, sizeof(Elf64_Ehdr));
+    m->phdr = malloc(sizeof(Elf64_Phdr) * ehdr->e_phnum);
+    memcpy(m->phdr, (Elf64_Phdr *)((char *)file_map + ehdr->e_phoff),
+           sizeof(Elf64_Phdr) * ehdr->e_phnum);
+
+    load_table(file_map, ehdr, &m->dynsym, &m->dynstr, &m->dynsym_count,
+               SHT_DYNSYM);
+
+    for (int i = 0; i < m->phdr_count; i++) {
+        if (m->phdr[i].p_type != PT_TLS)
+            continue;
+        size_t sz = ALIGN_UP(m->phdr[i].p_memsz, m->phdr[i].p_align);
+        void *blk = mmap(NULL, sz, PROT_READ | PROT_WRITE,
+                         MAP_PRIVATE | MAP_ANONYMOUS, -1, 0);
+        if (blk != MAP_FAILED) {
+            memset(blk, 0, sz);
+            m->tls_offset = (uintptr_t)blk - read_tp();
+            m->tls_memsz = m->phdr[i].p_memsz;
+            m->has_tls = 1;
+            fprintf(stderr, "[dbg] %s TLS blk=%p TP=%p tls_offset=%#lx memsz=%#zx\n",
+                    path, blk, (void *)read_tp(), m->tls_offset, m->tls_memsz);
+        }
+        break;
+    }
+
+    munmap(file_map, st.st_size);
+    close(fd);
+
+    load_module_needed(m, scope);
+    elf_scope_add(scope, m);
+    elf_relocate(m);
+
+    run_module_init(m);
+
+    fprintf(stderr, "[dbg] post-init %s\n", path);
+    for (int i = 0; i < m->phdr_count; i++) {
+        if (m->phdr[i].p_type != PT_TLS || !m->has_tls)
+            continue;
+        char *src = (char *)base + (m->phdr[i].p_vaddr - mbv);
+        memcpy((void *)read_tp() + m->tls_offset, src, m->phdr[i].p_filesz);
+        break;
+    }
+
+    for (size_t j = 0; j < m->dynsym_count; j++) {
+        const Elf64_Sym *sym = &m->dynsym[j];
+        if (sym->st_shndx == SHN_UNDEF)
+            continue;
+        const char *nm = m->dynstr + sym->st_name;
+        if (strcmp(nm, "__environ") == 0 || strcmp(nm, "environ") == 0 ||
+            strcmp(nm, "_environ") == 0) {
+            *(uintptr_t *)((char *)base + (sym->st_value - mbv)) =
+                (uintptr_t)environ;
+            break;
+        }
+    }
+    for (size_t j = 0; j < m->dynsym_count; j++) {
+        const Elf64_Sym *sym = &m->dynsym[j];
+        if (sym->st_shndx == SHN_UNDEF)
+            continue;
+        const char *nm = m->dynstr + sym->st_name;
+        if (strcmp(nm, "__curbrk") == 0 || strcmp(nm, "___brk_addr") == 0) {
+            extern void *sbrk(long);
+            *(uintptr_t *)((char *)base + (sym->st_value - mbv)) =
+                (uintptr_t)sbrk(0);
+            break;
+        }
+    }
+    printf("[+] own-loaded module: %s (base %p, %zu dynsym)\n", path,
+           (void *)base, m->dynsym_count);
+    fflush(stdout);
+    return m;
+}
+
+static sym_status_t lookup_table(const Elf64_Sym *symtab, const char *strtab,
+                                 size_t count, const char *name, void **out_addr,
+                                 const elf_object_t *obj) {
+    if (!symtab || !strtab)
+        return SYM_NOT_FOUND;
+
+    for (size_t i = 0; i < count; i++) {
+        if (symtab[i].st_name == 0)
+            continue;
+        const char *sym_name = strtab + symtab[i].st_name;
+        if (strcmp(sym_name, name) != 0)
+            continue;
+
+        if (symtab[i].st_shndx == SHN_UNDEF) {
+            if (out_addr)
+                *out_addr = NULL;
+            return SYM_IMPORT;
+        }
+        if (out_addr)
+            *out_addr = va(obj, symtab[i].st_value);
+        return SYM_DEFINED;
+    }
+    return SYM_NOT_FOUND;
+}
+
+void *elf_resolve_import(elf_object_t *obj, const char *name) {
+    void *sym = override_lookup(name);
+    if (sym)
+        return sym;
+    if (obj && obj->scope) {
+        sym = elf_scope_lookup(obj->scope, name);
+        if (sym)
+            return sym;
+    }
+    for (size_t i = 0; obj && i < obj->handle_count; i++) {
+        if (!obj->handles[i])
+            continue;
+        void *h = dlsym(obj->handles[i], name);
+        if (h)
+            return h;
+    }
+    return dlsym(RTLD_DEFAULT, name);
+}
+
+sym_status_t elf_resolve_symbol(elf_object_t *obj, const char *name, void **out_addr) {
+    if (!obj || !name)
+        return SYM_NOT_FOUND;
+
+    sym_status_t st = lookup_table(obj->symtab, obj->strtab, obj->symtab_count,
+                                   name, out_addr, obj);
+    if (st != SYM_NOT_FOUND)
+        return st;
+    st = lookup_table(obj->dynsym, obj->dynstr, obj->dynsym_count,
+                      name, out_addr, obj);
+
+    if (st == SYM_DEFINED)
+        return st;
+
+    void *imp = elf_resolve_import(obj, name);
+    if (imp) {
+        if (out_addr)
+            *out_addr = imp;
+        return SYM_IMPORT;
+    }
+    if (st == SYM_IMPORT) {
+        if (out_addr)
+            *out_addr = NULL;
+        return SYM_IMPORT;
+    }
+    return SYM_NOT_FOUND;
+}
+
+static void relocate_tls(elf_object_t *obj, Elf64_Rela *r, uint64_t *where) {
+    size_t sym_idx = ELF64_R_SYM(r->r_info);
+    elf_object_t *dm = obj;
+    uintptr_t sym_off = 0;
+    if (sym_idx < obj->dynsym_count) {
+        const Elf64_Sym *s = &obj->dynsym[sym_idx];
+        if (s->st_shndx != SHN_UNDEF) {
+            sym_off = s->st_value;
+        } else if (s->st_name && obj->scope) {
+            const Elf64_Sym *os = NULL;
+            elf_object_t *dm2 =
+                elf_scope_find(obj->scope, obj->dynstr + s->st_name, &os);
+            if (dm2 && os) {
+                dm = dm2;
+                sym_off = os->st_value;
+            }
+        }
+    }
+    uintptr_t off = sym_off + r->r_addend + (dm->has_tls ? dm->tls_offset : 0);
+    if (ELF64_R_TYPE(r->r_info) == R_AARCH64_TLS_TPREL)
+        *where = off;
+    else {
+        where[0] = (uint64_t)tlsdesc_return;
+        where[1] = off;
+    }
+}
+
+static void apply_relr(elf_object_t *obj) {
+    Elf64_Dyn *dyn = find_dynamic(obj);
+    if (!dyn)
+        return;
+    void *relr = NULL;
+    size_t relrsz = 0;
+    for (Elf64_Dyn *d = dyn; d->d_tag != DT_NULL; d++) {
+        if (d->d_tag == DT_RELR)
+            relr = va(obj, d->d_un.d_ptr);
+        else if (d->d_tag == DT_RELRSZ)
+            relrsz = d->d_un.d_val;
+    }
+    if (!relr || !relrsz)
+        return;
+    uint64_t *where = NULL;
+    uint64_t *r = (uint64_t *)relr;
+    uint64_t *end = (uint64_t *)((char *)relr + relrsz);
+    uintptr_t l_addr = (uintptr_t)obj->base_addr;
+    for (; r < end; r++) {
+        uint64_t entry = *r;
+        if ((entry & 1) == 0) {
+            where = (uint64_t *)(l_addr + entry);
+            *where++ += l_addr;
+        } else {
+            for (long i = 0; (entry >>= 1) != 0; i++)
+                if ((entry & 1) != 0)
+                    where[i] += l_addr;
+            where += CHAR_BIT * sizeof(uint64_t) - 1;
+        }
+    }
+}
+
+int elf_relocate(elf_object_t *obj) {
+    if (!obj)
+        return -1;
+
+    loader_phase = obj->soname ? obj->soname : "exe";
+
+    Elf64_Dyn *dyn = find_dynamic(obj);
+    if (!dyn)
+        return 0;
+
+    apply_relr(obj);
+
+    size_t mbv = map_base_vaddr(obj);
+    char *base = obj->base_addr;
+
+    Elf64_Rela *rela = NULL;
+    size_t rela_size = 0;
+    Elf64_Rela *jmp_rela = NULL;
+    size_t jmp_size = 0;
+
+    for (Elf64_Dyn *d = dyn; d->d_tag != DT_NULL; d++) {
+        switch (d->d_tag) {
+        case DT_RELA:
+            rela = (Elf64_Rela *)va(obj, d->d_un.d_ptr);
+            break;
+        case DT_RELASZ:
+            rela_size = d->d_un.d_val;
+            break;
+        case DT_JMPREL:
+            jmp_rela = (Elf64_Rela *)va(obj, d->d_un.d_ptr);
+            break;
+        case DT_PLTRELSZ:
+            jmp_size = d->d_un.d_val;
+            break;
+        default:
+            break;
+        }
+    }
+
+    obj->jmp_rela = jmp_rela;
+    obj->jmp_size = jmp_size;
+    if (lazy_binding) {
+        lazy_current = obj;
+        if (lazy_obj_count < MAX_LAZY_OBJS)
+            lazy_objs[lazy_obj_count++] = obj;
+    }
+
+    int count = 0;
+    for (size_t off = 0; off < rela_size; off += sizeof(Elf64_Rela)) {
+        Elf64_Rela *r = (Elf64_Rela *)((char *)rela + off);
+        uint64_t *where = (uint64_t *)(base + (r->r_offset - mbv));
+        size_t sym_idx = ELF64_R_SYM(r->r_info);
+        switch (ELF64_R_TYPE(r->r_info)) {
+        case R_AARCH64_RELATIVE:
+            *where = (uint64_t)va(obj, r->r_addend);
+            count++;
+            break;
+        case R_AARCH64_IRELATIVE:
+            break;
+        case R_AARCH64_TLS_TPREL:
+        case R_AARCH64_TLSDESC:
+            relocate_tls(obj, r, where);
+            count++;
+            break;
+        case R_AARCH64_ABS64:
+        case R_AARCH64_GLOB_DAT:
+        case R_AARCH64_JUMP_SLOT: {
+            void *addr = NULL;
+            if (sym_idx < obj->dynsym_count) {
+                const Elf64_Sym *s = &obj->dynsym[sym_idx];
+                const char *name = obj->dynstr + s->st_name;
+                if (s->st_shndx == SHN_UNDEF)
+                    addr = elf_resolve_import(obj, name);
+                else
+                    addr = va(obj, s->st_value);
+            }
+            if (addr) {
+                if (ELF64_R_TYPE(r->r_info) == R_AARCH64_ABS64)
+                    *where = (uint64_t)addr + r->r_addend;
+                else
+                    *where = (uint64_t)addr;
+                count++;
+            }
+            break;
+        }
+        default:
+            break;
+        }
+    }
+
+    for (size_t off = 0; jmp_rela && off < jmp_size; off += sizeof(Elf64_Rela)) {
+        Elf64_Rela *r = (Elf64_Rela *)((char *)jmp_rela + off);
+        uint64_t *where = (uint64_t *)(base + (r->r_offset - mbv));
+        if (ELF64_R_TYPE(r->r_info) == R_AARCH64_IRELATIVE)
+            continue;
+        if (ELF64_R_TYPE(r->r_info) == R_AARCH64_TLSDESC ||
+            ELF64_R_TYPE(r->r_info) == R_AARCH64_TLS_TPREL) {
+            relocate_tls(obj, r, where);
+            count++;
+            continue;
+        }
+        if (lazy_binding) {
+            *where = (uint64_t)lazy_plt_stub;
+            count++;
+            continue;
+        }
+        void *addr = resolve_jmp_symbol(obj, r);
+        if (addr) {
+            *where = (uint64_t)addr;
+            count++;
+        }
+    }
+
+    apply_segment_prots(obj);
+
+    for (size_t off = 0; off < rela_size; off += sizeof(Elf64_Rela)) {
+        Elf64_Rela *r = (Elf64_Rela *)((char *)rela + off);
+        if (ELF64_R_TYPE(r->r_info) != R_AARCH64_IRELATIVE)
+            continue;
+        uint64_t *where = (uint64_t *)(base + (r->r_offset - mbv));
+        void *(*resolver)(void) = (void *(*)(void))va(obj, r->r_addend);
+        *where = (uint64_t)resolver();
+        count++;
+    }
+    for (size_t off = 0; jmp_rela && off < jmp_size; off += sizeof(Elf64_Rela)) {
+        Elf64_Rela *r = (Elf64_Rela *)((char *)jmp_rela + off);
+        if (ELF64_R_TYPE(r->r_info) != R_AARCH64_IRELATIVE)
+            continue;
+        uint64_t *where = (uint64_t *)(base + (r->r_offset - mbv));
+        void *(*resolver)(void) = (void *(*)(void))va(obj, r->r_addend);
+        *where = (uint64_t)resolver();
+        count++;
+    }
+
+    printf("[+] relocated %d entries\n", count);
+    return 0;
+}
+
+static void apply_segment_prots(elf_object_t *obj) {
+    size_t mbv = map_base_vaddr(obj);
+    char *base = obj->base_addr;
+    for (int i = 0; i < obj->phdr_count; i++) {
+        if (obj->phdr[i].p_type != PT_LOAD)
+            continue;
+        int prot = PROT_READ;
+        if (obj->phdr[i].p_flags & PF_W)
+            prot |= PROT_WRITE;
+        if (obj->phdr[i].p_flags & PF_X)
+            prot |= PROT_EXEC;
+        size_t a = ALIGN_DOWN(obj->phdr[i].p_vaddr, PAGE_SIZE);
+        size_t b = ALIGN_UP(obj->phdr[i].p_vaddr + obj->phdr[i].p_memsz, PAGE_SIZE);
+        mprotect((char *)base + (a - mbv), b - a, prot);
+    }
+}
+
+uintptr_t g_tls_new_tp = 0;
+uintptr_t g_tls_old_tp = 0;
+
+extern void jump_to_entry(void *entry, void *rsp, uintptr_t new_tp,
+                          uintptr_t old_tp);
+
+#define TLS_EXE_BASE_OFF 0x10u
+#define TLS_PRE_TCB_SIZE 0x720u
+#define TLS_TCB_HEAD_SIZE 0x800u
+
+elf_tls_ctx_t elf_setup_own_tls(elf_object_t *exe, elf_scope_t *scope) {
+    elf_tls_ctx_t ctx = {0};
+    uintptr_t host_tp = read_tp();
+    ctx.old_tp = host_tp;
+
+    int any = 0;
+    size_t max_end = 0;
+    if (exe && exe->has_tls) {
+        any = 1;
+        max_end = TLS_EXE_BASE_OFF + exe->tls_memsz;
+    }
+    for (size_t i = 0; scope && i < scope->count; i++) {
+        elf_object_t *m = scope->mods[i];
+        if (m && m->has_tls) {
+            any = 1;
+            size_t end = m->tls_offset + m->tls_memsz;
+            if (end > max_end)
+                max_end = end;
+        }
+    }
+    if (!any)
+        return ctx;
+
+    size_t size = ALIGN_UP(TLS_PRE_TCB_SIZE + TLS_TCB_HEAD_SIZE + max_end + 0x1000,
+                           4096);
+    void *region = mmap(NULL, size, PROT_READ | PROT_WRITE,
+                        MAP_PRIVATE | MAP_ANONYMOUS, -1, 0);
+    if (region == MAP_FAILED)
+        return ctx;
+    memset(region, 0, size);
+
+    uintptr_t new_tp = (uintptr_t)region + TLS_PRE_TCB_SIZE;
+    size_t copy_len = TLS_PRE_TCB_SIZE + TLS_TCB_HEAD_SIZE;
+    memcpy(region, (void *)(host_tp - TLS_PRE_TCB_SIZE), copy_len);
+
+    uintptr_t old_lo = host_tp - TLS_PRE_TCB_SIZE;
+    uintptr_t old_hi = host_tp + TLS_TCB_HEAD_SIZE;
+    for (size_t off = 0; off < copy_len; off += 8) {
+        uintptr_t v = *(uintptr_t *)((char *)region + off);
+        if (v >= old_lo && v < old_hi)
+            *(uintptr_t *)((char *)region + off) = (uintptr_t)region + (v - old_lo);
+    }
+    *(uintptr_t *)(new_tp + 8) = 0;
+
+    for (size_t i = 0; scope && i < scope->count; i++) {
+        elf_object_t *m = scope->mods[i];
+        if (m && m->has_tls)
+            memcpy((char *)new_tp + m->tls_offset,
+                   (char *)host_tp + m->tls_offset, m->tls_memsz);
+    }
+    if (exe && exe->has_tls) {
+        for (int i = 0; i < exe->phdr_count; i++) {
+            if (exe->phdr[i].p_type != PT_TLS)
+                continue;
+            char *src = (char *)exe->base_addr +
+                        (exe->phdr[i].p_vaddr - map_base_vaddr(exe));
+            memcpy((char *)new_tp + TLS_EXE_BASE_OFF, src, exe->phdr[i].p_filesz);
+            break;
+        }
+    }
+
+    g_tls_new_tp = new_tp;
+    g_tls_old_tp = host_tp;
+    ctx.region = region;
+    ctx.size = size;
+    return ctx;
+}
+
+void elf_teardown_own_tls(elf_tls_ctx_t *ctx) {
+    if (!ctx || !ctx->region)
+        return;
+    __asm__ volatile("msr tpidr_el0, %0" : : "r"(ctx->old_tp));
+    munmap(ctx->region, ctx->size);
+    ctx->region = NULL;
+    ctx->size = 0;
+}
+
+static Elf64_auxv_t *auxv_append(Elf64_auxv_t *a, uint64_t type, uint64_t val) {
+    a->a_type = type;
+    a->a_un.a_val = val;
+    return a + 1;
+}
+
+static void fault_handler(int sig, siginfo_t *si, void *ctx) {
+    ucontext_t *uc = (ucontext_t *)ctx;
+
+    static const char hexd[] = "0123456789abcdef";
+    static char raw[2048];
+    char *rp = raw;
+    char *rpend = raw + sizeof(raw);
+    #define RAW(c) do { if (rp < rpend-2) *rp++ = (c); } while (0)
+    #define HX(vv) do { uintptr_t __v=(uintptr_t)(vv); for(int __sh=60;__sh>=0;__sh-=4) RAW(hexd[(__v>>__sh)&0xf]); } while (0)
+    RAW('F'); RAW(':');
+    uintptr_t cur_tp; __asm__ volatile("mrs %0, tpidr_el0" : "=r"(cur_tp));
+    RAW('t');RAW('p');RAW('='); HX(cur_tp); RAW(' ');
+    RAW('p');RAW('c');RAW('='); HX(uc->uc_mcontext.pc); RAW(' ');
+    RAW('s');RAW('p');RAW('='); HX(uc->uc_mcontext.sp); RAW(' ');
+    RAW('a');RAW('d');RAW('='); HX(si->si_addr); RAW(' ');
+    for (int i = 0; i <= 30; i++) {
+        RAW('x'); RAW('0'+i/10); RAW('0'+i%10); RAW('=');
+        HX(uc->uc_mcontext.regs[i]); RAW(' ');
+    }
+    RAW('\n');
+    #undef RAW
+    #undef HX
+    {
+        register long x8 __asm__("x8") = 64;
+        register long x0 __asm__("x0") = 2;
+        register const char *x1 __asm__("x1") = raw;
+        register long x2 __asm__("x2") = (long)(rp - raw);
+        __asm__ volatile("svc #0" : "+r"(x0) : "r"(x8), "r"(x1), "r"(x2)
+                         : "memory", "cc");
+    }
+
+    {
+        volatile uint32_t *iptr = (volatile uint32_t *)uc->uc_mcontext.pc;
+        uint32_t insn = 0;
+        for (int i = -2; i <= 2; i++) {
+            insn = *iptr;
+            fprintf(stderr, "  insn[%+d] @%p = 0x%08x\n", i,
+                    (void *)((char *)iptr), (unsigned)insn);
+            iptr++;
+        }
+    }
+
+    {
+        uintptr_t *fp = (uintptr_t *)uc->uc_mcontext.regs[29];
+        for (int i = 0; i < 6 && fp && (uintptr_t)fp > 0x1000; i++) {
+            uintptr_t *next = (uintptr_t *)*fp;
+            uintptr_t ra = fp[1];
+            fprintf(stderr, "  frame[%d] fp=%p ra=%p\n", i, (void *)fp,
+                    (void *)ra);
+            if (next <= fp || (uintptr_t)next > 0x7fffffffffffUL)
+                break;
+            fp = next;
+        }
+    }
+
+    if (getenv("ELF_LOADER_DUMP_PHDR") && g_exe_base) {
+        char *b = (char *)g_exe_base;
+        unsigned long phoff = 0x40, phnum = 0;
+        Elf64_Ehdr *eh = (Elf64_Ehdr *)b;
+        phoff = eh->e_phoff;
+        phnum = eh->e_phnum;
+        for (unsigned long i = 0; i < phnum; i++) {
+            Elf64_Phdr *p = (Elf64_Phdr *)(b + phoff + i * sizeof(Elf64_Phdr));
+            fprintf(stderr, "  memph[%lu] type=%#x vaddr=%#lx\n", i, p->p_type,
+                    (unsigned long)p->p_vaddr);
+        }
+    }
+
+    if (g_exe_base) {
+        char *b = (char *)g_exe_base;
+        uintptr_t t0 = (uintptr_t)b + 0x7440, t1 = (uintptr_t)b + 0x60728;
+        uintptr_t *s = (uintptr_t *)uc->uc_mcontext.sp;
+        uintptr_t *smax = s + 256;
+        for (int i = 0; s < smax; s++, i++) {
+            uintptr_t v = *s;
+            if (v >= t0 && v < t1)
+                fprintf(stderr, "  stack[%d] @%p = base+0x%lx (return?)\n", i,
+                        (void *)s, (unsigned long)(v - (uintptr_t)b));
+        }
+    }
+
+    fprintf(stderr, "[fault] phase=%s sig=%d addr=%p pc=%p sp=%p\n", loader_phase,
+            sig, si->si_addr,
+            (void *)uc->uc_mcontext.pc, (void *)uc->uc_mcontext.sp);
+    Dl_info di;
+    if (dladdr((void *)uc->uc_mcontext.pc, &di) && di.dli_fname)
+        fprintf(stderr, "  pc in: %s (%s+%#lx)\n", di.dli_fname,
+                di.dli_sname ? di.dli_sname : "?",
+                (unsigned long)((char *)uc->uc_mcontext.pc -
+                                (char *)di.dli_fbase));
+    fflush(stderr);
+    _exit(128 + sig);
+}
+
+
+void elf_install_fault_handlers(void) {
+    static char altstack[32768];
+    static stack_t ss;
+    ss.ss_sp = altstack;
+    ss.ss_size = sizeof(altstack);
+    sigaltstack(&ss, NULL);
+    struct sigaction sa;
+    memset(&sa, 0, sizeof(sa));
+    sa.sa_sigaction = fault_handler;
+    sa.sa_flags = SA_SIGINFO | SA_ONSTACK;
+    sigaction(SIGSEGV, &sa, NULL);
+    sigaction(SIGILL, &sa, NULL);
+    sigaction(SIGBUS, &sa, NULL);
+}
+
+int elf_run(elf_object_t *obj, int argc, char **argv, char **envp) {
+    if (!obj)
+        return -1;
+
+    apply_segment_prots(obj);
+
+    size_t env_count = 0;
+    while (envp[env_count])
+        env_count++;
+
+    size_t stack_size = 8 * 1024 * 1024;
+    char *stack = mmap(NULL, stack_size, PROT_READ | PROT_WRITE,
+                       MAP_PRIVATE | MAP_ANONYMOUS, -1, 0);
+    if (stack == MAP_FAILED) {
+        perror("mmap stack");
+        return -1;
+    }
+
+    char *stack_top = stack + stack_size;
+
+    size_t str_total = 256 + argc * 128 + env_count * 256;
+
+    size_t argv_off_size = (argc > 0) ? argc : 1;
+    size_t envp_off_size = (env_count > 0) ? env_count : 1;
+    size_t *argv_off = calloc(argv_off_size, sizeof(size_t));
+    size_t *envp_off = calloc(envp_off_size, sizeof(size_t));
+    if (!argv_off || !envp_off)
+        return -1;
+
+    size_t frame = 8 + (argc + 1) * 8 + (env_count + 1) * 8 + 24 * 2 * 8 + 16 + str_total;
+    char *sp = stack_top - frame;
+    sp = (char *)((uintptr_t)sp & ~(uintptr_t)15);
+
+    uint64_t *argc_slot = (uint64_t *)sp;
+    uint64_t *argv_arr = argc_slot + 1;
+    uint64_t *envp_arr = argv_arr + (argc + 1);
+    Elf64_auxv_t *aux = (Elf64_auxv_t *)(envp_arr + env_count + 1);
+    uint8_t *rand_bytes = (uint8_t *)(aux + 24);
+    char *strings = (char *)(rand_bytes + 16);
+
+    size_t off = 0;
+    for (int i = 0; i < argc; i++) {
+        size_t len = strlen(argv[i]) + 1;
+        argv_off[i] = off;
+        memcpy(strings + off, argv[i], len);
+        off += len;
+    }
+    for (size_t i = 0; i < env_count; i++) {
+        size_t len = strlen(envp[i]) + 1;
+        envp_off[i] = off;
+        memcpy(strings + off, envp[i], len);
+        off += len;
+    }
+
+    *argc_slot = (uint64_t)argc;
+    for (int i = 0; i < argc; i++)
+        argv_arr[i] = (uint64_t)(strings + argv_off[i]);
+    argv_arr[argc] = 0;
+    free(argv_off);
+
+    for (size_t i = 0; i < env_count; i++)
+        envp_arr[i] = (uint64_t)(strings + envp_off[i]);
+    envp_arr[env_count] = 0;
+    free(envp_off);
+
+    Elf64_auxv_t *a = aux;
+    a = auxv_append(a, AT_PHDR, (uint64_t)((char *)obj->base_addr + obj->ehdr->e_phoff));
+    a = auxv_append(a, AT_PHENT, sizeof(Elf64_Phdr));
+    a = auxv_append(a, AT_PHNUM, obj->phdr_count);
+    a = auxv_append(a, AT_PAGESZ, (uint64_t)sysconf(_SC_PAGESIZE));
+    a = auxv_append(a, AT_ENTRY, (uint64_t)obj->entry_point);
+    a = auxv_append(a, AT_BASE, (uint64_t)obj->base_addr);
+    a = auxv_append(a, AT_UID, (uint64_t)getuid());
+    a = auxv_append(a, AT_GID, (uint64_t)getgid());
+    a = auxv_append(a, AT_SECURE, 0);
+    a = auxv_append(a, AT_RANDOM, (uint64_t)rand_bytes);
+    a = auxv_append(a, AT_HWCAP, (uint64_t)getauxval(AT_HWCAP));
+    a = auxv_append(a, AT_HWCAP2, (uint64_t)getauxval(AT_HWCAP2));
+    a = auxv_append(a, AT_EXECFN, (uint64_t)(argv[0] ? (uintptr_t)argv[0] : 0));
+    a = auxv_append(a, AT_NULL, 0);
+    {
+        int fd = open("/dev/urandom", O_RDONLY);
+        if (fd >= 0) {
+            ssize_t got = read(fd, rand_bytes, 16);
+            if (got < 16)
+                memset(rand_bytes, 0x5a, 16);
+            close(fd);
+        } else {
+            memset(rand_bytes, 0x5a, 16);
+        }
+    }
+
+    if (getenv("ELF_LOADER_DUMP_AUXV")) {
+        for (Elf64_auxv_t *q = aux; q->a_type != AT_NULL; q++)
+            fprintf(stderr, "[aux] type=%#lx val=%#lx\n", q->a_type, q->a_un.a_val);
+        fprintf(stderr, "[aux] argc=%zu argv0=%p env0=%p rand=%p\n",
+                (size_t)*argc_slot, (void *)argv_arr[0],
+                (void *)(env_count ? envp_arr[0] : 0), (void *)rand_bytes);
+    }
+
+    elf_install_fault_handlers();
+
+    printf("[+] entering %p (stack %p)\n", obj->entry_point, sp);
+    fflush(stdout);
+
+    jump_to_entry(obj->entry_point, sp, g_tls_new_tp, g_tls_old_tp);
+    return -1;
+}
+
+void elf_unload(elf_object_t *obj) {
+    if (!obj)
+        return;
+    if (obj->base_addr)
+        munmap(obj->base_addr, obj->total_size);
+    free(obj->ehdr);
+    free(obj->phdr);
+    free(obj->symtab);
+    free(obj->strtab);
+    free(obj->dynsym);
+    free(obj->dynstr);
+    for (size_t i = 0; i < obj->handle_count; i++)
+        if (obj->handles[i])
+            dlclose(obj->handles[i]);
+    free(obj->handles);
+    free(obj->origin_dir);
+    free(obj);
+}
