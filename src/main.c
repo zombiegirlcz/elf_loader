@@ -199,8 +199,10 @@ int main(int argc, char **argv, char **envp) {
     setenv("MALLOC_MMAP_THRESHOLD_", "33554432", 0);
     setenv("MALLOC_TOP_PAD_", "8388608", 0);
     setenv("MALLOC_MMAP_MAX_", "1024", 0);
+#ifdef __GLIBC__
     mallopt(M_TRIM_THRESHOLD, 0x7fffffff);
     mallopt(M_TOP_PAD, 8388608);
+#endif
 
     {
         struct rlimit rl;

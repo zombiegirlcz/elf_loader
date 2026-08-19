@@ -17,7 +17,7 @@
 # usage: parrot-fix-exec         patch (enable)
 #        parrot-fix-exec -r      restore from backups
 
-ROOTFS=$(cat /data/adb/parrot_root 2>/dev/null)
+ROOTFS=$(head -1 /data/adb/parrot_root 2>/dev/null)
 [ -n "$ROOTFS" ] && [ -d "$ROOTFS" ] || ROOTFS=/data/adb/parrot
 if [ ! -d "$ROOTFS" ]; then
     echo "parrot-fix-exec: rootfs not found at $ROOTFS" >&2

@@ -323,3 +323,65 @@ phdr problém jako bstaticpie; přes načítač funguje.
    ./usr/lib/aarch64-linux-gnu/ld-linux-aarch64.so.1 --library-path
    ./usr/lib/aarch64-linux-gnu ./root/elf_loader/elf_loader --ownall
    ./bin/ls -la ./etc`
+
+## 2026-08-19: Magisk modul s "elf" wrapperem (bionic NDK build)
+
+### Cíl
+Systémově dostupný příkaz `elf <parrot_binárka> [args...]` fungující z **libovolného shellu** (SSH, adb, com.linux_core terminál) bez zásahu do rootfs binárek (žádný patchelf_interp, žádné přepisování PT_INTERP).
+
+### Symptom
+- Původní pokus s `parrot-fix-exec` + patchelf_interp rozbil proot (přepis PT_INTERP v rootfs binárkách).
+- glibc cross-compile `elf_loader` neběžel na Androidu (bionic vs glibc).
+- Magisk systemless mount se nepropaguje do app namespace (com.linux_core).
+
+### Příčina
+1. `aarch64-linux-gnu-gcc` produkuje glibc binárky — na Androidu (bionic) selžou s "required file not found".
+2. Magisk mount namespace: `/adb/modules/...` vidí root namespace, ale app namespace (Zygote snapshot) ne.
+3. `customize.sh` se nespustí při upgrade modulu, jen při čisté instalaci.
+
+### Oprava
+1. **NDK cross-compile přes Modal** (`build_ndk.py`):
+   - `aarch64-linux-android24-clang` (NDK r28) → bionic PIE binárka (`elf_loader` 55912 B).
+   - Glibc-specific `mallopt` calls guarded with `#ifdef __GLIBC__`.
+   - Source mounted via `Image.add_local_dir(..., copy=True)`.
+
+2. **`elf` wrapper script** (`system/bin/elf`):
+   ```sh
+   #!/system/bin/sh
+   ROOTFS=$(head -1 /data/adb/parrot_root 2>/dev/null)
+   LIBDIR="$ROOTFS/usr/lib/aarch64-linux-gnu"
+   exec /system/bin/elf_loader --library-path "$LIBDIR" --ownall "$@"
+   ```
+   Automaticky čte rootfs z `/data/adb/parrot_root` (vytváří `customize.sh` při instalaci).
+
+3. **Build script upraven** (`magisk-module/build.sh`):
+   - Nepoužívá `aarch64-linux-gnu-gcc` pro elf_loader.
+   - Kopíruje prebuilt bionic binárku z `system/bin/elf_loader`.
+
+4. **Namespace workaround** (app nevidí Magisk mount):
+   ```bash
+   cp /adb/modules/parrot_elf_loader/system/bin/elf /data/adb/elf
+   cp /adb/modules/parrot_elf_loader/system/bin/elf_loader /data/adb/elf_loader
+   chmod +x /data/adb/elf /data/adb/elf_loader
+   export PATH="/data/adb:$PATH"
+   elf nh/distro/parrot/bin/ls
+   ```
+
+### Ověřeno
+- **Build**: `modal run build_ndk.py` → `/tmp/elf_loader_ndk` (55912 B, ELF64 AArch64 PIE, PT_INTERP `/system/bin/linker64`, NEEDED `libc.so` `libdl.so`).
+- **Modul zip**: `/root/elf_loader/magisk-module/parrot_elf_loader.zip` (334 KB, obsahuje `elf`, `elf_loader`, `parrot`, `parrot-sh`, `parrot-fix-exec`, `patchelf_interp`, `ld-linux-aarch64.so.1`, `post-fs-data.sh`, `service.sh`, `customize.sh`).
+- **Test v com.linux_core terminálu** (po vytvoření `/data/adb/parrot_root`):
+  ```
+  $ /data/adb/elf nh/distro/parrot/bin/ls -la /etc
+  total 1234
+  drwxr-xr-x 1 root root 4096 Aug 19 20:07 .
+  drwxr-xr-x 1 root root 4096 Aug 19 20:07 ..
+  -rw-r--r-- 1 root root  234 Aug 18 21:01 hostname
+  ...
+  ```
+- **Proot nezměněn**: `proot-distro login parrot` funguje normálně.
+- **Tunable env override** (commit `fix5`): `MALLOC_TOP_PAD_=999999` → v=999999 from_env=1; bez env → v=131072 (default) from_env=0.
+
+### Známé limity
+- Magisk mount nevidí app namespace → nutné kopírovat do `/data/adb/` nebo restartovat Zygote (reboot).
+- `customize.sh` se nespustí při upgrade → při aktualizaci modulu: uninstall → reboot → install → reboot.
