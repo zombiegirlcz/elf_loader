@@ -139,6 +139,7 @@ Výsledek se uloží do GOT slotu.
 ### Zbývá
 
 - `src/main.c:149` sign-compare warning (int vs size_t) — kosmetika.
+- **Libc.so.6 dep handling**: loader by měl při "dep libc.so.6 not found" tvrdně skončit chybou HNED, ne pokračovat až k segfaultu na `mp_` čtení. Řešení: v `load_module_needed` (src/elf_loader.c ř. ~1152) po selhání, když soname == "libc.so.6", `exit(1)` přímo z `run_ownall`.
 - Otevřeno: Step 3 (bare-Android / NDK static-PIE).
 - **Tunable env override** (tunable_get_val): přidáno načítání env proměnné
   před výpočet default hodnoty. Předchozí implementace vracela vždy default
