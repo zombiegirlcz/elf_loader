@@ -140,6 +140,13 @@ Výsledek se uloží do GOT slotu.
 
 - `src/main.c:149` sign-compare warning (int vs size_t) — kosmetika.
 - Otevřeno: Step 3 (bare-Android / NDK static-PIE).
+- **Tunable env override** (tunable_get_val): přidáno načítání env proměnné
+  před výpočet default hodnoty. Předchozí implementace vracela vždy default
+  hodnotu, env proměnné nebyly zohledněny. Nyní: `getenv(env_name)` → strtoll,
+  pokud není nastaveno → default_val. Ověřeno: `MALLOC_TOP_PAD_=999999`
+  → v=999999, from_env=1; bez env → v=131072 (default), from_env=0.
+
+### Fixy 2026-08-19 (brk desync + TLS offset under TP)
 
 ## Step 3 — bionic (NDK) binárky přes načítač
 
