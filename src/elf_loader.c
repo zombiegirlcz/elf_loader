@@ -402,23 +402,78 @@ static void patch_module_heap_syms(elf_object_t *m) {
 
 typedef struct { int64_t numval; } ldso_tunable_val_t;
 
+typedef struct {
+    const char *env_name;
+    int64_t default_val;
+    int is_size_t;
+} malloc_tunable_t;
+
+static const malloc_tunable_t malloc_tunables[] = {
+    [0]  = { "MALLOC_CHECK_",          0,           0 },
+    [1]  = { "MALLOC_TOP_PAD_",        131072,      1 },
+    [2]  = { "MALLOC_PERTURB_",        0,           0 },
+    [3]  = { "MALLOC_MMAP_THRESHOLD_", 128 * 1024,  1 },
+    [4]  = { "MALLOC_TRIM_THRESHOLD_", 128 * 1024,  1 },
+    [5]  = { "MALLOC_MMAP_MAX_",       65536,       0 },
+    [6]  = { "MALLOC_ARENA_TEST",      0,           1 },
+    [7]  = { "MALLOC_ARENA_MAX",       0,           1 },
+    [8]  = { "MALLOC_MXFAST_",         128 * 1024,  1 },
+    [9]  = { "MALLOC_TCACHE_COUNT",    7,           1 },
+    [10] = { "MALLOC_TCACHE_MAX",      0,           1 },
+    [11] = { "MALLOC_TCACHE_UNSORTED_LIMIT", 0,     1 },
+    [12] = { "MALLOC_MMAP_THRESHOLD_DYNAMIC", 1,   0 },
+    [13] = { "MALLOC_TRIM_THRESHOLD_DYNAMIC", 1,   0 },
+    [14] = { "MALLOC_HUGETLB",         0,           0 },
+};
+
 static int tunable_is_initialized(int id) {
-    (void)id;
+    if (id < 10)
+        return 0;
+    int idx = id - 10;
+    if (idx >= 0 && idx < (int)(sizeof(malloc_tunables) / sizeof(malloc_tunables[0]))) {
+        const char *env = getenv(malloc_tunables[idx].env_name);
+        return env && env[0] != '\0';
+    }
     return 0;
 }
 
 static void tunable_get_default(int id, void *valp) {
-    (void)id;
-    *(int32_t *)valp = 0;
+    if (id >= 10) {
+        int idx = id - 10;
+        if (idx >= 0 && idx < (int)(sizeof(malloc_tunables) / sizeof(malloc_tunables[0]))) {
+            *(int64_t *)valp = malloc_tunables[idx].default_val;
+            return;
+        }
+    }
+    *(int64_t *)valp = 0;
 }
 
 static void tunable_get_val(int id, void *valp, void (*cb)(void *)) {
-    (void)id;
-    ldso_tunable_val_t v;
-    v.numval = 0;
-    if (cb)
+    if (id >= 10) {
+        int idx = id - 10;
+        if (idx >= 0 && idx < (int)(sizeof(malloc_tunables) / sizeof(malloc_tunables[0]))) {
+            const char *env = getenv(malloc_tunables[idx].env_name);
+            if (env && env[0] != '\0') {
+                int64_t v = strtoll(env, NULL, 0);
+                *(int64_t *)valp = v;
+                return;
+            }
+            int64_t def = malloc_tunables[idx].default_val;
+            *(int64_t *)valp = def;
+            if (cb) {
+                ldso_tunable_val_t v;
+                v.numval = def;
+                cb(&v);
+            }
+            return;
+        }
+    }
+    *(int64_t *)valp = 0;
+    if (cb) {
+        ldso_tunable_val_t v;
+        v.numval = 0;
         cb(&v);
-    *(int32_t *)valp = 0;
+    }
 }
 
 static void ldso_signal_error(void) {
