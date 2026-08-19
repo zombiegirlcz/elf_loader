@@ -140,3 +140,124 @@ Výsledek se uloží do GOT slotu.
 
 - `src/main.c:149` sign-compare warning (int vs size_t) — kosmetika.
 - Otevřeno: Step 3 (bare-Android / NDK static-PIE).
+
+## Step 3 — bionic (NDK) binárky přes načítač
+
+### Bionic static-PIE (`/tmp/bstaticpie`) — OPRAVENO
+
+**Symptom:** `/tmp/bstaticpie` (NDK r28, `-static-pie`) přes načítač → rc=139.
+`pc=base+0x1e6f8` v `__find_elf_note`, čtení `addr=0x270` (link-time adresa,
+nemapováno). Crashne i nativně (QEMU-user, rc=139), zatímco glibc statiky
+(`/tmp/sfull` rc=7, `/tmp/spie` rc=42) běží nativně OK.
+
+**Příčina:** bionic static (`libc_init_static.cpp`) používá `phdr->p_vaddr`
+PŘÍMO s `load_bias=0`: `__find_elf_note(type,name,phdr,phnum,note,desc,0)`
+počítá `note_addr = 0 + p_vaddr`; `__libc_init_mte(..., /*load_bias=*/0)`;
+`__bionic_get_tls_segment(phdr, phnum, 0, ...)`. Tedy vyžaduje, aby **pole
+`p_vaddr` v mapované phdr tabulce byla předrelokovaná (base-added)**. Nic ji
+nerelokuje: kernel (`fs/binfmt_elf.c` jen lokální `phdr_addr += load_bias` pro
+AT_PHDR), QEMU ani načítač (0 rela targetů v phdr rozsahu `[0x40,0x270)` —
+všech 424 relokací je R_AARCH64_RELATIVE jen do RW segmentů).
+
+**Oprava (`maybe_fixup_bionic_phdr` v src/elf_loader.c, voláno v `elf_load`
+po namapování, před `apply_segment_prots`):** detekce bionic přes PT_NOTE se
+jménem "Android" (`.note.android.ident`); pokud ano, `phdr[i].p_vaddr += base`
+přímo v mapovaném obraze (stránky jsou ještě RW). Glibc se nedotkne (nemá
+Android note) — jinak by se rozbil výpočet `load_bias` glibc static-pie.
+
+**Ověřeno:**
+```
+./elf_loader --run /tmp/bstaticpie
+[dbg] bionic phdr p_vaddr rebased (+0x7541350000)
+bionic (NDK) hello
+printf via bionic: 42
+rc=42
+```
+sfull rc=7, sstatic rc=42, spie rc=0, `make test` — bez regrese.
+Pozn.: ET_EXEC varianta `/tmp/bstatic` (base 0x200000) NELZE spustit v tomto
+prostředí — 0x200000 je v každém procesu obsazena emulační vrstvou proot/QEMU
+(`loader` binárka), MAP_FIXED_NOREPLACE selže.
+
+### Task 1 — page size patch (bug.md)
+
+**Symptom:** `#define PAGE_SIZE 4096` — na Androidu 15+ (16K stránky) by
+ALIGN_UP/ALIGN_DOWN i TLS region dávaly špatné rozsahy.
+
+**Oprava:** runtime verze:
+```c
+static size_t sys_page_size(void) {
+    if (!g_page_size)
+        g_page_size = (size_t)sysconf(_SC_PAGESIZE);
+    return g_page_size;
+}
+#define PAGE_SIZE sys_page_size()
+```
+Nahrazen i zbylý `4096` literál (TLS region `ALIGN_UP(..., PAGE_SIZE)`).
+Zbylé `0x1000` na ř. 1286 (slack margin TLS) a 1390 (sanity check `> 0x1000`)
+nejsou page-size závislé — ponechány.
+
+**Ověřeno:** `make test` rc=0, všechny segment totals násobkem runtime page
+size (`0x97000`/`0x8f000`/`0xa3000`).
+
+### Task 2 — NDK cross-compile loaderu (bug.md)
+
+`finale_loader_build.py` (Modal, NDK r28, `aarch64-linux-android24-clang`,
+stejné flagy jako Makefile mínus proot-only `-B/usr/bin`). Výsledky:
+
+- **a) MAP_FIXED_NOREPLACE:** v NDK r28 sysroot **dostupný i pro API 24**,
+  hodnota `0x100000` (ověřeno `-dM -E` pro API 24/29/30/35). Fallback netřeba.
+  (První grep "MISSING" byl chyba regexu, `-dM` je autoritativní.)
+- **b) _GNU_SOURCE / chybějící symboly:** `_GNU_SOURCE` definován v hlavičce
+  i v command line → `-Wmacro-redefined` (opraveno odstraněním `-D`). Použité
+  GNU symboly (strndup, dlfcn, getauxval, RTLD_NEXT) v bionic jsou. Jediný
+  problém: **bionic static libc nemá dlfcn** (`dlopen/dlsym/dlclose/dladdr`
+  undefined při `-static-pie`) → přidán `src/dlfcn_stubs.c` (no-op vracející
+  NULL) jen pro static-PIE variantu.
+- **c) entry.S:** kompiluje se bez chyb clang integrated assemblerem
+  (`.type ..., %function` podporováno).
+
+**Výstupy:**
+- `/tmp/elf_loader_ndk` (89712 B): ELF64 AArch64 PIE, PT_INTERP
+  `/system/bin/linker64`, NEEDED `libc.so`/`libdl.so` → připraveno na
+  `adb push` + `adb shell`.
+- `/tmp/elf_loader_ndk_staticpie` (2244416 B): self-contained.
+
+**Ověřeno (vrstvené načítání):**
+```
+./elf_loader --run /tmp/elf_loader_ndk_staticpie --run /tmp/bstaticpie
+[+] Base: 0x734b4f9000 Entry: 0x734b517c40 deps: 0   <- NDK loader
+[+] Base: 0x734b68c000 Entry: 0x734b6a9840 deps: 0   <- bstaticpie přes NDK loader
+bionic (NDK) hello
+printf via bionic: 42
+rc=42
+```
+glibc načítač → NDK loader (bionic static-PIE) → který sám načte/spustí
+bstaticpie. Pozn.: NDK loader spuštěný nativně (QEMU) crashne rc=139 — stejný
+phdr problém jako bstaticpie; přes načítač funguje.
+
+### Task 3 — empirický test page size (bug.md)
+
+- Toto prostředí (QEMU-user): `getconf PAGESIZE` = **4096**.
+- Runtime použití sysconf ověřeno: `make test` zelené, segment totals
+  (0x97000/0x8f000/0xa3000) jsou násobky runtime page size.
+- Test na 16K zařízení **nelze provést** — není dostupné Android zařízení/
+  emulátor; vyžaduje `adb` + Android 15+ 16K system image.
+
+### Task 4 — dlopen_search() namespace (bug.md, informační)
+
+- Bionic dlopen namespaces (API 26+) omezují dlopen knihoven mimo
+  app/system adresáře (např. `/data/local/tmp`).
+- Načítání přes **vlastní loader** (`--own`, `--ownall`) host dlopen vůbec
+  nevyužívá (`load_needed` ř. 413: `if (elf_own_deps && obj->scope)` →
+  `elf_load_shared`; `load_module_needed` ř. 683: `if (elf_own_deps)` →
+  vlastní cesta) → **namespaces nejsou blokující** pro `--ownall` flow.
+- Empirický test (dlerror/errno v bionic) zde nelze — glibc host.
+
+## Zbývá
+
+- `src/main.c:149` sign-compare warning (int vs size_t) — kosmetika.
+- Vyčistit debug instrumentaci v elf_loader.c: `[dbg] map_elf_segments` print,
+  `ELF_LOADER_DUMP_AUXV` / `ELF_LOADER_DUMP_PHDR` bloky, regrese výpisu
+  fault handleru (insn-dump končí po F: řádku registrů).
+- Task 3: ověřit na reálném 16K zařízení (Android 15+, `adb`).
+- Task 4: empirický dlerror/errno test na bionic cíli (mimo proot).

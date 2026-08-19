@@ -9,13 +9,18 @@
 extern char **environ;
 #include <signal.h>
 #include <dlfcn.h>
-#define _GNU_SOURCE
 #include <sys/mman.h>
 #include <sys/auxv.h>
 #include <sys/stat.h>
 #include <limits.h>
 
-#define PAGE_SIZE 4096
+static size_t g_page_size = 0;
+static size_t sys_page_size(void) {
+    if (!g_page_size)
+        g_page_size = (size_t)sysconf(_SC_PAGESIZE);
+    return g_page_size;
+}
+#define PAGE_SIZE sys_page_size()
 #define ALIGN_UP(x, align) (((x) + (align) - 1) & ~((align) - 1))
 #define ALIGN_DOWN(x, align) ((x) & ~((align) - 1))
 
@@ -56,6 +61,7 @@ static int is_ld_linux(const char *name) {
 static size_t map_base_vaddr(const elf_object_t *obj);
 static void *va(const elf_object_t *obj, size_t vaddr);
 static void apply_segment_prots(elf_object_t *obj);
+static void maybe_fixup_bionic_phdr(elf_object_t *obj);
 static char *find_in_paths(const char *soname, const char *search);
 
 void elf_set_lazy(int on) {
@@ -519,6 +525,8 @@ elf_object_t *elf_load(const char *path) {
 
     obj->phdr = (Elf64_Phdr *)malloc(sizeof(Elf64_Phdr) * ehdr->e_phnum);
     memcpy(obj->phdr, file_phdr, sizeof(Elf64_Phdr) * ehdr->e_phnum);
+
+    maybe_fixup_bionic_phdr(obj);
 
     for (int i = 0; i < obj->phdr_count; i++) {
         if (obj->phdr[i].p_type != PT_TLS)
@@ -1200,6 +1208,31 @@ int elf_relocate(elf_object_t *obj) {
     return 0;
 }
 
+static void maybe_fixup_bionic_phdr(elf_object_t *obj) {
+    char *base = obj->base_addr;
+    int is_bionic = 0;
+
+    for (int i = 0; i < obj->phdr_count; i++) {
+        if (obj->phdr[i].p_type != PT_NOTE)
+            continue;
+        if (obj->phdr[i].p_filesz < 16)
+            continue;
+        const char *note = (const char *)va(obj, obj->phdr[i].p_vaddr);
+        uint32_t n_namesz = *(const uint32_t *)note;
+        if (n_namesz == 8 && memcmp(note + 12, "Android", 8) == 0) {
+            is_bionic = 1;
+            break;
+        }
+    }
+
+    if (is_bionic) {
+        Elf64_Phdr *mapped = (Elf64_Phdr *)(base + obj->ehdr->e_phoff);
+        for (int i = 0; i < obj->phdr_count; i++)
+            mapped[i].p_vaddr += (uint64_t)base;
+        fprintf(stderr, "[dbg] bionic phdr p_vaddr rebased (+%p)\n", base);
+    }
+}
+
 static void apply_segment_prots(elf_object_t *obj) {
     size_t mbv = map_base_vaddr(obj);
     char *base = obj->base_addr;
@@ -1251,7 +1284,7 @@ elf_tls_ctx_t elf_setup_own_tls(elf_object_t *exe, elf_scope_t *scope) {
         return ctx;
 
     size_t size = ALIGN_UP(TLS_PRE_TCB_SIZE + TLS_TCB_HEAD_SIZE + max_end + 0x1000,
-                           4096);
+                           PAGE_SIZE);
     void *region = mmap(NULL, size, PROT_READ | PROT_WRITE,
                         MAP_PRIVATE | MAP_ANONYMOUS, -1, 0);
     if (region == MAP_FAILED)
@@ -1514,7 +1547,9 @@ int elf_run(elf_object_t *obj, int argc, char **argv, char **envp) {
 
     if (getenv("ELF_LOADER_DUMP_AUXV")) {
         for (Elf64_auxv_t *q = aux; q->a_type != AT_NULL; q++)
-            fprintf(stderr, "[aux] type=%#lx val=%#lx\n", q->a_type, q->a_un.a_val);
+            fprintf(stderr, "[aux] type=%#llx val=%#llx\n",
+                    (unsigned long long)q->a_type,
+                    (unsigned long long)q->a_un.a_val);
         fprintf(stderr, "[aux] argc=%zu argv0=%p env0=%p rand=%p\n",
                 (size_t)*argc_slot, (void *)argv_arr[0],
                 (void *)(env_count ? envp_arr[0] : 0), (void *)rand_bytes);
