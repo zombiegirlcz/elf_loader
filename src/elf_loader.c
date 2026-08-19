@@ -463,7 +463,12 @@ static void tunable_get_val(int id, void *valp, void (*cb)(void *)) {
     if (id >= 10) {
         int idx = id - 10;
         if (idx >= 0 && idx < (int)(sizeof(malloc_tunables) / sizeof(malloc_tunables[0]))) {
-            int64_t v = malloc_tunables[idx].default_val;
+            int64_t v;
+            const char *env = getenv(malloc_tunables[idx].env_name);
+            if (env && env[0] != '\0')
+                v = strtoll(env, NULL, 0);
+            else
+                v = malloc_tunables[idx].default_val;
             if (malloc_tunables[idx].is_size_t)
                 *(int64_t *)valp = v;
             else
