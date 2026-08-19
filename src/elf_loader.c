@@ -107,16 +107,155 @@ static void *call_ifunc_resolver(void *resolver) {
 
 /* ---- emulation of glibc's ld.so-private runtime state ---- */
 
-#define LDSO_RO_SIZE 0x200
+#define LDSO_RO_SIZE 0x400
+#define LDSO_GLOBAL_SIZE 0xc00
 
 static unsigned char ldso_ro[LDSO_RO_SIZE];
-static unsigned char ldso_global[0x200];
+static unsigned char ldso_global[LDSO_GLOBAL_SIZE];
 static unsigned int ldso_enable_secure;
 static uintptr_t ldso_pointer_chk_guard;
 static char ldso_platform[] = "aarch64";
 static char *ldso_argv_copy[8];
 static Elf64_auxv_t ldso_auxv[64];
 static int ldso_setup_done;
+
+/* Minimal glibc-shaped struct link_map for the main executable.  glibc reads
+   GL(dl_ns)[0]._ns_loaded (offset 0 of _rtld_global) and then l->l_info[DT_INIT]
+   (+0xa0) / l_info[DT_INIT_ARRAY] (+0x108) to run the exe's constructors; we
+   leave those NULL because the loader already ran them.  dl_iterate_phdr /
+   _dl_find_object additionally read l_real(+0x28), l_phdr(+0x2f0),
+   l_phnum(+0x300), l_contiguous(0x366 bit3), l_map_start(+0x398),
+   l_map_end(+0x3a0), l_tls_modid(+0x498).  */
+static uint64_t ldso_exe_linkmap[0x100];
+static char ldso_exe_name[256];
+
+void ldso_install_exe_linkmap(elf_object_t *exe, const char *name) {
+    memset(ldso_exe_linkmap, 0, sizeof ldso_exe_linkmap);
+    unsigned char *lm = (unsigned char *)ldso_exe_linkmap;
+    uintptr_t base = (uintptr_t)exe->base_addr;
+    *(uintptr_t *)(lm + 0x00) = base;                       /* l_addr */
+    if (name) {
+        strncpy(ldso_exe_name, name, sizeof ldso_exe_name - 1);
+        ldso_exe_name[sizeof ldso_exe_name - 1] = 0;
+    }
+    *(uintptr_t *)(lm + 0x08) = (uintptr_t)ldso_exe_name;   /* l_name */
+    *(uintptr_t *)(lm + 0x28) = (uintptr_t)ldso_exe_linkmap;/* l_real = self */
+    *(uintptr_t *)(lm + 0x2f0) = (uintptr_t)exe->phdr;      /* l_phdr */
+    *(uint16_t *)(lm + 0x300) = (uint16_t)exe->phdr_count;  /* l_phnum */
+    lm[0x366] = 0x8;                                        /* l_contiguous */
+    *(uintptr_t *)(lm + 0x398) = base;                      /* l_map_start */
+    *(uintptr_t *)(lm + 0x3a0) = base + exe->total_size;    /* l_map_end */
+    /* l_tls_modid (+0x498) left 0: loader resolves TLS directly */
+    ((uint64_t *)ldso_global)[0] = (uintptr_t)ldso_exe_linkmap;
+}
+
+/* Per-module fake link_map structs so _dl_find_dso_for_object /
+   _dl_find_object / dl_iterate_phdr can attribute addresses to objects.  The
+   layout mirrors ldso_exe_linkmap.  */
+#define LDSO_MAX_MODULES 64
+static uint64_t ldso_module_linkmaps[LDSO_MAX_MODULES][0x100];
+static char ldso_module_names[LDSO_MAX_MODULES][256];
+static size_t ldso_module_count;
+static int ldso_modules_built;
+
+void ldso_install_module_list(elf_object_t *const *mods, size_t count) {
+    if (count > LDSO_MAX_MODULES)
+        count = LDSO_MAX_MODULES;
+    for (size_t i = 0; i < count; i++) {
+        elf_object_t *m = mods[i];
+        if (!m)
+            continue;
+        uint64_t *lm = ldso_module_linkmaps[ldso_module_count];
+        memset(lm, 0, sizeof ldso_module_linkmaps[0]);
+        unsigned char *b = (unsigned char *)lm;
+        uintptr_t base = (uintptr_t)m->base_addr;
+        const char *name = m->soname ? m->soname : "";
+        strncpy(ldso_module_names[ldso_module_count], name,
+                sizeof ldso_module_names[0] - 1);
+        ldso_module_names[ldso_module_count][sizeof ldso_module_names[0] - 1] = 0;
+        *(uintptr_t *)(b + 0x00) = base;                          /* l_addr */
+        *(uintptr_t *)(b + 0x08) = (uintptr_t)ldso_module_names[ldso_module_count];
+        *(uintptr_t *)(b + 0x28) = (uintptr_t)lm;                 /* l_real */
+        *(uintptr_t *)(b + 0x2f0) = (uintptr_t)m->phdr;           /* l_phdr */
+        *(uint16_t *)(b + 0x300) = (uint16_t)m->phdr_count;       /* l_phnum */
+        b[0x366] = 0x8;                                           /* l_contiguous */
+        *(uintptr_t *)(b + 0x398) = base;                         /* l_map_start */
+        *(uintptr_t *)(b + 0x3a0) = base + m->total_size;         /* l_map_end */
+        ldso_module_count++;
+    }
+    ldso_modules_built = 1;
+}
+
+/* New-glibc _dl_find_dso_for_object: locate the object whose mapped range
+   contains ADDR and return its struct link_map *, or NULL.  The extra
+   arguments are cache/bookkeeping hints the caller passes; they are
+   irrelevant for a correct linear lookup.  */
+static void *ldso_find_dso_for_object(uintptr_t addr, long a1, long a2,
+                                      long a3, int a4, long a5, long a6) {
+    (void)a1; (void)a2; (void)a3; (void)a4; (void)a5; (void)a6;
+    if (!addr)
+        return NULL;
+    {
+        uintptr_t start = *(uintptr_t *)((unsigned char *)ldso_exe_linkmap + 0x398);
+        uintptr_t end = *(uintptr_t *)((unsigned char *)ldso_exe_linkmap + 0x3a0);
+        if (addr >= start && addr < end)
+            return ldso_exe_linkmap;
+    }
+    for (size_t i = 0; i < ldso_module_count; i++) {
+        unsigned char *b = (unsigned char *)ldso_module_linkmaps[i];
+        uintptr_t start = *(uintptr_t *)(b + 0x398);
+        uintptr_t end = *(uintptr_t *)(b + 0x3a0);
+        if (addr >= start && addr < end)
+            return ldso_module_linkmaps[i];
+    }
+    return NULL;
+}
+
+/* glibc 2.41+ _dl_find_object: (const void *pc, struct dl_find_object *result).
+   Fills result for the object containing PC, returns 0 on success / -1 on
+   not-found.  Result layout: +0 dlfo_addr, +8 dlfo_name, +16 dlfo_phdr,
+   +24 dlfo_phnum, +32 dlfo_map_start, +40 dlfo_map_end, +48 dlfo_link_map.  */
+static int ldso_find_object(uintptr_t pc, void *result) {
+    uintptr_t *dlfo = (uintptr_t *)result;
+    void *lm = ldso_find_dso_for_object(pc, 0, 0, 0, 0, 0, 0);
+    if (!dlfo || !lm) {
+        if (dlfo)
+            dlfo[0] = 0;
+        return -1;
+    }
+    unsigned char *b = (unsigned char *)lm;
+    dlfo[0] = *(uintptr_t *)(b + 0x00);   /* dlfo_addr = l_addr */
+    dlfo[1] = *(uintptr_t *)(b + 0x08);   /* dlfo_name */
+    dlfo[2] = *(uintptr_t *)(b + 0x2f0);  /* dlfo_phdr */
+    *(uint16_t *)((unsigned char *)dlfo + 24) = *(uint16_t *)(b + 0x300);
+    dlfo[4] = *(uintptr_t *)(b + 0x398);  /* dlfo_map_start */
+    dlfo[5] = *(uintptr_t *)(b + 0x3a0);  /* dlfo_map_end */
+    dlfo[6] = (uintptr_t)lm;              /* dlfo_link_map */
+    return 0;
+}
+
+/* glibc 2.41+ _dl_catch_exception: runs operate(args) under exception
+   protection.  Returns 0 on success and reports exception state through the
+   out-params (NULL / 1 on success).  Our operate closures never raise, so the
+   happy path always applies.  */
+static int ldso_catch_exception(void *exc, void **result,
+                                unsigned char *cancelled,
+                                void (*operate)(void *), void *args) {
+    (void)exc;
+    *result = NULL;
+    *cancelled = 1;
+    operate(args);
+    return 0;
+}
+
+static void ldso_debug_state(void) {
+}
+
+/* dl_tls_get_addr_soft: current thread's TLS block for a module, or NULL.  */
+static void *ldso_tls_get_addr_soft(void *l) {
+    (void)l;
+    return NULL;
+}
 
 static void ldso_setup(void) {
     if (ldso_setup_done)
@@ -154,6 +293,111 @@ static void ldso_setup(void) {
     ro[12] = getauxval(AT_HWCAP);                /* +0x60 _dl_hwcap */
     ro[13] = (uintptr_t)ldso_auxv;               /* +0x68 _dl_auxv */
     /* +0x70 midr_el1: 0 -> generic ifunc variants */
+    /* glibc function-pointer slots called through _rtld_global_ro */
+    ro[0x270 / 8] = (uintptr_t)ldso_find_dso_for_object;  /* _dl_find_dso_for_object */
+    ro[0x280 / 8] = (uintptr_t)ldso_catch_exception;  /* _dl_catch_exception */
+    ro[0x288 / 8] = (uintptr_t)ldso_debug_state;      /* _dl_debug_state */
+    ro[0x290 / 8] = (uintptr_t)ldso_tls_get_addr_soft;/* dl_tls_get_addr_soft */
+    ro[0x2a0 / 8] = (uintptr_t)ldso_find_object;      /* _dl_find_object */
+
+    uint64_t *g = (uint64_t *)ldso_global;
+    g[0xa80 / 8] = 1;                           /* _dl_nns */
+    g[0xb18 / 8] = 1;                           /* dl_load_adds */
+    /* dl_load_write_lock at +0xab8 stays all-zero (unlocked initial state) */
+}
+
+#define PARROT_HEAP_SIZE 0x4000000u  /* 64 MB */
+static void *parrot_heap_base;
+static char *parrot_brk_cur;
+
+static void ldso_private_heap_init(void) {
+    if (parrot_heap_base)
+        return;
+    void *base = mmap((void *)0x7f00000000UL, PARROT_HEAP_SIZE,
+                      PROT_READ | PROT_WRITE,
+                      MAP_PRIVATE | MAP_ANONYMOUS | MAP_FIXED, -1, 0);
+    if (base == MAP_FAILED)
+        base = mmap(NULL, PARROT_HEAP_SIZE, PROT_READ | PROT_WRITE,
+                    MAP_PRIVATE | MAP_ANONYMOUS, -1, 0);
+    if (base == MAP_FAILED)
+        base = NULL;
+    parrot_heap_base = base;
+    parrot_brk_cur = (char *)base;
+}
+
+void *ldso_sbrk(long inc) {
+    if (!parrot_heap_base)
+        ldso_private_heap_init();
+    if (!parrot_heap_base)
+        return (void *)-1;
+    char *old = parrot_brk_cur;
+    char *lo = (char *)parrot_heap_base;
+    char *hi = lo + PARROT_HEAP_SIZE;
+    char *nxt = old + inc;
+    if (nxt < lo)
+        nxt = lo;
+    if (nxt > hi)
+        nxt = hi;
+    parrot_brk_cur = nxt;
+    return old;
+}
+
+int ldso_brk(void *addr) {
+    if (!parrot_heap_base)
+        ldso_private_heap_init();
+    if (!parrot_heap_base)
+        return -1;
+    char *lo = (char *)parrot_heap_base;
+    char *hi = lo + PARROT_HEAP_SIZE;
+    if ((char *)addr < lo || (char *)addr > hi)
+        return -1;
+    parrot_brk_cur = (char *)addr;
+    return 0;
+}
+
+void *ldso_parrot_heap_base(void) {
+    ldso_private_heap_init();
+    return parrot_heap_base;
+}
+
+static void write_heap_veneer(void *target, void *fn) {
+    uint32_t *p = (uint32_t *)target;
+    uintptr_t page = (uintptr_t)target & ~0xfffUL;
+    mprotect((void *)page, 0x2000, PROT_READ | PROT_WRITE | PROT_EXEC);
+    p[0] = 0x58000050u;  /* ldr x16, [pc, #8] */
+    p[1] = 0xd61f0200u;  /* br x16 */
+    memcpy(&p[2], &fn, 8);
+    __builtin___clear_cache(target, (char *)target + 16);
+    mprotect((void *)page, 0x2000, PROT_READ | PROT_EXEC);
+}
+
+static void patch_module_heap_syms(elf_object_t *m) {
+    if (!m || !m->dynsym || !m->dynstr)
+        return;
+    uintptr_t mbv = 0;
+    for (int i = 0; i < m->phdr_count; i++) {
+        if (m->phdr[i].p_type == PT_LOAD) {
+            mbv = m->phdr[i].p_vaddr - m->phdr[i].p_offset;
+            break;
+        }
+    }
+    for (size_t j = 0; j < m->dynsym_count; j++) {
+        const Elf64_Sym *sym = &m->dynsym[j];
+        if (sym->st_shndx == SHN_UNDEF)
+            continue;
+        const char *nm = m->dynstr + sym->st_name;
+        void *fn = NULL;
+        if (strcmp(nm, "sbrk") == 0 || strcmp(nm, "__sbrk") == 0)
+            fn = (void *)ldso_sbrk;
+        else if (strcmp(nm, "brk") == 0 || strcmp(nm, "__brk") == 0)
+            fn = (void *)ldso_brk;
+        if (fn) {
+            void *tgt = (char *)m->base_addr + (sym->st_value - mbv);
+            fprintf(stderr, "[dbg] patching %s %s @%p -> %p\n", m->soname, nm,
+                    tgt, fn);
+            write_heap_veneer(tgt, fn);
+        }
+    }
 }
 
 typedef struct { int64_t numval; } ldso_tunable_val_t;
@@ -202,13 +446,27 @@ static void *ldso_lookup(const char *name) {
         return (void *)tunable_is_initialized;
     if (strcmp(name, "_dl_signal_error") == 0 ||
         strcmp(name, "_dl_signal_exception") == 0 ||
-        strcmp(name, "_dl_catch_exception") == 0 ||
-        strcmp(name, "_dl_allocate_tls") == 0 ||
+        strcmp(name, "_dl_catch_exception") == 0) {
+        if (strcmp(name, "_dl_catch_exception") == 0)
+            return (void *)ldso_catch_exception;
+        return (void *)ldso_signal_error;
+    }
+    if (strcmp(name, "_dl_allocate_tls") == 0 ||
         strcmp(name, "_dl_allocate_tls_init") == 0 ||
         strcmp(name, "_dl_deallocate_tls") == 0 ||
-        strcmp(name, "_dl_find_dso_for_object") == 0 ||
-        strcmp(name, "_dl_rtld_di_serinfo") == 0)
+        strcmp(name, "_dl_find_dso_for_object") == 0) {
+        if (strcmp(name, "_dl_find_dso_for_object") == 0)
+            return (void *)ldso_find_dso_for_object;
         return (void *)ldso_signal_error;
+    }
+    if (strcmp(name, "_dl_find_object") == 0)
+        return (void *)ldso_find_object;
+    if (strcmp(name, "_dl_rtld_di_serinfo") == 0)
+        return (void *)ldso_signal_error;
+    if (strcmp(name, "brk") == 0 || strcmp(name, "__brk") == 0)
+        return (void *)ldso_brk;
+    if (strcmp(name, "sbrk") == 0 || strcmp(name, "__sbrk") == 0)
+        return (void *)ldso_sbrk;
     return NULL;
 }
 
@@ -1026,6 +1284,8 @@ elf_object_t *elf_load_shared(const char *path, elf_scope_t *scope) {
     elf_scope_add(scope, m);
     elf_relocate(m);
 
+    patch_module_heap_syms(m);
+
     if (strstr(path, "libc.so.6")) {
         fprintf(stderr, "[dbg] libc pre-init mp_ bytes: ");
         unsigned char *mpp = (unsigned char *)base + 0x1b6760;
@@ -1050,6 +1310,27 @@ elf_object_t *elf_load_shared(const char *path, elf_scope_t *scope) {
         if (sym->st_shndx == SHN_UNDEF)
             continue;
         const char *nm = m->dynstr + sym->st_name;
+        if ((uintptr_t)nm >= 0x3000000000UL && (uintptr_t)nm < 0x3000080000UL) {
+            extern void *sbrk(long);
+            register long x8 __asm__("x8") = 214;  /* brk */
+            register long x0 __asm__("x0") = 0;
+            __asm__ volatile("svc #0" : "+r"(x0) : "r"(x8) : "memory", "cc");
+            fprintf(stderr, "[dbg] environ-patch %s: bad nm=%p dynstr=%p j=%zu st_name=%u brk=%p rawbrk=%p\n",
+                    path, nm, m->dynstr, j, sym->st_name, sbrk(0), (void *)x0);
+            if ((uintptr_t)nm >= 0x300006f000UL) {
+                static int dumped_maps;
+                if (!dumped_maps) {
+                    dumped_maps = 1;
+                    FILE *mf = fopen("/proc/self/maps", "r");
+                    if (mf) {
+                        char line[512];
+                        while (fgets(line, sizeof line, mf))
+                            fprintf(stderr, "  map: %s", line);
+                        fclose(mf);
+                    }
+                }
+            }
+        }
         if (strcmp(nm, "__environ") == 0 || strcmp(nm, "environ") == 0 ||
             strcmp(nm, "_environ") == 0) {
             *(uintptr_t *)((char *)base + (sym->st_value - mbv)) =
@@ -1063,9 +1344,8 @@ elf_object_t *elf_load_shared(const char *path, elf_scope_t *scope) {
             continue;
         const char *nm = m->dynstr + sym->st_name;
         if (strcmp(nm, "__curbrk") == 0 || strcmp(nm, "___brk_addr") == 0) {
-            extern void *sbrk(long);
             *(uintptr_t *)((char *)base + (sym->st_value - mbv)) =
-                (uintptr_t)sbrk(0);
+                (uintptr_t)ldso_sbrk(0);
             break;
         }
     }
@@ -1405,16 +1685,21 @@ elf_tls_ctx_t elf_setup_own_tls(elf_object_t *exe, elf_scope_t *scope) {
     ctx.old_tp = host_tp;
 
     int any = 0;
+    int64_t min_off = 0;
     size_t max_end = 0;
     if (exe && exe->has_tls) {
         any = 1;
-        max_end = TLS_EXE_BASE_OFF + exe->tls_memsz;
+        min_off = TLS_EXE_BASE_OFF;
+        max_end = (size_t)(TLS_EXE_BASE_OFF + exe->tls_memsz);
     }
     for (size_t i = 0; scope && i < scope->count; i++) {
         elf_object_t *m = scope->mods[i];
         if (m && m->has_tls) {
             any = 1;
-            size_t end = m->tls_offset + m->tls_memsz;
+            int64_t off = (int64_t)m->tls_offset;
+            if (off < min_off)
+                min_off = off;
+            size_t end = (size_t)(off + (int64_t)m->tls_memsz);
             if (end > max_end)
                 max_end = end;
         }
@@ -1422,15 +1707,15 @@ elf_tls_ctx_t elf_setup_own_tls(elf_object_t *exe, elf_scope_t *scope) {
     if (!any)
         return ctx;
 
-    size_t size = ALIGN_UP(TLS_PRE_TCB_SIZE + TLS_TCB_HEAD_SIZE + max_end + 0x1000,
-                           PAGE_SIZE);
+    size_t span = max_end - (size_t)min_off;
+    size_t size = ALIGN_UP(TLS_PRE_TCB_SIZE + span + 0x1000, PAGE_SIZE);
     void *region = mmap(NULL, size, PROT_READ | PROT_WRITE,
                         MAP_PRIVATE | MAP_ANONYMOUS, -1, 0);
     if (region == MAP_FAILED)
         return ctx;
     memset(region, 0, size);
 
-    uintptr_t new_tp = (uintptr_t)region + TLS_PRE_TCB_SIZE;
+    uintptr_t new_tp = (uintptr_t)region + TLS_PRE_TCB_SIZE + (size_t)(-min_off);
     /* region was zeroed above: struct pthread occupies [region, new_tp) */
 
     /* tcbhead_t at new_tp: { dtv, private } -- dtv filled below */
@@ -1461,8 +1746,7 @@ elf_tls_ctx_t elf_setup_own_tls(elf_object_t *exe, elf_scope_t *scope) {
     for (size_t i = 0; scope && i < scope->count; i++)
         if (scope->mods[i] && scope->mods[i]->has_tls)
             tls_mods++;
-    ldso_dtv_t *dtv = (ldso_dtv_t *)((uintptr_t)region + TLS_PRE_TCB_SIZE +
-                                     max_end + 0x800);
+    ldso_dtv_t *dtv = (ldso_dtv_t *)(new_tp + max_end + 0x800);
     memset(dtv, 0, sizeof(ldso_dtv_t) * (tls_mods + 2));
     dtv[0].u[0] = tls_mods + 1;          /* dtv length */
     dtv[1].u[0] = 1;                     /* TLS generation counter */
@@ -1498,6 +1782,29 @@ static Elf64_auxv_t *auxv_append(Elf64_auxv_t *a, uint64_t type, uint64_t val) {
     return a + 1;
 }
 
+static long sys_read(int fd, void *buf, size_t n) {
+    register long x8 __asm__("x8") = 63;
+    register long x0 __asm__("x0") = fd;
+    register long x1 __asm__("x1") = (long)buf;
+    register long x2 __asm__("x2") = (long)n;
+    __asm__ volatile("svc #0" : "+r"(x0) : "r"(x8), "r"(x1), "r"(x2)
+                     : "memory", "cc");
+    return x0;
+}
+
+static void sys_write(int fd, const void *buf, size_t n) {
+    register long x8 __asm__("x8") = 64;
+    register long x0 __asm__("x0") = fd;
+    register const char *x1 __asm__("x1") = buf;
+    register long x2 __asm__("x2") = (long)n;
+    __asm__ volatile("svc #0" : "+r"(x0) : "r"(x8), "r"(x1), "r"(x2)
+                     : "memory", "cc");
+}
+
+#ifndef AT_FDCWD
+#define AT_FDCWD -100
+#endif
+
 static void fault_handler(int sig, siginfo_t *si, void *ctx) {
     ucontext_t *uc = (ucontext_t *)ctx;
 
@@ -1529,6 +1836,27 @@ static void fault_handler(int sig, siginfo_t *si, void *ctx) {
     #undef RAW
     #undef HX
     {
+        register long x8 __asm__("x8") = 56;  /* openat */
+        register long x0 __asm__("x0") = AT_FDCWD;
+        register const char *x1 __asm__("x1") = "/proc/self/maps";
+        register long x2 __asm__("x2") = O_RDONLY;
+        register long x3 __asm__("x3") = 0;
+        __asm__ volatile("svc #0" : "+r"(x0) : "r"(x8), "r"(x1), "r"(x2), "r"(x3)
+                         : "memory", "cc");
+        if (x0 >= 0) {
+            int mfd = (int)x0;
+            sys_write(2, "  [maps-begin]\n", 15);
+            char mline[1024];
+            long nr;
+            while ((nr = sys_read(mfd, mline, sizeof mline)) > 0)
+                sys_write(2, mline, (size_t)nr);
+            sys_write(2, "  [maps-end]\n", 13);
+        } else {
+            sys_write(2, "  [openat-failed]\n", 18);
+        }
+    }
+
+    {
         register long x8 __asm__("x8") = 64;
         register long x0 __asm__("x0") = 2;
         register const char *x1 __asm__("x1") = raw;
@@ -1539,13 +1867,27 @@ static void fault_handler(int sig, siginfo_t *si, void *ctx) {
 
     {
         volatile uint32_t *iptr = (volatile uint32_t *)uc->uc_mcontext.pc;
-        uint32_t insn = 0;
-        for (int i = -2; i <= 2; i++) {
-            insn = *iptr;
-            fprintf(stderr, "  insn[%+d] @%p = 0x%08x\n", i,
-                    (void *)((char *)iptr), (unsigned)insn);
-            iptr++;
+        if ((uintptr_t)uc->uc_mcontext.pc > 0x10000) {
+            uint32_t insn = 0;
+            for (int i = -2; i <= 2; i++) {
+                insn = *iptr;
+                fprintf(stderr, "  insn[%+d] @%p = 0x%08x\n", i,
+                        (void *)((char *)iptr), (unsigned)insn);
+                iptr++;
+            }
         }
+    }
+
+    {
+        uintptr_t *s = (uintptr_t *)uc->uc_mcontext.sp;
+        uintptr_t *smax = s + 96;
+        fprintf(stderr, "  stack:");
+        for (int i = 0; s < smax; s++, i++) {
+            if (i % 4 == 0)
+                fprintf(stderr, "\n  %p:", (void *)s);
+            fprintf(stderr, " %016lx", (unsigned long)*s);
+        }
+        fprintf(stderr, "\n");
     }
 
     {
@@ -1590,6 +1932,37 @@ static void fault_handler(int sig, siginfo_t *si, void *ctx) {
     fprintf(stderr, "[fault] phase=%s sig=%d addr=%p pc=%p sp=%p\n", loader_phase,
             sig, si->si_addr,
             (void *)uc->uc_mcontext.pc, (void *)uc->uc_mcontext.sp);
+    {
+        FILE *mf = fopen("/proc/self/maps", "r");
+        if (mf) {
+            char line[512];
+            while (fgets(line, sizeof line, mf)) {
+                if (strstr(line, "3000000000") || strstr(line, "heap") ||
+                    strstr(line, "ld-linux") || strstr(line, "elf_loader") ||
+                    strstr(line, "libc.so.6") || strstr(line, "\[stack\]"))
+                    fprintf(stderr, "  map: %s", line);
+            }
+            fclose(mf);
+        }
+    }
+    {
+        register long x8 __asm__("x8") = 56;  /* openat */
+        register long x0 __asm__("x0") = AT_FDCWD;
+        register const char *x1 __asm__("x1") = "/proc/self/maps";
+        register long x2 __asm__("x2") = O_RDONLY;
+        register long x3 __asm__("x3") = 0;
+        __asm__ volatile("svc #0" : "+r"(x0) : "r"(x8), "r"(x1), "r"(x2), "r"(x3)
+                         : "memory", "cc");
+        if (x0 >= 0) {
+            int mfd = (int)x0;
+            char mline[1024];
+            long nr;
+            while ((nr = sys_read(mfd, mline, sizeof mline)) > 0)
+                sys_write(2, mline, (size_t)nr);
+            sys_write(2, "  [maps-end]\n", 13);
+        }
+    }
+
     Dl_info di;
     if (dladdr((void *)uc->uc_mcontext.pc, &di) && di.dli_fname)
         fprintf(stderr, "  pc in: %s (%s+%#lx)\n", di.dli_fname,

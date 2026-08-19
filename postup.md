@@ -258,6 +258,61 @@ phdr problém jako bstaticpie; přes načítač funguje.
 - `src/main.c:149` sign-compare warning (int vs size_t) — kosmetika.
 - Vyčistit debug instrumentaci v elf_loader.c: `[dbg] map_elf_segments` print,
   `ELF_LOADER_DUMP_AUXV` / `ELF_LOADER_DUMP_PHDR` bloky, regrese výpisu
-  fault handleru (insn-dump končí po F: řádku registrů).
+  fault handleru (insn-dump končí po F: řádku registrů), dočasné
+  `[dbg] environ-patch bad nm` / maps-dump / `libc mp_` bloky.
 - Task 3: ověřit na reálném 16K zařízení (Android 15+, `adb`).
 - Task 4: empirický dlerror/errno test na bionic cíli (mimo proot).
+- Zařízení: fork/exec nového binárního souboru (např. `wc` z bash) selhává
+  jen na Androidu, protože interp `/lib/ld-linux-aarch64.so.1` neexistuje
+  (bionic). Nativně (přes wrapper) fork/exec funguje.
+
+## Fixy 2026-08-19 (brk desync + TLS offset pod TP)
+
+### 1. Dva alokátory sdílející jedno brk → private heap pro parrot libc
+
+- **Příznak:** `sed` (a další větší binárky) padaly SIGSEGV při loadu v
+  `__environ` patching smyčce, čtením `dynstr` na adrese těsně za koncem
+  mapované regiony (např. `0x3000073ebd`, region končil `0x3000073000`).
+- **Příčina:** host loader (glibc) i vlastně-načtená parrot libc sdílejí
+  procesní brk. Parrot malloc si přes vlastní `__curbrk`/`brk` syscall hýbal
+  brk nezávisle → desync `__curbrk` (host tvrdil `0x3000873000`, kernel break
+  byl `0x3000073000`) a reálný kernel break se smrskl pod živé host chunk
+  (`dynstr` buffer) → díra → fault. `MALLOC_TRIM_THRESHOLD_` / `mallopt`
+  nestačily.
+- **Fix:** parrot alokátor dostal **vlastní mmap arena** (`ldso_private_heap_init`
+  → 64 MB MAP_FIXED na `0x7f00000000`). `sbrk`/`brk` v parrot libc (i ostatních
+  modulech) jsou:
+  - pro externí volání přemapovány v `ldso_lookup` na `ldso_sbrk`/`ldso_brk`
+    (PLT), a
+  - pro interní přímé `bl` volání `__sbrk`/`__brk`/`sbrk`/`brk` přelepeny
+    16-bajtovým veneerem (`ldr x16,[pc,#8]; br x16` + ukazatel) ve
+    `write_heap_veneer`/`patch_module_heap_syms` ihned po `elf_relocate`.
+  `__curbrk` patch nyní zapisuje `ldso_sbrk(0)` (private brk), ne host.
+- **Výsledek:** parrot malloc už brk nedotýká; trimy/rastr jen posouvají
+  pointer v privátní areně (bez munmap) → žádné díry. `sed`, `bash`, `wc`,
+  `ls` … vše EXIT=0 nativně.
+
+### 2. TLS blok pod TP (negativní tls_offset) na device-přímém startu
+
+- **Příznak:** na zařízení (su-přímý start přes parrot ld.so jako interp)
+  fault v `elf_setup_own_tls` — `memcpy` psal do nepokryté mezery
+  (`dest=0x736f362fe0`, mapa `736f365000-736f36c000`).
+- **Příčina:** modulové TLS bloky se na zařízení namapovaly POD host TP →
+  `tls_offset = blk - TP` byl záporný (libc `-0x2740`, libselinux `-0x1740`),
+  takže `new_tp + tls_offset` vyletěl pod začátek TLS regiony (nativně přes
+  wrapper byly offsety kladné — náhoda layoutu).
+- **Fix:** `elf_setup_own_tls` počítá `min_off` (minimální, může být záporný)
+  a `span = max_end - min_off`; `size` i `new_tp` se zvětší o `-min_off`, takže
+  `new_tp + min_off >= region` a `new_tp + max_end <= region + size`. DTV je
+  nyní umístěn na `new_tp + max_end + 0x800`.
+
+## Stav na zařízení (SSH 5555, su)
+
+- Nativně (wrapper) i na zařízení (su + parrot ld.so jako interp):
+  `ls`, `sed`, `grep`, `wc`, `cp`, `rm`, `head`, `echo`, `printf`, `stat`,
+  `bash` (builtiny) — EXIT=0.
+- Zařízení-spouštění příklad:
+  `LD_LIBRARY_PATH=<rootfs>/usr/lib/aarch64-linux-gnu cd <rootfs> &&
+   ./usr/lib/aarch64-linux-gnu/ld-linux-aarch64.so.1 --library-path
+   ./usr/lib/aarch64-linux-gnu ./root/elf_loader/elf_loader --ownall
+   ./bin/ls -la ./etc`

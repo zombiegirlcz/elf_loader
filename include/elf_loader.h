@@ -63,6 +63,8 @@ void elf_unload(elf_object_t *obj);
 void elf_install_fault_handlers(void);
 elf_tls_ctx_t elf_setup_own_tls(elf_object_t *exe, elf_scope_t *scope);
 void elf_teardown_own_tls(elf_tls_ctx_t *ctx);
+void ldso_install_exe_linkmap(elf_object_t *exe, const char *name);
+void ldso_install_module_list(elf_object_t *const *mods, size_t count);
 
 void elf_register_override(const char *name, void *fn);
 void elf_set_lazy(int on);

@@ -1,0 +1,5 @@
+#!/system/bin/sh
+# parrot-sh - interactive parrot shell on Android.
+# usage: parrot-sh [args...]
+
+exec parrot /bin/bash "$@"

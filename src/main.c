@@ -1,9 +1,13 @@
+#define _GNU_SOURCE 1
 #include "../include/elf_loader.h"
 
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
 #include <dlfcn.h>
+#include <malloc.h>
+#include <unistd.h>
+#include <sys/resource.h>
 
 static const char *status_str(sym_status_t st) {
     switch (st) {
@@ -155,6 +159,20 @@ static int run_ownall(const char *path, int argc, char **argv, char **envp) {
             libc_obj = scope->mods[mi]->base_addr;
     g_libc_base = (uintptr_t)libc_obj;
     g_exe_base = (uintptr_t)obj->base_addr;
+    ldso_install_exe_linkmap(obj, path);
+    ldso_install_module_list(scope->mods, scope->count);
+    if (getenv("ELF_LOADER_DUMP_MAPS")) {
+        FILE *mf = fopen("/proc/self/maps", "r");
+        if (mf) {
+            char line[512];
+            while (fgets(line, sizeof line, mf)) {
+                if (strstr(line, "3000") || strstr(line, "heap") ||
+                    strstr(line, "elf_loader") || strstr(line, "\[stack\]"))
+                    fprintf(stderr, "  map: %s", line);
+            }
+            fclose(mf);
+        }
+    }
     {
         unsigned char *mp = (unsigned char *)g_libc_base + 0x1b6760;
         fprintf(stderr, "[dbg] libc mp_ @ %p: ", (void *)mp);
@@ -173,6 +191,25 @@ static int run_ownall(const char *path, int argc, char **argv, char **envp) {
 }
 
 int main(int argc, char **argv, char **envp) {
+    /* The own-loaded parrot libc and the loader's host libc share the same
+       process brk.  Both allocators must never shrink the heap (brk): a trim
+       by either one unmaps live chunks of the other.  Set MALLOC_* tunables
+       (read by parrot malloc at its first malloc) and mallopt the host.  */
+    setenv("MALLOC_TRIM_THRESHOLD_", "2147483647", 0);
+    setenv("MALLOC_MMAP_THRESHOLD_", "33554432", 0);
+    setenv("MALLOC_TOP_PAD_", "8388608", 0);
+    setenv("MALLOC_MMAP_MAX_", "1024", 0);
+    mallopt(M_TRIM_THRESHOLD, 0x7fffffff);
+    mallopt(M_TOP_PAD, 8388608);
+
+    {
+        struct rlimit rl;
+        if (getrlimit(RLIMIT_DATA, &rl) == 0)
+            fprintf(stderr, "[dbg] rlimit_data soft=%llu hard=%llu\n",
+                    (unsigned long long)rl.rlim_cur,
+                    (unsigned long long)rl.rlim_max);
+    }
+
     if (argc < 2) {
         fprintf(stderr, "Usage: %s <elf_binary>        (introspect)\n", argv[0]);
         fprintf(stderr, "       %s --run <elf> [args..] (execute)\n", argv[0]);

@@ -1,0 +1,6 @@
+id=parrot_elf_loader
+name=Parrot Linux ELF Loader
+version=v1.0
+versionCode=1
+author=elf_loader project
+description=Spouští parrot/Linux aarch64 binárky na Androidu přes vlastní own-loading glibc loader (bez proot/qemu). Příkaz: parrot <cmd> [args...]
