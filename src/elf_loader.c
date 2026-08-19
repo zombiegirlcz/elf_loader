@@ -400,7 +400,7 @@ static void patch_module_heap_syms(elf_object_t *m) {
     }
 }
 
-typedef struct { int64_t numval; } ldso_tunable_val_t;
+typedef struct { uint64_t numval; uint64_t strval; } tunable_val_t;
 
 typedef struct {
     const char *env_name;
@@ -448,32 +448,39 @@ static void tunable_get_default(int id, void *valp) {
     *(int64_t *)valp = 0;
 }
 
+static __thread int tunable_recursion_guard = 0;
+
 static void tunable_get_val(int id, void *valp, void (*cb)(void *)) {
+    if (tunable_recursion_guard) {
+        *(int64_t *)valp = 0;
+        return;
+    }
+    tunable_recursion_guard = 1;
+
     if (id >= 10) {
         int idx = id - 10;
         if (idx >= 0 && idx < (int)(sizeof(malloc_tunables) / sizeof(malloc_tunables[0]))) {
-            const char *env = getenv(malloc_tunables[idx].env_name);
-            if (env && env[0] != '\0') {
-                int64_t v = strtoll(env, NULL, 0);
+            int64_t v = malloc_tunables[idx].default_val;
+            if (malloc_tunables[idx].is_size_t)
                 *(int64_t *)valp = v;
-                return;
-            }
-            int64_t def = malloc_tunables[idx].default_val;
-            *(int64_t *)valp = def;
+            else
+                *(int32_t *)valp = (int32_t)v;
             if (cb) {
-                ldso_tunable_val_t v;
-                v.numval = def;
-                cb(&v);
+                tunable_val_t cbv = { .numval = (uint64_t)v, .strval = 0 };
+                cb(&cbv);
             }
+            tunable_recursion_guard = 0;
             return;
         }
     }
+    if (getenv("ELF_LOADER_DBG"))
+        fprintf(stderr, "[tunable] id=%d (fallback, <10 or out of range)\n", id);
     *(int64_t *)valp = 0;
     if (cb) {
-        ldso_tunable_val_t v;
-        v.numval = 0;
+        tunable_val_t v = { .numval = 0, .strval = 0 };
         cb(&v);
     }
+    tunable_recursion_guard = 0;
 }
 
 static void ldso_signal_error(void) {

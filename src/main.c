@@ -143,7 +143,12 @@ static int run_ownall(const char *path, int argc, char **argv, char **envp) {
         elf_scope_destroy(scope);
         return 1;
     }
-    printf("[+] own deps: %zu modules in scope\n", scope->count);
+
+    void *libc_obj = NULL;
+    for (size_t mi = 0; mi < scope->count; mi++)
+        if (scope->mods[mi]->soname && strstr(scope->mods[mi]->soname, "libc.so.6"))
+            libc_obj = scope->mods[mi]->base_addr;
+    g_libc_base = (uintptr_t)libc_obj;
 
     if (elf_relocate(obj) != 0) {
         fprintf(stderr, "[-] Relocation failed\n");
@@ -153,11 +158,6 @@ static int run_ownall(const char *path, int argc, char **argv, char **envp) {
         return 1;
     }
 
-    void *libc_obj = NULL;
-    for (size_t mi = 0; mi < scope->count; mi++)
-        if (scope->mods[mi]->soname && strstr(scope->mods[mi]->soname, "libc.so.6"))
-            libc_obj = scope->mods[mi]->base_addr;
-    g_libc_base = (uintptr_t)libc_obj;
     g_exe_base = (uintptr_t)obj->base_addr;
     ldso_install_exe_linkmap(obj, path);
     ldso_install_module_list(scope->mods, scope->count);
@@ -174,7 +174,7 @@ static int run_ownall(const char *path, int argc, char **argv, char **envp) {
         }
     }
     {
-        unsigned char *mp = (unsigned char *)g_libc_base + 0x1b6760;
+        unsigned char *mp = (unsigned char *)g_libc_base + 0x1b0a40;
         fprintf(stderr, "[dbg] libc mp_ @ %p: ", (void *)mp);
         for (int bi = 0; bi < 0x20; bi++)
             fprintf(stderr, "%02x", mp[bi]);
