@@ -601,3 +601,26 @@ proot ani elf_loader pro běh rootfs — stačí **chroot**:
 | `linuxsh` | root/Magisk k dispozici | unshare -m + bind + **chroot**, nativní exec |
 | `elf` wrapper | bez rootu (app namespace) | elf_loader --ownall (own-loading glibc) |
 | parrot ld.so jako interp | su, ad-hoc | LD_LIBRARY_PATH + explicitní interp |
+
+## 2026-08-21 (noc): KRITICKÝ FIX — mount propagace leak do globálního NS
+
+### Incident
+Po nasazení linuxsh začaly padat systémové aplikace. Příčina: **toybox unshare -m
+nezmění mount propagaci** — Android root tree je `shared`, takže bind mounty
+(/dev,/proc,/sys,tmpfs → rootfs) se z "privátního" NS **propagovaly zpět do
+globálního**. Každý test/linuxsh run přidal 5+ mountů; napočítalo se 342,
+zrcadleně přes /data/user/0, /data/data i /data_mirror (vold CE mirror) →
+storage operace system_serveru/voldu selhávaly → crashe.
+
+### Oprava
+1. **Cleanup:** umount smyčka se snapshotem /proc/mounts + `umount -l` fallback
+   (mount table se mění během čtení) → 0 leaked mounts.
+2. **Root cause fix (linuxsh-root):** hned po `unshare -m` jako PRVNÍ věc
+   `mount --make-rprivate /` (Magisk busybox to umí; toybox mount ne).
+   Bez propagace ven = bezpečné opakované použití.
+3. Ověřeno: 3 po sobě jdoucí běhy linuxsh → 0 mountů v globálním NS,
+   funkčnost zachována (ls, child exec).
+
+### Lekce
+Na Androidu (shared propagation): `unshare -m` BEZ `make-rprivate` NENÍ izolace.
+Vždy: `unshare(CLONE_NEWNS)` → okamžitě `mount --make-rprivate /`.

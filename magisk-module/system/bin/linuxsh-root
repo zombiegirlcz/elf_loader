@@ -45,6 +45,15 @@ export LINUXSH_ROOTFS="$ROOTFS"
 
 exec uns -m sh -c '
 R="$LINUXSH_ROOTFS"
+BB=/data/adb/magisk/busybox
+
+# KRITICKE: Android root je shared mount -> bez tohoto by se nase bind mounty
+# PROPAGOVALY zpet do globalniho namespace a rozbily system (stalo se!).
+# make-rprivate izoluje tento NS: zadne zmeny se nešíří ven.
+if [ -x "$BB" ]; then
+    "$BB" mount --make-rprivate / 2>/dev/null || \
+        "$BB" mount --make-rslave / 2>/dev/null
+fi
 
 mkdir -p "$R/dev" "$R/proc" "$R/sys" "$R/tmp" "$R/run" 2>/dev/null
 
