@@ -489,3 +489,68 @@ Systémově dostupný příkaz `elf <parrot_binárka> [args...]` fungující z *
   Fail:    0
 
 [1;32m✓ Všechny testy doběhly v pořádku (s očekávanými stavy)![0m
+
+## 2026-08-21 (večer): Dokončení — segfault v libc po init VYŘEŠEN (10/10 PASS na zařízení)
+
+Dokončen poslední krok z ELF_LOADER_STATUS.md. Dvě příčiny za sebou:
+
+### Fix 1 — `__stack_chk_guard` + kernel symboly v `ldso_lookup`
+- **Symptom:** crash v `__libc_init_first` (`ldr x0,[x3]`, x3=0): GLOB_DAT relokace
+  `__stack_chk_guard` @ libc+0x1afe78 se tiše nulovala — symbol je UND v libc.so.6,
+  má ho dodat ld.so.
+- **Fix:** `ldso_lookup()` nyní dodává i `__stack_chk_guard` (statická proměnná
+  `ldso_stack_guard = 0xdeadbeefcafe1234`, GLOB_DAT ukládá do GOT adresu), dále
+  `__rseq_offset` (=0, rseq reg. off), `__rseq_size` (=0 → rseq disabled), 
+  `__libc_stack_end` (=NULL). Ověřeno proti UND seznamu parrot libc — tímto jsou
+  pokryty všechny 23 UND symbolů libc.
+- **Krok 2:** RELA loop nyní loguje `[WARN] Unresolved RELA GLOB_DAT|ABS64|JUMP_SLOT: ...`
+  pro non-weak nulované sloty (+ guard sym_idx proti OOB).
+
+### Fix 2 — emulated TLS v loaderu (vlastní root cause XFAIL binárek)
+- **Symptom (po fixu 1 se posunul):** `ad=0x300 x00=x19=0x300`, pc v **host bionic
+  libc**+0xF72EC (`ldr w21,[x0]`), po `[+] entering`. Všechny importy exe byly
+  správně v parrot libc — volání do bionic přišlo jinudy.
+- **Diagnostika:** fault handler insn/stack/frame dumpy se nikdy nevypsaly, protože
+  používaly `fprintf` (bionic stdio) — pod parrot TP spadly uvnitř handleru
+  (bionic čte pthread self přes x18 → guard page) a buffered výstup se ztratil.
+  Přepsáno na `sys_write` → plný trace: návratová adresa vedla do loaderova
+  `__emutls_get_address`.
+- **Příčina:** `static __thread int tunable_recursion_guard` v `tunable_get_val()`.
+  NDK clang kompiluje `__thread` jako **emutls** (`__emutls_get_address` → bionic
+  `pthread_once/pthread_mutex_lock/pthread_getspecific`). Parrot glibc volá
+  `__tunable_get_val` až **za entry** (malloc/locale init) — tedy pod parrot
+  TPIDR_EL0 — a bionic TLS primitivy pak dereferencují nesmysl → SIGSEGV.
+- **Fix:** `static int tunable_recursion_guard` (loader je v této fázi
+  single-threaded). Emutls z NDK buildu úplně zmizel (objdump: 0 výskytů).
+  Tím vysvětlen i rozdíl PASS/XFAIL předtím: true/wc/uname/date nevolají
+  tunables cestu, která sahne na guard, dřív padaly už na stack_chk_guard.
+
+### Krok 5 — úklid debug instrumentace (hotovo)
+- Odstraněno: `[dbg-sym]`, `[dbg-ifunc]`, `[dbg-reloc]`, `[DBG] processed`,
+  `[!] Wrote 0x21830`, `[dbg] rlimit_data/map_elf_segments/mapped EXE/post-init/
+  environ-patch bad nm/maps dump/libc mp_`, `MP:` registr-hack ve fault handleru,
+  `ELF_LOADER_DUMP_PHDR`/`ELF_LOADER_DUMP_AUXV` bloky, hardcoded stack-scan.
+- Fault handler insn/stack/frame dump ponechán (opraven na sys_write, funguje i
+  pod cizím TP); `[dbg] bionic phdr p_vaddr rebased` ponechán (signál bionic fixu);
+  `ELF_LOADER_DUMP_MAPS` ponechán (getenv-gated).
+- Binárka `/tmp/elf_loader_ndk`: 122184 → 113096 B.
+
+### Výsledky (zařízení, com.linux_core, mimo proot)
+```
+echo hello world -> hello world      rc=0   (dříve XFAIL)
+true             -> rc=0                    (PASS)
+false            -> rc=1                    (dříve XFAIL)
+uname -a         -> Linux localhost 4.14... aarch64 GNU/Linux  rc=0
+date             -> Fri Aug 21 ... UTC 2026                 rc=0
+wc -c etc/hostname -> 11 ./etc/hostname                     rc=0
+cat etc/hostname -> TERMINATOR       rc=0   (dříve XFAIL)
+ls ./etc         -> kompletní výpis  rc=0   (dříve XFAIL; libselinux/libacl ok)
+grep -c root ./etc/passwd -> 1        rc=0   (dříve XFAIL)
+sed -n 1p        -> TERMINATOR       rc=0   (dříve XFAIL)
+```
+**10/10 PASS.** `make test` (glibc flow) rc=0 — bez regrese. Commit `0e19733`.
+
+### Zbývá (aktualizace)
+- `src/main.c` warning `unknown escape sequence '\]'` — kosmetika.
+- Libc dep handling: tvrdý exit při "dep libc.so.6 not found" (viz výše).
+- Step 3 otevřené body: test page-size na reálném 16K zařízení; bionic dlerror/errno test.
