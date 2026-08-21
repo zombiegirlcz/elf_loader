@@ -173,13 +173,6 @@ static int run_ownall(const char *path, int argc, char **argv, char **envp) {
             fclose(mf);
         }
     }
-    {
-        unsigned char *mp = (unsigned char *)g_libc_base + 0x1b0a40;
-        fprintf(stderr, "[dbg] libc mp_ @ %p: ", (void *)mp);
-        for (int bi = 0; bi < 0x20; bi++)
-            fprintf(stderr, "%02x", mp[bi]);
-        fprintf(stderr, "\n");
-    }
     elf_install_fault_handlers();
     elf_tls_ctx_t tls = elf_setup_own_tls(obj, scope);
     int ret = elf_run(obj, argc, argv, envp);
@@ -203,14 +196,6 @@ int main(int argc, char **argv, char **envp) {
     mallopt(M_TRIM_THRESHOLD, 0x7fffffff);
     mallopt(M_TOP_PAD, 8388608);
 #endif
-
-    {
-        struct rlimit rl;
-        if (getrlimit(RLIMIT_DATA, &rl) == 0)
-            fprintf(stderr, "[dbg] rlimit_data soft=%llu hard=%llu\n",
-                    (unsigned long long)rl.rlim_cur,
-                    (unsigned long long)rl.rlim_max);
-    }
 
     if (argc < 2) {
         fprintf(stderr, "Usage: %s <elf_binary>        (introspect)\n", argv[0]);

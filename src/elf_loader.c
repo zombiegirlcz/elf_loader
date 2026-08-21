@@ -114,6 +114,13 @@ static unsigned char ldso_ro[LDSO_RO_SIZE];
 static unsigned char ldso_global[LDSO_GLOBAL_SIZE];
 static unsigned int ldso_enable_secure;
 static uintptr_t ldso_pointer_chk_guard;
+
+/* Statická proměnná jako __stack_chk_guard pro Parrot glibc (je UND v libc.so.6,
+ * musí ji dodat ld.so; GLOB_DAT ukládá do GOT slotu ADRESU této proměnné).  */
+static uint64_t ldso_stack_guard = 0xdeadbeefcafe1234ULL;
+static int64_t ldso_rseq_offset;
+static unsigned int ldso_rseq_size;
+static void *ldso_stack_end;
 static char ldso_platform[] = "aarch64";
 static char *ldso_argv_copy[8];
 static Elf64_auxv_t ldso_auxv[64];
@@ -396,8 +403,6 @@ static void patch_module_heap_syms(elf_object_t *m) {
             fn = (void *)ldso_brk;
         if (fn) {
             void *tgt = (char *)m->base_addr + (sym->st_value - mbv);
-            fprintf(stderr, "[dbg] patching %s %s @%p -> %p\n", m->soname, nm,
-                    tgt, fn);
             write_heap_veneer(tgt, fn);
         }
     }
@@ -454,7 +459,12 @@ static void tunable_get_default(int id, void *valp) {
     *(int64_t *)valp = 0;
 }
 
-static __thread int tunable_recursion_guard = 0;
+/* Musí být plain static: __thread by NDK clang zkompiloval jako emulated TLS
+ * (__emutls_get_address -> bionic pthread_once/pthread_getspecific), které
+ * pod parrot TPIDR_EL0 (po switch_tls v jump_to_entry) padají — parrot glibc
+ * volá __tunable_get_val až za entry (malloc/locale init). Loader je zde
+ * single-threaded, prostá statická proměnná bohatě stačí. */
+static int tunable_recursion_guard = 0;
 
 static void tunable_get_val(int id, void *valp, void (*cb)(void *)) {
     if (tunable_recursion_guard) {
@@ -509,6 +519,14 @@ static void *ldso_lookup(const char *name) {
         return &ldso_enable_secure;
     if (strcmp(name, "__pointer_chk_guard") == 0)
         return &ldso_pointer_chk_guard;
+    if (strcmp(name, "__stack_chk_guard") == 0)
+        return &ldso_stack_guard;
+    if (strcmp(name, "__rseq_offset") == 0)
+        return &ldso_rseq_offset;
+    if (strcmp(name, "__rseq_size") == 0)
+        return &ldso_rseq_size;
+    if (strcmp(name, "__libc_stack_end") == 0)
+        return &ldso_stack_end;
     if (strcmp(name, "__tunable_get_val") == 0)
         return (void *)tunable_get_val;
     if (strcmp(name, "__tunable_get_default") == 0)
@@ -555,8 +573,6 @@ static void *resolve_jmp_symbol(elf_object_t *obj, Elf64_Rela *r) {
     if (sym_idx < obj->dynsym_count) {
         const Elf64_Sym *s = &obj->dynsym[sym_idx];
         const char *name = obj->dynstr + s->st_name;
-        fprintf(stderr, "[dbg-sym] resolving %s for %s\n", name, obj->soname ? obj->soname : "EXE");
-        fflush(stderr);
         int is_ifunc = 0;
         if (s->st_shndx == SHN_UNDEF) {
             if (obj && obj->scope) {
@@ -573,15 +589,8 @@ static void *resolve_jmp_symbol(elf_object_t *obj, Elf64_Rela *r) {
         } else {
             addr = va(obj, s->st_value);
         }
-        if (addr && is_ifunc) {
-            fprintf(stderr, "[dbg-ifunc] calling ifunc resolver for %s in %s @ %p\n", name, obj->soname ? obj->soname : "EXE", addr);
-            fflush(stderr);
+        if (addr && is_ifunc)
             addr = call_ifunc_resolver(addr);
-            fprintf(stderr, "[dbg-ifunc] resolver for %s returned %p\n", name, addr);
-            fflush(stderr);
-        }
-        fprintf(stderr, "[dbg-sym] resolved %s for %s to %p\n", name, obj->soname ? obj->soname : "EXE", addr);
-        fflush(stderr);
     }
     return addr;
 }
@@ -681,8 +690,6 @@ static void *map_elf_segments(void *file_map, Elf64_Ehdr *ehdr, size_t *out_tota
 
     size_t mbv = ALIGN_DOWN(min_vaddr, PAGE_SIZE);
     size_t total = ALIGN_UP(max_vaddr, PAGE_SIZE) - mbv;
-    fprintf(stderr, "[dbg] map_elf_segments: e_type=%d mbv=%#zx total=%#zx\n",
-            ehdr->e_type, mbv, total);
     void *base;
     if (ehdr->e_type == ET_EXEC) {
         base = mmap((void *)mbv, total, PROT_READ | PROT_WRITE,
@@ -961,7 +968,6 @@ elf_object_t *elf_load(const char *path) {
 
     size_t total_size = 0, map_base_vaddr_ = 0;
     void *base = map_elf_segments(file_map, ehdr, &total_size, &map_base_vaddr_);
-    fprintf(stderr, "[dbg] mapped EXE %s -> %p (total %#zx)\n", path, base, total_size);
     if (!base) {
         fprintf(stderr, "[-] No LOAD segments\n");
         goto cleanup;
@@ -1309,7 +1315,6 @@ elf_object_t *elf_load_shared(const char *path, elf_scope_t *scope) {
 
     size_t total_size = 0, mbv = 0;
     void *base = map_elf_segments(file_map, ehdr, &total_size, &mbv);
-    fprintf(stderr, "[dbg] mapped %s -> %p (total %#zx)\n", path, base, total_size);
     loader_phase = "loading";
     if (!base) {
         fprintf(stderr, "[-] %s: no LOAD segments\n", path);
@@ -1354,8 +1359,6 @@ elf_object_t *elf_load_shared(const char *path, elf_scope_t *scope) {
             m->tls_offset = (uintptr_t)blk - read_tp();
             m->tls_memsz = m->phdr[i].p_memsz;
             m->has_tls = 1;
-            fprintf(stderr, "[dbg] %s TLS blk=%p TP=%p tls_offset=%#lx memsz=%#zx\n",
-                    path, blk, (void *)read_tp(), m->tls_offset, m->tls_memsz);
         }
         break;
     }
@@ -1369,17 +1372,8 @@ elf_object_t *elf_load_shared(const char *path, elf_scope_t *scope) {
 
     patch_module_heap_syms(m);
 
-    if (strstr(path, "libc.so.6")) {
-        fprintf(stderr, "[dbg] libc pre-init mp_ bytes: ");
-        unsigned char *mpp = (unsigned char *)base + 0x1b6760;
-        for (int bi = 0; bi < 0x18; bi++)
-            fprintf(stderr, "%02x", mpp[bi]);
-        fprintf(stderr, "\n");
-    }
-
     run_module_init(m);
 
-    fprintf(stderr, "[dbg] post-init %s\n", path);
     for (int i = 0; i < m->phdr_count; i++) {
         if (m->phdr[i].p_type != PT_TLS || !m->has_tls)
             continue;
@@ -1393,27 +1387,6 @@ elf_object_t *elf_load_shared(const char *path, elf_scope_t *scope) {
         if (sym->st_shndx == SHN_UNDEF)
             continue;
         const char *nm = m->dynstr + sym->st_name;
-        if ((uintptr_t)nm >= 0x3000000000UL && (uintptr_t)nm < 0x3000080000UL) {
-            extern void *sbrk(long);
-            register long x8 __asm__("x8") = 214;  /* brk */
-            register long x0 __asm__("x0") = 0;
-            __asm__ volatile("svc #0" : "+r"(x0) : "r"(x8) : "memory", "cc");
-            fprintf(stderr, "[dbg] environ-patch %s: bad nm=%p dynstr=%p j=%zu st_name=%u brk=%p rawbrk=%p\n",
-                    path, nm, m->dynstr, j, sym->st_name, sbrk(0), (void *)x0);
-            if ((uintptr_t)nm >= 0x300006f000UL) {
-                static int dumped_maps;
-                if (!dumped_maps) {
-                    dumped_maps = 1;
-                    FILE *mf = fopen("/proc/self/maps", "r");
-                    if (mf) {
-                        char line[512];
-                        while (fgets(line, sizeof line, mf))
-                            fprintf(stderr, "  map: %s", line);
-                        fclose(mf);
-                    }
-                }
-            }
-        }
         if (strcmp(nm, "__environ") == 0 || strcmp(nm, "environ") == 0 ||
             strcmp(nm, "_environ") == 0) {
             *(uintptr_t *)((char *)base + (sym->st_value - mbv)) =
@@ -1657,8 +1630,17 @@ int elf_relocate(elf_object_t *obj) {
                     *where = (uint64_t)addr;
                 count++;
             } else {
-                fprintf(stderr, "[WARN] Unresolved RELA JUMP_SLOT: %s in %s\n", obj->dynstr + obj->dynsym[sym_idx].st_name, obj->soname ? obj->soname : "EXE");
-                fflush(stderr);
+                /* GLOB_DAT/ABS64: loguj co se nuluje (kromě weak), ať nezůstane
+                 * skrytý NULL slot (např. __stack_chk_guard → crash na ldr [x3]). */
+                if (sym_idx < obj->dynsym_count &&
+                    ELF64_ST_BIND(obj->dynsym[sym_idx].st_info) != STB_WEAK) {
+                    fprintf(stderr, "[WARN] Unresolved RELA %s: %s in %s\n",
+                        ELF64_R_TYPE(r->r_info) == R_AARCH64_GLOB_DAT ? "GLOB_DAT" :
+                        ELF64_R_TYPE(r->r_info) == R_AARCH64_ABS64 ? "ABS64" : "JUMP_SLOT",
+                        obj->dynstr + obj->dynsym[sym_idx].st_name,
+                        obj->soname ? obj->soname : "EXE");
+                    fflush(stderr);
+                }
                 *where = 0;
             }
             break;
@@ -1668,14 +1650,9 @@ int elf_relocate(elf_object_t *obj) {
         }
     }
 
-    fprintf(stderr, "[dbg-reloc] starting JMPREL loop for %s: jmp_rela=%p jmp_size=%zu\n", obj->soname ? obj->soname : "EXE", (void *)jmp_rela, jmp_size);
-    fflush(stderr);
-
     for (size_t off = 0; jmp_rela && off < jmp_size; off += sizeof(Elf64_Rela)) {
         Elf64_Rela *r = (Elf64_Rela *)((char *)jmp_rela + off);
         uint64_t *where = (uint64_t *)(base + (r->r_offset - mbv));
-        fprintf(stderr, "[dbg-reloc] JMPREL entry off=%zu: r_offset=%#lx r_info=%#lx where=%p\n", off, (unsigned long)r->r_offset, (unsigned long)r->r_info, (void *)where);
-        fflush(stderr);
 
         if (ELF64_R_TYPE(r->r_info) == R_AARCH64_IRELATIVE)
             continue;
@@ -1686,6 +1663,7 @@ int elf_relocate(elf_object_t *obj) {
             continue;
         }
         if (obj->soname && strcmp(obj->soname, "libc.so.6") == 0 && ELF64_R_SYM(r->r_info) < obj->dynsym_count) {
+            /* no-op */
         }
         if (lazy_binding) {
             *where = (uint64_t)lazy_plt_stub;
@@ -1695,17 +1673,16 @@ int elf_relocate(elf_object_t *obj) {
         void *addr = resolve_jmp_symbol(obj, r);
         if (addr) {
             *where = (uint64_t)addr;
-            if (*where == 0x21830 || (uint64_t)addr == 0x21830)
-                fprintf(stderr, "[!] Wrote 0x21830 to %p\n", where);
             count++;
         } else {
-            printf("[WARN] Unresolved JUMP_SLOT: %s in %s\n", obj->dynstr + obj->dynsym[ELF64_R_SYM(r->r_info)].st_name, obj->soname ? obj->soname : "EXE");
-            fflush(stdout);
+            fprintf(stderr, "[WARN] Unresolved JUMP_SLOT: %s in %s\n",
+                    ELF64_R_SYM(r->r_info) < obj->dynsym_count
+                        ? obj->dynstr + obj->dynsym[ELF64_R_SYM(r->r_info)].st_name : "?",
+                    obj->soname ? obj->soname : "EXE");
+            fflush(stderr);
             *where = 0;
         }
     }
-    printf("[DBG] %s: processed %d jmp_rela entries out of %zu bytes\n", obj->soname ? obj->soname : "unknown", count, jmp_size);
-    fflush(stdout);
 
     apply_segment_prots(obj);
 
@@ -1931,14 +1908,6 @@ static void fault_handler(int sig, siginfo_t *si, void *ctx) {
         HX(uc->uc_mcontext.regs[i]); RAW(' ');
     }
     RAW('\n');
-    {
-        RAW('M'); RAW('P'); RAW(':');
-        volatile unsigned char *mbase =
-            (volatile unsigned char *)uc->uc_mcontext.regs[23];
-        for (int bi = 0; bi < 0x30; bi++)
-            HX(mbase[bi] & 0xff);
-        RAW('\n');
-    }
     #undef RAW
     #undef HX
     {
@@ -1971,102 +1940,64 @@ static void fault_handler(int sig, siginfo_t *si, void *ctx) {
                          : "memory", "cc");
     }
 
+    /* Dumpy musejí jit pres sys_write: fprintf (bionic stdio) pod parrot TP
+     * sam spadne (bionic cte pthread self pres x18 -> guard page) a buffered
+     * vystup se pri smrti procesu nikdy nevyflushuje. */
     {
+        char dbuf[256];
+        #define DHX(vv) do { uintptr_t __v=(uintptr_t)(vv); \
+            for(int __sh=60;__sh>=0;__sh-=4) { if(dp<dbuf+sizeof(dbuf)-1)*dp++=hexd[(__v>>__sh)&0xf]; } } while (0)
+        #define DFLUSH() do { sys_write(2, dbuf, (size_t)(dp-dbuf)); dp = dbuf; } while (0)
+        char *dp = dbuf;
+
         volatile uint32_t *iptr = (volatile uint32_t *)uc->uc_mcontext.pc;
         if ((uintptr_t)uc->uc_mcontext.pc > 0x10000) {
-            uint32_t insn = 0;
             for (int i = -2; i <= 2; i++) {
-                insn = *iptr;
-                fprintf(stderr, "  insn[%+d] @%p = 0x%08x\n", i,
-                        (void *)((char *)iptr), (unsigned)insn);
+                uint32_t insn = *iptr;
+                memcpy(dp, "  insn@", 6); dp += 6;
+                DHX(iptr);
+                memcpy(dp, "=", 1); dp += 1;
+                DHX(insn);
+                memcpy(dp, "\n", 1); dp += 1;
+                DFLUSH();
                 iptr++;
             }
         }
-    }
 
-    {
-        uintptr_t *s = (uintptr_t *)uc->uc_mcontext.sp;
-        uintptr_t *smax = s + 96;
-        fprintf(stderr, "  stack:");
-        for (int i = 0; s < smax; s++, i++) {
-            if (i % 4 == 0)
-                fprintf(stderr, "\n  %p:", (void *)s);
-            fprintf(stderr, " %016lx", (unsigned long)*s);
-        }
-        fprintf(stderr, "\n");
-    }
-
-    {
-        uintptr_t *fp = (uintptr_t *)uc->uc_mcontext.regs[29];
-        for (int i = 0; i < 6 && fp && (uintptr_t)fp > 0x1000; i++) {
-            uintptr_t *next = (uintptr_t *)*fp;
-            uintptr_t ra = fp[1];
-            fprintf(stderr, "  frame[%d] fp=%p ra=%p\n", i, (void *)fp,
-                    (void *)ra);
-            if (next <= fp || (uintptr_t)next > 0x7fffffffffffUL)
-                break;
-            fp = next;
-        }
-    }
-
-    if (getenv("ELF_LOADER_DUMP_PHDR") && g_exe_base) {
-        char *b = (char *)g_exe_base;
-        unsigned long phoff = 0x40, phnum = 0;
-        Elf64_Ehdr *eh = (Elf64_Ehdr *)b;
-        phoff = eh->e_phoff;
-        phnum = eh->e_phnum;
-        for (unsigned long i = 0; i < phnum; i++) {
-            Elf64_Phdr *p = (Elf64_Phdr *)(b + phoff + i * sizeof(Elf64_Phdr));
-            fprintf(stderr, "  memph[%lu] type=%#x vaddr=%#lx\n", i, p->p_type,
-                    (unsigned long)p->p_vaddr);
-        }
-    }
-
-    if (g_exe_base) {
-        char *b = (char *)g_exe_base;
-        uintptr_t t0 = (uintptr_t)b + 0x7440, t1 = (uintptr_t)b + 0x60728;
-        uintptr_t *s = (uintptr_t *)uc->uc_mcontext.sp;
-        uintptr_t *smax = s + 256;
-        for (int i = 0; s < smax; s++, i++) {
-            uintptr_t v = *s;
-            if (v >= t0 && v < t1)
-                fprintf(stderr, "  stack[%d] @%p = base+0x%lx (return?)\n", i,
-                        (void *)s, (unsigned long)(v - (uintptr_t)b));
-        }
-    }
-
-    fprintf(stderr, "[fault] phase=%s sig=%d addr=%p pc=%p sp=%p\n", loader_phase,
-            sig, si->si_addr,
-            (void *)uc->uc_mcontext.pc, (void *)uc->uc_mcontext.sp);
-    {
-        FILE *mf = fopen("/proc/self/maps", "r");
-        if (mf) {
-            char line[512];
-            while (fgets(line, sizeof line, mf)) {
-                if (strstr(line, "3000000000") || strstr(line, "heap") ||
-                    strstr(line, "ld-linux") || strstr(line, "elf_loader") ||
-                    strstr(line, "libc.so.6") || strstr(line, "\[stack\]"))
-                    fprintf(stderr, "  map: %s", line);
+        memcpy(dp, "  stack:\n", 8); dp += 8; DFLUSH();
+        {
+            uintptr_t *s = (uintptr_t *)uc->uc_mcontext.sp;
+            uintptr_t *smax = s + 64;
+            for (int i = 0; s < smax && dp + 20 < dbuf + sizeof(dbuf); s++, i++) {
+                if (i % 4 == 0) {
+                    DHX(s);
+                    memcpy(dp, ":", 1); dp += 1;
+                }
+                memcpy(dp, " ", 1); dp += 1;
+                DHX(*s);
+                if (i % 4 == 3)
+                    memcpy(dp, "\n", 1), dp += 1;
             }
-            fclose(mf);
+            memcpy(dp, "\n", 1); dp += 1;
+            DFLUSH();
         }
-    }
-    {
-        register long x8 __asm__("x8") = 56;  /* openat */
-        register long x0 __asm__("x0") = AT_FDCWD;
-        register const char *x1 __asm__("x1") = "/proc/self/maps";
-        register long x2 __asm__("x2") = O_RDONLY;
-        register long x3 __asm__("x3") = 0;
-        __asm__ volatile("svc #0" : "+r"(x0) : "r"(x8), "r"(x1), "r"(x2), "r"(x3)
-                         : "memory", "cc");
-        if (x0 >= 0) {
-            int mfd = (int)x0;
-            char mline[1024];
-            long nr;
-            while ((nr = sys_read(mfd, mline, sizeof mline)) > 0)
-                sys_write(2, mline, (size_t)nr);
-            sys_write(2, "  [maps-end]\n", 13);
+
+        {
+            uintptr_t *fp = (uintptr_t *)uc->uc_mcontext.regs[29];
+            for (int i = 0; i < 12 && fp && (uintptr_t)fp > 0x1000; i++) {
+                uintptr_t *next = (uintptr_t *)*fp;
+                uintptr_t ra = fp[1];
+                memcpy(dp, "  frame ra=", 11); dp += 11;
+                DHX(ra);
+                memcpy(dp, "\n", 1); dp += 1;
+                DFLUSH();
+                if (next <= fp || (uintptr_t)next > 0x7fffffffffffUL)
+                    break;
+                fp = next;
+            }
         }
+        #undef DHX
+        #undef DFLUSH
     }
 
     Dl_info di;
@@ -2185,16 +2116,6 @@ int elf_run(elf_object_t *obj, int argc, char **argv, char **envp) {
         } else {
             memset(rand_bytes, 0x5a, 16);
         }
-    }
-
-    if (getenv("ELF_LOADER_DUMP_AUXV")) {
-        for (Elf64_auxv_t *q = aux; q->a_type != AT_NULL; q++)
-            fprintf(stderr, "[aux] type=%#llx val=%#llx\n",
-                    (unsigned long long)q->a_type,
-                    (unsigned long long)q->a_un.a_val);
-        fprintf(stderr, "[aux] argc=%zu argv0=%p env0=%p rand=%p\n",
-                (size_t)*argc_slot, (void *)argv_arr[0],
-                (void *)(env_count ? envp_arr[0] : 0), (void *)rand_bytes);
     }
 
     elf_install_fault_handlers();
