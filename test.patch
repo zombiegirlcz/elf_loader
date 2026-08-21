@@ -1,0 +1,10 @@
+--- src/elf_loader.c
++++ src/elf_loader.c
+@@ -1665,6 +1665,8 @@
+         if (addr) {
+             *where = (uint64_t)addr;
+             count++;
++        } else {
++            printf("[WARN] Unresolved JUMP_SLOT: %s in %s\n", obj->dynstr + obj->dynsym[ELF64_R_SYM(r->r_info)].st_name, obj->soname);
+         }
+     }

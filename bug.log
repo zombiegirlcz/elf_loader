@@ -1,0 +1,13 @@
+[1/4] introspection /bin/ls
+./test_elf.sh[20]: /data/user/0/com.linux_core/files/nh/distro/parrot/usr/bin/tail: No such file or directory
+
+[2/4] run ls -la /etc
+./test_elf.sh[24]: /data/user/0/com.linux_core/files/nh/distro/parrot/usr/bin/tail: No such file or directory
+
+[3/4] run cat /etc/hostname
+./test_elf.sh[28]: /data/user/0/com.linux_core/files/nh/distro/parrot/usr/bin/tail: No such file or directory
+
+[4/4] run uname -a
+./test_elf.sh[32]: /data/user/0/com.linux_core/files/nh/distro/parrot/usr/bin/tail: No such file or directory
+
+=== done ===

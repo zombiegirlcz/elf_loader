@@ -462,3 +462,30 @@ Systémově dostupný příkaz `elf <parrot_binárka> [args...]` fungující z *
   pád je až ve spuštěném exe/loaderu po úspěšném načtení libc, ne v závislostech.
   → viz Zbývá (nový bug k vyšetření).
 
+
+[1;36m═══ Nasazení do aplikace (/data/user/0/com.linux_core/files/usr/bin) ═══[0m
+  [+] Wrapper skript 'elf' nastaven a zkontrolován.
+  [+] Bionic binárka 'elf_loader' připravena.
+
+[1;36m═══ Běh testů na Android hostiteli (přes ashell) ═══[0m
+[1;36m  ROOTFS:  /data/user/0/com.linux_core/files/nh/distro/parrot[0m
+[1;36m  Příkaz:  unset PATH; export ROOTFS=...; /data/user/0/com.linux_core/files/usr/bin/elf $ROOTFS/bin/...[0m
+
+  [1;32mPASS[0m  true (/data/user/0/com.linux_core/files/nh/distro/parrot/bin/true) [2m(xfail resolved!)[0m
+  [1;33mXFAIL[0m false (/data/user/0/com.linux_core/files/nh/distro/parrot/bin/false) [2m(segfault v libc po init, exit=0)[0m
+  [1;33mXFAIL[0m echo (/data/user/0/com.linux_core/files/nh/distro/parrot/bin/echo) [2m(segfault v libc po init, exit=0)[0m
+  [1;33mXFAIL[0m ls (/data/user/0/com.linux_core/files/nh/distro/parrot/bin/ls) [2m(segfault v libc po init, exit=0)[0m
+  [1;33mXFAIL[0m cat (/data/user/0/com.linux_core/files/nh/distro/parrot/bin/cat) [2m(segfault v libc po init, exit=0)[0m
+  [1;33mXFAIL[0m grep (/data/user/0/com.linux_core/files/nh/distro/parrot/bin/grep) [2m(segfault v libc po init, exit=0)[0m
+  [1;32mPASS[0m  wc (/data/user/0/com.linux_core/files/nh/distro/parrot/bin/wc) [2m(xfail resolved!)[0m
+  [1;33mXFAIL[0m sed (/data/user/0/com.linux_core/files/nh/distro/parrot/bin/sed) [2m(segfault v libc po init, exit=0)[0m
+  [1;32mPASS[0m  uname (/data/user/0/com.linux_core/files/nh/distro/parrot/bin/uname) [2m(xfail resolved!)[0m
+  [1;32mPASS[0m  date (/data/user/0/com.linux_core/files/nh/distro/parrot/bin/date) [2m(xfail resolved!)[0m
+
+[1;36m═══ Souhrn výsledků ═══[0m
+  Celkem:  10
+  [1;32mPass:    4[0m
+  [1;33mXFail:   6[0m  [2m(známé problémy, neselhává testovací skript)[0m
+  Fail:    0
+
+[1;32m✓ Všechny testy doběhly v pořádku (s očekávanými stavy)![0m

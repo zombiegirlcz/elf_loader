@@ -1,0 +1,17 @@
+--- src/elf_loader.c
++++ src/elf_loader.c
+@@ -1661,6 +1661,8 @@
+             count++;
+             continue;
+         }
++        if (strcmp(obj->soname, "libc.so.6") == 0 && ELF64_R_SYM(r->r_info) < obj->dynsym_count) {
++        }
+         if (lazy_binding) {
+             *where = (uint64_t)lazy_plt_stub;
+             count++;
+@@ -1678,6 +1680,7 @@
+         }
+     }
++    if (strcmp(obj->soname, "libc.so.6") == 0) fprintf(stderr, "[DBG] libc.so.6: processed %d jmp_rela entries out of %zu bytes\n", count, jmp_size);
+ 
+     apply_segment_prots(obj);

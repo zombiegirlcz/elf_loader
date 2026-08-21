@@ -257,9 +257,6 @@ static void *ldso_tls_get_addr_soft(void *l) {
     return NULL;
 }
 
-static void ldso_noop(void) {
-}
-
 static void ldso_setup(void) {
     if (ldso_setup_done)
         return;
@@ -534,9 +531,6 @@ static void *ldso_lookup(const char *name) {
         return (void *)ldso_find_object;
     if (strcmp(name, "_dl_rtld_di_serinfo") == 0)
         return (void *)ldso_signal_error;
-    if (strcmp(name, "_dl_audit_preinit") == 0 ||
-        strcmp(name, "_dl_audit_symbind_alt") == 0)
-        return (void *)ldso_noop;
     if (strcmp(name, "brk") == 0 || strcmp(name, "__brk") == 0)
         return (void *)ldso_brk;
     if (strcmp(name, "sbrk") == 0 || strcmp(name, "__sbrk") == 0)
@@ -555,8 +549,6 @@ static void *resolve_jmp_symbol(elf_object_t *obj, Elf64_Rela *r) {
     if (sym_idx < obj->dynsym_count) {
         const Elf64_Sym *s = &obj->dynsym[sym_idx];
         const char *name = obj->dynstr + s->st_name;
-        fprintf(stderr, "[dbg-sym] resolving %s for %s\n", name, obj->soname ? obj->soname : "EXE");
-        fflush(stderr);
         int is_ifunc = 0;
         if (s->st_shndx == SHN_UNDEF) {
             if (obj && obj->scope) {
@@ -573,15 +565,8 @@ static void *resolve_jmp_symbol(elf_object_t *obj, Elf64_Rela *r) {
         } else {
             addr = va(obj, s->st_value);
         }
-        if (addr && is_ifunc) {
-            fprintf(stderr, "[dbg-ifunc] calling ifunc resolver for %s in %s @ %p\n", name, obj->soname ? obj->soname : "EXE", addr);
-            fflush(stderr);
+        if (addr && is_ifunc)
             addr = call_ifunc_resolver(addr);
-            fprintf(stderr, "[dbg-ifunc] resolver for %s returned %p\n", name, addr);
-            fflush(stderr);
-        }
-        fprintf(stderr, "[dbg-sym] resolved %s for %s to %p\n", name, obj->soname ? obj->soname : "EXE", addr);
-        fflush(stderr);
     }
     return addr;
 }
@@ -1482,7 +1467,7 @@ void *elf_resolve_import(elf_object_t *obj, const char *name) {
         if (h)
             return h;
     }
-    return NULL;
+    return dlsym(RTLD_DEFAULT, name);
 }
 
 sym_status_t elf_resolve_symbol(elf_object_t *obj, const char *name, void **out_addr) {
@@ -1575,8 +1560,6 @@ static void apply_relr(elf_object_t *obj) {
 int elf_relocate(elf_object_t *obj) {
     if (!obj)
         return -1;
-    if (obj->relocated)
-        return 0;
 
     loader_phase = obj->soname ? obj->soname : "exe";
 
@@ -1657,9 +1640,8 @@ int elf_relocate(elf_object_t *obj) {
                     *where = (uint64_t)addr;
                 count++;
             } else {
-                fprintf(stderr, "[WARN] Unresolved RELA JUMP_SLOT: %s in %s\n", obj->dynstr + obj->dynsym[sym_idx].st_name, obj->soname ? obj->soname : "EXE");
+                fprintf(stderr, "[WARN] Unresolved RELA JUMP_SLOT: %s in %s\n", obj->dynstr + obj->dynsym[sym_idx].st_name, obj->soname);
                 fflush(stderr);
-                *where = 0;
             }
             break;
         }
@@ -1668,15 +1650,9 @@ int elf_relocate(elf_object_t *obj) {
         }
     }
 
-    fprintf(stderr, "[dbg-reloc] starting JMPREL loop for %s: jmp_rela=%p jmp_size=%zu\n", obj->soname ? obj->soname : "EXE", (void *)jmp_rela, jmp_size);
-    fflush(stderr);
-
     for (size_t off = 0; jmp_rela && off < jmp_size; off += sizeof(Elf64_Rela)) {
         Elf64_Rela *r = (Elf64_Rela *)((char *)jmp_rela + off);
         uint64_t *where = (uint64_t *)(base + (r->r_offset - mbv));
-        fprintf(stderr, "[dbg-reloc] JMPREL entry off=%zu: r_offset=%#lx r_info=%#lx where=%p\n", off, (unsigned long)r->r_offset, (unsigned long)r->r_info, (void *)where);
-        fflush(stderr);
-
         if (ELF64_R_TYPE(r->r_info) == R_AARCH64_IRELATIVE)
             continue;
         if (ELF64_R_TYPE(r->r_info) == R_AARCH64_TLSDESC ||
@@ -1684,8 +1660,6 @@ int elf_relocate(elf_object_t *obj) {
             relocate_tls(obj, r, where);
             count++;
             continue;
-        }
-        if (obj->soname && strcmp(obj->soname, "libc.so.6") == 0 && ELF64_R_SYM(r->r_info) < obj->dynsym_count) {
         }
         if (lazy_binding) {
             *where = (uint64_t)lazy_plt_stub;
@@ -1699,13 +1673,10 @@ int elf_relocate(elf_object_t *obj) {
                 fprintf(stderr, "[!] Wrote 0x21830 to %p\n", where);
             count++;
         } else {
-            printf("[WARN] Unresolved JUMP_SLOT: %s in %s\n", obj->dynstr + obj->dynsym[ELF64_R_SYM(r->r_info)].st_name, obj->soname ? obj->soname : "EXE");
-            fflush(stdout);
-            *where = 0;
+            fprintf(stderr, "[WARN] Unresolved JUMP_SLOT: %s in %s\n", obj->dynstr + obj->dynsym[ELF64_R_SYM(r->r_info)].st_name, obj->soname);
+            fflush(stderr);
         }
     }
-    printf("[DBG] %s: processed %d jmp_rela entries out of %zu bytes\n", obj->soname ? obj->soname : "unknown", count, jmp_size);
-    fflush(stdout);
 
     apply_segment_prots(obj);
 
@@ -1729,7 +1700,6 @@ int elf_relocate(elf_object_t *obj) {
     }
 
     printf("[+] relocated %d entries\n", count);
-    obj->relocated = 1;
     return 0;
 }
 

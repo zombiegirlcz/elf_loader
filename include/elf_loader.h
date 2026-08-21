@@ -32,6 +32,7 @@ typedef struct {
     int has_tls;
     size_t tls_memsz;
 
+    int relocated;
     struct elf_scope *scope;
 } elf_object_t;
 
