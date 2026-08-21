@@ -401,154 +401,64 @@ Systémově dostupný příkaz `elf <parrot_binárka> [args...]` fungující z *
 
 ### Známé limity
 - Magisk mount nevidí app namespace → nutné kopírovat do `/data/adb/` nebo restartovat Zygote (reboot).
-- `customize.sh` se nespustí při upgrade → při aktualizaci modulu: uninstall → reboot → install → reboot.[+] own-loading dependency: /data/user/0/com.linux_core/files/nh/distro/parrot/usr/lib/aarch64-linux-gnu/libselinux.so.1
-[+] own-loading dependency: /data/user/0/com.linux_core/files/nh/distro/parrot/usr/lib/aarch64-linux-gnu/libpcre2-8.so.0
-[+] own-loading dependency: /data/user/0/com.linux_core/files/nh/distro/parrot/usr/lib/aarch64-linux-gnu/libc.so.6
-[+] relocated 96 entries
-[+] own-loaded module: /data/user/0/com.linux_core/files/nh/distro/parrot/usr/lib/aarch64-linux-gnu/libc.so.6 (base 0x7082dc4000, 3076 dynsym)
-[+] relocated 103 entries
-[+] own-loaded module: /data/user/0/com.linux_core/files/nh/distro/parrot/usr/lib/aarch64-linux-gnu/libpcre2-8.so.0 (base 0x7083127000, 107 dynsym)
-[+] own-loading dependency: /data/user/0/com.linux_core/files/nh/distro/parrot/usr/lib/aarch64-linux-gnu/libc.so.6
-[+] relocated 296 entries
-[+] own-loaded module: /data/user/0/com.linux_core/files/nh/distro/parrot/usr/lib/aarch64-linux-gnu/libselinux.so.1 (base 0x7083279000, 395 dynsym)
-[+] own-loading dependency: /data/user/0/com.linux_core/files/nh/distro/parrot/usr/lib/aarch64-linux-gnu/libc.so.6
-[+] dep ld-linux-aarch64.so.1: host ld-linux fallback
-[+] relocated 340 entries
-[+] entering 0x7103f72818 (stack 0x7081ad2f60)
+- `customize.sh` se nespustí při upgrade → při aktualizaci modulu: uninstall → reboot → install → reboot.
 
-                                =======POKROK=======
-TP=0x710550c010 tls_offset=0x13fff0 memsz=0x98
-[dbg] patching libc.so.6 sbrk @0x7082eaf500 -> 0x63d3174550
-[dbg] patching libc.so.6 __sbrk @0x7082eaf500 -> 0x63d3174550
-[dbg] patching libc.so.6 brk @0x7082ea9d40 -> 0x63d31746e8
-[dbg] libc pre-init mp_ bytes: 000000000000000000000000000000000000000000000000
-[+] running libc.so.6 init_array[0] @ 0x7082de6080
-[+] init_array[0] returned
-[+] running libc.so.6 init_array[1] @ 0x7082de5f20
-[+] init_array[1] returned
-[+] running libc.so.6 init_array[2] @ 0x7082de5fc0
-[+] init_array[2] returned
-[+] running libc.so.6 init_array[3] @ 0x7082de6040
-[+] init_array[3] returned
-[dbg] post-init /data/user/0/com.linux_core/files/nh/distro/parrot/usr/lib/aarch64-linux-gnu/libc.so.6
-[+] running libpcre2-8.so.0 DT_INIT
-[+] running libpcre2-8.so.0 init_array[0] @ 0x7083129760
-[+] init_array[0] returned
-[dbg] post-init /data/user/0/com.linux_core/files/nh/distro/parrot/usr/lib/aarch64-linux-gnu/libpcre2-8.so.0
-[+] running libselinux.so.1 DT_INIT
-[+] running libselinux.so.1 init_array[0] @ 0x7083280f00
-[+] init_array[0] returned
-[+] running libselinux.so.1 init_array[1] @ 0x7083280c44
-[+] init_array[1] returned
-[dbg] post-init /data/user/0/com.linux_core/files/nh/distro/parrot/usr/lib/aarch64-linux-gnu/libselinux.so.1
-[dbg] libc mp_ @ 0x7082f74a40: 0000000000000000000000000000000000000000000000000000000000000000
-  [maps-begin]
-63d316c000-63d3170000 r--p 00000000 fd:29 1545926                        /data/user/0/com.linux_core/files/usr/bin/elf_loader
-63d3173000-63d317d000 r-xp 00003000 fd:29 1545926                        /data/user/0/com.linux_core/files/usr/bin/elf_loader
-63d3180000-63d3182000 r--p 0000c000 fd:29 1545926                        /data/user/0/com.linux_core/files/usr/bin/elf_loader
-63d3185000-63d3186000 rw-p 0000d000 fd:29 1545926                        /data/user/0/com.linux_core/files/usr/bin/elf_loader
-63d3186000-63d31b5000 rw-p 00000000 00:00 0                              [anon:.bss]
-70812d4000-7082dc4000 rw-p 00000000 00:00 0
-7082dc4000-7082f60000 r-xp 00000000 00:00 0
-7082f60000-7082f83000 rw-p 00000000 00:00 0
-7083127000-70831bd000 r-xp 00000000 00:00 0
-70831bd000-70831d8000 rw-p 00000000 00:00 0
-7083279000-70832aa000 r-xp 00000000 00:00 0
-70832aa000-70832cc000 rw-p 00000000 00:00 0
-70832cc000-70835ea000 ---p 00000000 00:00 0                              [anon:cfi shadow]
-70835ea000-70835eb000 r--p 00000000 00:00 0                              [anon:cfi shadow]
-70835eb000-7083654000 ---p 00000000 00:00 0                              [anon:cfi shadow]
-7083654000-7083655000 r--p 00000000 00:00 0                              [anon:cfi shadow]
-7083655000-71032cc000 ---p 00000000 00:00 0                              [anon:cfi shadow]
-71032cc000-71032cf000 r--p 00000000 fd:06 2873                           /system/lib64/libnetd_client.so
-71032cf000-71032d4000 r-xp 00003000 fd:06 2873                           /system/lib64/libnetd_client.so
-71032d4000-71032d5000 r--p 00008000 fd:06 2873                           /system/lib64/libnetd_client.so
-71032d5000-71032d6000 rw-p 00008000 fd:06 2873                           /system/lib64/libnetd_client.so
-7103300000-7103312000 r--p 00000000 07:30 42                             /apex/com.android.runtime/lib64/bionic/libm.so
-7103312000-7103337000 r-xp 00012000 07:30 42                             /apex/com.android.runtime/lib64/bionic/libm.so
-7103337000-7103338000 r--p 00037000 07:30 42                             /apex/com.android.runtime/lib64/bionic/libm.so
-7103338000-7103339000 rw-p 00037000 07:30 42                             /apex/com.android.runtime/lib64/bionic/libm.so
-710334a000-7103394000 r--p 00000000 fd:06 2621                           /system/lib64/libc++.so
-7103394000-71033f2000 r-xp 0004a000 fd:06 2621                           /system/lib64/libc++.so
-71033f2000-71033f9000 r--p 000a8000 fd:06 2621                           /system/lib64/libc++.so
-71033f9000-71033fa000 rw-p 000ae000 fd:06 2621                           /system/lib64/libc++.so
-71033fa000-71033fd000 rw-p 00000000 00:00 0                              [anon:.bss]
-7103400000-7103c00000 rw-p 00000000 00:00 0                              [anon:libc_malloc]
-7103c28000-7103c70000 r--p 00000000 07:30 39                             /apex/com.android.runtime/lib64/bionic/libc.so
-7103c70000-7103d2a000 r-xp 00048000 07:30 39                             /apex/com.android.runtime/lib64/bionic/libc.so
-7103d2a000-7103d31000 r--p 00102000 07:30 39                             /apex/com.android.runtime/lib64/bionic/libc.so
-7103d31000-7103d34000 rw-p 00108000 07:30 39                             /apex/com.android.runtime/lib64/bionic/libc.so
-7103d34000-7103f44000 rw-p 00000000 00:00 0                              [anon:.bss]
-7103f44000-7103f45000 r--p 00000000 00:00 0                              [anon:.bss]
-7103f45000-7103f4d000 rw-p 00000000 00:00 0                              [anon:.bss]
-7103f6d000-7103f8d000 r-xp 00000000 00:00 0
-7103f8d000-7103fa0000 rw-p 00000000 00:00 0
-7103fa0000-7103fc0000 r--s 00000000 00:11 143                            /dev/__properties__/u:object_r:heapprofd_prop:s0
-7103fc0000-7103fe0000 r--s 00000000 00:11 157                            /dev/__properties__/u:object_r:libc_debug_prop:s0
-7103fe0000-7104000000 r--s 00000000 00:11 44                             /dev/__properties__/u:object_r:build_prop:s0
-7104000000-7105400000 ---p 00000000 00:00 0
-7105415000-7105435000 r--s 00000000 00:11 138                            /dev/__properties__/u:object_r:gwp_asan_prop:s0
-7105435000-7105455000 r--s 00000000 00:11 85                             /dev/__properties__/u:object_r:debug_prop:s0
-7105455000-7105475000 r--s 00000000 00:11 1310                           /dev/__properties__/properties_serial
-7105475000-710548f000 r--s 00000000 00:11 11                             /dev/__properties__/property_info
-710548f000-71054f3000 rw-p 00000000 00:00 0                              [anon:linker_alloc]
-71054f3000-71054f4000 r--p 00000000 07:30 40                             /apex/com.android.runtime/lib64/bionic/libdl.so
-71054f4000-71054f5000 r-xp 00001000 07:30 40                             /apex/com.android.runtime/lib64/bionic/libdl.so
-71054f5000-71054f6000 r--p 00002000 07:30 40                             /apex/com.android.runtime/lib64/bionic/libdl.so
-71054f6000-71054f7000 ---p 00000000 00:00 0
-71054f7000-71054f8000 r--p 00000000 00:00 0                              [anon:.bss]
-7105507000-710550b000 rw-p 00000000 00:00 0                              [anon:System property context nodes]
-710550b000-710550c000 ---p 00000000 00:00 0
-710550c000-710550f000 rw-p 00000000 00:00 0                              [anon:stack_and_tls:main]
-710550f000-7105510000 ---p 00000000 00:00 0
-7105554000-7105574000 r--s 00000000 00:11 1266                           /dev/__properties__/u:object_r:vendor_socket_hook_prop:s0
-7105574000-710563c000 r--p 00000000 00:00 0                              [anon:linker_alloc]
-710563c000-710563e000 rw-p 00000000 00:00 0                              [anon:bionic_alloc_small_objects]
-710563f000-7105640000 rw-p 00000000 00:00 0                              [anon:bionic_alloc_small_objects]
-7105641000-7105644000 rw-p 00000000 00:00 0                              [anon:bionic_alloc_small_objects]
-7105646000-7105647000 rw-p 00000000 00:00 0                              [anon:bionic_alloc_small_objects]
-7105648000-710564c000 rw-p 00000000 00:00 0                              [anon:bionic_alloc_small_objects]
-710564c000-710564d000 rw-p 00000000 00:00 0
-710564d000-7105654000 rw-p 00000000 00:00 0                              [anon:bionic_alloc_small_objects]
-7105654000-7105655000 rw-p 00000000 00:00 0                              [anon:bionic_alloc_lob]
-7105655000-7105657000 rw-p 00000000 00:00 0                              [anon:bionic_alloc_small_objects]
-7105657000-7105677000 r--s 00000000 00:11 1295                           /dev/__properties__/u:object_r:vndk_prop:s0
-7105677000-710567c000 rw-p 00000000 00:00 0                              [anon:bionic_alloc_small_objects]
-710567c000-710569c000 r--s 00000000 00:11 22                             /dev/__properties__/u:object_r:arm64_memtag_prop:s0
-710569c000-7105700000 r--p 00000000 00:00 0                              [anon:linker_alloc]
-7105700000-7105701000 rw-p 00000000 00:00 0                              [anon:bionic_alloc_small_objects]
-7105701000-7105721000 r--s 00000000 00:11 85                             /dev/__properties__/u:object_r:debug_prop:s0
-7105721000-7105741000 r--s 00000000 00:11 44                             /dev/__properties__/u:object_r:build_prop:s0
-7105741000-7105742000 ---p 00000000 00:00 0
-7105742000-710574a000 rw-p 00000000 00:00 0
-710574a000-710574b000 ---p 00000000 00:00 0
-710574b000-710576b000 r--s 00000000 00:11 1310                           /dev/__properties__/properties_serial
-710576b000-710576f000 rw-p 00000000 00:00 0                              [anon:System property context nodes]
-710576f000-7105789000 r--s 00000000 00:11 11                             /dev/__properties__/property_info
-7105789000-71057ed000 r--p 00000000 00:00 0                              [anon:linker_alloc]
-71057ed000-71057ef000 rw-p 00000000 00:00 0                              [anon:bionic_alloc_small_objects]
-71057ef000-71057f0000 r--p 00000000 00:00 0                              [anon:atexit handlers]
-71057f0000-7105930000 ---p 00000000 00:00 0
-7105930000-7105932000 rw-p 00000000 00:00 0
-7105932000-71067f0000 ---p 00000000 00:00 0
-71067f0000-71067f1000 ---p 00000000 00:00 0
-71067f1000-71067f9000 rw-p 00000000 00:00 0                              [anon:thread signal stack]
-71067f9000-71067fa000 rw-p 00000000 00:00 0                              [anon:arc4random data]
-71067fa000-71067fb000 rw-p 00000000 00:00 0
-71067fb000-71067fc000 r--p 00000000 00:00 0                              [anon:atexit handlers]
-71067fc000-71067fd000 rw-p 00000000 00:00 0                              [anon:arc4random data]
-71067fd000-71067fe000 r--p 00000000 00:00 0                              [vvar]
-71067fe000-71067ff000 r-xp 00000000 00:00 0                              [vdso]
-71067ff000-7106837000 r--p 00000000 07:30 16                             /apex/com.android.runtime/bin/linker64
-7106837000-7106921000 r-xp 00038000 07:30 16                             /apex/com.android.runtime/bin/linker64
-7106921000-7106929000 r--p 00122000 07:30 16                             /apex/com.android.runtime/bin/linker64
-7106929000-710692b000 rw-p 00129000 07:30 16                             /apex/com.android.runtime/bin/linker64
-710692b000-7106934000 rw-p 00000000 00:00 0                              [anon:.bss]
-7106934000-7106935000 r--p 00000000 00:00 0                              [anon:.bss]
-7106935000-7106937000 rw-p 00000000 00:00 0                              [anon:.bss]
-7f00000000-7f04000000 rw-p 00000000 00:00 0
-7febcbc000-7febcdd000 rw-p 00000000 00:00 0                              [stack]
-  [maps-end]
-F:tp=0000007081ad4720 pc=0000000000021830 sp=0000007081ad2f00 ad=0000000000021830 x00=00000063d3185420 x01=0000000000000000 x02=b40000710380c000 x03=0000007103f72918 x04=0000007103f84328 x05=0000000000000000 x06=0000007081ad2f60 x07=0000007081ad2f60 x08=00000063d31aa000 x09=000000710550c010 x10=00000063d317aeec x11=0000000000000001 x12=0000007febcdbc24 x13=0000000000000003 x14=0000000000000000 x15=0000007103c53982 x16=0000007082f73d38 x17=0000000000021830 x18=0000007105930000 x19=0000007081ad2f68 x20=0000000000000001 x21=0000007103f842a8 x22=0000007103f70eb0 x23=b40000710380c000 x24=00000063d31b3190 x25=0000000000000000 x26=00000063d3185d20 x27=0000000000000000 x28=0000000000000000 x29=0000007081ad2f00 x30=0000007082de6328
-MP:000000000000000c00000000000000cd00000000000000cd00000000000000eb000000000000007f000000000000000000000000000000000000000000000000000000000000004300000000000000cd00000000000000cd00000000000000eb000000000000007f000000000000000000000000000000000000000000000000000000000000005600000000000000cd00000000000000cd00000000000000eb000000000000007f000000000000000000000000000000000000000000000000000000000000008900000000000000cd00000000000000cd00000000000000eb000000000000007f000000000000000000000000000000000000000000000000000000000000009600000000000000cd00000000000000cd00000000000000eb000000000000007f00000000000000000000000000000000000000000000000000000000000000bd00000000000000cd00000000000000cd00000000000000eb000000000000007f000000000000000000000000000000000000000000000000
-Segmentation fault
+## 2026-08-21: Oprava elf wrapperu + LD_LIBRARY_PATH poisoning
+
+### 1. Vymyšlený --library-path flag
+- `elf_loader` nezná `--library-path` (`main.c` rozpoznává jen `--lazy`/`--own`/`--ownall`/`--shim`).
+- Původní wrapper volal `exec /system/bin/elf_loader --library-path "$LIBDIR" --ownall "$@"`
+  → flag byl ignorován, `LD_LIBRARY_PATH` se nenastavil, parrot knihovny se nenašly.
+- Opraveno: wrapper nastavuje `LD_LIBRARY_PATH` (skutečný mechanismus loaderu,
+  viz `elf_loader.c` ř. 842/1089) a volá jen `--ownall`.
+
+### 2. LD_LIBRARY_PATH poisoning (CANNOT LINK EXECUTABLE / bad ELF magic)
+- **Symptom** (první pokus s dynamickým bionic `elf_loader` + prepend `LD_LIBRARY_PATH=parrot`):
+  ```
+  CANNOT LINK EXECUTABLE .../elf_loader:
+  .../nh/distro/parrot/usr/lib/aarch64-linux-gnu/libc.so has bad ELF magic: 2f2a2047
+  ```
+- **Příčina:** `2f2a2047` = ASCII `/* G` = začátek GNU ld skriptu. Parrot `libc.so`
+  je linker script (text), ne ELF. Dynamický bionic `elf_loader` má `DT_NEEDED libc.so`;
+  bionic linker si z `LD_LIBRARY_PATH` natáhl parrot `libc.so` a pokusil se ho použít
+  jako vlastní závislost → pád dřív, než se spustí vnitřní glibc loader.
+- **Static-pie pokus (nepoužitelný pro standalone):** build z NDK (`-static-pie`,
+  `elf_loader_ndk_staticpie`, 2271072 B, nula `NEEDED`) by `LD_LIBRARY_PATH` nepoisonoval.
+  Ale tato varianta **nemá `PT_INTERP`** (readelf: 10 headers, žádný INTERP) →
+  kernel by ji na zařízení nespustil (relokace `.rela.dyn` by se neaplikovaly).
+  (Postup.md ho dřív popisoval jako "self-contained", ale jen pro vnořené načtení
+  přes glibc loader, ne samostatně.)
+- **Finální fix — dynamický build + pořadí `LD_LIBRARY_PATH`:** vrácen dynamický
+  bionic `elf_loader` (118496 B; `PT_INTERP=/system/bin/linker64`,
+  `NEEDED libc.so` `libdl.so`). Wrapper nastavuje:
+  ```sh
+  export LD_LIBRARY_PATH="/system/lib64:/system/lib:$LD_LIBRARY_PATH:$ROOTFS/usr/lib/aarch64-linux-gnu:$ROOTFS/lib"
+  ```
+  - `/system/lib64:/system/lib` JSOU PRVNÍ → vnější bionic loader najde svůj
+    vlastní `libc.so` (bionic) dřív, než parrot. Žádný ld-script, žádný pád.
+  - parrot cesty až na konec → vnitřní glibc loader hledá `libc.so.6` (a další
+    glibc sonamy s verzí: `libm.so.6`, `libpthread.so.0`, `libdl.so.2` …).
+    Ty v `/system/lib64` nejsou (bionic má jen `libc.so`, ne `libc.so.6`),
+    takže se trefí do parrotu.
+
+### 3. On-device test (`com.linux_core`, `ashell`, mimo proot)
+- Cwd `/data/user/0/com.linux_core/files`,
+  `ROOTFS=/data/user/0/com.linux_core/files/nh/distro/parrot`,
+  `PATH` s `usr/bin` první.
+- `elf usr/bin/ls -la /etc` → **`LD_LIBRARY_PATH` poisoning je pryč**:
+  ```
+  [+] own-loading dependency: .../libselinux.so.1
+  [+] own-loading dependency: .../libpcre2-8.so.0
+  [+] own-loading dependency: .../libc.so.6
+  ...
+  [+] entering 0x7103f72818 (stack 0x7081ad2f60)
+  ```
+  Loader own-loaduje všechny glibc závislosti z `$ROOTFS/usr/lib/aarch64-linux-gnu`,
+  spustí jejich `init_array`, pak vstoupí do exe.
+- **NOVÝ problém — segfault po init:** po `entering <exe>` + TLS setup +
+  heap-veneer patch + spuštění všech `init_array` se objeví
+  `Segmentation fault` s fault handlerem (`F:tp=0x710550c010 pc=0x21830
+  sp=0x7081ad2f00 ad=0x21830 ... MP:...`). Příčina zatím neurčena —
+  pád je až ve spuštěném exe/loaderu po úspěšném načtení libc, ne v závislostech.
+  → viz Zbývá (nový bug k vyšetření).
+
