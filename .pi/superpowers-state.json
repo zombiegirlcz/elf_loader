@@ -3,12 +3,12 @@
     "phases": {
       "brainstorm": "pending",
       "plan": "pending",
-      "execute": "pending",
+      "execute": "active",
       "verify": "pending",
       "review": "pending",
       "finish": "pending"
     },
-    "currentPhase": null,
+    "currentPhase": "execute",
     "artifacts": {
       "brainstorm": null,
       "plan": null,

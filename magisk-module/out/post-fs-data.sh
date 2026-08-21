@@ -1,15 +1,12 @@
 #!/system/bin/sh
-# Parrot ELF Loader - post-fs-data.sh (runs early before Zygote starts).
-# Interpreter bridge for fork/exec from within parrot shell.
+# Parrot ELF Loader - post-fs-data.sh (bezi pred Zygote).
+#
+# POZNAMKA: stary hack (mkdir /lib + bind mount ld-linux-aarch64.so.1) je
+# odstranen - na Androidu neni / zapisovatelny, takze /lib/ld-linux-aarch64.so.1
+# nelze vytvorit. Transparentni fork/exec glibc binarek resi linuxsh
+# (chroot v privatnim mount NS - interp existuje UVNITRI rootfs).
+# Bez rootu / mimo linuxsh se binarky spousteji pres `elf` wrapper (elf_loader).
 MODDIR=${0%/*}
 
-# Interpreter bridge for fork/exec
-if [ -f "$MODDIR/system/lib/ld-linux-aarch64.so.1" ]; then
-    mkdir -p /lib
-    if ! mountpoint -q /lib/ld-linux-aarch64.so.1 2>/dev/null; then
-        mount -o bind "$MODDIR/system/lib/ld-linux-aarch64.so.1" \
-            /lib/ld-linux-aarch64.so.1 2>/dev/null
-    fi
-fi
-
+# nic - vse resi service.sh a linuxsh
 exit 0

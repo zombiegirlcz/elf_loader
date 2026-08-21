@@ -554,3 +554,50 @@ sed -n 1p        -> TERMINATOR       rc=0   (dříve XFAIL)
 - `src/main.c` warning `unknown escape sequence '\]'` — kosmetika.
 - Libc dep handling: tvrdý exit při "dep libc.so.6 not found" (viz výše).
 - Step 3 otevřené body: test page-size na reálném 16K zařízení; bionic dlerror/errno test.
+
+## 2026-08-21 (noc): Magisk deploy — `linuxsh` nativní chroot rootfs (rychlejší alternativa prootu)
+
+### Průlom
+Na zařízení běží SSH na localhost:5555 (uživatel u0_a312, heslo) a **Magisk su
+funguje** (`su -c id` → uid=0, context u:r:magisk:s0). S rootem není potřeba
+proot ani elf_loader pro běh rootfs — stačí **chroot**:
+
+- Debian/parrot rootfs má `/lib/ld-linux-aarch64.so.1` fyzicky uvnitř, takže
+  kernel při exec najde PT_INTERP **uvnitř chrootu** → fork/exec glibc binárek
+  funguje nativně, bez ptrace, bez LD_LIBRARY_PATH hacků (stačí ld.so.cache).
+- Bind mounty /proc,/dev,/sys (+tmpfs na /tmp) v **privátním mount namespace**
+  (toybox unshare -m; kernel NEMÁ CONFIG_BINFMT_MISC — ověřeno v /proc/config.gz,
+  takže binfmt_misc cesta padá) → po skončení session se nic nerozsype.
+- Benchmark (20× echo): **chroot 500 ms vs elf_loader 1319 ms** (~2.6× rychlejší;
+  loader má per-exec režii mapování libc+relokace+TLS; proti proot-ptrace je
+  chroot o řád rychlejší).
+- Ověřeno v chrootu: bash -l login shell (root, debian_version=parrot), ls,
+  CHILD_EXEC (bash→echo), dpkg --version, apt-get (DNS přes resolv.conf OK),
+  uname. Rootfs má sice rozbité apt dependencies (systemd 241 vs 257 mix — stav
+  rootfs, ne našeho řešení), ale apt/dpkg tooling samotný běží.
+
+### Nové skripty (magisk-module/system/bin/)
+- **`linuxsh`** — wrapper: pokud není root, re-exec přes Magisk su.
+- **`linuxsh-root`** — vlastní logika: přečte ROOTFS z /data/adb/parrot_root,
+  unshare -m, bind mounty, env (PATH/HOME/TERM/LANG), `chroot` → interaktivní
+  `bash -l`, nebo `linuxsh <cmd> [args...]`.
+- Poučení z ladění: mksh necituje word-splitting jak čekáme (`exec "$UNSHARE"`
+  s mezerou ve stringu nefunguje — použita funkce `uns()` s case), tilde se v
+  su -c neexpanduje, /data/local/tmp nelze psát jako app user (deploy přes
+  Termux home + su cp), parrot_root může mít víc řádků (head -n 1).
+- `post-fs-data.sh`: odstraněn rozbitý hack mkdir /lib + bind mount (/ je RO).
+- `service.sh` + `customize.sh`: instalují linuxsh do /data/adb/ (viditelné ve
+  všech namespace hned po instalaci, bez čekání na reboot).
+- Modul zip rebuildnut s finálním bionic elf_loader (113 KB).
+
+### Nasazení na zařízení (hotovo)
+- `/data/adb/linuxsh`, `/data/adb/linuxsh-root`, `/data/adb/elf_loader` (nový build)
+- `/data/adb/modules/parrot_elf_loader/system/bin/{linuxsh,linuxsh-root,elf_loader}` aktualizováno in-place
+- Použití: `su -c linuxsh` (nebo z Termux: `linuxsh` po přidání do PATH)
+
+### Architektura spouštění (final)
+| Cesta | Kdy | Mechanizmus |
+|---|---|---|
+| `linuxsh` | root/Magisk k dispozici | unshare -m + bind + **chroot**, nativní exec |
+| `elf` wrapper | bez rootu (app namespace) | elf_loader --ownall (own-loading glibc) |
+| parrot ld.so jako interp | su, ad-hoc | LD_LIBRARY_PATH + explicitní interp |

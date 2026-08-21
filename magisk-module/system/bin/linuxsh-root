@@ -1,0 +1,74 @@
+#!/system/bin/sh
+# linuxsh-root - bezí jako root (volané linuxsh wrapperem).
+# Privátní mount namespace + bind /proc,/dev,/sys + chroot do rootfs.
+#
+# Proc chroot a ne proot: kernel execuje PT_INTERP (/lib/ld-linux-aarch64.so.1)
+# uvnitř chrootu, kde existuje -> fork/exec glibc binárek funguje nativně,
+# bez ptrace, bez LD_LIBRARY_PATH hacků (ld.so.cache v rootfs stačí).
+# Mounty jsou v privátním NS -> po skončení session zmizí, globální stav
+# Androidu se nezmění.
+
+ROOTFS_FILE=/data/adb/parrot_root
+if [ -f "$ROOTFS_FILE" ]; then
+    # vezmi prvni radek (soubor muze mit zbytky po starsich instalacich)
+    ROOTFS=$(head -n 1 "$ROOTFS_FILE")
+fi
+: "${ROOTFS:=/data/adb/parrot}"
+
+if [ ! -d "$ROOTFS" ]; then
+    echo "linuxsh: rootfs neexistuje: $ROOTFS" >&2
+    echo "linuxsh: zapiš cestu do $ROOTFS_FILE" >&2
+    exit 1
+fi
+
+# Unshare: preferuj toybox, fallback /system/bin, Magisk busybox, PATH
+if command -v toybox >/dev/null 2>&1 && toybox unshare true 2>/dev/null; then
+    UNSHARE_MODE=toybox
+elif [ -x /system/bin/unshare ]; then
+    UNSHARE_MODE=sysbin
+elif [ -x /data/adb/magisk/busybox ] && /data/adb/magisk/busybox unshare true 2>/dev/null; then
+    UNSHARE_MODE=bb
+else
+    UNSHARE_MODE=path
+fi
+
+uns() {
+    case "$UNSHARE_MODE" in
+    toybox) toybox unshare "$@" ;;
+    sysbin) /system/bin/unshare "$@" ;;
+    bb)     /data/adb/magisk/busybox unshare "$@" ;;
+    *)      unshare "$@" ;;
+    esac
+}
+
+export LINUXSH_ROOTFS="$ROOTFS"
+
+exec uns -m sh -c '
+R="$LINUXSH_ROOTFS"
+
+mkdir -p "$R/dev" "$R/proc" "$R/sys" "$R/tmp" "$R/run" 2>/dev/null
+
+# Bind mounty (best effort; stare jadro nemusi mit vsechno)
+mount --bind /dev      "$R/dev"      2>/dev/null
+mount --bind /dev/pts  "$R/dev/pts"  2>/dev/null
+mount --bind /proc     "$R/proc"     2>/dev/null
+mount --bind /sys      "$R/sys"      2>/dev/null
+mountpoint -q "$R/tmp" 2>/dev/null || mount -t tmpfs tmpfs "$R/tmp" 2>/dev/null
+
+# Prostredi pro Debian chroot
+export PATH=/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin
+export HOME="${HOME:-/root}"
+export TERM="${TERM:-xterm-256color}"
+export LANG="${LANG:-C.UTF-8}"
+export TMPDIR=/tmp
+
+cd / || exit 1
+
+# CHROOT: od tohoto okamžiku vidime jen rootfs - kernel najde PT_INTERP
+# /lib/ld-linux-aarch64.so.1 uvnitr rootfs -> nativni fork/exec glibc binarek.
+if [ $# -gt 0 ]; then
+    exec chroot "$LINUXSH_ROOTFS" "$@"
+else
+    exec chroot "$LINUXSH_ROOTFS" /bin/bash -l
+fi
+' linuxsh-inner "$@"

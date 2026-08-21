@@ -1,0 +1,29 @@
+#!/system/bin/sh
+# linuxsh - nativni Debian/parrot rootfs shell pres chroot (VYZADUJE root/Magisk).
+#
+# Na rozdil od proot nepouziva ptrace: syscally jdou primo do kernelu,
+# fork/exec funguje nativne (kernel najde PT_INTERP /lib/ld-linux-aarch64.so.1
+# UVNITRI chrootu, kde fyzicky existuje v Debian rootfs).
+#
+# Pouziti:
+#   linuxsh                      -> interaktivni login shell (bash -l)
+#   linuxsh <cmd> [args...]      -> spusti prikaz uvnitri rootfs
+#
+# Rootfs cesta se cte z /data/adb/parrot_root (vytvari service.sh/customize.sh).
+
+MODDIR=${0%/*}
+
+if [ "$(id -u)" != "0" ]; then
+    # re-exec pres Magisk su; args opatrne quotujeme single-quotes
+    SELF="$MODDIR/linuxsh-root"
+    Q=""
+    for a in "$@"; do
+        case "$a" in
+            *"'"*) echo "linuxsh: argument s apostrofem neni podporovan pres su: $a" >&2; exit 2 ;;
+        esac
+        Q="$Q '$a'"
+    done
+    exec su -c "$SELF$Q"
+fi
+
+exec "$MODDIR/linuxsh-root" "$@"

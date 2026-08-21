@@ -1,16 +1,13 @@
 #!/system/bin/sh
-# elf - run parrot/Linux binaries via own-loading glibc loader
-# Reads rootfs from /data/adb/parrot_root and sets up library path.
-
-ROOTFS=$(head -1 /data/adb/parrot_root 2>/dev/null)
-if [ -z "$ROOTFS" ] || [ ! -d "$ROOTFS" ]; then
-    echo "elf: rootfs not configured (missing /data/adb/parrot_root)" >&2
+if [ -z "$ROOTFS" ]; then
+    echo "elf: ROOTFS not set. export ROOTFS=/path/to/rootfs" >&2
     exit 1
 fi
-
-LIBDIR="$ROOTFS/usr/lib/aarch64-linux-gnu"
-if [ ! -d "$LIBDIR" ]; then
-    LIBDIR="$ROOTFS/lib"
-fi
-
-exec /system/bin/elf_loader --library-path "$LIBDIR" --ownall "$@"
+# The bionic loader (this elf_loader binary) must resolve its OWN libc.so /
+# libdl.so from the Android system, NOT from the parrot glibc dir -- otherwise
+# the bionic linker chokes on parrot's libc.so (a GNU ld script: bad ELF
+# magic). Put /system/lib64 first so the OUTER loader finds bionic libc.so,
+# then append the parrot glibc libdirs for the INNER glibc loader (which looks
+# for libc.so.6 etc. and only matches parrot, never bionic's libc.so).
+export LD_LIBRARY_PATH="/system/lib64:/system/lib:$LD_LIBRARY_PATH:$ROOTFS/usr/lib/aarch64-linux-gnu:$ROOTFS/lib"
+exec /system/bin/elf_loader --ownall "$@"
