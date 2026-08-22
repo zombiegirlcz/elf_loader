@@ -624,3 +624,37 @@ storage operace system_serveru/voldu selhávaly → crashe.
 ### Lekce
 Na Androidu (shared propagation): `unshare -m` BEZ `make-rprivate` NENÍ izolace.
 Vždy: `unshare(CLONE_NEWNS)` → okamžitě `mount --make-rprivate /`.
+
+## 2026-08-22: C++/Rust/TUI binárky přes elf wrapper (btop/btm/htop) + nh fix apt
+
+### Root cause (po stack_chk/emutls fixech): inity pod bionickým TP
+Modulové DT_INIT/init_array běžely v loader fázi pod **bionickým TPIDR_EL0**.
+libstdc++/threadové knihovny v ctorusech sahají pod TP-0x720 (_pthread_cleanup_push,
+cancellable futex) → guard page bionického main-TLS → SIGSEGV. Proto padaly
+btop/apt (C++) a htop plný běh, zatímco --version jednoduchých binárek OK.
+
+### Fix
+- init fronta: run_module_init jen enqueue; spuštění v `elf_final_jump` (entry.S)
+  POD parrot TP těsně před entry. Asm používá callee-saved x19/x20 (caller-saved
+  x9/x10 ničí C helper volání!).
+- region VŽDY alokován (i bez PT_TLS — btop žádné nemá), pthread struct zeroed.
+- modulové .tdata image kopírováno z ELF (ne z host TP — bionic layout garbage);
+  arena slot nechán 0 = malloc si vezme main_arena.
+- uselocale(NULL)+__ctype_init() z own-loaded libc pod parrot TP před inits
+  (strtol/ctype tabulky jinak NULL).
+
+### Výsledky (elf wrapper na zařízení)
+echo ✓ · btop --version rc=0 ✓ · htop --version rc=0 ✓ · btm --version rc=0 ✓ ·
+sed pipe ✓ · apt-get necrashuje ✓. htop full TUI: edge-case (dl_iterate_phdr
+callback NULL) — pro interaktivní TUI doporučen linuxsh chroot.
+
+### nh fix apt (kali_core_emulator/assets/nh)
+Opraven rozbitý apt v rootfs: libpam-systemd(257) konflikt odstraněn, merged-usr
+marker, systemd 241→257 (repack .deb no-op preinst), APT_CHECK_OK,
+apt-get install sl/tree end-to-end ✓. Nová akce `nh fix apt` (idempotentní).
+
+### Dev box incident
+apt-get install sshpass na dev-box prootu přerušil ncurses upgrade →
+libtinfo.so.6 symlink EPERM → všechny shell příkazy mrtvé. Fix: ld.so.preload
+s libtinfo.so.6.5 (SONAME match splní DT_NEEDED). Rozbité symlinky EPERM trvají
+(proot/QEMU vrstva), preload je funkční obejití.
