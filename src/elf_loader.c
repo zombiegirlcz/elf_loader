@@ -1200,6 +1200,61 @@ static int load_module_needed(elf_object_t *m, elf_scope_t *scope) {
     return 0;
 }
 
+/* Fronta init funkcí (DT_INIT + init_array všech own-loadených modulů).
+ * Nesmí se volat v loader fázi pod host bionic TP: libstdc++/threadové knihovny
+ * (btop, apt) v ctorusech sahají pod TP-0x720 (_pthread_cleanup_push /
+ * cancellable futex) -> guard page bionického main-TLS -> SIGSEGV.
+ * Spouští je elf_run_final() až POD parrot TP těsně před entry. */
+typedef void (*init_fn_t)(int, char **, char **);
+static init_fn_t *g_pending_inits;
+static size_t g_pending_count, g_pending_cap;
+
+/* libc TLS per-thread state: locale pointer + ctype tables leží v
+ * [TP + slot_off] slotech (offsety v libc .data na 0x1aff40 / 0x1afd58).
+ * Náš region je zeroed -> strtol/isalpha atd. dereferencují NULL.
+ * Resolvujeme uselocale(NULL) (= global locale) a __ctype_init()
+ * přímo z own-loadeného libc a voláme pod parrot TP. */
+static void *(*g_libc_uselocale)(void *);
+static void (*g_libc_ctype_init)(void);
+extern uintptr_t g_tls_new_tp;
+
+/* Volá se z asm (elf_final_jump) pod parrot TP. Žádný bionic kód/malloc. */
+void elf_run_pending_inits(void) {
+    if (g_tls_new_tp) {
+        if (!getenv("ELF_LOADER_NO_LOCALE")) {
+            if (g_libc_uselocale)
+                g_libc_uselocale(NULL);      /* thread locale = _nl_global_locale */
+            if (g_libc_ctype_init)
+                g_libc_ctype_init();         /* ctype_b/tolower sloty pro tento TP */
+        }
+    }
+    if (!getenv("ELF_LOADER_NO_INITS"))
+    for (size_t i = 0; i < g_pending_count; i++) {
+        init_fn_t fn = g_pending_inits[i];
+        fn(elf_init_argc, elf_init_argv, elf_init_envp);
+    }
+}
+
+static __attribute__((noreturn)) void elf_run_final(void *sp, void *entry, elf_object_t *obj);
+
+static void elf_queue_init(init_fn_t fn) {
+    if (!fn)
+        return;
+    if (g_pending_count == g_pending_cap) {
+        size_t nc = g_pending_cap ? g_pending_cap * 2 : 32;
+        init_fn_t *np = realloc(g_pending_inits, nc * sizeof(init_fn_t));
+        if (!np)
+            return;
+        g_pending_inits = np;
+        g_pending_cap = nc;
+    }
+    g_pending_inits[g_pending_count++] = fn;
+}
+
+static sym_status_t lookup_table(const Elf64_Sym *symtab, const char *strtab,
+                                 size_t count, const char *name, void **out_addr,
+                                 const elf_object_t *obj);
+
 static void run_module_init(elf_object_t *m) {
     Elf64_Dyn *dyn = find_dynamic(m);
     if (!dyn)
@@ -1209,8 +1264,18 @@ static void run_module_init(elf_object_t *m) {
      * to pick the "Unknown error %d" (asprintf) path vs. the plain static
      * string. Our loader never runs the real early-init, so we set the flag
      * ourselves to keep strerror/perror output identical to host glibc. */
-    if (m->soname && strcmp(m->soname, "libc.so.6") == 0)
+    if (m->soname && strcmp(m->soname, "libc.so.6") == 0) {
         *(char *)va(m, 0x1be009) = 1;
+        /* uselocale/__ctype_init pro TLS per-thread state (viz výše) */
+        void *a = NULL;
+        if (lookup_table(m->dynsym, m->dynstr, m->dynsym_count,
+                         "uselocale", &a, m) == SYM_DEFINED && a)
+            g_libc_uselocale = (void *(*)(void *))a;
+        a = NULL;
+        if (lookup_table(m->dynsym, m->dynstr, m->dynsym_count,
+                         "__ctype_init", &a, m) == SYM_DEFINED && a)
+            g_libc_ctype_init = (void (*)(void))a;
+    }
     uint64_t init = 0, init_array = 0, init_arraysz = 0;
     for (Elf64_Dyn *d = dyn; d->d_tag != DT_NULL; d++) {
         if (d->d_tag == DT_INIT)
@@ -1221,20 +1286,13 @@ static void run_module_init(elf_object_t *m) {
             init_arraysz = d->d_un.d_val;
     }
     typedef void (*init_fn_t)(int, char **, char **);
-    if (init) {
-        init_fn_t fn = (init_fn_t)va(m, init);
-        fprintf(stderr, "[+] running %s DT_INIT\n", m->soname);
-        fn(elf_init_argc, elf_init_argv, elf_init_envp);
-    }
+    if (init)
+        elf_queue_init((init_fn_t)va(m, init));
     if (init_array && init_arraysz) {
         uint64_t *arr = (uint64_t *)va(m, init_array);
         size_t n = init_arraysz / sizeof(uint64_t);
-        for (size_t i = 0; i < n; i++) {
-            init_fn_t fn = (init_fn_t)arr[i];
-            fprintf(stderr, "[+] running %s init_array[%zu] @ %p\n", m->soname, i, (void *)arr[i]);
-            fn(elf_init_argc, elf_init_argv, elf_init_envp);
-            fprintf(stderr, "[+] init_array[%zu] returned\n", i);
-        }
+        for (size_t i = 0; i < n; i++)
+            elf_queue_init((init_fn_t)arr[i]);
     }
 }
 
@@ -1356,8 +1414,14 @@ elf_object_t *elf_load_shared(const char *path, elf_scope_t *scope) {
                          MAP_PRIVATE | MAP_ANONYMOUS, -1, 0);
         if (blk != MAP_FAILED) {
             memset(blk, 0, sz);
+            /* Inicializacni image .tdata z ELF (ne z host TP!): arena/locale
+             * pointery libc jsou v .tdata - pod bionickym host TP by kopie
+             * z host TLS byla garbage. */
+            memcpy(blk, (char *)base + (m->phdr[i].p_vaddr - mbv),
+                   m->phdr[i].p_filesz);
             m->tls_offset = (uintptr_t)blk - read_tp();
             m->tls_memsz = m->phdr[i].p_memsz;
+            m->tdata_src = blk;   /* blk[0..filesz] = ELF .tdata image */
             m->has_tls = 1;
         }
         break;
@@ -1787,9 +1851,13 @@ elf_tls_ctx_t elf_setup_own_tls(elf_object_t *exe, elf_scope_t *scope) {
                 max_end = end;
         }
     }
-    if (!any)
-        return ctx;
-
+    /* FIX (btop/apt crash): i kdyz exe ani moduly nemaji PT_TLS, MUSIME vzdy
+     * alokovat vlastni region s pthread struct headroomem a prepnout TP.
+     * Modulove init_array (libstdc++ atd.) bezi jeste PRED trampolinou - pod
+     * bionickym TPIDR_EL0 narazi parrot libc pri prvnim dotku pod TP-0x720
+     * (_pthread_cleanup_push: cleanup listy, cancellable futex path) na guard
+     * page [anon:stack_and_tls] -> SIGSEGV. Nulovana pthread struct v regionu
+     * je validni prazdny stav (cleanup list head = NULL). */
     size_t span = max_end - (size_t)min_off;
     size_t size = ALIGN_UP(TLS_PRE_TCB_SIZE + span + 0x1000, PAGE_SIZE);
     void *region = mmap(NULL, size, PROT_READ | PROT_WRITE,
@@ -1799,7 +1867,9 @@ elf_tls_ctx_t elf_setup_own_tls(elf_object_t *exe, elf_scope_t *scope) {
     memset(region, 0, size);
 
     uintptr_t new_tp = (uintptr_t)region + TLS_PRE_TCB_SIZE + (size_t)(-min_off);
-    /* region was zeroed above: struct pthread occupies [region, new_tp) */
+    /* region was zeroed above: struct pthread occupies [region, new_tp).
+     * Pozn.: malloc thread_arena slot (TP-offset z libc .data @0x1afd68) zůstává
+     * NULL = "uninitialized" -> glibc malloc si sám vezme main_arena. */
 
     /* tcbhead_t at new_tp: { dtv, private } -- dtv filled below */
     *(uintptr_t *)(new_tp + 0x00) = 0;
@@ -1807,9 +1877,15 @@ elf_tls_ctx_t elf_setup_own_tls(elf_object_t *exe, elf_scope_t *scope) {
 
     for (size_t i = 0; scope && i < scope->count; i++) {
         elf_object_t *m = scope->mods[i];
-        if (m && m->has_tls)
-            memcpy((char *)new_tp + m->tls_offset,
-                   (char *)host_tp + m->tls_offset, m->tls_memsz);
+        if (!(m && m->has_tls))
+            continue;
+        /* .tdata image z modulu (arena/locale pointery libc!), ne garbage
+         * z host TP (na Androidu bionic layout nekompatibilní). */
+        char *dst = (char *)new_tp + m->tls_offset;
+        if (m->tdata_src)
+            memcpy(dst, m->tdata_src, m->tls_memsz);
+        else
+            memcpy(dst, (char *)host_tp + m->tls_offset, m->tls_memsz);
     }
     if (exe && exe->has_tls) {
         for (int i = 0; i < exe->phdr_count; i++) {
@@ -1847,6 +1923,10 @@ elf_tls_ctx_t elf_setup_own_tls(elf_object_t *exe, elf_scope_t *scope) {
     g_tls_old_tp = host_tp;
     ctx.region = region;
     ctx.size = size;
+    /* POZOR: tady NESMÍ být msr tpidr_el0! Host bionic malloc (scudo) čte
+     * per-thread cache z TLS pres TPIDR_EL0 - po switchi by kazdy loaderuv
+     * malloc/free dereferencoval nulovy cache v parrot regionu -> SIGSEGV.
+     * Switch dela az elf_run_final() tesne pred entry. */
     return ctx;
 }
 
@@ -2120,11 +2200,39 @@ int elf_run(elf_object_t *obj, int argc, char **argv, char **envp) {
 
     elf_install_fault_handlers();
 
-    printf("[+] entering %p (stack %p)\n", obj->entry_point, sp);
+    printf("[+] entering %p (stack %p) tp=%p inits=%zu\n", obj->entry_point, sp,
+           (void *)g_tls_new_tp, g_pending_count);
     fflush(stdout);
 
-    jump_to_entry(obj->entry_point, sp, g_tls_new_tp, g_tls_old_tp);
+    /* Finální fáze: od tady už ŽÁDNÝ bionic kód (žádný malloc/stdio).
+     * 1) switch na parrot TP (region má nulovanou pthread struct -> cleanup
+     *    listy/mutexy jsou validní prázdné),
+     * 2) spusit queued DT_INIT + init_array všech modulů POD parrot TP,
+     * 3) skoč na exe entry s exe stackem. Nikdy se nevrací (exit_group). */
+    elf_run_final(sp, obj->entry_point, obj);
     return -1;
+}
+
+/* Běží pod parrot TP; smí volat jen parrot kód a loaderovu pointer
+ * aritmetiku. Inits můžou lazy-resolvovat importy - resolve path je po
+ * úklidu debug printů malloc-free. */
+/* Běží pod parrot TP; smí volat jen parrot kód a loaderovu pointer
+ * aritmetiku. Inits můžou lazy-resolvovat importy - resolve path je po
+ * úklidu debug printů malloc-free. */
+static __attribute__((noreturn)) void elf_run_final(void *sp, void *entry,
+                                                    elf_object_t *obj) {
+    if (!g_tls_new_tp) {
+        /* Staré flow (--run/--own/--shim): žádný TLS switch, inity pod host TP
+         * (jak to dělal jump_to_entry). */
+        for (size_t i = 0; i < g_pending_count; i++)
+            g_pending_inits[i](elf_init_argc, elf_init_argv, elf_init_envp);
+        jump_to_entry(entry, sp, 0, 0);
+    }
+    fprintf(stderr, "[dbg-final] tp=%p sp=%p entry=%p pending=%zu\n",
+            (void *)g_tls_new_tp, sp, entry, g_pending_count);
+    fflush(stderr);
+    extern void elf_final_jump(void *, void *, uintptr_t, void (*)(void));
+    elf_final_jump(sp, entry, g_tls_new_tp, elf_run_pending_inits);
 }
 
 void elf_unload(elf_object_t *obj) {

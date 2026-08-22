@@ -24,6 +24,35 @@ jump_to_entry:
     ret
 .size jump_to_entry, .-jump_to_entry
 
+.text
+.globl elf_final_jump
+.type elf_final_jump, %function
+/* void elf_final_jump(void *sp, void *entry, uintptr_t new_tp,
+ *                     void (*run_inits)(void))
+ * NORETURN: switch TP, spustit queued module inity (pod parrot TP),
+ * pak skoc na exe entry s exe stackem. Pouze asm - zadny compiler-generated
+ * stack access po msr. */
+elf_final_jump:
+    /* x19/x20 = callee-saved: C helper (blr x6) je musi zachovat dle ABI */
+    mov x19, x1          /* entry */
+    mov x20, x0          /* sp */
+    mov x6, x3           /* run_inits helper */
+    cbz x2, .Lfj_ns
+    msr tpidr_el0, x2
+.Lfj_ns:
+    blr x6              /* elf_run_pending_inits() - C loop, malloc-free */
+    mov x0, #0
+    mov x1, #0
+    mov x2, #0
+    mov x3, #0
+    mov x4, #0
+    mov x5, #0
+    mov x29, xzr
+    mov x30, xzr
+    mov sp, x20
+    br x19
+.size elf_final_jump, .-elf_final_jump
+
 .globl lazy_plt_stub
 .type lazy_plt_stub, %function
 /* Entered with x16 = &GOT[n] (aarch64 PLT protocol). Resolve the slot

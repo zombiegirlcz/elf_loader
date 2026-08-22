@@ -31,6 +31,7 @@ typedef struct {
     uintptr_t tls_offset;
     int has_tls;
     size_t tls_memsz;
+    void *tdata_src;      /* inicializační image .tdata (ELF), ne host TLS */
 
     int relocated;
     struct elf_scope *scope;
