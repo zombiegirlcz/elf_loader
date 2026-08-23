@@ -681,3 +681,34 @@ s libtinfo.so.6.5 (SONAME match splní DT_NEEDED). Rozbité symlinky EPERM trvaj
 - `elf nmap --version` → SIGSEGV: NULL deref ad=0xc0, registry obsahují
   "ipv6"/"libnetd-" stringy → pád v síťové inicializaci (getaddrinfo/netd)
   pod bionic hostem. Stejná kategorie: starship (139), fzf (134/SIGABRT).
+
+## 2026-08-23 (večer): seccomp compat filtr + fork veneer — parity s prootem
+
+### Root cause pipeline SIGSYS
+- App seccomp sandbox (jadro 4.14): **clone3 → SECCOMP_RET_TRAP → SIGSYS** u dítěte
+  (glibc 2.41 fork volá clone3; jadro ho nema). Raw clone(220) fork-style → EPERM
+  (app uid policy); root/su kontext clone povolen.
+- vfork-style clone (CLONE_VM|CLONE_VFORK) projde i app uid → proto posix_spawn
+  cesty fungovaly a plain fork ne.
+
+### Opravy (elf_loader)
+1. **install_legacy_syscall_filter()** (elf_install_compat, main start):
+   stacked seccomp BPF filtr — clone3(435)/close_range(436)/openat2(437)/
+   faccessat2(439) → RET_ERRNO(ENOSYS). Glibc fallbacky na stare syscalls
+   tak zacnou fungovat. Filtr se dedi pres fork+exec.
+   POZOR: __NR_seccomp = **277** na aarch64 (278 je getrandom — EINVAL past).
+   Filtry nelze uvolnit (jen zpřísnit) — stacked ENOSYS je legalni cesta.
+2. **ldso_fork veneer** (fork/__fork v modulech): raw syscall clone(SIGCHLD only).
+   Bez SETTID/CLEARTID — child_tidptr by musel ukazovat do parrot TLS tid slotu.
+
+### Overeno (device, compat_tests.sh proot vs elf diff)
+- 20/23 testu IDENTICKY (echo/printf/seq/wc/sort/uniq/cut/tr/head/tail/grep/
+  sed/basename/dirname/expr/uname-m/hostname/bash-exit7/bash-hello/sh-pipe/fsops)
+- Zbyvajici 3 rozdily = SKUTECNE prostredi (nelzeme): id-u (0 vs 10310),
+  pwd, prazdny radek formatovani
+
+### Externi exec limit (dokumentace hranice)
+- fork+exec PARROT dynamicka binarka pod loaderem → PT_INTERP /lib/ld-linux
+  ENOENT → rc 127. Host toybox (/bin/*, /system/bin) funguje.
+- Reseni pro plny fork/exec: linuxsh chroot (root) nebo bind-mount lib do
+  privatniho namespace (su + unshare -m + make-rprivate + bind).
