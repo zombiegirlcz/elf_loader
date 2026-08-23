@@ -393,6 +393,33 @@ static void write_heap_veneer(void *target, void *fn) {
     mprotect((void *)page, 0x2000, PROT_READ | PROT_EXEC);
 }
 
+/* Android app seccomp filtr killne clone3 (glibc 2.34+ fork) — jadro 4.14
+ * ho nema a filtr na neznamem cisla da KILL_THREAD -> SIGSYS u dite.
+ * Raw clone syscall (stary cislo 220) projde. Veneer se instaluje na fork
+ * v modulech (dash/bash pipeline deti). */
+#ifndef CLONE_CHILD_CLEARTID
+#define CLONE_CHILD_CLEARTID 0x00020000
+#endif
+#ifndef CLONE_CHILD_SETTID
+#define CLONE_CHILD_SETTID   0x01000000
+#endif
+static pid_t ldso_fork(void) {
+    static volatile int child_tid_slot;
+    register long x8 __asm__("x8") = 220; /* __NR_clone */
+    register long x0 __asm__("x0") =
+        (long)(CLONE_CHILD_CLEARTID | CLONE_CHILD_SETTID | SIGCHLD);
+    register long x1 __asm__("x1") = 0;              /* newsp = derive */
+    register long x2 __asm__("x2") = 0;              /* parent_tidptr */
+    register long x3 __asm__("x3") = 0;              /* tls: inherit */
+    register long x4 __asm__("x4") = (long)&child_tid_slot;
+    __asm__ volatile("svc #0"
+                     : "+r"(x0), "+r"(x1), "+r"(x2), "+r"(x3), "+r"(x4)
+                     : "r"(x8)
+                     : "memory", "x5", "x6", "x7", "x9", "x10", "x11",
+                       "x12", "x13", "x14", "x15", "x16", "x17", "x18");
+    return (pid_t)x0;
+}
+
 static void patch_module_heap_syms(elf_object_t *m) {
     if (!m || !m->dynsym || !m->dynstr)
         return;
@@ -413,6 +440,8 @@ static void patch_module_heap_syms(elf_object_t *m) {
             fn = (void *)ldso_sbrk;
         else if (strcmp(nm, "brk") == 0 || strcmp(nm, "__brk") == 0)
             fn = (void *)ldso_brk;
+        else if (strcmp(nm, "fork") == 0 || strcmp(nm, "__fork") == 0)
+            fn = (void *)ldso_fork;
         if (fn) {
             void *tgt = (char *)m->base_addr + (sym->st_value - mbv);
             write_heap_veneer(tgt, fn);
@@ -2115,12 +2144,36 @@ static void fault_handler(int sig, siginfo_t *si, void *ctx) {
 }
 
 
+/* SIGSYS = seccomp odmitl syscall. Vypise cislo syscallu cistym sys_write
+ * (handler muze bezet pod parrot TP, bionic stdio je tam nedostupne). */
+static void sigsys_handler(int sig, siginfo_t *si, void *uc) {
+    (void)sig; (void)uc;
+    char buf[64];
+    const char *pre = "[SIGSYS] denied syscall nr=";
+    char *p = buf;
+    for (const char *q = pre; *q; q++) *p++ = *q;
+    long nr = si->si_syscall;
+    char tmp[24]; int ti = 0;
+    if (nr == 0) tmp[ti++] = '0';
+    while (nr > 0) { tmp[ti++] = (char)('0' + (nr % 10)); nr /= 10; }
+    while (ti > 0) *p++ = tmp[--ti];
+    *p++ = '\n';
+    sys_write(2, buf, (size_t)(p - buf));
+    _exit(159);
+}
+
 void elf_install_fault_handlers(void) {
     static char altstack[32768];
     static stack_t ss;
     ss.ss_sp = altstack;
     ss.ss_size = sizeof(altstack);
     sigaltstack(&ss, NULL);
+    /* SIGSYS: vypise cislo odmitaneho syscallu a exit(159) */
+    struct sigaction sc;
+    memset(&sc, 0, sizeof(sc));
+    sc.sa_sigaction = sigsys_handler;
+    sc.sa_flags = SA_SIGINFO | SA_ONSTACK;
+    sigaction(SIGSYS, &sc, NULL);
     struct sigaction sa;
     memset(&sa, 0, sizeof(sa));
     sa.sa_sigaction = fault_handler;
