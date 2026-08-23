@@ -8,6 +8,7 @@
 #include <malloc.h>
 #include <unistd.h>
 #include <sys/resource.h>
+extern int elf_debug(void);
 
 static const char *status_str(sym_status_t st) {
     switch (st) {
@@ -57,7 +58,8 @@ static int run(const char *path, int argc, char **argv, char **envp) {
         return 1;
     }
 
-    printf("[+] Base: %p Entry: %p deps: %zu\n",
+    if (elf_debug())
+        printf("[+] Base: %p Entry: %p deps: %zu\n",
            obj->base_addr, obj->entry_point, obj->handle_count);
 
     g_libc_base = 0;
@@ -85,7 +87,8 @@ static int shim_puts(const char *s) {
 
 static int run_shim(const char *path, int argc, char **argv, char **envp) {
     elf_register_override("puts", (void *)shim_puts);
-    fprintf(stderr, "[+] interposing 'puts' for %s\n", path);
+    if (elf_debug())
+        fprintf(stderr, "[+] interposing 'puts' for %s\n", path);
     return run(path, argc, argv, envp);
 }
 
@@ -107,7 +110,8 @@ static int run_own(const char *path, const char *mod, int argc, char **argv,
     }
     if (mod)
         elf_load_shared(mod, obj->scope);
-    printf("[+] scope: %zu modules\n", obj->scope->count);
+    if (elf_debug())
+        printf("[+] scope: %zu modules\n", obj->scope->count);
 
     if (elf_relocate(obj) != 0) {
         fprintf(stderr, "[-] Relocation failed\n");
@@ -167,7 +171,7 @@ static int run_ownall(const char *path, int argc, char **argv, char **envp) {
             char line[512];
             while (fgets(line, sizeof line, mf)) {
                 if (strstr(line, "3000") || strstr(line, "heap") ||
-                    strstr(line, "elf_loader") || strstr(line, "\[stack\]"))
+                    strstr(line, "elf_loader") || strstr(line, "\\[stack\\]"))
                     fprintf(stderr, "  map: %s", line);
             }
             fclose(mf);
@@ -213,7 +217,8 @@ int main(int argc, char **argv, char **envp) {
         ai++;
     }
     if (lazy_was_set)
-        fprintf(stderr, "[+] lazy PLT binding enabled\n");
+        if (elf_debug())
+            fprintf(stderr, "[+] lazy PLT binding enabled\n");
 
     if (strcmp(argv[ai], "--run") == 0) {
         if (ai + 1 >= argc) {

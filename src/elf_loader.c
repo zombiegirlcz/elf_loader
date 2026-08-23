@@ -74,6 +74,18 @@ static const char *sys_libdirs(void) {
     return buf;
 }
 
+/* Verbose loader logging: default TICHY (cisty vystup spustene binarky).
+ * ELF_DEBUG=<cokoli krome "0"> zapne [+] / [dbg] trace zpet na stderr.
+ * getenv nealokuje -> bezpecne i pro malloc-free resolve path. */
+int elf_debug(void) {
+    static int cached = -1;
+    if (cached < 0) {
+        const char *d = getenv("ELF_DEBUG");
+        cached = (d && d[0] && strcmp(d, "0") != 0) ? 1 : 0;
+    }
+    return cached;
+}
+
 static size_t map_base_vaddr(const elf_object_t *obj);
 static void *va(const elf_object_t *obj, size_t vaddr);
 static void apply_segment_prots(elf_object_t *obj);
@@ -894,12 +906,14 @@ static int load_needed(elf_object_t *obj) {
                 continue;
             const char *soname = dynstr + d->d_un.d_val;
             if (is_ld_linux(soname)) {
-                printf("[+] dep %s: host ld-linux fallback\n", soname);
+                if (elf_debug())
+                    printf("[+] dep %s: host ld-linux fallback\n", soname);
                 continue;
             }
             char *cand = find_in_paths(soname, osearch);
             if (cand) {
-                printf("[+] own-loading dependency: %s\n", cand);
+                if (elf_debug())
+                    printf("[+] own-loading dependency: %s\n", cand);
                 elf_load_shared(cand, obj->scope);
                 free(cand);
             } else {
@@ -921,7 +935,8 @@ static int load_needed(elf_object_t *obj) {
             h = dlopen(soname, RTLD_NOW | RTLD_GLOBAL);
         if (!h)
             return 0;
-        printf("[+] loaded dependency: %s\n", soname);
+        if (elf_debug())
+            printf("[+] loaded dependency: %s\n", soname);
         handles[n++] = h;
     }
 
@@ -1166,7 +1181,8 @@ static int load_module_needed(elf_object_t *m, elf_scope_t *scope) {
                 continue;
             char *cand = find_in_paths(soname, osearch);
             if (cand) {
-                printf("[+] own-loading dependency: %s\n", cand);
+                if (elf_debug())
+                    printf("[+] own-loading dependency: %s\n", cand);
                 elf_load_shared(cand, scope);
                 free(cand);
             } else {
@@ -1188,7 +1204,8 @@ static int load_module_needed(elf_object_t *m, elf_scope_t *scope) {
             continue;
         char *cand = find_in_paths(soname, search);
         if (cand) {
-            printf("[+] own-loading dependency: %s\n", cand);
+            if (elf_debug())
+                printf("[+] own-loading dependency: %s\n", cand);
             elf_object_t *dep = elf_load_shared(cand, scope);
             free(cand);
             if (dep)
@@ -1469,7 +1486,8 @@ elf_object_t *elf_load_shared(const char *path, elf_scope_t *scope) {
             break;
         }
     }
-    printf("[+] own-loaded module: %s (base %p, %zu dynsym)\n", path,
+    if (elf_debug())
+        printf("[+] own-loaded module: %s (base %p, %zu dynsym)\n", path,
            (void *)base, m->dynsym_count);
     fflush(stdout);
     return m;
@@ -1739,12 +1757,19 @@ int elf_relocate(elf_object_t *obj) {
             *where = (uint64_t)addr;
             count++;
         } else {
-            fprintf(stderr, "[WARN] Unresolved JUMP_SLOT: %s in %s\n",
-                    ELF64_R_SYM(r->r_info) < obj->dynsym_count
-                        ? obj->dynstr + obj->dynsym[ELF64_R_SYM(r->r_info)].st_name : "?",
-                    obj->soname ? obj->soname : "EXE");
-            fflush(stderr);
+            /* weak undefined (__gmon_start__, __cxa_finalize...) je normalni -
+             * tiskneme jen non-weak a jen pod ELF_DEBUG */
+            const Elf64_Sym *ws =
+                ELF64_R_SYM(r->r_info) < obj->dynsym_count
+                    ? &obj->dynsym[ELF64_R_SYM(r->r_info)] : NULL;
+            int is_weak = ws && ELF64_ST_BIND(ws->st_info) == STB_WEAK;
             *where = 0;
+            if (!is_weak && elf_debug()) {
+                fprintf(stderr, "[WARN] Unresolved JUMP_SLOT: %s in %s\n",
+                        ws ? obj->dynstr + ws->st_name : "?",
+                        obj->soname ? obj->soname : "EXE");
+                fflush(stderr);
+            }
         }
     }
 
@@ -1769,7 +1794,8 @@ int elf_relocate(elf_object_t *obj) {
         count++;
     }
 
-    printf("[+] relocated %d entries\n", count);
+    if (elf_debug())
+        printf("[+] relocated %d entries\n", count);
     obj->relocated = 1;
     return 0;
 }
@@ -1795,7 +1821,8 @@ static void maybe_fixup_bionic_phdr(elf_object_t *obj) {
         Elf64_Phdr *mapped = (Elf64_Phdr *)(base + obj->ehdr->e_phoff);
         for (int i = 0; i < obj->phdr_count; i++)
             mapped[i].p_vaddr += (uint64_t)base;
-        fprintf(stderr, "[dbg] bionic phdr p_vaddr rebased (+%p)\n", base);
+        if (elf_debug())
+            fprintf(stderr, "[dbg] bionic phdr p_vaddr rebased (+%p)\n", base);
     }
 }
 
@@ -1831,18 +1858,15 @@ elf_tls_ctx_t elf_setup_own_tls(elf_object_t *exe, elf_scope_t *scope) {
     uintptr_t host_tp = read_tp();
     ctx.old_tp = host_tp;
 
-    int any = 0;
     int64_t min_off = 0;
     size_t max_end = 0;
     if (exe && exe->has_tls) {
-        any = 1;
         min_off = TLS_EXE_BASE_OFF;
         max_end = (size_t)(TLS_EXE_BASE_OFF + exe->tls_memsz);
     }
     for (size_t i = 0; scope && i < scope->count; i++) {
         elf_object_t *m = scope->mods[i];
         if (m && m->has_tls) {
-            any = 1;
             int64_t off = (int64_t)m->tls_offset;
             if (off < min_off)
                 min_off = off;
@@ -2200,7 +2224,8 @@ int elf_run(elf_object_t *obj, int argc, char **argv, char **envp) {
 
     elf_install_fault_handlers();
 
-    printf("[+] entering %p (stack %p) tp=%p inits=%zu\n", obj->entry_point, sp,
+    if (elf_debug())
+        printf("[+] entering %p (stack %p) tp=%p inits=%zu\n", obj->entry_point, sp,
            (void *)g_tls_new_tp, g_pending_count);
     fflush(stdout);
 
@@ -2221,18 +2246,22 @@ int elf_run(elf_object_t *obj, int argc, char **argv, char **envp) {
  * úklidu debug printů malloc-free. */
 static __attribute__((noreturn)) void elf_run_final(void *sp, void *entry,
                                                     elf_object_t *obj) {
+    (void)obj;
     if (!g_tls_new_tp) {
         /* Staré flow (--run/--own/--shim): žádný TLS switch, inity pod host TP
          * (jak to dělal jump_to_entry). */
         for (size_t i = 0; i < g_pending_count; i++)
             g_pending_inits[i](elf_init_argc, elf_init_argv, elf_init_envp);
         jump_to_entry(entry, sp, 0, 0);
+        __builtin_unreachable(); /* exe končí exit_group, sem se nedostane */
     }
-    fprintf(stderr, "[dbg-final] tp=%p sp=%p entry=%p pending=%zu\n",
+    if (elf_debug())
+        fprintf(stderr, "[dbg-final] tp=%p sp=%p entry=%p pending=%zu\n",
             (void *)g_tls_new_tp, sp, entry, g_pending_count);
     fflush(stderr);
     extern void elf_final_jump(void *, void *, uintptr_t, void (*)(void));
     elf_final_jump(sp, entry, g_tls_new_tp, elf_run_pending_inits);
+    __builtin_unreachable();
 }
 
 void elf_unload(elf_object_t *obj) {
