@@ -1,0 +1,28 @@
+# ~/.gbshrc — gbsh konfigurace (provádí se při startu stejným parserem)
+# Umístění: $HOME/.gbshrc nebo $GBSHRC
+
+# ── prompt ──
+export GBSH_PROMPT='%u@%h:%~ $ '
+
+# ── prostředí ──
+export EDITOR=vi
+export PAGER=less
+
+# ── aliasy ──
+alias ll='ls -la'
+alias la='ls -a'
+alias l='ls'
+alias ..='cd ..'
+alias ...='cd ../..'
+alias grep='grep --color=auto'
+
+# parrot zkratky (běží přes elf_loader own-loading)
+alias pdate='date'
+alias ppython='python3'
+
+# ── historie ──
+# (historka je in-memory, MAX_HISTORY 256)
+
+# tip: rootfs příkazy se resolvují automaticky:
+#   gbsh$ ls          -> host toybox (je v PATH dřív)
+#   gbsh$ apt --help  -> parrot apt přes elf_loader (není v host PATH)
