@@ -188,6 +188,9 @@ static int run_ownall(const char *path, int argc, char **argv, char **envp) {
 }
 
 int main(int argc, char **argv, char **envp) {
+    /* seccomp stacked filtr: nove syscalls (clone3/close_range/...) -> ENOSYS,
+     * aby fungovaly glibc fallbacky pod app profilem jadra 4.14 */
+    elf_install_compat();
     /* The own-loaded parrot libc and the loader's host libc share the same
        process brk.  Both allocators must never shrink the heap (brk): a trim
        by either one unmaps live chunks of the other.  Set MALLOC_* tunables

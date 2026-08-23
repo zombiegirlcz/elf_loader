@@ -13,6 +13,9 @@ extern char **environ;
 #include <sys/auxv.h>
 #include <sys/stat.h>
 #include <limits.h>
+#include <linux/filter.h>
+#include <linux/seccomp.h>
+#include <sys/prctl.h>
 
 static size_t g_page_size = 0;
 static size_t sys_page_size(void) {
@@ -393,31 +396,19 @@ static void write_heap_veneer(void *target, void *fn) {
     mprotect((void *)page, 0x2000, PROT_READ | PROT_EXEC);
 }
 
-/* Android app seccomp filtr killne clone3 (glibc 2.34+ fork) — jadro 4.14
- * ho nema a filtr na neznamem cisla da KILL_THREAD -> SIGSYS u dite.
- * Raw clone syscall (stary cislo 220) projde. Veneer se instaluje na fork
- * v modulech (dash/bash pipeline deti). */
-#ifndef CLONE_CHILD_CLEARTID
-#define CLONE_CHILD_CLEARTID 0x00020000
-#endif
-#ifndef CLONE_CHILD_SETTID
-#define CLONE_CHILD_SETTID   0x01000000
-#endif
+/* Android app seccomp filtr killne nove syscalls (clone3/close_range/
+ * openat2/faccessat2) TRAPem — viz elf_install_compat.
+ * Veneery sbrk/brk zachovavaji private heap pro parrot libc. */
+#include <errno.h>
+static void sys_write(int fd, const void *buf, size_t n);
+
+/* Veneer fork -> raw clone(SIGCHLD). App sandbox: clone3 TRAP (SIGSYS),
+ * fork-style clone EPERM pro app uid; root kontext clone projde.
+ * Bez SETTID/CLEARTID: child_tidptr by musel ukazovat do parrot TLS tid
+ * slotu — pro exec-and-go deti (sh/bash pipeline) nepovinne. */
 static pid_t ldso_fork(void) {
-    static volatile int child_tid_slot;
-    register long x8 __asm__("x8") = 220; /* __NR_clone */
-    register long x0 __asm__("x0") =
-        (long)(CLONE_CHILD_CLEARTID | CLONE_CHILD_SETTID | SIGCHLD);
-    register long x1 __asm__("x1") = 0;              /* newsp = derive */
-    register long x2 __asm__("x2") = 0;              /* parent_tidptr */
-    register long x3 __asm__("x3") = 0;              /* tls: inherit */
-    register long x4 __asm__("x4") = (long)&child_tid_slot;
-    __asm__ volatile("svc #0"
-                     : "+r"(x0), "+r"(x1), "+r"(x2), "+r"(x3), "+r"(x4)
-                     : "r"(x8)
-                     : "memory", "x5", "x6", "x7", "x9", "x10", "x11",
-                       "x12", "x13", "x14", "x15", "x16", "x17", "x18");
-    return (pid_t)x0;
+    return (pid_t)syscall((long)220 /* __NR_clone */, (unsigned long)SIGCHLD,
+                          0UL, 0UL, 0UL, 0UL);
 }
 
 static void patch_module_heap_syms(elf_object_t *m) {
@@ -2020,6 +2011,59 @@ static void sys_write(int fd, const void *buf, size_t n) {
 #ifndef AT_FDCWD
 #define AT_FDCWD -100
 #endif
+
+/* Android app seccomp profil zabíjí TRAPem (SIGSYS) nove syscalls ktere
+ * jadro 4.14 nema (clone3/close_range/openat2/faccessat2). Glibc 2.41 je
+ * pouziva s fallbackem na stare varianty — ale fallback nikdy nepobezi,
+ * protoze filtr misto ENOSYS da TRAP. Stacked filtr (bezi pred app
+ * profilem) prelozi tyto cisla na ENOSYS -> glibc fallbacky zacnou fungovat.
+ * Filtr se dedi pres fork+exec, takze kryje i spoustene binarky. */
+void elf_install_compat(void);  /* see below */
+
+static void install_legacy_syscall_filter_impl(void);
+void elf_install_compat(void) {
+    install_legacy_syscall_filter_impl();
+}
+static void install_legacy_syscall_filter_impl(void) {
+    /* MINIMALNI program nejdrive — izolace EINVAL priciny */
+    struct sock_filter prog[16];
+    size_t n = 0;
+    prog[n++] = (struct sock_filter)BPF_STMT(BPF_LD | BPF_W | BPF_ABS,
+                                            offsetof(struct seccomp_data, nr));
+    /* aarch64 nr: clone3=435 close_range=436 openat2=437 faccessat2=439 */
+    static const int blocked[] = { 435, 436, 437, 439 };
+    for (size_t i = 0; i < sizeof(blocked)/sizeof(blocked[0]); i++) {
+        prog[n++] = (struct sock_filter)
+            BPF_JUMP(BPF_JMP | BPF_JEQ | BPF_K, blocked[i], 0, 1);
+        prog[n++] = (struct sock_filter)
+            BPF_STMT(BPF_RET | BPF_K, SECCOMP_RET_ERRNO | ENOSYS);
+    }
+    prog[n++] = (struct sock_filter)BPF_STMT(BPF_RET | BPF_K, SECCOMP_RET_ALLOW);
+    struct sock_fprog fprog = { .len = (unsigned short)n, .filter = prog };
+    long pr = prctl(PR_SET_NO_NEW_PRIVS, 1, 0, 0, 0);
+    long sc = syscall((long)277 /* __NR_seccomp aarch64 */,
+                      1UL /* SECCOMP_SET_MODE_FILTER */, 0UL, &fprog);
+    if (sc != 0) {
+        errno = 0;
+        sc = prctl(PR_SET_SECCOMP /* 22 */, 1UL /* MODE_FILTER */, &fprog);
+    }
+    if (sc != 0) {
+        char db[96]; char *dp = db;
+        const char *pr = "[compat] filter install failed sc=";
+        for (const char *q = pr; *q; q++) *dp++ = *q;
+        unsigned long v = (unsigned long)(-sc);
+        static const char hx[] = "0123456789abcdef";
+        *dp++ = '-';
+        for (int sh = 28; sh >= 0; sh -= 4) *dp++ = hx[(v >> sh) & 0xf];
+        *dp++ = ' '; *dp++ = 'e'; *dp++ = 'r'; *dp++ = 'r'; *dp++ = 'n';
+        *dp++ = 'o'; *dp++ = '=';
+        v = (unsigned long)errno;
+        for (int sh = 28; sh >= 0; sh -= 4) *dp++ = hx[(v >> sh) & 0xf];
+        *dp++ = '\n';
+        sys_write(2, db, (size_t)(dp - db));
+    }
+    (void)pr;
+}
 
 static void fault_handler(int sig, siginfo_t *si, void *ctx) {
     ucontext_t *uc = (ucontext_t *)ctx;

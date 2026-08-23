@@ -63,6 +63,7 @@ int elf_run(elf_object_t *obj, int argc, char **argv, char **envp);
 void elf_unload(elf_object_t *obj);
 
 void elf_install_fault_handlers(void);
+void elf_install_compat(void);
 elf_tls_ctx_t elf_setup_own_tls(elf_object_t *exe, elf_scope_t *scope);
 void elf_teardown_own_tls(elf_tls_ctx_t *ctx);
 void ldso_install_exe_linkmap(elf_object_t *exe, const char *name);
