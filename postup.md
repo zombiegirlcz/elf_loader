@@ -658,3 +658,26 @@ apt-get install sshpass na dev-box prootu přerušil ncurses upgrade →
 libtinfo.so.6 symlink EPERM → všechny shell příkazy mrtvé. Fix: ld.so.preload
 s libtinfo.so.6.5 (SONAME match splní DT_NEEDED). Rozbité symlinky EPERM trvají
 (proot/QEMU vrstva), preload je funkční obejití.
+
+## 2026-08-23: elf wrapper resolve-by-name + rootfs symlink problém
+
+### Wrapper `elf` (finální podoba)
+- `elf <název>` i `elf /cesta` — první argument bez `/` se resolvuje v
+  `$ROOTFS/usr/bin, $ROOTFS/bin, $ROOTFS/usr/sbin, $ROOTFS/sbin, ${0%/*}`.
+- **Mksh pasti**: `command -v` vrací builtiny bez cesty; `$(dirname)` a
+  `printf` se resolveují na PARROT glibc verze (parrot dirs v PATH dřív než
+  /system/bin) → exec fail. Použito: explicitní dir seznam + `echo` + `${0%/*}`.
+- `elf X | head` — pipe utility se v host PATH resolveují na parrot verze
+  (parrot/usr/bin dřív než /system/bin) → nejde execnout. Používat
+  `elf ... > file` nebo /system/bin/head.
+
+### Rootfs absolutní symlinky nefungují mimo chroot
+- `libblas.so.3 -> /etc/alternatives/...` — elf_loader běží na hostu BEZ
+  chrootu → symlink vede na hostovské /etc → "dep libblas.so.3: not found"
+  → segfault (známý dep-handling bug). Fix: přepsat symlink na relativní
+  (`blas/libblas.so.3`). Dotýká se všech alternativní symlinků po apt install.
+
+### Nové bugy (Zbývá)
+- `elf nmap --version` → SIGSEGV: NULL deref ad=0xc0, registry obsahují
+  "ipv6"/"libnetd-" stringy → pád v síťové inicializaci (getaddrinfo/netd)
+  pod bionic hostem. Stejná kategorie: starship (139), fzf (134/SIGABRT).
