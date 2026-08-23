@@ -23,8 +23,11 @@ test/hello: test/hello.c
 test/ifunc: test/ifunc.c
 	$(CC) $(CFLAGS) -o $@ $<
 
-test/mods/libmod.so: test/mod.c
+test/mods/libmod.so: test/mod.c | test/mods
 	$(CC) $(CFLAGS) -fPIC -shared -o $@ $<
+
+test/mods:
+	mkdir -p $@
 
 test/use_mod: test/use_mod.c test/mods/libmod.so
 	$(CC) $(CFLAGS) -o $@ $< -Ltest/mods -lmod
@@ -49,6 +52,8 @@ test: $(TARGET) test/hello test/ifunc test/mods/libmod.so test/use_mod
 	./$(TARGET) --lazy test/hello foo bar 2>&1 | tail -4
 
 clean:
-	rm -f $(OBJS) $(TARGET) test/hello test/ifunc test/mods/libmod.so test/use_mod
+	rm -f $(OBJS) $(TARGET) test/hello test/ifunc test/use_mod
+	rm -f test/env test/math test/tls test/tls-gd test/uselib test/libtls.so
+	rm -rf test/mods
 
 .PHONY: all clean test
