@@ -1,27 +1,22 @@
-# ~/.gbshrc — gbsh konfigurace (provádí se při startu)
-# Barvy: ANSI escape lze psát přímo do GBSH_PROMPT
+# ~/.gbshrc — gbsh konfigurace
+#
+# ═══ OBRÁCENÝ SVĚT (dual-world) ═══
+#   /           = kořen distro (parrot)     [start]
+#   cd .. z "/" = překlopí tě NA DRUHOU STRANU → host Android filesystem
+#   cd /parrot  = v host světě se vrátíš dovnitř do distra
+#   ROOTFS_SYMBOL=... změní vstupní symbol (default /parrot)
+# V rootfs světě běží parrot příkazy přes elf_loader own-loading.
+# V host světě běží nativní Android (toybox) příkazy.
+# Procesy vidí pravdu — nelžeme jim o hranici SW/HW.
 
-# ── prompt (barevný) ──
-export GBSH_PROMPT='[1;32m%u@%h[0m:[36m%~[0m$ '
+export GBSH_PROMPT='\x1b[1;32m%u@%h\x1b[0m:\x1b[36m%~\x1b[0m$ '
+export HOST_ENTRY=$HOME
 
-# ── prostředí ──
-export EDITOR=vi
-export PAGER=less
-export LS_COLORS='di=01;34:ln=01;36:ex=01;32'
-
-# ── aliasy ──
+# ── aliasy fungují v obou světech ──
 alias ll='ls -la'
-alias la='ls -a --color=auto'
-alias ls='ls --color=auto'
+alias la='ls -a'
 alias grep='grep --color=auto'
 alias ..='cd ..'
-alias ...='cd ../..'
-alias cls='clear'
 
-# parrot zkratky (běží přes elf_loader own-loading, plné barvy)
-alias llp='ls -la'
-alias papt='apt --help'
-
-# syntax highlight ve vstupu je zapnutý vždy (TTY režim):
-#   zelená = builtin, žlutá = operátor |;&<>,
-#   tyrkysová = flagy/cesty, červená = $VAR, magenta = "stringy"
+# tip: v rootfs světě je PATH distro; v host světě /system/bin.
+# "cd /parrot && apt update" = vstup do distra a spustí apt.

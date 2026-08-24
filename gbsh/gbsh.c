@@ -50,6 +50,47 @@ struct alias { char name[64]; char value[256]; };
 static struct alias g_aliases[MAX_ALIAS];
 static int g_alias_count = 0;
 
+/* ═══ OBRÁCENÝ SVĚT (dual-world navigation) ═══
+ * WORLD_ROOTFS: "/" = kořen distro (parrot) — příkazy běží přes ownall,
+ *               cesty se fyzicky mapují pod $ROOTFS/
+ * WORLD_HOST:   skutečný Android filesystem — příkazy běží nativně
+ * cd .. z "/" (rootfs) tě překlopí na druhou stranu (host entry point),
+ * cd $ROOTFS_SYMBOL (default "/parrot") v host světě tě vrátí dovnitř. */
+#define WORLD_HOST  0
+#define WORLD_ROOTFS 1
+static int  g_world = WORLD_ROOTFS;
+static char g_vpath[1024];            /* virtuální cesta uvnitř rootfs ("/") */
+static char g_host_entry[600];        /* kam ses dostane cd .. z "/" */
+
+/* normalizuj vpath: zpracuj . / .. / opakování */
+static void vpath_normalize(const char *in, char *out, size_t cap) {
+    char stack[64][256];
+    int sp = 0;
+    char tmp[1024];
+    snprintf(tmp, sizeof tmp, "%s", in);
+    char *save = NULL;
+    for (char *seg = strtok_r(tmp, "/", &save); seg; seg = strtok_r(NULL, "/", &save)) {
+        if (strcmp(seg, ".") == 0) continue;
+        if (strcmp(seg, "..") == 0) { if (sp > 0) sp--; continue; }
+        if (sp < 64) snprintf(stack[sp++], 256, "%s", seg);
+    }
+    size_t o = 0;
+    out[o++] = '/';
+    for (int i = 0; i < sp && o + strlen(stack[i]) + 2 < cap; i++) {
+        size_t l = strlen(stack[i]);
+        memcpy(out + o, stack[i], l); o += l;
+        if (i + 1 < sp) out[o++] = '/';
+    }
+    if (o > 1 && out[o-1] == '/') o--;
+    out[o] = 0;
+}
+
+/* virtuální PWD podle světa */
+static void get_vpwd(char *out, size_t cap) {
+    if (g_world == WORLD_ROOTFS) snprintf(out, cap, "%s", g_vpath);
+    else snprintf(out, cap, "%s", g_cwd);
+}
+
 /* ─────────────────────────── utility ─────────────────────────── */
 
 static char *xstrdup(const char *s) {
@@ -236,8 +277,29 @@ static int tokenize(const char *line, struct token *toks, int max_tok) {
 
 enum { SRC_HOST, SRC_ROOTFS };
 
-/* rozhodne kde binárka je: rootfs (parrot) má prioritu jen pokud host nemá */
+/* rozhodne kde binárka je; v ROOTFS světě má parrot VŽDY prioritu */
 static int resolve_source(const char *cmd, char *rootfs_path, size_t rp_cap) {
+    if (g_world == WORLD_ROOTFS) {
+        if (!strchr(cmd, '/')) {
+            static const char *rdirs[] = { "/usr/bin", "/bin", "/usr/sbin", "/sbin" };
+            for (size_t i = 0; i < sizeof rdirs / sizeof rdirs[0]; i++) {
+                snprintf(rootfs_path, rp_cap, "%s%s/%s", g_rootfs, rdirs[i], cmd);
+                if (access(rootfs_path, X_OK) == 0) return SRC_ROOTFS;
+            }
+            /* cizí příkaz zkusíme taky hostem (nelžeme — není v distru) */
+            return -1;
+        }
+        /* cesta: /X uvnitř rootfs = fyzicky $ROOTFS/X */
+        if (cmd[0] == '/') {
+            snprintf(rootfs_path, rp_cap, "%s%s", g_rootfs,
+                     strcmp(cmd, "/") == 0 ? "" : cmd);
+            if (access(rootfs_path, X_OK) == 0) return SRC_ROOTFS;
+        } else {
+            snprintf(rootfs_path, rp_cap, "%s", cmd); /* relativní už je fyzické */
+            if (access(rootfs_path, X_OK) == 0) return SRC_ROOTFS;
+        }
+        return -1;
+    }
     /* 1) absolutní/relativní cesta */
     if (strchr(cmd, '/')) {
         if (access(cmd, X_OK) == 0) return SRC_HOST;
@@ -260,33 +322,109 @@ static int resolve_source(const char *cmd, char *rootfs_path, size_t rp_cap) {
         }
     }
 
-    /* 3) rootfs bin, usr/bin */
-    static const char *rdirs[] = { "/usr/bin", "/bin", "/usr/sbin", "/sbin" };
-    for (size_t i = 0; i < sizeof rdirs / sizeof rdirs[0]; i++) {
-        snprintf(rootfs_path, rp_cap, "%s%s/%s", g_rootfs, rdirs[i], cmd);
-        if (access(rootfs_path, X_OK) == 0) return SRC_ROOTFS;
+    /* 3) rootfs fallback jen v ROOTFS světě (host svět = čistý host) */
+    if (g_world == WORLD_ROOTFS) {
+        static const char *rdirs[] = { "/usr/bin", "/bin", "/usr/sbin", "/sbin" };
+        for (size_t i = 0; i < sizeof rdirs / sizeof rdirs[0]; i++) {
+            snprintf(rootfs_path, rp_cap, "%s%s/%s", g_rootfs, rdirs[i], cmd);
+            if (access(rootfs_path, X_OK) == 0) return SRC_ROOTFS;
+        }
     }
     return -1;
 }
 
 /* ─────────────────────────── builtins ─────────────────────────── */
 
+static int enter_rootfs(const char *vpath) {
+    char full[1200];
+    const char *vp = (vpath && vpath[0]) ? vpath : "/";
+    snprintf(full, sizeof full, "%s%s", g_rootfs, strcmp(vp, "/") == 0 ? "" : vp);
+    if (chdir(full) != 0) return -1;
+    g_world = WORLD_ROOTFS;
+    vpath_normalize(vp, g_vpath, sizeof g_vpath);
+    setenv("PWD", g_vpath, 1);
+    return 0;
+}
+
+static int enter_host(const char *hpath) {
+    if (chdir(hpath) != 0) return -1;
+    g_world = WORLD_HOST;
+    if (getcwd(g_cwd, sizeof g_cwd) == NULL) g_cwd[0] = 0;
+    setenv("PWD", g_cwd, 1);
+    return 0;
+}
+
+/* přepočet virtuální cesty v rootfs po relativním cd */
+static int rootfs_relcd(const char *target, char *newvpath, size_t cap) {
+    char combined[2048];
+    if (target[0] == '/')
+        snprintf(combined, sizeof combined, "%s", target);
+    else
+        snprintf(combined, sizeof combined, "%s/%s", g_vpath, target);
+    vpath_normalize(combined, newvpath, cap);
+
+    /* fyzická kontrola existence */
+    char full[1200];
+    snprintf(full, sizeof full, "%s%s", g_rootfs,
+             strcmp(newvpath, "/") == 0 ? "" : newvpath);
+    struct stat st;
+    if (stat(full, &st) != 0 || !S_ISDIR(st.st_mode)) return -1;
+    return chdir(full);
+}
+
 static int bi_cd(char **argv, int argc) {
+    char targetbuf[MAX_LINE];
     const char *target;
     if (argc < 2) target = env_or("HOME", "/");
     else target = argv[1];
-    if (chdir(target) != 0) {
+
+    /* ~ expanze */
+    if (starts_with(target, "~")) {
+        snprintf(targetbuf, sizeof targetbuf, "%s%s",
+                 env_or("HOME", "/"), target + 1);
+        target = targetbuf;
+    }
+
+    const char *sym = env_or("ROOTFS_SYMBOL", "/parrot");
+
+    if (g_world == WORLD_ROOTFS) {
+        /* zvláštní cíle světa */
+        if (strcmp(target, sym) == 0 || strcmp(target, "..") != 0 ? 0 : 0) { }
+        if (strcmp(target, "..") == 0 && strcmp(g_vpath, "/") == 0) {
+            /* ─── PŘEKLOP SE NA DRUHOU STRANU ─── */
+            if (enter_host(g_host_entry) == 0) return 0;
+            fprintf(stderr, "cd: cannot flip to host world\n");
+            return 1;
+        }
+        char newvp[1024];
+        if (rootfs_relcd(target, newvp, sizeof newvp) == 0) {
+            snprintf(g_vpath, sizeof g_vpath, "%s", newvp);
+            setenv("PWD", g_vpath, 1);
+            return 0;
+        }
         fprintf(stderr, "cd: %s: %s\n", target, strerror(errno));
         return 1;
     }
-    if (getcwd(g_cwd, sizeof g_cwd) == NULL)
-        g_cwd[0] = 0;
+
+    /* HOST svět */
+    if (strcmp(target, sym) == 0) {
+        /* vstup do rootfs světa */
+        if (enter_rootfs("/") == 0) return 0;
+        fprintf(stderr, "cd: %s: %s\n", sym, strerror(errno));
+        return 1;
+    }
+    if (enter_host(target) != 0) {
+        fprintf(stderr, "cd: %s: %s\n", target, strerror(errno));
+        return 1;
+    }
     return 0;
 }
 
 static int bi_pwd(char **argv, int argc) {
     (void)argv; (void)argc;
-    printf("%s\n", getcwd(g_cwd, sizeof g_cwd) ? g_cwd : "?");
+    char vp[1024];
+    get_vpwd(vp, sizeof vp);
+    printf("%s\n", vp);
     return 0;
 }
 
@@ -441,6 +579,18 @@ static int bi_source(char **argv, int argc) {
 
 /* ─────────────────────────── externí příkazy ─────────────────────────── */
 
+
+/* otevři soubor respektující svět: v rootfs světě se /X mapuje pod $ROOTFS */
+static int open_world(const char *path, int flags, int mode) {
+    char full[1200];
+    if (g_world == WORLD_ROOTFS && path[0] == '/') {
+        snprintf(full, sizeof full, "%s%s", g_rootfs,
+                 strcmp(path, "/") == 0 ? "" : path);
+        path = full;
+    }
+    return open(path, flags, mode);
+}
+
 /* spustit parrot binárku přes elf_loader (ownall) */
 static int exec_rootfs(const char *rootfs_path, char **argv) {
     char *eargv[MAX_ARGS];
@@ -463,6 +613,11 @@ static pid_t launch_external(char **argv, int src, const char *rootfs_path,
     if (pid == 0) {
         signal(SIGINT, SIG_DFL);
         signal(SIGQUIT, SIG_DFL);
+        /* PATH podle světa: rootfs děti vidí distro PATH, host děti systémovou */
+        if (g_world == WORLD_ROOTFS)
+            setenv("PATH", "/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin", 1);
+        else
+            setenv("PATH", "/system/bin:/system/xbin", 1);
         if (stdin_fd != STDIN_FILENO)  { dup2(stdin_fd, STDIN_FILENO);  close(stdin_fd); }
         if (stdout_src >= 0 && stdout_src != stdout_target) {
             dup2(stdout_src, stdout_target);
@@ -564,7 +719,7 @@ static int run_pipeline(struct command *cmds, int ncmd) {
         /* redirekce output */
         if (c->outfile) {
             int flags = O_WRONLY | O_CREAT | (c->append ? O_APPEND : O_TRUNC);
-            out_fd = open(c->outfile, flags, 0644);
+            out_fd = open_world(c->outfile, flags, 0644);
             if (out_fd < 0) { perror(c->outfile); return 1; }
             /* presmerovani na jiny fd nez 1 (napr. 2>): dup2 uvnitr child */
         } else if (!is_last) {
@@ -573,7 +728,7 @@ static int run_pipeline(struct command *cmds, int ncmd) {
 
         /* redirekce input */
         if (c->infile) {
-            in_fd = open(c->infile, O_RDONLY);
+            in_fd = open_world(c->infile, O_RDONLY, 0);
             if (in_fd < 0) { perror(c->infile); return 1; }
         }
 
@@ -820,14 +975,17 @@ static void hl_emit(const char *buf, size_t len) {
 /* ─────────────────────────── prompt ─────────────────────────── */
 
 static void print_prompt_text(const char *ps1) {
-    char cwd[1024];
-    const char *show = getcwd(cwd, sizeof cwd) ? cwd : "?";
-    const char *home = env_or("HOME", "");
+    char vp[1024];
+    get_vpwd(vp, sizeof vp);
+    const char *show = vp;
+    const char *home = (g_world == WORLD_ROOTFS) ? "" : env_or("HOME", "");
     char shortcwd[1100];
     if (home[0] && starts_with(show, home))
         snprintf(shortcwd, sizeof shortcwd, "~%s", show + strlen(home));
     else
         snprintf(shortcwd, sizeof shortcwd, "%s", show);
+    if (g_world == WORLD_HOST && ps1 && !strstr(ps1, "\x1b"))
+        ; /* host svět — bez dekorací, cesta je skutečná */
 
     for (const char *p = ps1; *p; p++) {
         if (p[0] == '%' && p[1]) {
@@ -1177,6 +1335,11 @@ static void detect_env(void) {
     const char *rf = getenv("ROOTFS");
     if (!rf || !rf[0]) rf = "/data/user/0/com.linux_core/files/nh/distro/parrot";
     snprintf(g_rootfs, sizeof g_rootfs, "%s", rf);
+    /* host entry point: kam se dostaneš cd .. z "/" rootfs světa */
+    snprintf(g_host_entry, sizeof g_host_entry, "%s",
+             env_or("HOST_ENTRY", env_or("HOME", "/data")));
+    if (!getenv("ROOTFS_SYMBOL"))
+        setenv("ROOTFS_SYMBOL", "/parrot", 0);
 
     const char *elf = getenv("ELF_LOADER");
     if (elf && elf[0])
@@ -1223,6 +1386,10 @@ int main(void) {
     detect_env();
     if (getcwd(g_cwd, sizeof g_cwd) == NULL) g_cwd[0] = 0;
     setenv("SHELL", "gbsh", 1);
+    /* startujeme uvnitř distro světa: / == rootfs */
+    if (enter_rootfs("/") != 0)
+        fprintf(stderr, "gbsh: varování: rootfs %s nedostupné, startuji na hostu\n",
+                g_rootfs);
     {
         char vn[32]; snprintf(vn, sizeof vn, "%s", GBSH_VERSION);
         setenv("GBSH_VERSION", vn, 0);
