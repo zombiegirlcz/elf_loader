@@ -614,10 +614,21 @@ static pid_t launch_external(char **argv, int src, const char *rootfs_path,
         signal(SIGINT, SIG_DFL);
         signal(SIGQUIT, SIG_DFL);
         /* PATH podle světa: rootfs děti vidí distro PATH, host děti systémovou */
-        if (g_world == WORLD_ROOTFS)
+        if (g_world == WORLD_ROOTFS) {
             setenv("PATH", "/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin", 1);
-        else
+            /* elf_loader vlastní libc.so musí brát z /system (jinak GNU ld
+               script z parrotu = bad ELF magic), parrot glibc libs až za tím
+               pro INNER loader (libc.so.6 apod.) */
+            {
+                char ldp[1200];
+                snprintf(ldp, sizeof ldp,
+                         "/system/lib64:/system/lib:%s/usr/lib/aarch64-linux-gnu:%s/lib",
+                         g_rootfs, g_rootfs);
+                setenv("LD_LIBRARY_PATH", ldp, 1);
+            }
+        } else {
             setenv("PATH", "/system/bin:/system/xbin", 1);
+        }
         if (stdin_fd != STDIN_FILENO)  { dup2(stdin_fd, STDIN_FILENO);  close(stdin_fd); }
         if (stdout_src >= 0 && stdout_src != stdout_target) {
             dup2(stdout_src, stdout_target);
