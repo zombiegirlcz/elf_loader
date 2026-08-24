@@ -739,3 +739,32 @@ s libtinfo.so.6.5 (SONAME match splní DT_NEEDED). Rozbité symlinky EPERM trvaj
 - app uid seccomp: fork-style clone EPERM, clone3 TRAP — proto elf wrapper
   nemůže fork+exec parrot dynamické binárky (PT_INTERP ENOENT navíc).
 - Root cesta tyto limity nemá (jiný SELinux domain, žádný restriktivní filtr).
+
+## 2026-08-24 (noc): bugfixy #3 #5 + diagnostika #2
+
+### #3 OPRAVENO — libc dep hard-exit
+- is_core_lib() + fatal_missing_dep(): libc.so.6/libm/libpthread/libdl/librt/
+  ld-linux not found → čistá FATAL hláška (s prohledanými cestami a hinty)
+  + exit(1) místo pozdního pc=0x0 segfaultu.
+- Ověřeno: LD_LIBRARY_PATH=/nonexistent → FATAL hláška rc=1.
+
+### #5 OPRAVENO — --own flow pc=0x0
+- Root cause: --own mód nemá handles ani libc ve scope → unresolved
+  printf/__libc_start_main → where=0 → jump NULL.
+- Fix: elf_resolve_import() host fallback dlsym(RTLD_DEFAULT) JEN pro
+  non-ownall flow (!elf_own_deps); --ownall zůstává strict (parrot svět).
+- Ověřeno: make test use_mod mod_add=103/130 ✓ (dříve SIGSEGV).
+
+### #2 DIAGNOSTIKA — ft6 syscall probe (test/ft6.c)
+- Metoda: per-probe child přes raw clone(CLONE_VM|CLONE_VFORK); sig=31 =
+  app sandbox TRAP; errno = syscall exists.
+- Zjištěno: app kontext je agresivní i k vfork-style raw clone v některých
+  kombinacích; prakticky: **těžké runtimes (starship/nmap/fzf) používat
+  přes linuxsh chroot** (starship 1.22.1 tam ověřeno ✓).
+- Deploy tooling fix: deploy_b64.sh su-varianta vytvářela root-owned tmp →
+  app mv selhal tiše; vše nyní ashell (app uid).
+
+### Zbylé bugy
+- Externí exec parrot dynamických binárek z bashe: PT_INTERP ENOENT —
+  řešení bind-mount lib (NS) nebo chroot; gbsh to obchází ownall re-exec.
+- htop full TUI dl_iterate_phdr edge-case; 16K page test; init SIGABRT watch.

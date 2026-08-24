@@ -385,6 +385,29 @@ void *ldso_parrot_heap_base(void) {
     return parrot_heap_base;
 }
 
+/* Tvrdý konec při chybějící kritické závislosti: bez ní by zůstaly
+ * unresolved GOT sloty (=0) a program padl SIGSEGV pc=0x0 mnohem později
+ * na nesouvisejícím místě. Lepší čistá chyba hned teď. */
+static int is_core_lib(const char *soname) {
+    static const char *core[] = {
+        "libc.so.6", "libm.so.6", "libpthread.so.0",
+        "libdl.so.2", "librt.so.1", "ld-linux-aarch64.so.1"
+    };
+    for (size_t i = 0; i < sizeof core / sizeof core[0]; i++)
+        if (strcmp(soname, core[i]) == 0) return 1;
+    return 0;
+}
+
+static void fatal_missing_dep(const char *soname, const char *searched) {
+    fprintf(stderr,
+            "\n[-] FATAL: required dependency \"%s\" was not found\n"
+            "    searched paths: %s\n"
+            "    hint: check LD_LIBRARY_PATH / ELF_ROOTFS point to the distro\n"
+            "    hint: absolute symlinks in rootfs must be relative (chroot-less run)\n\n",
+            soname, searched ? searched : "(none)");
+    exit(1);
+}
+
 static void write_heap_veneer(void *target, void *fn) {
     uint32_t *p = (uint32_t *)target;
     uintptr_t page = (uintptr_t)target & ~0xfffUL;
@@ -938,6 +961,8 @@ static int load_needed(elf_object_t *obj) {
                 free(cand);
             } else {
                 fprintf(stderr, "[-] dep %s not found\n", soname);
+                if (is_core_lib(soname))
+                    fatal_missing_dep(soname, osearch);
             }
         }
         free(osearch);
@@ -1207,6 +1232,8 @@ static int load_module_needed(elf_object_t *m, elf_scope_t *scope) {
                 free(cand);
             } else {
                 fprintf(stderr, "[-] module dep %s: not found\n", soname);
+                if (is_core_lib(soname))
+                    fatal_missing_dep(soname, osearch);
             }
         }
         free(osearch);
@@ -1232,6 +1259,8 @@ static int load_module_needed(elf_object_t *m, elf_scope_t *scope) {
                 continue;
         }
         fprintf(stderr, "[-] module dep %s: not found\n", soname);
+        if (is_core_lib(soname))
+            fatal_missing_dep(soname, search);
     }
     free(search);
     return 0;
@@ -1556,6 +1585,15 @@ void *elf_resolve_import(elf_object_t *obj, const char *name) {
         void *h = dlsym(obj->handles[i], name);
         if (h)
             return h;
+    }
+    /* Host fallback jen pro non-ownall flow (--run/--own/--shim): proces
+     * běží pod host libc, takže její symboly (printf, __libc_start_main...)
+     * můžeme použít přímo. --ownall (parrot svět) musí zůstat strict —
+     * tam by bionic symboly tiše rozbily glibc program. */
+    if (!elf_own_deps) {
+        void *h2 = dlsym(RTLD_DEFAULT, name);
+        if (h2)
+            return h2;
     }
     return NULL;
 }

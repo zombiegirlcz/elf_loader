@@ -36,11 +36,11 @@ for attempt in 1 2 3 4 5; do
     fi
 
     # dekód + verifikace velikosti
-    OUT=$(ashell -c "/product/bin/su -c '/system/bin/base64 -d $F/deploy.b64 > $DEST.tmp && /system/bin/wc -c $DEST.tmp'" 2>/dev/null | awk '{print $1}')
+    OUT=$(ashell -c "/system/bin/base64 -d $F/deploy.b64 > $DEST.tmp && /system/bin/wc -c $DEST.tmp" 2>/dev/null | awk '{print $1}')
     if [ "$OUT" = "$(wc -c < "$LOCAL")" ]; then
-        ashell -c "/product/bin/su -c '/system/bin/mv $DEST.tmp $DEST'" >/dev/null 2>&1 \
-          || ashell -c "/system/bin/mv $DEST.tmp $DEST" >/dev/null 2>&1
-        ashell -c "/system/bin/chmod 755 $DEST" >/dev/null 2>&1
+        ashell -c "/system/bin/rm -f $DEST.old" >/dev/null 2>&1
+        ashell -c "/system/bin/cp $DEST $DEST.old" >/dev/null 2>&1
+        ashell -c "/system/bin/cat $DEST.tmp > $DEST && /system/bin/chmod 755 $DEST && /system/bin/rm $F/deploy.b64 $DEST.tmp $DEST.old" >/dev/null 2>&1
         echo "OK: $DEST ($OUT bytes, attempt $attempt)"
         exit 0
     fi
