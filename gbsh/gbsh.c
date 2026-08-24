@@ -697,10 +697,128 @@ int gbsh_eval_line(const char *raw) {
     return eval_tokens(toks, nt);
 }
 
+
+/* ════════════════════════ barevný výstup / line editor ═══════════════ */
+
+#include <termios.h>
+
+#define C_RESET  "\x1b[0m"
+#define C_BOLD   "\x1b[1m"
+#define C_DIM    "\x1b[2m"
+#define C_GREEN  "\x1b[32m"
+#define C_BGRN   "\x1b[1;32m"
+#define C_YELLOW "\x1b[33m"
+#define C_CYAN   "\x1b[36m"
+#define C_MAGENTA"\x1b[35m"
+#define C_RED    "\x1b[91m"
+#define C_GRAY   "\x1b[90m"
+
+static struct termios g_orig_termios;
+static int g_raw_enabled = 0;
+
+static void raw_enable(void) {
+    struct termios t;
+    if (tcgetattr(STDIN_FILENO, &t) != 0) return;
+    g_orig_termios = t;
+    t.c_lflag &= ~(ECHO | ICANON);
+    t.c_cc[VMIN] = 1;
+    t.c_cc[VTIME] = 0;
+    if (tcsetattr(STDIN_FILENO, TCSANOW, &t) == 0) g_raw_enabled = 1;
+}
+
+static void raw_disable(void) {
+    if (g_raw_enabled) { tcsetattr(STDIN_FILENO, TCSANOW, &g_orig_termios); g_raw_enabled = 0; }
+}
+
+/* je slovo builtin? */
+static int word_is_builtin(const char *w) {
+    for (int i = 0; i < builtin_count; i++)
+        if (strcmp(builtins[i].name, w) == 0) return 1;
+    return 0;
+}
+
+/* vypsat buf[0..len) se syntax highlightem */
+static void hl_emit(const char *buf, size_t len) {
+    char out[MAX_LINE * 8];
+    size_t o = 0;
+#define EMITS(s) do { size_t l_ = strlen(s); if (o + l_ < sizeof out) { memcpy(out+o, s, l_); o += l_; } } while (0)
+#define EMITC(c_) do { if (o + 2 < sizeof out) out[o++] = (c_); } while (0)
+
+    int first_done = 0;
+    size_t i = 0;
+    while (i < len) {
+        if (isspace((unsigned char)buf[i])) { EMITC(buf[i++]); continue; }
+
+        /* komentar */
+        if (buf[i] == '#' && (i == 0 || isspace((unsigned char)buf[i-1]))) {
+            EMITS(C_GRAY);
+            while (i < len) EMITC(buf[i++]);
+            EMITS(C_RESET);
+            break;
+        }
+
+        /* uvozovky */
+        if (buf[i] == '"' || buf[i] == '\'') {
+            char q = buf[i];
+            EMITS(C_MAGENTA); EMITC(q); i++;
+            while (i < len) {
+                EMITC(buf[i]);
+                if (buf[i] == q) { i++; break; }
+                i++;
+            }
+            EMITS(C_RESET);
+            continue;
+        }
+
+        /* operatory */
+        if (strchr("|;&<>", buf[i])) {
+            EMITS(C_YELLOW);
+            while (i < len && strchr("|;&<>", buf[i])) EMITC(buf[i++]);
+            EMITS(C_RESET);
+            continue;
+        }
+
+        /* slovo */
+        {
+            size_t ws = i;
+            int has_var = 0;
+            while (i < len && !isspace((unsigned char)buf[i]) &&
+                   !strchr("|;&<>", buf[i])) {
+                if (buf[i] == '$') has_var = 1;
+                i++;
+            }
+            size_t wl = i - ws;
+            char w[256]; size_t cl = wl < sizeof w - 1 ? wl : sizeof w - 1;
+            memcpy(w, buf + ws, cl); w[cl] = 0;
+
+            const char *col = NULL;
+            if (!first_done) {
+                if (word_is_builtin(w)) col = C_BGRN;
+                else if (wl > 2 && w[0] == '/' && access(w, X_OK) == 0) col = C_CYAN;
+                else if (w[0] != '-' && w[0] != '.' && w[0] != '/' &&
+                         access(w, X_OK) == 0) col = C_BGRN;
+                first_done = 1;
+            } else if (w[0] == '-') {
+                col = C_CYAN;
+            } else if (has_var) {
+                col = C_RED;
+            } else if (access(w, X_OK) == 0) {
+                col = C_CYAN;
+            }
+            if (col) EMITS(col);
+            for (size_t q = ws; q < i && o + 2 < sizeof out; q++) EMITC(buf[q]);
+            if (col) EMITS(C_RESET);
+        }
+    }
+    out[o] = 0;
+#undef EMITS
+#undef EMITC
+    fputs(out, stdout);
+}
+
 /* ─────────────────────────── prompt ─────────────────────────── */
 
-static void print_prompt(void) {
-    const char *ps1 = env_or("GBSH_PROMPT", "%u@%h:%~ $ ");
+static void print_prompt_text(const char *ps1) {
     char cwd[1024];
     const char *show = getcwd(cwd, sizeof cwd) ? cwd : "?";
     const char *home = env_or("HOME", "");
@@ -725,6 +843,122 @@ static void print_prompt(void) {
         }
     }
     fflush(stdout);
+}
+
+
+/* ─────────────────────────── line editor (raw mode) ─────────────────── */
+
+static void print_prompt_raw(void);
+static void print_prompt_text(const char *ps1);
+
+static void ed_render(const char *prompt, const char *buf, size_t len, size_t cur) {
+    char seq[64];
+    /* zacátek řádku + clear */
+    snprintf(seq, sizeof seq, "\r\x1b[K");
+    fputs(seq, stdout);
+    print_prompt_raw();
+    hl_emit(buf, len);
+    fputs("\x1b[0m", stdout);
+    fputs("\x1b[K", stdout);
+    if (cur < len) {
+        snprintf(seq, sizeof seq, "\x1b[%zuD", len - cur);
+        fputs(seq, stdout);
+    }
+    fflush(stdout);
+}
+
+/* interaktivní čtení s live syntax highlightem; NULL = EOF */
+static char *read_line_interactive(void) {
+    static char buf[MAX_LINE];
+    size_t len = 0, cur = 0;
+    int hist_idx = g_hist_count;
+
+    raw_enable();
+    while (1) {
+        ed_render("", buf, len, cur);
+        char c;
+        ssize_t r = read(STDIN_FILENO, &c, 1);
+        if (r <= 0) { raw_disable(); return NULL; }
+
+        if (c == '\r' || c == '\n') {          /* Enter */
+            fputs("\n", stdout); fflush(stdout);
+            raw_disable();
+            buf[len] = 0;
+            return xstrdup(buf);
+        }
+        if (c == 3) {                           /* Ctrl-C */
+            fputs("^C\n", stdout); fflush(stdout);
+            raw_disable();
+            buf[0] = 0;
+            return xstrdup("");
+        }
+        if (c == 4) {                           /* Ctrl-D na prázdném řádku */
+            if (len == 0) { printf("exit\n"); raw_disable(); return NULL; }
+            continue;
+        }
+        if (c == 12) {                          /* Ctrl-L clear */
+            fputs("\x1b[2J\x1b[H", stdout);
+            continue;
+        }
+        if (c == 127 || c == 8) {               /* Backspace */
+            if (cur > 0) {
+                memmove(buf + cur - 1, buf + cur, len - cur);
+                cur--; len--;
+            }
+            continue;
+        }
+        if (c == 27) {                          /* escape sequence */
+            char e1, e2;
+            if (read(STDIN_FILENO, &e1, 1) <= 0) continue;
+            if (e1 != '[') continue;
+            if (read(STDIN_FILENO, &e2, 1) <= 0) continue;
+            if (e2 == 'A') {                    /* Up: historie zpět */
+                if (hist_idx > 0) {
+                    hist_idx--;
+                    snprintf(buf, MAX_LINE, "%s", g_history[hist_idx]);
+                    len = strlen(buf); cur = len;
+                }
+                continue;
+            }
+            if (e2 == 'B') {                    /* Down */
+                if (hist_idx < g_hist_count) {
+                    hist_idx++;
+                    if (hist_idx == g_hist_count) { len = cur = 0; }
+                    else { snprintf(buf, MAX_LINE, "%s", g_history[hist_idx]); len = strlen(buf); cur = len; }
+                }
+                continue;
+            }
+            if (e2 == 'C') { if (cur < len) cur++; continue; }   /* Right */
+            if (e2 == 'D') { if (cur > 0) cur--; continue; }     /* Left */
+            if (e2 == 'H') { cur = 0; continue; }                /* Home */
+            if (e2 == 'F') { cur = len; continue; }              /* End */
+            char e3;
+            if ((e2 == '1' || e2 == '4' || e2 == '3') && read(STDIN_FILENO, &e3, 1) > 0) {
+                if (e2 == '1' && e3 == '~') { cur = 0; continue; }
+                if (e2 == '4' && e3 == '~') { cur = len; continue; }
+                if (e2 == '3' && e3 == '~') {                   /* Delete */
+                    if (cur < len) { memmove(buf + cur, buf + cur + 1, len - cur - 1); len--; }
+                    continue;
+                }
+            }
+            continue;
+        }
+        if (c >= 32 && c != 127 && len + 1 < MAX_LINE) {   /* printable */
+            memmove(buf + cur + 1, buf + cur, len - cur);
+            buf[cur++] = c;
+            len++;
+        }
+    }
+}
+
+static void print_prompt_raw(void) {
+    /* barevný default; GBSH_PROMPT může obsahovat vlastní ANSI */
+    const char *ps1 = env_or("GBSH_PROMPT", "\x1b[1;32m%u@%h\x1b[0m:\x1b[36m%~\x1b[0m$ ");
+    print_prompt_text(ps1);
+}
+
+static void print_prompt(void) {
+    print_prompt_raw();
 }
 
 /* ─────────────────────────── init ─────────────────────────── */
@@ -786,20 +1020,28 @@ int main(void) {
 
     load_rc();
 
-    char *line = NULL;
-    size_t cap = 0;
-
-    while (g_running) {
-        print_prompt();
-        ssize_t n = getline(&line, &cap, stdin);
-        if (n < 0) {                       /* EOF (Ctrl-D) */
-            printf("exit\n");
-            break;
+    if (isatty(STDIN_FILENO)) {
+        /* interaktivní režim: live syntax highlighting + historie */
+        while (g_running) {
+            print_prompt_raw();
+            char *line = read_line_interactive();
+            if (!line) { printf("exit\n"); break; }
+            hist_add(line);
+            gbsh_eval_line(line);
+            free(line);
         }
-        if (n > 0 && line[n-1] == '\n') line[n-1] = 0;
-        hist_add(line);
-        gbsh_eval_line(line);
+    } else {
+        /* non-tty (pipe/skript) — žádné barvy ani raw mode */
+        char *line = NULL;
+        size_t cap = 0;
+        while (g_running) {
+            ssize_t n = getline(&line, &cap, stdin);
+            if (n < 0) break;
+            if (n > 0 && line[n-1] == '\n') line[n-1] = 0;
+            hist_add(line);
+            gbsh_eval_line(line);
+        }
+        free(line);
     }
-    free(line);
     return g_last_status;
 }

@@ -1,28 +1,27 @@
-# ~/.gbshrc — gbsh konfigurace (provádí se při startu stejným parserem)
-# Umístění: $HOME/.gbshrc nebo $GBSHRC
+# ~/.gbshrc — gbsh konfigurace (provádí se při startu)
+# Barvy: ANSI escape lze psát přímo do GBSH_PROMPT
 
-# ── prompt ──
-export GBSH_PROMPT='%u@%h:%~ $ '
+# ── prompt (barevný) ──
+export GBSH_PROMPT='[1;32m%u@%h[0m:[36m%~[0m$ '
 
 # ── prostředí ──
 export EDITOR=vi
 export PAGER=less
+export LS_COLORS='di=01;34:ln=01;36:ex=01;32'
 
 # ── aliasy ──
 alias ll='ls -la'
-alias la='ls -a'
-alias l='ls'
+alias la='ls -a --color=auto'
+alias ls='ls --color=auto'
+alias grep='grep --color=auto'
 alias ..='cd ..'
 alias ...='cd ../..'
-alias grep='grep --color=auto'
+alias cls='clear'
 
-# parrot zkratky (běží přes elf_loader own-loading)
-alias pdate='date'
-alias ppython='python3'
+# parrot zkratky (běží přes elf_loader own-loading, plné barvy)
+alias llp='ls -la'
+alias papt='apt --help'
 
-# ── historie ──
-# (historka je in-memory, MAX_HISTORY 256)
-
-# tip: rootfs příkazy se resolvují automaticky:
-#   gbsh$ ls          -> host toybox (je v PATH dřív)
-#   gbsh$ apt --help  -> parrot apt přes elf_loader (není v host PATH)
+# syntax highlight ve vstupu je zapnutý vždy (TTY režim):
+#   zelená = builtin, žlutá = operátor |;&<>,
+#   tyrkysová = flagy/cesty, červená = $VAR, magenta = "stringy"
