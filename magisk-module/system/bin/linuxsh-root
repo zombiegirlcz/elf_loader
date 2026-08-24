@@ -11,7 +11,7 @@
 ROOTFS_FILE=/data/adb/parrot_root
 if [ -f "$ROOTFS_FILE" ]; then
     # vezmi prvni radek (soubor muze mit zbytky po starsich instalacich)
-    ROOTFS=$(head -n 1 "$ROOTFS_FILE")
+    ROOTFS=$(/system/bin/head -n 1 "$ROOTFS_FILE")
 fi
 : "${ROOTFS:=/data/adb/parrot}"
 
@@ -55,14 +55,14 @@ if [ -x "$BB" ]; then
         "$BB" mount --make-rslave / 2>/dev/null
 fi
 
-mkdir -p "$R/dev" "$R/proc" "$R/sys" "$R/tmp" "$R/run" 2>/dev/null
+/system/bin/mkdir -p "$R/dev" "$R/proc" "$R/sys" "$R/tmp" "$R/run" 2>/dev/null
 
 # Bind mounty (best effort; stare jadro nemusi mit vsechno)
-mount --bind /dev      "$R/dev"      2>/dev/null
-mount --bind /dev/pts  "$R/dev/pts"  2>/dev/null
-mount --bind /proc     "$R/proc"     2>/dev/null
-mount --bind /sys      "$R/sys"      2>/dev/null
-mountpoint -q "$R/tmp" 2>/dev/null || mount -t tmpfs tmpfs "$R/tmp" 2>/dev/null
+/system/bin/mount --bind /dev      "$R/dev"      2>/dev/null || /data/adb/magisk/busybox mount --bind /dev "$R/dev" 2>/dev/null
+/system/bin/mount --bind /dev/pts  "$R/dev/pts"  2>/dev/null || /data/adb/magisk/busybox mount --bind /dev/pts "$R/dev/pts" 2>/dev/null
+/system/bin/mount --bind /proc     "$R/proc"     2>/dev/null || /data/adb/magisk/busybox mount --bind /proc "$R/proc" 2>/dev/null
+/system/bin/mount --bind /sys      "$R/sys"      2>/dev/null || /data/adb/magisk/busybox mount --bind /sys "$R/sys" 2>/dev/null
+/system/bin/mountpoint -q "$R/tmp" 2>/dev/null || { /system/bin/mount -t tmpfs tmpfs "$R/tmp" 2>/dev/null || /data/adb/magisk/busybox mount -t tmpfs tmpfs "$R/tmp" 2>/dev/null; }
 
 # Prostredi pro Debian chroot
 export PATH=/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin

@@ -712,3 +712,30 @@ s libtinfo.so.6.5 (SONAME match splní DT_NEEDED). Rozbité symlinky EPERM trvaj
   ENOENT → rc 127. Host toybox (/bin/*, /system/bin) funguje.
 - Reseni pro plny fork/exec: linuxsh chroot (root) nebo bind-mount lib do
   privatniho namespace (su + unshare -m + make-rprivate + bind).
+
+## 2026-08-24: compat parity dokončena — linuxsh chroot 22/23 identických
+
+### Nasazení po tvrdém resetu
+- /data/adb/* zmizely → linuxsh/linuxsh-root znovu nasazeny (base64 přes ashell,
+  soubory root:root 700 v /data/adb ✓; parrot_root → app files rootfs cesta).
+- Mksh/PATH pasti ve skriptech: id/head/mount/mountpoint se resolveovaly na
+  PARROT glibc verze (parrot dirs první v PATH) → exec fail mimo chroot.
+  Fix: absolutní /system/bin/* + Magisk busybox fallback pro mount --bind.
+
+### Ověření parity (compat_tests.sh)
+- proot reference vs chroot běh: **všechny funkční testy IDENTICKÉ**
+  (echo/printf/seq/wc/sort/uniq/cut/tr/head/tail/grep/sed/basename/dirname/
+  expr/uname-m/hostname/bash-exit7/bash-hello/sh-pipe/fsops) — jediný rozdíl
+  pwd (/root/elf_loader vs / podle spouštěcího adresáře).
+
+### Finální architektura spouštění (kompletní)
+| Cesta | Fork/exec | Použití |
+|---|---|---|
+| gbsh (bionic) | builtiny ✓, host exec ✓, parrot přes ownall ✓ | interaktivní shell bez rootu |
+| elf wrapper | single-process ✓, pipeline uvnitř sh ✓ | ad-hoc příkazy bez rootu |
+| linuxsh chroot (root) | **plná kompatibilita** včetně parrot→parrot exec | těžká práce |
+
+### Hranice (nelžeme)
+- app uid seccomp: fork-style clone EPERM, clone3 TRAP — proto elf wrapper
+  nemůže fork+exec parrot dynamické binárky (PT_INTERP ENOENT navíc).
+- Root cesta tyto limity nemá (jiný SELinux domain, žádný restriktivní filtr).

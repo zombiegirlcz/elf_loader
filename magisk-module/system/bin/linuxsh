@@ -13,7 +13,7 @@
 
 MODDIR=${0%/*}
 
-if [ "$(id -u)" != "0" ]; then
+if [ "$(/system/bin/id -u)" != "0" ]; then
     # re-exec pres Magisk su; args opatrne quotujeme single-quotes
     SELF="$MODDIR/linuxsh-root"
     Q=""
