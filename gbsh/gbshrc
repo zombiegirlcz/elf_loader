@@ -1,22 +1,28 @@
 # ~/.gbshrc — gbsh konfigurace
 #
-# ═══ OBRÁCENÝ SVĚT (dual-world) ═══
-#   /           = kořen distro (parrot)     [start]
-#   cd .. z "/" = překlopí tě NA DRUHOU STRANU → host Android filesystem
-#   cd /parrot  = v host světě se vrátíš dovnitř do distra
-#   ROOTFS_SYMBOL=... změní vstupní symbol (default /parrot)
-# V rootfs světě běží parrot příkazy přes elf_loader own-loading.
-# V host světě běží nativní Android (toybox) příkazy.
-# Procesy vidí pravdu — nelžeme jim o hranici SW/HW.
+# ═══ OBRÁCENÝ SVĚT ═══
+# Aktivace: spustit gbsh s flagem --double-world (nebo -dw)
+#   gbsh --double-world
+#   gbsh -dw
+#
+# V dual módu:
+#   /           = kořen distro (parrot)          [start]
+#   cd .. z "/" = překlopí tě NA DRUHOU STRANU   → host Android fs
+#                 (prompt pak ukazuje žlutý [host] prefix)
+#   cd /parrot  = zpět dovnitř do distra (ROOTFS_SYMBOL, default /parrot)
+#
+# Bez flagu: single world — / je strop, host svět nedostupný.
+#
+# Prompt escape sekvence: \e \n \t \xNN + %u %h %~ \$
 
-export GBSH_PROMPT='\x1b[1;32m%u@%h\x1b[0m:\x1b[36m%~\x1b[0m$ '
-export HOST_ENTRY=$HOME
+export GBSH_PROMPT='\e[1;32m%u@%h\e[0m:\e[36m%~\e[0m$ '
 
-# ── aliasy fungují v obou světech ──
+# ── prostředí ──
+export EDITOR=vi
+export PAGER=less
+
+# ── aliasy ──
 alias ll='ls -la'
 alias la='ls -a'
 alias grep='grep --color=auto'
 alias ..='cd ..'
-
-# tip: v rootfs světě je PATH distro; v host světě /system/bin.
-# "cd /parrot && apt update" = vstup do distra a spustí apt.

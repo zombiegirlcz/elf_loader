@@ -59,6 +59,7 @@ static int g_alias_count = 0;
 #define WORLD_HOST  0
 #define WORLD_ROOTFS 1
 static int  g_world = WORLD_ROOTFS;
+static int  g_dual_world = 0;   /* --double-world / -dw */
 static char g_vpath[1024];            /* virtuální cesta uvnitř rootfs ("/") */
 static char g_host_entry[600];        /* kam ses dostane cd .. z "/" */
 
@@ -388,10 +389,12 @@ static int bi_cd(char **argv, int argc) {
     const char *sym = env_or("ROOTFS_SYMBOL", "/parrot");
 
     if (g_world == WORLD_ROOTFS) {
-        /* zvláštní cíle světa */
-        if (strcmp(target, sym) == 0 || strcmp(target, "..") != 0 ? 0 : 0) { }
         if (strcmp(target, "..") == 0 && strcmp(g_vpath, "/") == 0) {
-            /* ─── PŘEKLOP SE NA DRUHOU STRANU ─── */
+            if (!g_dual_world) {
+                /* single world: / je strop — zůstaneme (chroot-like) */
+                return 0;
+            }
+            /* ─── PŘEKLOP SE NA DRUHOU STRANU (jen --double-world) ─── */
             if (enter_host(g_host_entry) == 0) return 0;
             fprintf(stderr, "cd: cannot flip to host world\n");
             return 1;
@@ -406,7 +409,28 @@ static int bi_cd(char **argv, int argc) {
         return 1;
     }
 
-    /* HOST svět */
+    /* HOST svět (reálný pouze v dual mode; jinak se tam nedostaneme) */
+    if (!g_dual_world) {
+        /* single world nemá host svět — cd funguje jen v rámci rootfs */
+        char newvp[1024];
+        snprintf(newvp, sizeof newvp, "%s", target);
+        char nv[1024];
+        vpath_normalize(newvp, nv, sizeof nv);
+        char full[1200];
+        snprintf(full, sizeof full, "%s%s", g_rootfs,
+                 strcmp(nv, "/") == 0 ? "" : nv);
+        struct stat st;
+        if (stat(full, &st) == 0 && S_ISDIR(st.st_mode)) {
+            if (chdir(full) == 0) {
+                snprintf(g_vpath, sizeof g_vpath, "%s", nv);
+                setenv("PWD", g_vpath, 1);
+                return 0;
+            }
+        }
+        fprintf(stderr, "cd: %s: %s\n", target,
+                errno ? strerror(errno) : "Not a directory");
+        return 1;
+    }
     if (strcmp(target, sym) == 0) {
         /* vstup do rootfs světa */
         if (enter_rootfs("/") == 0) return 0;
@@ -995,10 +1019,35 @@ static void print_prompt_text(const char *ps1) {
         snprintf(shortcwd, sizeof shortcwd, "~%s", show + strlen(home));
     else
         snprintf(shortcwd, sizeof shortcwd, "%s", show);
-    if (g_world == WORLD_HOST && ps1 && !strstr(ps1, "\x1b"))
-        ; /* host svět — bez dekorací, cesta je skutečná */
+
+    /* dual mode: host svět označíme žlutým [host] prefixem */
+    if (g_dual_world && g_world == WORLD_HOST)
+        fputs("\x1b[33m[host]\x1b[0m ", stdout);
 
     for (const char *p = ps1; *p; p++) {
+        /* interpretace escape sekvencí z gbshrc (\e \n \t \x1b ...) */
+        if (p[0] == '\\' && p[1]) {
+            p++;
+            switch (*p) {
+            case 'e': putchar('\033'); break;
+            case 'n': putchar('\n'); break;
+            case 't': putchar('\t'); break;
+            case '\\': putchar('\\'); break;
+            case 'x': {
+                int hv = 0; int nd = 0;
+                while (nd < 2 && isxdigit((unsigned char)p[1])) {
+                    char c = p[1]; p++;
+                    int dv = isdigit((unsigned char)c) ? c - '0'
+                            : (c | 32) - 'a' + 10;
+                    hv = hv * 16 + dv; nd++;
+                }
+                putchar(hv ? hv : '\033');
+                break;
+            }
+            default: putchar(*p); break;
+            }
+            continue;
+        }
         if (p[0] == '%' && p[1]) {
             p++;
             switch (*p) {
@@ -1389,7 +1438,21 @@ static void sigint_handler(int sig) {
     write(STDOUT_FILENO, "\n", 1);
 }
 
-int main(void) {
+int main(int argc, char **argv) {
+    /* CLI flags: --double-world / -dw */
+    for (int i = 1; i < argc; i++) {
+        if (strcmp(argv[i], "--double-world") == 0 ||
+            strcmp(argv[i], "-dw") == 0)
+            g_dual_world = 1;
+        else if (strcmp(argv[i], "--version") == 0) {
+            printf("gbsh %s\n", GBSH_VERSION);
+            return 0;
+        } else if (argv[i][0] == '-' && argv[i][1]) {
+            fprintf(stderr, "gbsh: unknown option: %s\n"
+                    "usage: gbsh [--double-world|-dw]\n", argv[i]);
+            return 2;
+        }
+    }
     setvbuf(stdout, NULL, _IOLBF, 0);
     signal(SIGINT, sigint_handler);
     signal(SIGQUIT, SIG_IGN);
@@ -1397,7 +1460,8 @@ int main(void) {
     detect_env();
     if (getcwd(g_cwd, sizeof g_cwd) == NULL) g_cwd[0] = 0;
     setenv("SHELL", "gbsh", 1);
-    /* startujeme uvnitř distro světa: / == rootfs */
+    /* startujeme uvnitř distro světa: / == rootfs
+       (--double-world umožní cd .. z "/" překlopit na host) */
     if (enter_rootfs("/") != 0)
         fprintf(stderr, "gbsh: varování: rootfs %s nedostupné, startuji na hostu\n",
                 g_rootfs);
