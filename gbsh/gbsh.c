@@ -26,6 +26,7 @@
 #include <sys/types.h>
 #include <sys/wait.h>
 #include <sys/stat.h>
+#include <dirent.h>
 
 #define GBSH_VERSION "0.1"
 #define MAX_LINE     8192
@@ -846,6 +847,208 @@ static void print_prompt_text(const char *ps1) {
 }
 
 
+
+/* ─────────────────────────── completion ─────────────────────────── */
+
+/* doplň slovo; vrátí počet matchů, common prefix uloží do buf */
+static int complete_word(char *buf, size_t *plen, size_t *pcur) {
+    size_t len = *plen, cur = *pcur;
+    /* najdi začátek aktuálního slova */
+    size_t ws = cur;
+    while (ws > 0 && !isspace((unsigned char)buf[ws-1])) ws--;
+    char word[256];
+    size_t wl = cur - ws;
+    if (wl >= sizeof word) return 0;
+    memcpy(word, buf + ws, wl); word[wl] = 0;
+
+    char matches[MAX_ARGS][256];
+    int nm = 0;
+
+    int first_word = 1;
+    for (size_t q = 0; q < ws; q++)
+        if (!isspace((unsigned char)buf[q])) { first_word = 0; break; }
+
+    if (!first_word || wl == 0 || word[0] == '/' || word[0] == '.') {
+        /* souborová completion v CWD */
+        char dir[1024]; const char *base = word;
+        snprintf(dir, sizeof dir, ".");
+        char *slash = strrchr(word, '/');
+        if (slash) {
+            size_t dl = slash - word;
+            if (dl == 0) snprintf(dir, sizeof dir, "/");
+            else { memcpy(dir, word, dl); dir[dl] = 0; }
+            base = slash + 1;
+        }
+        DIR *d = opendir(dir);
+        if (!d) return 0;
+        struct dirent *de;
+        size_t bl = strlen(base);
+        while ((de = readdir(d)) && nm < MAX_ARGS) {
+            if (strncmp(de->d_name, base, bl) == 0) {
+                snprintf(matches[nm], 256, "%.*s%s",
+                         (int)(slash ? slash - word + 1 : 0), word, de->d_name);
+                nm++;
+            }
+        }
+        closedir(d);
+    } else {
+        /* příkazová completion: builtins + host PATH + rootfs dirs */
+        for (int i = 0; i < builtin_count && nm < MAX_ARGS; i++) {
+            if (strcmp(builtins[i].name, word) == 0)
+                snprintf(matches[nm++], 256, "%s", builtins[i].name);
+        }
+        const char *paths[] = {
+            "/system/bin", "/system/xbin", "$ROOTFS/usr/bin", "$ROOTFS/bin"
+        };
+        for (size_t pi = 0; pi < sizeof paths / sizeof paths[0] && nm < MAX_ARGS; pi++) {
+            char dir[600];
+            if (starts_with(paths[pi], "$"))
+                snprintf(dir, sizeof dir, "%s%s", g_rootfs, paths[pi] + 7);
+            else
+                snprintf(dir, sizeof dir, "%s", paths[pi]);
+            DIR *d = opendir(dir);
+            if (!d) continue;
+            struct dirent *de;
+            size_t bl = strlen(word);
+            while ((de = readdir(d)) && nm < MAX_ARGS) {
+                char full[1200];
+                snprintf(full, sizeof full, "%s/%s", dir, de->d_name);
+                if (strncmp(de->d_name, word, bl) == 0 &&
+                    access(full, X_OK) == 0) {
+                    snprintf(matches[nm++], 256, "%s", de->d_name);
+                }
+            }
+            closedir(d);
+        }
+    }
+    if (nm == 0) return 0;
+
+    /* deduplikace */
+    for (int i = 0; i < nm; i++)
+        for (int j = i + 1; j < nm; j++)
+            if (strcmp(matches[i], matches[j]) == 0) matches[j][0] = 0;
+
+    /* common prefix */
+    size_t cp = strlen(matches[0]);
+    for (int i = 1; i < nm; i++) {
+        if (matches[i][0] == 0) continue;
+        size_t l = strlen(matches[i]);
+        size_t k = 0;
+        while (k < cp && k < l && matches[i][k] == matches[0][k]) k++;
+        cp = k;
+    }
+
+    /* vlož common prefix místo slova */
+    size_t pl = cp - wl;   /* kolik přidat */
+    if (len + pl + 2 >= MAX_LINE) return nm;
+    memmove(buf + cur + pl, buf + cur, len - cur);
+    memcpy(buf + ws, matches[0], cp);
+    cur = ws + cp; len += pl;
+    *pcur = cur; *plen = len;
+
+    /* jediný match → mezera; více → vypiš seznam */
+    int uniq = 0;
+    for (int i = 0; i < nm; i++) if (matches[i][0]) uniq++;
+    if (uniq == 1) {
+        memmove(buf + cur + 1, buf + cur, len - cur);
+        buf[cur++] = ' '; len++;
+    } else {
+        fputc('\n', stdout);
+        for (int i = 0; i < nm; i++)
+            if (matches[i][0]) printf("%s  ", matches[i]);
+        fputc('\n', stdout);
+    }
+    return nm;
+}
+
+/* ─────────────────────────── git branch pro prompt ─────────────────── */
+
+static void get_git_branch(char *out, size_t cap) {
+    out[0] = 0;
+    char dir[1024];
+    snprintf(dir, sizeof dir, "%s", g_cwd);
+    for (;;) {
+        char p[1200];
+        snprintf(p, sizeof p, "%.900s/.git/HEAD", dir);
+        FILE *f = fopen(p, "r");
+        if (f) {
+            char head[256] = "";
+            if (fgets(head, sizeof head, f)) {
+                head[strcspn(head, "\n")] = 0;
+                const char *sl = strstr(head, "refs/heads/");
+                snprintf(out, cap, "%s", sl ? sl + strlen("refs/heads/") : head);
+            }
+            fclose(f);
+            return;
+        }
+        char *slash = strrchr(dir, '/');
+        if (!slash || slash == dir) { out[0] = 0; return; }
+        *slash = 0;
+    }
+}
+
+/* starship-style dvouřádkový prompt (nativní fallback) */
+static void print_fancy_prompt(void) {
+    char cwd[1024];
+    const char *show = getcwd(cwd, sizeof cwd) ? cwd : "?";
+    const char *home = env_or("HOME", "");
+    char shortc[1100];
+    if (home[0] && starts_with(show, home))
+        snprintf(shortc, sizeof shortc, "~%s", show + strlen(home));
+    else
+        snprintf(shortc, sizeof shortc, "%s", show);
+
+    char branch[128];
+    get_git_branch(branch, sizeof branch);
+
+    fputs("\x1b[1;34m", stdout);
+    fputs(shortc, stdout);
+    fputs("\x1b[0m", stdout);
+    if (branch[0]) {
+        fputs(" \x1b[1;32m\xe2\x8e\x87 ", stdout);   /* ⎇ */
+        fputs(branch, stdout);
+        fputs("\x1b[0m", stdout);
+    }
+    if (g_last_status != 0) {
+        printf(" \x1b[1;91m\xe2\x9c\x97%d\x1b[0m", g_last_status);  /* ✗N */
+    }
+    fputs("\n\x1b[1;36m\xe2\x9d\xaf\x1b[0m ", stdout);          /* ❯ */
+    fflush(stdout);
+}
+
+/* starship přes elf_loader (pokud funguje) — výstup do bufferu */
+static int try_starship_prompt(void) {
+    int fds[2];
+    if (pipe(fds) < 0) return -1;
+    pid_t pid = fork();
+    if (pid < 0) { close(fds[0]); close(fds[1]); return -1; }
+    if (pid == 0) {
+        dup2(fds[1], STDOUT_FILENO);
+        close(fds[0]); close(fds[1]);
+        freopen("/dev/null", "w", stderr);
+        char path[600];
+        snprintf(path, sizeof path, "%s/usr/bin/starship", g_rootfs);
+        char *ea[MAX_ARGS];
+        int n = 0;
+        ea[n++] = (char *)g_elfloader;
+        ea[n++] = (char *)"--ownall";
+        ea[n++] = path;
+        ea[n++] = (char *)"prompt";
+        ea[n] = NULL;
+        execv(g_elfloader, ea);
+        _exit(127);
+    }
+    close(fds[1]);
+    char tmp[2048];
+    ssize_t n = read(fds[0], tmp, sizeof tmp - 1);
+    close(fds[0]);
+    int st; waitpid(pid, &st, 0);
+    if (n <= 0 || !WIFEXITED(st) || WEXITSTATUS(st) != 0) return -1;
+    tmp[n] = 0;
+    fputs(tmp, stdout);
+    return 0;
+}
+
 /* ─────────────────────────── line editor (raw mode) ─────────────────── */
 
 static void print_prompt_raw(void);
@@ -857,6 +1060,7 @@ static void ed_render(const char *prompt, const char *buf, size_t len, size_t cu
     snprintf(seq, sizeof seq, "\r\x1b[K");
     fputs(seq, stdout);
     print_prompt_raw();
+    (void)prompt;
     hl_emit(buf, len);
     fputs("\x1b[0m", stdout);
     fputs("\x1b[K", stdout);
@@ -898,6 +1102,12 @@ static char *read_line_interactive(void) {
         }
         if (c == 12) {                          /* Ctrl-L clear */
             fputs("\x1b[2J\x1b[H", stdout);
+            continue;
+        }
+        if (c == '\t') {                        /* Tab: completion */
+            int nmatches = complete_word(buf, &len, &cur);
+            buf[len] = 0;
+            (void)nmatches;
             continue;
         }
         if (c == 127 || c == 8) {               /* Backspace */
@@ -1020,10 +1230,16 @@ int main(void) {
 
     load_rc();
 
+    const char *pmode = env_or("GBSH_PROMPT_MODE", "");
+    int use_starship = strcmp(pmode, "starship") == 0;
+    int use_fancy    = strcmp(pmode, "fancy") == 0;
+
     if (isatty(STDIN_FILENO)) {
         /* interaktivní režim: live syntax highlighting + historie */
         while (g_running) {
-            print_prompt_raw();
+            if (use_starship)      { if (try_starship_prompt() != 0) print_fancy_prompt(); }
+            else if (use_fancy)    print_fancy_prompt();
+            else                   print_prompt_raw();
             char *line = read_line_interactive();
             if (!line) { printf("exit\n"); break; }
             hist_add(line);
