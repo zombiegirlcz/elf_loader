@@ -386,7 +386,7 @@ static int bi_cd(char **argv, int argc) {
         target = targetbuf;
     }
 
-    const char *sym = env_or("ROOTFS_SYMBOL", "/parrot");
+    const char *sym = getenv("ROOTFS_SYMBOL");   /* volitelný alias */
 
     if (g_world == WORLD_ROOTFS) {
         if (strcmp(target, "..") == 0 && strcmp(g_vpath, "/") == 0) {
@@ -394,8 +394,16 @@ static int bi_cd(char **argv, int argc) {
                 /* single world: / je strop — zůstaneme (chroot-like) */
                 return 0;
             }
-            /* ─── PŘEKLOP SE NA DRUHOU STRANU (jen --double-world) ─── */
-            if (enter_host(g_host_entry) == 0) return 0;
+            /* ─── PŘEKLOP NA DRUHOU STRANU ───
+             * host svět začíná ve FYZICKÉM RODIČI rootfs:
+             *   $ROOTFS=/data/…/nh/distro/parrot  →  cd .. = /data/…/nh/distro
+             * a odtud se dá chodit dál nahoru i dolů (do files, tmp, …) */
+            char parent[1024];
+            snprintf(parent, sizeof parent, "%s", g_rootfs);
+            char *sl = strrchr(parent, '/');
+            if (sl && sl != parent) *sl = 0;
+            if (!sl || strcmp(parent, "") == 0) snprintf(parent, sizeof parent, "/");
+            if (enter_host(parent) == 0) return 0;
             fprintf(stderr, "cd: cannot flip to host world\n");
             return 1;
         }
@@ -409,7 +417,17 @@ static int bi_cd(char **argv, int argc) {
         return 1;
     }
 
-    /* HOST svět (reálný pouze v dual mode; jinak se tam nedostaneme) */
+    /* HOST svět (reálný pouze v dual mode; jinak se tam nedostaneme).
+     * Návrat dovnitř: cd $ROOTFS (fyzická cesta — univerzální, žádný
+     * vymyšlený symbol). Jakákoli cesta uvnitř $ROOTFS prefixu tě přepne
+     * do rootfs světa se správnou virtuální vpath. */
+    if (strncmp(target, g_rootfs, strlen(g_rootfs)) == 0 &&
+        (target[strlen(g_rootfs)] == 0 || target[strlen(g_rootfs)] == '/')) {
+        const char *vpath = target + strlen(g_rootfs);
+        if (enter_rootfs(vpath[0] ? vpath : "/") == 0) return 0;
+        fprintf(stderr, "cd: %s: %s\n", target, strerror(errno));
+        return 1;
+    }
     if (!g_dual_world) {
         /* single world nemá host svět — cd funguje jen v rámci rootfs */
         char newvp[1024];
@@ -431,7 +449,7 @@ static int bi_cd(char **argv, int argc) {
                 errno ? strerror(errno) : "Not a directory");
         return 1;
     }
-    if (strcmp(target, sym) == 0) {
+    if (sym && strcmp(target, sym) == 0) {
         /* vstup do rootfs světa */
         if (enter_rootfs("/") == 0) return 0;
         fprintf(stderr, "cd: %s: %s\n", sym, strerror(errno));
@@ -1398,8 +1416,7 @@ static void detect_env(void) {
     /* host entry point: kam se dostaneš cd .. z "/" rootfs světa */
     snprintf(g_host_entry, sizeof g_host_entry, "%s",
              env_or("HOST_ENTRY", env_or("HOME", "/data")));
-    if (!getenv("ROOTFS_SYMBOL"))
-        setenv("ROOTFS_SYMBOL", "/parrot", 0);
+
 
     const char *elf = getenv("ELF_LOADER");
     if (elf && elf[0])

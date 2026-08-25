@@ -1,27 +1,19 @@
 # ~/.gbshrc — gbsh konfigurace
 #
-# ═══ OBRÁCENÝ SVĚT ═══
-# Aktivace: spustit gbsh s flagem --double-world (nebo -dw)
-#   gbsh --double-world
-#   gbsh -dw
+# ═══ OBRÁCENÝ SVĚT ═══ (aktivace: gbsh --double-world nebo -dw)
+#   /           = kořen distro (parrot)            [start]
+#   cd .. z "/" = překlopí tě do FYZICKÉHO RODIČE rootfs
+#                 ($ROOTFS=/data/…/nh/distro/parrot → cd .. = …/nh/distro)
+#   cd $ROOTFS  = návrat dovnitř do distra (funguje odkudkoli,
+#                 i s hloubkou: cd $ROOTFS/usr/bin)
+#   V host světě prompt ukazuje skutečnou Android cestu.
 #
-# V dual módu:
-#   /           = kořen distro (parrot)          [start]
-#   cd .. z "/" = překlopí tě NA DRUHOU STRANU   → host Android fs
-#                 (prompt pak ukazuje žlutý [host] prefix)
-#   cd /parrot  = zpět dovnitř do distra (ROOTFS_SYMBOL, default /parrot)
-#
-# Bez flagu: single world — / je strop, host svět nedostupný.
-#
-# Prompt escape sekvence: \e \n \t \xNN + %u %h %~ \$
-
+# Prompt: \e = escape, \n \t, \\xNN hex; %u %h %~ \$
 export GBSH_PROMPT='\e[1;32m%u@%h\e[0m:\e[36m%~\e[0m$ '
 
-# ── prostředí ──
 export EDITOR=vi
 export PAGER=less
 
-# ── aliasy ──
 alias ll='ls -la'
 alias la='ls -a'
 alias grep='grep --color=auto'
