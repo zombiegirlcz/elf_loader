@@ -389,6 +389,28 @@ static int bi_cd(char **argv, int argc) {
     const char *sym = getenv("ROOTFS_SYMBOL");   /* volitelný alias */
 
     if (g_world == WORLD_ROOTFS) {
+        /* fyzická cesta pod $ROOTFS prefixem = cesta dovnitř distra
+           (např. cd $ROOTFS/usr/lib/...) → přepočet na virtuální vpath */
+        size_t rflen = strlen(g_rootfs);
+        if (strncmp(target, g_rootfs, rflen) == 0 &&
+            (target[rflen] == 0 || target[rflen] == '/')) {
+            const char *vp2 = target[rflen] ? target + rflen : "/";
+            char nv[1024];
+            vpath_normalize(vp2, nv, sizeof nv);
+            char chk[1200];
+            snprintf(chk, sizeof chk, "%s%s", g_rootfs,
+                     strcmp(nv, "/") == 0 ? "" : nv);
+            struct stat st;
+            if (stat(chk, &st) == 0 && S_ISDIR(st.st_mode)) {
+                if (chdir(chk) != 0) {
+                    fprintf(stderr, "cd: %s: %s\n", target, strerror(errno));
+                    return 1;
+                }
+                snprintf(g_vpath, sizeof g_vpath, "%s", nv);
+                setenv("PWD", g_vpath, 1);
+                return 0;
+            }
+        }
         if (strcmp(target, "..") == 0 && strcmp(g_vpath, "/") == 0) {
             if (!g_dual_world) {
                 /* single world: / je strop — zůstaneme (chroot-like) */
