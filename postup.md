@@ -791,3 +791,20 @@ s libtinfo.so.6.5 (SONAME match splní DT_NEEDED). Rozbité symlinky EPERM trvaj
 - #3 libc.so.6 hard-exit (is_core_lib/fatal_missing_dep, 3 místa)
 - #5 --own pc=0x0 → dlsym(RTLD_DEFAULT) fallback jen non-ownall
 - ft6.c syscall probe tool; deploy_b64.sh su→ashell fix (root-owned tmp)
+
+### nano 8.4 FUNGUJE — derive_distro_libdirs (klíčová funkce)
+- Root cause "nano nefunguje": loader hledal libs jen v origin_dir(usr/bin)
+  + sys_libdirs(host cesty) — parrot libs jsou v usr/lib/aarch64-linux-gnu.
+  Bez LD_LIBRARY_PATH (unset v ashell.conf) → libc.so.6 not found.
+- Fix: **derive_distro_libdirs(origin_dir)** — z cesty exe odvodí distro
+  lib dirs: …/distro/usr/bin → …/distro/{usr/lib/aarch64-linux-gnu,
+  lib/aarch64-linux-gnu, usr/lib, lib}. Prepend do search paths ve všech
+  třech load cestách (exe ownall, module own_deps, module non-own).
+- Funguje bez LD_LIBRARY_PATH i bez ELF_ROOTFS — loader si to odvodí
+  z cesty binárky. Device ověřeno: nano --version (GNU nano 8.4),
+  uname, ls, grep ✓.
+
+### Poznámka k testování přes ashell
+- ashell -c "… \$ROOTFS/…" — dvojité uvozovky expandují \$ROOTFS LOKÁLNÍM
+  bashem (prázdné!) → loader dostane /usr/bin/uname → zdánlivý fail.
+  Používat \$ escapování nebo plné cesty.

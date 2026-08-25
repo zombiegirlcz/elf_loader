@@ -61,6 +61,8 @@ static int is_ld_linux(const char *name) {
 #define SYSTEM_LIBDIRS "/usr/lib/aarch64-linux-gnu:/lib/aarch64-linux-gnu" \
                        ":/usr/lib:/lib"
 
+static char *derive_distro_libdirs(const char *origin_dir);
+
 static const char *sys_libdirs(void) {
     static char buf[512];
     static int done = 0;
@@ -942,8 +944,16 @@ static int load_needed(elf_object_t *obj) {
 
     int n = 0;
     if (elf_own_deps && obj->scope) {
-        char *osearch = malloc(strlen(search) + strlen(sys_libdirs()) + 8);
-        sprintf(osearch, "%s:%s", search, sys_libdirs());
+        char *dl = derive_distro_libdirs(obj->origin_dir ? obj->origin_dir : "");
+        char *osearch;
+        if (dl) {
+            osearch = malloc(strlen(dl) + strlen(search) +
+                             strlen(sys_libdirs()) + 4);
+            sprintf(osearch, "%s:%s:%s", dl, search, sys_libdirs());
+        } else {
+            osearch = malloc(strlen(search) + strlen(sys_libdirs()) + 8);
+            sprintf(osearch, "%s:%s", search, sys_libdirs());
+        }
         for (Elf64_Dyn *d = dyn; d->d_tag != DT_NULL; d++) {
             if (d->d_tag != DT_NEEDED)
                 continue;
@@ -971,6 +981,15 @@ static int load_needed(elf_object_t *obj) {
         return 0;
     }
 
+    {
+        char *dl2 = derive_distro_libdirs(obj->origin_dir ? obj->origin_dir : "");
+        if (dl2) {
+            char *ns = malloc(strlen(search) + strlen(dl2) + 2);
+            sprintf(ns, "%s:%s", dl2, search);
+            free(search);
+            search = ns;
+        }
+    }
     for (Elf64_Dyn *d = dyn; d->d_tag != DT_NULL; d++) {
         if (d->d_tag != DT_NEEDED)
             continue;
@@ -995,7 +1014,7 @@ static int load_needed(elf_object_t *obj) {
 elf_object_t *elf_load(const char *path) {
     int fd = open(path, O_RDONLY);
     if (fd < 0) {
-        perror("open");
+        fprintf(stderr, "[-] open(%s): %s\n", path ? path : "(null)", strerror(errno));
         return NULL;
     }
 
@@ -1180,6 +1199,36 @@ static char *build_search(const char *origin_dir) {
     return search;
 }
 
+/* Odvození distro lib cest z origin_dir binárky v distro layoutu:
+ *   …/distro/usr/bin/exe → …/distro/{usr/lib/aarch64-linux-gnu,
+ *   lib/aarch64-linux-gnu, usr/lib, lib}
+ * Umožňuje najít libc.so.6 apod. bez LD_LIBRARY_PATH i bez ELF_ROOTFS. */
+static char *derive_distro_libdirs(const char *origin_dir) {
+    static char buf[2048];
+    size_t l = strlen(origin_dir);
+    const char *base_end = NULL;
+
+    if (l >= 8 && strcmp(origin_dir + l - 8, "/usr/bin") == 0)
+        base_end = origin_dir + l - 8;
+    else if (l >= 4 && strcmp(origin_dir + l - 4, "/bin") == 0)
+        base_end = origin_dir + l - 4;
+    if (!base_end)
+        return NULL;
+
+    size_t bl = (size_t)(base_end - origin_dir);
+    if (bl + 128 >= sizeof buf) return NULL;
+    memcpy(buf, origin_dir, bl); buf[bl] = 0;
+
+    /* pořadí: multiarch, lib, usr/lib, lib — nejlepší match první */
+    char tmp[2048];
+    snprintf(tmp, sizeof tmp,
+             "%s/usr/lib/aarch64-linux-gnu:%s/lib/aarch64-linux-gnu:"
+             "%s/usr/lib:%s/lib",
+             buf, buf, buf, buf);
+    snprintf(buf, sizeof buf, "%s", tmp);
+    return buf;
+}
+
 static char *find_in_paths(const char *soname, const char *search) {
     const char *p = search;
     while (p && *p) {
@@ -1216,8 +1265,16 @@ static int load_module_needed(elf_object_t *m, elf_scope_t *scope) {
 
     char *search = build_search(m->origin_dir ? m->origin_dir : ".");
     if (elf_own_deps) {
-        char *osearch = malloc(strlen(search) + strlen(sys_libdirs()) + 8);
-        sprintf(osearch, "%s:%s", search, sys_libdirs());
+        char *dl = derive_distro_libdirs(m->origin_dir ? m->origin_dir : "");
+        char *osearch;
+        if (dl) {
+            osearch = malloc(strlen(dl) + strlen(search) +
+                             strlen(sys_libdirs()) + 4);
+            sprintf(osearch, "%s:%s:%s", dl, search, sys_libdirs());
+        } else {
+            osearch = malloc(strlen(search) + strlen(sys_libdirs()) + 8);
+            sprintf(osearch, "%s:%s", search, sys_libdirs());
+        }
         for (Elf64_Dyn *d = dyn; d->d_tag != DT_NULL; d++) {
             if (d->d_tag != DT_NEEDED)
                 continue;
@@ -1365,7 +1422,7 @@ static void run_module_init(elf_object_t *m) {
 elf_object_t *elf_load_shared(const char *path, elf_scope_t *scope) {
     int fd = open(path, O_RDONLY);
     if (fd < 0) {
-        perror("open");
+        fprintf(stderr, "[-] open(%s): %s\n", path ? path : "(null)", strerror(errno));
         return NULL;
     }
     struct stat st;
