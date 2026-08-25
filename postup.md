@@ -768,3 +768,26 @@ s libtinfo.so.6.5 (SONAME match splní DT_NEEDED). Rozbité symlinky EPERM trvaj
 - Externí exec parrot dynamických binárek z bashe: PT_INTERP ENOENT —
   řešení bind-mount lib (NS) nebo chroot; gbsh to obchází ownall re-exec.
 - htop full TUI dl_iterate_phdr edge-case; 16K page test; init SIGABRT watch.
+
+## 2026-08-24: gbsh v0.4/v0.5 — dual-world flag + fix navigace
+
+### v0.4
+- Obrácený svět JEN přes `gbsh --double-world` / `-dw` (default single world).
+- FIX promptu: PS1 escape sekvence (\e \x1b \n \t \xNN) z gbshrc se dřív
+  vypisovaly literálně — print_prompt_text nyní interpretuje backslash
+  escapes → skutečné ANSI barvy (pty test: 0x1b bajty ve výstupu).
+- Dual mode host svět = žlutý [host] prompt prefix.
+
+### v0.5 — fix dual-world navigace (podle uživatele)
+- cd .. z "/" rootfs světa → **FYZICKÝ RODIČ $ROOTFS** (…/nh/distro),
+  ne HOME. Skutečná struktura, odtud chodíš celým Android fs.
+- Návrat dovnitř: **cd $ROOTFS** (univerzální) nebo jakákoli cesta pod
+  $ROOTFS prefixem → rootfs svět se správnou vpath (cd $ROOTFS/usr → /usr).
+- ROOTFS_SYMBOL hardcoded "/parrot" odstraněn (nepřenositelné); volitelný
+  env alias.
+- Fix SIGSEGV: strcmp(target, getenv=NULL) při chybějícím symbolu.
+
+### Bugfixy téže noci
+- #3 libc.so.6 hard-exit (is_core_lib/fatal_missing_dep, 3 místa)
+- #5 --own pc=0x0 → dlsym(RTLD_DEFAULT) fallback jen non-ownall
+- ft6.c syscall probe tool; deploy_b64.sh su→ashell fix (root-owned tmp)
