@@ -31,9 +31,13 @@ aarch64-linux-gnu-gcc -static -O2 -s \
 echo "[3/4] staging module tree..."
 cp "$HERE/module.prop" "$OUT/"
 cp "$HERE/customize.sh" "$HERE/service.sh" "$HERE/post-fs-data.sh" "$HERE/uninstall.sh" "$OUT/"
-cp "$HERE/system/bin/parrot" "$HERE/system/bin/parrot-sh" "$HERE/system/bin/parrot-fix-exec" "$HERE/system/bin/elf" "$OUT/system/bin/"
+cp "$HERE/system/bin/parrot" "$HERE/system/bin/parrot-sh" "$HERE/system/bin/parrot-fix-exec" \
+   "$HERE/system/bin/elf" "$HERE/system/bin/linuxsh" "$HERE/system/bin/linuxsh-root" \
+   "$HERE/system/bin/gbsh" "$OUT/system/bin/"
 chmod +x "$OUT/customize.sh" "$OUT/service.sh" "$OUT/post-fs-data.sh" "$OUT/uninstall.sh"
-chmod +x "$OUT/system/bin/parrot" "$OUT/system/bin/parrot-sh" "$OUT/system/bin/parrot-fix-exec" "$OUT/system/bin/elf"
+chmod +x "$OUT/system/bin/parrot" "$OUT/system/bin/parrot-sh" "$OUT/system/bin/parrot-fix-exec" \
+         "$OUT/system/bin/elf" "$OUT/system/bin/linuxsh" "$OUT/system/bin/linuxsh-root" \
+         "$OUT/system/bin/gbsh" "$OUT/system/bin/elf_loader" "$OUT/system/bin/patchelf_interp"
 
 # Magisk module zip layout: META-INF + module root
 rm -f "$ZIP"

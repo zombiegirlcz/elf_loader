@@ -21,11 +21,15 @@ if [ ! -f /data/adb/parrot_root ]; then
 else
     echo "parrot: keeping existing /data/adb/parrot_root"
 fi
-# linuxsh: nativni chroot shell - dostupny i pred rebootem
+# linuxsh + gbsh: nativni shelly - dostupne i pred rebootem
 if [ -f "$MODDIR/system/bin/linuxsh" ]; then
     cp "$MODDIR/system/bin/linuxsh"      /data/adb/linuxsh      2>/dev/null
     cp "$MODDIR/system/bin/linuxsh-root" /data/adb/linuxsh-root 2>/dev/null
     chmod 755 /data/adb/linuxsh /data/adb/linuxsh-root 2>/dev/null
+fi
+if [ -f "$MODDIR/system/bin/gbsh" ]; then
+    cp "$MODDIR/system/bin/gbsh" /data/adb/gbsh 2>/dev/null
+    chmod 755 /data/adb/gbsh 2>/dev/null
 fi
 
 exit 0
