@@ -63,6 +63,13 @@ static int is_ld_linux(const char *name) {
 
 static char *derive_distro_libdirs(const char *origin_dir);
 
+/* Proaktivně own-loadnout distro ld.so (ld-linux-aarch64.so.1) do scope.
+ * GLIBC_PRIVATE symboly (_dl_exception_create, _dl_signal_error, …) a
+ * u glibc < 2.30 i __tls_get_addr žijí v ld.so; libc je importuje → musí
+ * být ve scope už při jejím loadu. Starší rootfs (glibc 2.28, Termux
+ * proot-distro) bez toho padají na unresolved JUMP_SLOTs → SIGSEGV. */
+static void preload_distro_ldso(const char *osearch, elf_scope_t *scope);
+
 static const char *sys_libdirs(void) {
     static char buf[512];
     static int done = 0;
@@ -667,8 +674,11 @@ void *elf_lazy_resolve(uintptr_t got_slot) {
     }
     if (!obj)
         obj = lazy_current;
-    if (!obj)
+    if (!obj) {
+        if (elf_debug())
+            fprintf(stderr, "[!] lazy: no obj for slot %p\n", (void *)got_slot);
         return 0;
+    }
     size_t mbv = map_base_vaddr(obj);
     for (size_t off = 0; obj->jmp_rela && off < obj->jmp_size;
          off += sizeof(Elf64_Rela)) {
@@ -678,8 +688,18 @@ void *elf_lazy_resolve(uintptr_t got_slot) {
         void *addr = resolve_jmp_symbol(obj, r);
         if (addr)
             *(uintptr_t *)got_slot = (uintptr_t)addr;
+        else if (elf_debug()) {
+            size_t sym_idx = ELF64_R_SYM(r->r_info);
+            const char *nm = (sym_idx < obj->dynsym_count)
+                                 ? obj->dynstr + obj->dynsym[sym_idx].st_name : "?";
+            fprintf(stderr, "[!] lazy resolve FAILED: %s (obj %s)\n",
+                    nm, obj->soname ? obj->soname : "?");
+        }
         return addr;
     }
+    if (elf_debug())
+        fprintf(stderr, "[!] lazy: slot %p not in jmp_rela of %s\n",
+                (void *)got_slot, obj->soname ? obj->soname : "?");
     return 0;
 }
 
@@ -954,10 +974,15 @@ static int load_needed(elf_object_t *obj) {
             osearch = malloc(strlen(search) + strlen(sys_libdirs()) + 8);
             sprintf(osearch, "%s:%s", search, sys_libdirs());
         }
+        /* distro ld.so do scope PŘED ostatními deps (libc importuje
+           GLIBC_PRIVATE symboly z ld.so) */
+        preload_distro_ldso(osearch, obj->scope);
+        if (elf_debug()) printf("[dbg] preload ok\n");
         for (Elf64_Dyn *d = dyn; d->d_tag != DT_NULL; d++) {
             if (d->d_tag != DT_NEEDED)
                 continue;
             const char *soname = dynstr + d->d_un.d_val;
+            if (elf_debug()) printf("[dbg] needed=%s\n", soname);
             if (is_ld_linux(soname)) {
                 if (elf_debug())
                     printf("[+] dep %s: host ld-linux fallback\n", soname);
@@ -1098,6 +1123,7 @@ elf_object_t *elf_load(const char *path) {
                    &obj->dynsym_count, SHT_DYNSYM) < 0)
         goto cleanup_obj;
 
+    if (elf_debug()) printf("[dbg3] tls-block done\n");
     munmap(file_map, st.st_size);
     close(fd);
 
@@ -1229,6 +1255,24 @@ static char *derive_distro_libdirs(const char *origin_dir) {
     return buf;
 }
 
+static int g_ldso_preloaded = 0;
+
+static void preload_distro_ldso(const char *osearch, elf_scope_t *scope) {
+    if (!elf_own_deps || !scope || g_ldso_preloaded)
+        return;
+    if (getenv("ELF_LOADER_NO_LDSO_PRELOAD"))
+        return;
+    char *ldc = find_in_paths("ld-linux-aarch64.so.1", osearch);
+    if (!ldc)
+        return;
+    g_ldso_preloaded = 1; /* před loadem — load_module_needed(ld.so) by
+                             jinak rekurzoval donekonečna */
+    if (elf_debug())
+        printf("[+] own-loading %s (distro ld.so)\n", ldc);
+    elf_load_shared(ldc, scope);
+    free(ldc);
+}
+
 static char *find_in_paths(const char *soname, const char *search) {
     const char *p = search;
     while (p && *p) {
@@ -1275,6 +1319,7 @@ static int load_module_needed(elf_object_t *m, elf_scope_t *scope) {
             osearch = malloc(strlen(search) + strlen(sys_libdirs()) + 8);
             sprintf(osearch, "%s:%s", search, sys_libdirs());
         }
+        preload_distro_ldso(osearch, scope);
         for (Elf64_Dyn *d = dyn; d->d_tag != DT_NULL; d++) {
             if (d->d_tag != DT_NEEDED)
                 continue;
@@ -1388,7 +1433,18 @@ static void run_module_init(elf_object_t *m) {
      * string. Our loader never runs the real early-init, so we set the flag
      * ourselves to keep strerror/perror output identical to host glibc. */
     if (m->soname && strcmp(m->soname, "libc.so.6") == 0) {
-        *(char *)va(m, 0x1be009) = 1;
+        /* Flag byte __libc_early_init: strerror_l čte bit 0 → cesta
+         * "Unknown error %d". Skutečné ei(1) volat NEMŮŽEME — sahá na
+         * GLRO struktury naší ld.so simulace (SIGSEGV). Hardcoded offset
+         * platí pro glibc 2.41 build; guard: symbol musí existovat
+         * (glibc ≥ 2.34; starší 2.28 rootfy ho nemají → skip) a adresa
+         * musí ležet v mapování modulu (jinak kosmetická odchylka). */
+        void *ei = NULL;
+        if (lookup_table(m->dynsym, m->dynstr, m->dynsym_count,
+                         "__libc_early_init", &ei, m) == SYM_DEFINED && ei &&
+            m->total_size > 0x1be009 + 1) {
+            *(char *)va(m, 0x1be009) = 1;
+        }
         /* uselocale/__ctype_init pro TLS per-thread state (viz výše) */
         void *a = NULL;
         if (lookup_table(m->dynsym, m->dynstr, m->dynsym_count,
@@ -1528,10 +1584,16 @@ elf_object_t *elf_load_shared(const char *path, elf_scope_t *scope) {
 
     load_table(file_map, ehdr, &m->dynsym, &m->dynstr, &m->dynsym_count,
                SHT_DYNSYM);
+    if (elf_debug()) printf("[dbg3] dynsym %s: %zu\n", path, m->dynsym_count);
 
     for (int i = 0; i < m->phdr_count; i++) {
         if (m->phdr[i].p_type != PT_TLS)
             continue;
+        if (elf_debug())
+            printf("[dbg3] tls phdr %s: filesz=%llx memsz=%llx align=%llx\n",
+                   path, (unsigned long long)m->phdr[i].p_filesz,
+                   (unsigned long long)m->phdr[i].p_memsz,
+                   (unsigned long long)m->phdr[i].p_align);
         size_t sz = ALIGN_UP(m->phdr[i].p_memsz, m->phdr[i].p_align);
         void *blk = mmap(NULL, sz, PROT_READ | PROT_WRITE,
                          MAP_PRIVATE | MAP_ANONYMOUS, -1, 0);
@@ -1555,19 +1617,29 @@ elf_object_t *elf_load_shared(const char *path, elf_scope_t *scope) {
 
     load_module_needed(m, scope);
     elf_scope_add(scope, m);
+    if (elf_debug()) printf("[dbg2] reloc-start %s\n", path);
     elf_relocate(m);
+    if (elf_debug()) printf("[dbg2] reloc-done\n");
 
     patch_module_heap_syms(m);
+    if (elf_debug()) printf("[dbg2] heap-syms-done\n");
 
     run_module_init(m);
+    if (elf_debug()) printf("[dbg2] init-queued\n");
 
     for (int i = 0; i < m->phdr_count; i++) {
         if (m->phdr[i].p_type != PT_TLS || !m->has_tls)
             continue;
         char *src = (char *)base + (m->phdr[i].p_vaddr - mbv);
+        if (elf_debug())
+            printf("[dbg2] tls-copy off=%llx filesz=%llx memsz=%llx\n",
+                   (unsigned long long)m->tls_offset,
+                   (unsigned long long)m->phdr[i].p_filesz,
+                   (unsigned long long)m->phdr[i].p_memsz);
         memcpy((void *)read_tp() + m->tls_offset, src, m->phdr[i].p_filesz);
         break;
     }
+    if (elf_debug()) printf("[dbg2] tls-done\n");
 
     for (size_t j = 0; j < m->dynsym_count; j++) {
         const Elf64_Sym *sym = &m->dynsym[j];
@@ -1702,6 +1774,15 @@ static void relocate_tls(elf_object_t *obj, Elf64_Rela *r, uint64_t *where) {
         }
     }
     uintptr_t off = sym_off + r->r_addend + (dm->has_tls ? dm->tls_offset : 0);
+    if (elf_debug())
+        fprintf(stderr,
+                "[tls] %s sym_off=%llx addend=%llx dm=%s has_tls=%d -> %llx\n",
+                ELF64_R_TYPE(r->r_info) == R_AARCH64_TLS_TPREL ? "TPREL"
+                                                                : "TLSDESC",
+                (unsigned long long)sym_off,
+                (unsigned long long)r->r_addend,
+                dm && dm->soname ? dm->soname : "EXE",
+                dm ? dm->has_tls : -1, (unsigned long long)off);
     if (ELF64_R_TYPE(r->r_info) == R_AARCH64_TLS_TPREL)
         *where = off;
     else {

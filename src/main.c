@@ -188,6 +188,9 @@ static int run_ownall(const char *path, int argc, char **argv, char **envp) {
 }
 
 int main(int argc, char **argv, char **envp) {
+    /* ELF_DEBUG → unbuffered stdout, ať trace při SIGSEGV nekončí v bufferu */
+    if (getenv("ELF_DEBUG"))
+        setvbuf(stdout, NULL, _IONBF, 0);
     /* seccomp stacked filtr: nove syscalls (clone3/close_range/...) -> ENOSYS,
      * aby fungovaly glibc fallbacky pod app profilem jadra 4.14 */
     elf_install_compat();
