@@ -1478,7 +1478,8 @@ static void sigint_handler(int sig) {
 }
 
 int main(int argc, char **argv) {
-    /* CLI flags: --double-world / -dw */
+    const char *cmd_string = NULL;
+    /* CLI flags: --double-world/-dw, -c <command>, --version */
     for (int i = 1; i < argc; i++) {
         if (strcmp(argv[i], "--double-world") == 0 ||
             strcmp(argv[i], "-dw") == 0)
@@ -1486,9 +1487,18 @@ int main(int argc, char **argv) {
         else if (strcmp(argv[i], "--version") == 0) {
             printf("gbsh %s\n", GBSH_VERSION);
             return 0;
-        } else if (argv[i][0] == '-' && argv[i][1]) {
+        } else if (strcmp(argv[i], "-c") == 0) {
+            if (i + 1 >= argc) {
+                fprintf(stderr, "gbsh: -c: chybí argument (příkaz)\n");
+                return 2;
+            }
+            cmd_string = argv[++i];
+        } else if (argv[i][0] == '-' && argv[i][1] &&
+                   strcmp(argv[i], "-c") != 0 &&
+                   !(strcmp(argv[i], "-dw") == 0 ||
+                     strcmp(argv[i], "--double-world") == 0)) {
             fprintf(stderr, "gbsh: unknown option: %s\n"
-                    "usage: gbsh [--double-world|-dw]\n", argv[i]);
+                    "usage: gbsh [--double-world|-dw] [-c command]\n", argv[i]);
             return 2;
         }
     }
@@ -1510,6 +1520,14 @@ int main(int argc, char **argv) {
     }
 
     load_rc();
+
+    /* gbsh -c <command>: spustit příkaz a skončit s jeho statusem.
+       Rc se načítá (na rozdíl od bashe), aby měl příkaz k dispozici
+       env/funkce/aliasy definované v ~/.gbshrc. */
+    if (cmd_string) {
+        gbsh_eval_line(cmd_string);
+        return g_last_status;
+    }
 
     const char *pmode = env_or("GBSH_PROMPT_MODE", "");
     int use_starship = strcmp(pmode, "starship") == 0;
