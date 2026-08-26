@@ -866,3 +866,20 @@ s libtinfo.so.6.5 (SONAME match splní DT_NEEDED). Rozbité symlinky EPERM trvaj
     finální size check. Používat MÍSTO ručních echo loopů!
 - Debug: ELF_DEBUG=1 (unbuffered), ELF_LOADER_NO_LDSO_PRELOAD=1,
   ELF_LOADER_NO_INITS=1, [dbg]/[dbg2]/[dbg3] markery v trace.
+
+## 2026-08-26: TUI testy (top/htop/btop/btm) — výsledky
+- **FUNGUJÍ přes own-loading** (--version + start, device ověřeno):
+  - btop 1.3.2 ✓, htop 3.4.1 ✓, btm (bottom) 0.11.0 ✓
+  - interaktivní render: btop bez TTY vypíše ~11 KB (start OK); plný
+    fullscreen vyžaduje reálný terminál
+- **NEFUNGUJÍ**: procps top + ps → SIGSEGV i při --version/--help
+  (crash brzy po main; free/uptime/w/vmstat ze stejného balíčku OK).
+  ps má vlastní SEGV handler (display.c:75) co přepíše náš fault dump —
+  proto žádný backtrace. Diag nástroj: ELF_LOADER_KEEP_HANDLERS=1
+  (reinstaluje handler PO initech; pro appky s vlastním handlerem
+  instalovaným v main to nestačí — přepíší ho zpět).
+- **Workaround ověřen**: top v chrootu FUNGUJE 100 % (plný render):
+  unshare -m → make-rprivate → mount proc → chroot $ROOTFS /usr/bin/top
+  ⇒ pro TUI appky s problémem použít gbsh --chroot.
+- Instalace do rootfs: apt-get install -y htop btop bottom (bottom jen
+  v některých repa; gdb 16.3 lze také nainstalovat pro debug v chrootu).

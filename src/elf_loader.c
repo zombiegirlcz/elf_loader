@@ -1401,6 +1401,10 @@ void elf_run_pending_inits(void) {
         init_fn_t fn = g_pending_inits[i];
         fn(elf_init_argc, elf_init_argv, elf_init_envp);
     }
+    /* po initech: libc/program může mít přepsán SIGSEGV handler (procps
+     * ps/top) → reinstalovat náš fault dump handler pro diagnostiku */
+    if (getenv("ELF_LOADER_KEEP_HANDLERS"))
+        elf_install_fault_handlers();
 }
 
 static __attribute__((noreturn)) void elf_run_final(void *sp, void *entry, elf_object_t *obj);
@@ -2531,6 +2535,10 @@ static __attribute__((noreturn)) void elf_run_final(void *sp, void *entry,
     if (elf_debug())
         fprintf(stderr, "[dbg-final] tp=%p sp=%p entry=%p pending=%zu\n",
             (void *)g_tls_new_tp, sp, entry, g_pending_count);
+    /* některé programy (procps ps/top) si instalují vlastní SIGSEGV
+     * handler → náš fault dump se nezobrazí; flag umožní reinstalaci */
+    if (getenv("ELF_LOADER_KEEP_HANDLERS"))
+        elf_install_fault_handlers();
     fflush(stderr);
     extern void elf_final_jump(void *, void *, uintptr_t, void (*)(void));
     elf_final_jump(sp, entry, g_tls_new_tp, elf_run_pending_inits);
