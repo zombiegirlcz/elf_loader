@@ -609,14 +609,44 @@ static int run_builtin(char **argv, int argc) {
     return -1; /* není builtin */
 }
 
+/* Kompletní nápověda — sdílená pro --help flag i help builtin */
+static void print_usage(void) {
+    printf("gbsh %s — nativní Android shell (bionic, bez závislostí)\n\n",
+           GBSH_VERSION);
+    printf("POUŽITÍ:\n");
+    printf("  gbsh [FLAGY] [-c \"příkaz\" ]\n");
+    printf("  su -c 'ROOTFS=<rootfs> gbsh --chroot'   # cizí rootfs\n\n");
+    printf("FLAGY:\n");
+    printf("  -dw, --double-world  cd .. z rootfs / překlopí na fyzický Android,\n"
+           "                       cd $ROOTFS se vrátí zpět\n");
+    printf("  -C,  --chroot        běžet uvnitř chroot(rootfs) — vyžaduje root;\n"
+           "                       100 %% kompatibilita (kernel PT_INTERP), vhodné\n"
+           "                       pro cizí/starší rootfy (např. glibc 2.28)\n");
+    printf("  -c  \"příkaz\"         spustit příkaz a skončit s jeho statusem\n");
+    printf("  --version            verze\n");
+    printf("  --help               tato nápověda\n\n");
+    printf("BUILTINY:");
+    for (int i = 0; i < builtin_count; i++)
+        printf(" %s", builtins[i].name);
+    printf("\n\nSYNTAXE:\n");
+    printf("  roura:      cmd1 | cmd2            sekvenční: a ; b   a && b   a || b\n");
+    printf("  redirect:   cmd > f   cmd >> f   cmd < f   cmd N> f (fd form)\n");
+    printf("  expanze:    $VAR  ${VAR}  ~/  ~  *  ?\n");
+    printf("  uvozovky:   \"...\" expanduje, '...' literální\n\n");
+    printf("PROSTŘEDÍ:\n");
+    printf("  ROOTFS       cesta k distro rootfs (default: auto-detekce)\n");
+    printf("  GBSHRC       config file (default ~/.gbshrc)\n");
+    printf("  GBSH_PROMPT_MODE  '' | fancy | starship\n\n");
+    printf("PŘÍKLADY:\n");
+    printf("  gbsh                                  # interaktivní shell (own-loading)\n");
+    printf("  gbsh -dw                              # + obrácený svět (cd .. z /)\n");
+    printf("  gbsh -c \"uname -m | wc -c\"             # jeden příkaz, exit status propagován\n");
+    printf("  su -c 'ROOTFS=$T gbsh --chroot'        # chroot shell do cizího rootfs\n");
+}
+
 static int bi_help(char **argv, int argc) {
     (void)argv; (void)argc;
-    printf("gbsh %s — native android shell\n\n", GBSH_VERSION);
-    printf("builtins:");
-    for (int i = 0; i < builtin_count; i++) printf(" %s", builtins[i].name);
-    printf("\n\nsyntax: cmd | cmd > f  >> f  < f  &&  ||  ;\n");
-    printf("rootfs (parrot) prikazy se spousti pres elf_loader automaticky.\n");
-    printf("config: ~/.gbshrc\n");
+    print_usage();
     return 0;
 }
 
@@ -1552,6 +1582,10 @@ int main(int argc, char **argv) {
             g_chroot_mode = 1;
         else if (strcmp(argv[i], "--version") == 0) {
             printf("gbsh %s\n", GBSH_VERSION);
+            return 0;
+        } else if (strcmp(argv[i], "--help") == 0 ||
+                   strcmp(argv[i], "-h") == 0) {
+            print_usage();
             return 0;
         } else if (strcmp(argv[i], "-c") == 0) {
             if (i + 1 >= argc) {
