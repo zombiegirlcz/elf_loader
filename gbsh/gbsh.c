@@ -15,9 +15,12 @@
  * Syntaxe: |  >  >>  <  &&  ||  ;  "quotes"  'quotes'  $VAR  ~/
  * ═══════════════════════════════════════════════════════════════════════ */
 
+#define _GNU_SOURCE
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
+#include <sched.h>
+#include <sys/mount.h>
 #include <unistd.h>
 #include <errno.h>
 #include <ctype.h>
@@ -59,7 +62,8 @@ static int g_alias_count = 0;
 #define WORLD_HOST  0
 #define WORLD_ROOTFS 1
 static int  g_world = WORLD_ROOTFS;
-static int  g_dual_world = 0;   /* --double-world / -dw */
+static int  g_dual_world = 0;
+static int  g_chroot_mode = 0;  /* --chroot: běžet uvnitř chroot(rootfs) */   /* --double-world / -dw */
 static char g_vpath[1024];            /* virtuální cesta uvnitř rootfs ("/") */
 static char g_host_entry[600];        /* kam ses dostane cd .. z "/" */
 
@@ -657,6 +661,13 @@ static int open_world(const char *path, int flags, int mode) {
 
 /* spustit parrot binárku přes elf_loader (ownall) */
 static int exec_rootfs(const char *rootfs_path, char **argv) {
+    if (g_chroot_mode) {
+        /* jsme fyzicky uvnitř chroot(rootfs): kernel spustí PT_INTERP
+           (ld.so v rootfs), žádný own-loading ani LD_LIBRARY_PATH hack */
+        execv(rootfs_path[0] == '/' ? rootfs_path + 1 : rootfs_path, argv);
+        fprintf(stderr, "gbsh: exec %s: %s\n", rootfs_path, strerror(errno));
+        _exit(127);
+    }
     char *eargv[MAX_ARGS];
     int n = 0;
     eargv[n++] = (char *)g_elfloader;
@@ -1477,6 +1488,58 @@ static void sigint_handler(int sig) {
     write(STDOUT_FILENO, "\n", 1);
 }
 
+/* ─────────────────────── chroot režim (--chroot) ────────────────────────────
+ * Pro CIZÍ/starší rootfs (např. termux proot-distro, glibc 2.28), kde
+ * own-loading loader nemusí fungovat. Vyžaduje root.
+ * unshare(CLONE_NEWNS) → make-rprivate → bind proc/dev/sys do rootfs
+ * (vše v privátním NS — po smrti procesu zmizí) → chroot(rootfs).
+ * Externí binárky pak execv PŘÍMO — kernel spustí PT_INTERP uvnitř. */
+static int setup_chroot(void) {
+    if (geteuid() != 0) {
+        fprintf(stderr, "gbsh: --chroot vyžaduje root. Spustit:\n"
+                        "  su -c 'ROOTFS=<cesta> gbsh --chroot'\n");
+        return -1;
+    }
+    const unsigned long CLONE_NEWNS_ = 0x00020000UL;
+    const unsigned long MS_BIND_    = 4096UL;
+    const unsigned long MS_REC_     = 16384UL;
+    const unsigned long MS_PRIVATE_ = 262144UL;
+    if (unshare((int)CLONE_NEWNS_) != 0) {
+        perror("gbsh: unshare");
+        return -1;
+    }
+    /* propagace mountů zůstane v tomto NS */
+    if (mount(NULL, "/", NULL, MS_REC_ | MS_PRIVATE_, NULL) != 0)
+        perror("gbsh: varování: make-rprivate");
+    char p[1200];
+    static const char *const dirs[] = { "proc", "dev", "sys" };
+    for (size_t k = 0; k < sizeof dirs / sizeof dirs[0]; k++) {
+        snprintf(p, sizeof p, "%s/%s", g_rootfs, dirs[k]);
+        mkdir(p, 0755); /* best effort */
+    }
+    snprintf(p, sizeof p, "%s/proc", g_rootfs);
+    if (mount("proc", p, "proc", 0, NULL) != 0)
+        fprintf(stderr, "gbsh: varování: mount proc: %s\n", strerror(errno));
+    snprintf(p, sizeof p, "%s/dev", g_rootfs);
+    if (mount("/dev", p, NULL, MS_BIND_, NULL) != 0)
+        fprintf(stderr, "gbsh: varování: bind /dev: %s\n", strerror(errno));
+    snprintf(p, sizeof p, "%s/sys", g_rootfs);
+    if (mount("/sys", p, NULL, MS_BIND_, NULL) != 0)
+        fprintf(stderr, "gbsh: varování: bind /sys: %s\n", strerror(errno));
+    if (chroot(g_rootfs) != 0) {
+        perror("gbsh: chroot");
+        return -1;
+    }
+    if (chdir("/") != 0) perror("gbsh: chdir");
+    g_world = WORLD_ROOTFS;
+    snprintf(g_vpath, sizeof g_vpath, "/");
+    setenv("PWD", "/", 1);
+    setenv("HOME", "/root", 1);
+    setenv("PATH",
+           "/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin", 1);
+    return 0;
+}
+
 int main(int argc, char **argv) {
     const char *cmd_string = NULL;
     /* CLI flags: --double-world/-dw, -c <command>, --version */
@@ -1484,6 +1547,9 @@ int main(int argc, char **argv) {
         if (strcmp(argv[i], "--double-world") == 0 ||
             strcmp(argv[i], "-dw") == 0)
             g_dual_world = 1;
+        else if (strcmp(argv[i], "--chroot") == 0 ||
+                 strcmp(argv[i], "-C") == 0)
+            g_chroot_mode = 1;
         else if (strcmp(argv[i], "--version") == 0) {
             printf("gbsh %s\n", GBSH_VERSION);
             return 0;
@@ -1498,7 +1564,7 @@ int main(int argc, char **argv) {
                    !(strcmp(argv[i], "-dw") == 0 ||
                      strcmp(argv[i], "--double-world") == 0)) {
             fprintf(stderr, "gbsh: unknown option: %s\n"
-                    "usage: gbsh [--double-world|-dw] [-c command]\n", argv[i]);
+                    "usage: gbsh [--double-world|-dw] [--chroot|-C] [-c command]\n", argv[i]);
             return 2;
         }
     }
@@ -1507,11 +1573,18 @@ int main(int argc, char **argv) {
     signal(SIGQUIT, SIG_IGN);
 
     detect_env();
+    if (g_chroot_mode) {
+        if (setup_chroot() != 0)
+            return 1;
+    }
     if (getcwd(g_cwd, sizeof g_cwd) == NULL) g_cwd[0] = 0;
     setenv("SHELL", "gbsh", 1);
     /* startujeme uvnitř distro světa: / == rootfs
-       (--double-world umožní cd .. z "/" překlopit na host) */
-    if (enter_rootfs("/") != 0)
+       (--double-world umožní cd .. z "/" překlopit na host)
+       v chroot režimu jsme fyzicky uvnitř — enter_rootfs netřeba */
+    if (g_chroot_mode) {
+        snprintf(g_vpath, sizeof g_vpath, "/");
+    } else if (enter_rootfs("/") != 0)
         fprintf(stderr, "gbsh: varování: rootfs %s nedostupné, startuji na hostu\n",
                 g_rootfs);
     {
