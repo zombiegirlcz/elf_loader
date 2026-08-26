@@ -883,3 +883,26 @@ s libtinfo.so.6.5 (SONAME match splní DT_NEEDED). Rozbité symlinky EPERM trvaj
   ⇒ pro TUI appky s problémem použít gbsh --chroot.
 - Instalace do rootfs: apt-get install -y htop btop bottom (bottom jen
   v některých repa; gdb 16.3 lze také nainstalovat pro debug v chrootu).
+
+## 2026-08-26: Komplexní test všech binárek (docker kopie parrota)
+- Metoda: kopie parrot→docker (disposable), `elf_loader --ownall` na každou binárku v
+  usr/bin s `--help`, app-uid (stejné jako uživatel), timeout 2s, clean PATH.
+  SKIP: destruktivní (rm/dd/mkfs/chroot/apt/dpkg/kill...) + interaktivní (vi/top/less).
+- VÝSLEDKY (723 unikátních binárek):
+  - rc=0 (--help OK):          238  (33%)
+  - rc 1-127 (běží, legit):    160  (22%)
+  - SIGNAL >=128 (CRASH pc=0): 127  (18%)  ← loader bug
+  - SKIPPED:                    26
+  - NOTFILE (symlinky gcc apod., netestováno): 161
+  - Z 525 spuštěných: ~76 % funguje, ~24 % crashuje.
+- CHROOT (kernel ld.so) funguje 100 % i pro crashující (ověřeno: curl --version
+  own=139, chroot=0).
+- gbsh používá stejný loader → stejná limitace.
+- ROOT CAUSE (pc=0000000000000000 hned po "entering <platný entry>"):
+  loader dosáhne entry, _start zavolá IFUNC-resolved funkci (memcpy apod.)
+  která se vyřešila na 0. Loaderův `call_ifunc_resolver` předává getauxval(AT_HWCAP)
+  + emulovaný auxv, ale pro těžké binárky (mnoho závislostí/ifunců) se resolver
+  zavolá dřív než jsou jeho RELATIVE relokace hotové, nebo hwcap/auxv emulace
+  nesedí → resolver vrátí 0. Postihuje: gcc toolchain, gpg/gcrypt, systemd-*,
+  curl/nmap/ping, mount/util-linux, ncurses, X11, perl/python3.13, gdb/qemu, dbus.
+- Plný seznam 127 crashů: results/binaries_ownall_test.txt (řádky s :139/:159/:134).
