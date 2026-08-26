@@ -906,3 +906,23 @@ s libtinfo.so.6.5 (SONAME match splní DT_NEEDED). Rozbité symlinky EPERM trvaj
   nesedí → resolver vrátí 0. Postihuje: gcc toolchain, gpg/gcrypt, systemd-*,
   curl/nmap/ping, mount/util-linux, ncurses, X11, perl/python3.13, gdb/qemu, dbus.
 - Plný seznam 127 crashů: results/binaries_ownall_test.txt (řádky s :139/:159/:134).
+
+## 2026-08-26 (2): Revize — docker kopie byla neplatný test, reálný bug je FLAKY
+- PŮVODNÍ test na docker kopii (129224B loader) dal 127 signal-crashů. PŘÍČINA:
+  docker kopie (`cp -a parrot`) měla část knihoven pro app-uid NČITELNÝCH
+  (SELinux/`access()` EACCES) → `find_in_paths` vrátil "dep not found" →
+  závislost (libcurl/libz/...) se NENAČETLA → EXE symboly zůstaly 0 v GOT →
+  volání → pc=0. CHROOT fungoval (běží jako root, čte vše).
+- OPRAVA testu: stejný loader proti CORE rootfs (čitelný app-uid) → curl/gpg/
+  gcc/python/mount teď běží (rc 0/1/2, žádný pc=0). Loader je v pořádku,
+  docker kopie byla artefakt.
+- ALE proti core zbývá ~129 signal-crashů, a to FLAKY/neteterministických:
+  `tput --help` 50× → 49× rc=2, 1× rc=139. systemd-*/ncurses/X11/xz rodiny
+  crashují spolehlivěji, jiné (tput) jen ~2 %.
+- ROOT CAUSE (skutečný, k vyřešení): loader má ASLR/timing-závislý bug →
+  občas pc=0 (skok na NULL) hned po "entering <platný entry>". Ifunc/IRELATIVE
+  i symbol resolution jsou OK (curl načte 33 modulů a běží) — viník je
+  pravděpodobně neinicializovaný/raced ukazatel v loaderu (GOT/ifunc resolver
+  výsledek nebo init pořadí), který je při některém memory-layoutu 0.
+- Plný seznam core crashů: results/binaries_ownall_core.txt.
+- chroot (gbsh --chroot) = 100% spolehlivý fallback pro crashující binárky.
