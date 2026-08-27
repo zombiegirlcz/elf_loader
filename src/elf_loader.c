@@ -65,6 +65,7 @@ static int is_ld_linux(const char *name) {
                        ":/usr/lib:/lib"
 
 static char *derive_distro_libdirs(const char *origin_dir);
+static const char *find_distro_root(const char *origin_dir);
 
 /* Proaktivně own-loadnout distro ld.so (ld-linux-aarch64.so.1) do scope.
  * GLIBC_PRIVATE symboly (_dl_exception_create, _dl_signal_error, …) a
@@ -330,7 +331,6 @@ static void ldso_setup(void) {
     ro[12] = getauxval(AT_HWCAP);                /* +0x60 _dl_hwcap */
     ro[13] = (uintptr_t)ldso_auxv;               /* +0x68 _dl_auxv */
     /* +0x70 midr_el1: 0 -> generic ifunc variants */
-    /* glibc function-pointer slots called through _rtld_global_ro */
     ro[0x270 / 8] = (uintptr_t)ldso_find_dso_for_object;  /* _dl_find_dso_for_object */
     ro[0x280 / 8] = (uintptr_t)ldso_catch_exception;  /* _dl_catch_exception */
     ro[0x288 / 8] = (uintptr_t)ldso_debug_state;      /* _dl_debug_state */
@@ -845,13 +845,8 @@ static char *expand_dirs(const char *list, const char *origin_dir) {
      * bez toho je loader hleda na Android /usr/lib a nenajde je. */
     char *rootfs_base = NULL;
     if (origin_dir) {
-        size_t ol = strlen(origin_dir);
-        if (ol >= 8 && strcmp(origin_dir + ol - 8, "/usr/bin") == 0)
-            rootfs_base = strndup(origin_dir, ol - 8);
-        else if (ol >= 4 && strcmp(origin_dir + ol - 4, "/bin") == 0)
-            rootfs_base = strndup(origin_dir, ol - 4);
-        else
-            rootfs_base = strdup("/");
+        const char *dr = find_distro_root(origin_dir);
+        rootfs_base = strdup(dr ? dr : "/");
     }
     while (*list) {
         const char *semi = strchr(list, ':');
@@ -1260,36 +1255,48 @@ static char *build_search(const char *origin_dir) {
     return search;
 }
 
+/* Najde distro root: prochazi origin_dir smerem nahoru a vraci nejvyssi
+ * adresar d, pro ktery existuje d/usr/lib/aarch64-linux-gnu (multiarch libdir =
+ * podpis distro rootfsu). Funguje pro klasicky exe (/distro/usr/bin/exe) i pro
+ * binarky mimo /usr/bin ci /bin (napr. /distro/root/.nvm/.../bin/node): v obou
+ * pripadech je rootfs base ten adresar, ktery obsahuje usr/lib. Vraci static
+ * buf (rootfs base) nebo NULL. */
+static const char *find_distro_root(const char *origin_dir) {
+    static char fbuf[2048];
+    if (!origin_dir || !*origin_dir) return NULL;
+    char path[2048];
+    size_t n = strlen(origin_dir);
+    if (n == 0 || n >= sizeof path) return NULL;
+    memcpy(path, origin_dir, n + 1);
+    for (;;) {
+        char test[2048];
+        int tl = snprintf(test, sizeof test, "%s/usr/lib/aarch64-linux-gnu", path);
+        if (tl < 0 || (size_t)tl >= sizeof test) return NULL;
+        if (access(test, F_OK) == 0) {
+            size_t pl = strlen(path);
+            if (pl >= sizeof fbuf) return NULL;
+            memcpy(fbuf, path, pl + 1);
+            return fbuf;
+        }
+        char *slash = strrchr(path, '/');
+        if (!slash) return NULL;
+        if (slash == path) { fbuf[0] = '/'; fbuf[1] = 0; return fbuf; }
+        *slash = 0;
+    }
+}
+
 /* Odvození distro lib cest z origin_dir binárky v distro layoutu:
  *   …/distro/usr/bin/exe → …/distro/{usr/lib/aarch64-linux-gnu,
  *   lib/aarch64-linux-gnu, usr/lib, lib}
  * Umožňuje najít libc.so.6 apod. bez LD_LIBRARY_PATH i bez ELF_ROOTFS. */
 static char *derive_distro_libdirs(const char *origin_dir) {
     static char buf[2048];
-    if (!origin_dir) return NULL;
-    size_t l = strlen(origin_dir);
-    /* rootfs base = prefix pred PRVNIM /usr, /lib nebo /bin komponentou.
-     * Plati pro exe (/distro/usr/bin) i pro sdilene knihovny
-     * (/distro/usr/lib/aarch64-linux-gnu/systemd/libfoo.so), takze i jejich
-     * transitivni deps (libacl, libblkid, ...) se najdou v standardnim libdiru. */
-    size_t bl = 0;
-    for (size_t i = 0; i < l; i++) {
-        if ((i == 0 || origin_dir[i - 1] == '/') &&
-            ((origin_dir[i] == 'u' && strncmp(origin_dir + i, "usr", 3) == 0 &&
-              (origin_dir[i + 3] == '/' || origin_dir[i + 3] == 0)) ||
-             (origin_dir[i] == 'l' && strncmp(origin_dir + i, "lib", 3) == 0 &&
-              (origin_dir[i + 3] == '/' || origin_dir[i + 3] == 0)) ||
-             (origin_dir[i] == 'b' && strncmp(origin_dir + i, "bin", 3) == 0 &&
-              (origin_dir[i + 3] == '/' || origin_dir[i + 3] == 0)))) {
-            bl = i;
-            break;
-        }
-    }
-    if (bl == 0)
-        bl = l; /* zadna standardni komponenta -> cely adresar */
+    const char *base = find_distro_root(origin_dir);
+    if (!base) return NULL;
+    size_t bl = strlen(base);
 
     if (bl + 256 >= sizeof buf) return NULL;
-    memcpy(buf, origin_dir, bl); buf[bl] = 0;
+    memcpy(buf, base, bl); buf[bl] = 0;
 
     /* pořadí: multiarch, lib, usr/lib, lib — nejlepší match první */
     char tmp[2048];
@@ -2495,12 +2502,22 @@ static void fault_handler(int sig, siginfo_t *si, void *ctx) {
 /* SIGSYS = seccomp odmitl syscall. Vypise cislo syscallu cistym sys_write
  * (handler muze bezet pod parrot TP, bionic stdio je tam nedostupne). */
 static void sigsys_handler(int sig, siginfo_t *si, void *uc) {
-    (void)sig; (void)uc;
+    (void)sig;
+    ucontext_t *ctx = (ucontext_t *)uc;
+    long nr = si->si_syscall;
+    /* Emulovatelné syscally zakazané Androidím seccompem:
+     * 151 setfsuid, 152 setfsgid. Binarky je volaji best-effort (app nemeni
+     * UID), navratovou hodnotu obvykle ignoruji. Vratime soucasne UID a
+     * preskocime svc #0 -> binarka pokracuje, jako by syscall "prosel". */
+    if (nr == 151 || nr == 152) {
+        ctx->uc_mcontext.pc += 4;              /* preskoc svc #0 */
+        ctx->uc_mcontext.regs[0] = getuid();   /* navrat = fsuid */
+        return;                                /* sigreturn -> pokracovani */
+    }
     char buf[64];
     const char *pre = "[SIGSYS] denied syscall nr=";
     char *p = buf;
     for (const char *q = pre; *q; q++) *p++ = *q;
-    long nr = si->si_syscall;
     char tmp[24]; int ti = 0;
     if (nr == 0) tmp[ti++] = '0';
     while (nr > 0) { tmp[ti++] = (char)('0' + (nr % 10)); nr /= 10; }
