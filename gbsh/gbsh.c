@@ -30,6 +30,7 @@
 #include <sys/wait.h>
 #include <sys/stat.h>
 #include <dirent.h>
+#include <sys/ioctl.h>
 
 #define GBSH_VERSION "0.1"
 #define MAX_LINE     8192
@@ -963,10 +964,19 @@ int gbsh_eval_line(const char *raw) {
     char expanded[MAX_LINE];
     expand_vars(raw, expanded, sizeof expanded);
 
-    struct token toks[MAX_ARGS];
-    int nt = tokenize(expanded, toks, MAX_ARGS);
-    if (nt == 0) return g_last_status;
-    return eval_tokens(toks, nt);
+    /* rozděl na řádky (víceřádkový vklad / skript) */
+    char *save = NULL;
+    char *line = strtok_r(expanded, "\n", &save);
+    int status = g_last_status;
+    while (line) {
+        if (line[0]) {
+            struct token toks[MAX_ARGS];
+            int nt = tokenize(line, toks, MAX_ARGS);
+            if (nt > 0) status = eval_tokens(toks, nt);
+        }
+        line = strtok_r(NULL, "\n", &save);
+    }
+    return status;
 }
 
 
@@ -987,6 +997,7 @@ int gbsh_eval_line(const char *raw) {
 
 static struct termios g_orig_termios;
 static int g_raw_enabled = 0;
+static int g_saved = 0;       /* uložena pozice startu promptu (\x1b[s / \x1b[u) */
 
 static void raw_enable(void) {
     struct termios t;
@@ -1353,20 +1364,86 @@ static int try_starship_prompt(void) {
 static void print_prompt_raw(void);
 static void print_prompt_text(const char *ps1);
 
+/* šířka terminálu (sloupce) — přes ioctl, jinak $COLUMNS, jinak 80 */
+static int get_term_cols(void) {
+    struct winsize ws;
+    if (ioctl(STDOUT_FILENO, TIOCGWINSZ, &ws) == 0 && ws.ws_col > 0)
+        return (int)ws.ws_col;
+    const char *c = getenv("COLUMNS");
+    if (c && atoi(c) > 0) return atoi(c);
+    return 80;
+}
+
+/* viditelná šířka promptu (bez ANSI) — pro výpočet pozice kurzoru při zalomení */
+static int prompt_display_width(void) {
+    const char *ps1 = env_or("GBSH_PROMPT",
+        "\x1b[1;32m%u@%h\x1b[0m:\x1b[36m%~\x1b[0m$ ");
+    int w = 0;
+    for (const char *p = ps1; *p; p++) {
+        if (p[0] == '\\' && p[1]) {
+            p++;
+            switch (*p) {
+            case 'n': w = 0; break;
+            case 't': w += 8; break;
+            case 'x': while (p[1] && isxdigit((unsigned char)p[1])) p++; break;
+            default: break;
+            }
+            continue;
+        }
+        if (p[0] == '%' && p[1]) {
+            p++;
+            switch (*p) {
+            case 'u': w += (int)strlen(env_or("USER", env_or("LOGNAME", "?"))); break;
+            case 'h': w += (int)strlen(env_or("HOSTNAME", "android")); break;
+            case '~': {
+                char cwd[1024]; const char *show = getcwd(cwd, sizeof cwd) ? cwd : "?";
+                const char *home = env_or("HOME", "");
+                char sc[1100];
+                if (home[0] && starts_with(show, home))
+                    snprintf(sc, sizeof sc, "~%s", show + strlen(home));
+                else snprintf(sc, sizeof sc, "%s", show);
+                w += (int)strlen(sc);
+                break;
+            }
+            case '$': w += 1; break;
+            default: w += 1; break;
+            }
+            continue;
+        }
+        w += 1;
+    }
+    return w;
+}
+
 static void ed_render(const char *prompt, const char *buf, size_t len, size_t cur) {
-    char seq[64];
-    /* zacátek řádku + clear */
-    snprintf(seq, sizeof seq, "\r\x1b[K");
-    fputs(seq, stdout);
-    print_prompt_raw();
     (void)prompt;
+    int tw = get_term_cols();
+
+    /* Vrátit kurzor na začátek promptu (uložená pozice) a smazat CELU
+       oblast vstupu včetně zalomených řádků. To odstraňuje duplicity,
+       které vznikaly, když \r\x1b[K smazalo jen jeden fyzický řádek. */
+    if (g_saved) fputs("\x1b[u", stdout);   /* obnov start promptu */
+    else         fputs("\r", stdout);         /* první překreslení: začátek řádku */
+    fputs("\x1b[s", stdout);                  /* ulož start promptu pro příště */
+    fputs("\x1b[J", stdout);                  /* smaž od startu promptu dolů */
+
+    print_prompt_raw();
     hl_emit(buf, len);
     fputs("\x1b[0m", stdout);
-    fputs("\x1b[K", stdout);
+    fputs("\x1b[K", stdout);                  /* umazat zbytek posledního řádku */
+
     if (cur < len) {
-        snprintf(seq, sizeof seq, "\x1b[%zuD", len - cur);
-        fputs(seq, stdout);
+        /* přesuň kurzor zpět na cur s ohledem na zalomení řádku */
+        int pw = prompt_display_width();
+        int disp_cur = pw + (int)cur;
+        int disp_end = pw + (int)len;
+        int back_rows = (disp_end / tw) - (disp_cur / tw);
+        int back_cols = (disp_end % tw) - (disp_cur % tw);
+        if (back_cols < 0) { back_rows--; back_cols += tw; }
+        if (back_rows > 0) printf("\x1b[%dA", back_rows);
+        if (back_cols > 0) printf("\x1b[%dD", back_cols);
     }
+    g_saved = 1;
     fflush(stdout);
 }
 
@@ -1375,52 +1452,32 @@ static char *read_line_interactive(void) {
     static char buf[MAX_LINE];
     size_t len = 0, cur = 0;
     int hist_idx = g_hist_count;
+    int paste = 0;
 
     raw_enable();
+    g_saved = 0;
     while (1) {
         ed_render("", buf, len, cur);
         char c;
         ssize_t r = read(STDIN_FILENO, &c, 1);
         if (r <= 0) { raw_disable(); return NULL; }
 
-        if (c == '\r' || c == '\n') {          /* Enter */
-            fputs("\n", stdout); fflush(stdout);
-            raw_disable();
-            buf[len] = 0;
-            return xstrdup(buf);
-        }
-        if (c == 3) {                           /* Ctrl-C */
-            fputs("^C\n", stdout); fflush(stdout);
-            raw_disable();
-            buf[0] = 0;
-            return xstrdup("");
-        }
-        if (c == 4) {                           /* Ctrl-D na prázdném řádku */
-            if (len == 0) { printf("exit\n"); raw_disable(); return NULL; }
-            continue;
-        }
-        if (c == 12) {                          /* Ctrl-L clear */
-            fputs("\x1b[2J\x1b[H", stdout);
-            continue;
-        }
-        if (c == '\t') {                        /* Tab: completion */
-            int nmatches = complete_word(buf, &len, &cur);
-            buf[len] = 0;
-            (void)nmatches;
-            continue;
-        }
-        if (c == 127 || c == 8) {               /* Backspace */
-            if (cur > 0) {
-                memmove(buf + cur - 1, buf + cur, len - cur);
-                cur--; len--;
-            }
-            continue;
-        }
         if (c == 27) {                          /* escape sequence */
             char e1, e2;
             if (read(STDIN_FILENO, &e1, 1) <= 0) continue;
             if (e1 != '[') continue;
             if (read(STDIN_FILENO, &e2, 1) <= 0) continue;
+            if (e2 == '2') {                    /* bracketed paste 200~/201~ */
+                char e3, e4, e5;
+                if (read(STDIN_FILENO, &e3, 1) <= 0) continue;
+                if (read(STDIN_FILENO, &e4, 1) <= 0) continue;
+                if (read(STDIN_FILENO, &e5, 1) <= 0) continue;
+                if (e5 == '~') {
+                    if (e3 == '0' && e4 == '0') paste = 1;        /* 200~ start */
+                    else if (e3 == '0' && e4 == '1') paste = 0;    /* 201~ end */
+                }
+                continue;
+            }
             if (e2 == 'A') {                    /* Up: historie zpět */
                 if (hist_idx > 0) {
                     hist_idx--;
@@ -1449,6 +1506,63 @@ static char *read_line_interactive(void) {
                     if (cur < len) { memmove(buf + cur, buf + cur + 1, len - cur - 1); len--; }
                     continue;
                 }
+            }
+            continue;
+        }
+
+        if (paste) {                            /* vkládání: vše jako text */
+            char in = c;
+            if (in == '\r') in = '\n';
+            if (in >= 32 && len + 1 < MAX_LINE) {
+                memmove(buf + cur + 1, buf + cur, len - cur);
+                buf[cur++] = in; len++;
+            }
+            continue;
+        }
+
+        if (c == '\r' || c == '\n') {          /* Enter */
+            fputs("\n", stdout); fflush(stdout);
+            raw_disable();
+            buf[len] = 0;
+            return xstrdup(buf);
+        }
+        if (c == 3) {                           /* Ctrl-C */
+            fputs("^C\n", stdout); fflush(stdout);
+            raw_disable();
+            g_saved = 0;
+            buf[0] = 0;
+            return xstrdup("");
+        }
+        if (c == 4) {                           /* Ctrl-D na prázdném řádku */
+            if (len == 0) { printf("exit\n"); raw_disable(); return NULL; }
+            continue;
+        }
+        if (c == 12) {                          /* Ctrl-L clear */
+            fputs("\x1b[2J\x1b[H", stdout);
+            g_saved = 0;
+            continue;
+        }
+        if (c == 1)  { cur = 0; continue; }     /* Ctrl-A: začátek řádku */
+        if (c == 5)  { cur = len; continue; }   /* Ctrl-E: konec řádku */
+        if (c == 11) { len = cur; continue; }   /* Ctrl-K: smazat do konce */
+        if (c == 23) {                          /* Ctrl-W: smazat slovo */
+            size_t p = cur;
+            while (p > 0 && isspace((unsigned char)buf[p-1])) p--;
+            while (p > 0 && !isspace((unsigned char)buf[p-1])) p--;
+            memmove(buf + p, buf + cur, len - cur);
+            len -= (cur - p); cur = p;
+            continue;
+        }
+        if (c == '\t') {                        /* Tab: completion */
+            int nmatches = complete_word(buf, &len, &cur);
+            buf[len] = 0;
+            (void)nmatches;
+            continue;
+        }
+        if (c == 127 || c == 8) {               /* Backspace */
+            if (cur > 0) {
+                memmove(buf + cur - 1, buf + cur, len - cur);
+                cur--; len--;
             }
             continue;
         }
