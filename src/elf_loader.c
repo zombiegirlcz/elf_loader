@@ -833,14 +833,36 @@ static Elf64_Dyn *find_dynamic(const elf_object_t *obj) {
 }
 
 static char *expand_dirs(const char *list, const char *origin_dir) {
-    size_t cap = strlen(list) + 1024;
+    size_t cap = strlen(list) + 2048;
     char *out = calloc(1, cap);
     size_t o = 0;
+    /* rootfs_base = origin_dir bez trailing /usr/bin nebo /bin.
+     * Absolutni RUNPATH/RPATH (napr. /usr/lib/aarch64-linux-gnu/systemd
+     * u systemd binarek) jsou relativni k ROOTFS, ne k device rootu -
+     * bez toho je loader hleda na Android /usr/lib a nenajde je. */
+    char *rootfs_base = NULL;
+    if (origin_dir) {
+        size_t ol = strlen(origin_dir);
+        if (ol >= 8 && strcmp(origin_dir + ol - 8, "/usr/bin") == 0)
+            rootfs_base = strndup(origin_dir, ol - 8);
+        else if (ol >= 4 && strcmp(origin_dir + ol - 4, "/bin") == 0)
+            rootfs_base = strndup(origin_dir, ol - 4);
+        else
+            rootfs_base = strdup("/");
+    }
     while (*list) {
         const char *semi = strchr(list, ':');
         size_t len = semi ? (size_t)(semi - list) : strlen(list);
         char *item = strndup(list, len);
         char *p = item;
+        /* Absolutni cesta v RUNPATH -> prepend rootfs_base */
+        if (rootfs_base && item[0] == '/') {
+            size_t bl = strlen(rootfs_base);
+            if (o + bl + 1 < cap) {
+                memcpy(out + o, rootfs_base, bl);
+                o += bl;
+            }
+        }
         while (*p) {
             if (strncmp(p, "$ORIGIN", 7) == 0) {
                 size_t d = strlen(origin_dir);
@@ -879,6 +901,7 @@ static char *expand_dirs(const char *list, const char *origin_dir) {
     }
     if (o > 0)
         out[o - 1] = '\0';
+    free(rootfs_base);
     return out;
 }
 
@@ -1231,18 +1254,29 @@ static char *build_search(const char *origin_dir) {
  * Umožňuje najít libc.so.6 apod. bez LD_LIBRARY_PATH i bez ELF_ROOTFS. */
 static char *derive_distro_libdirs(const char *origin_dir) {
     static char buf[2048];
+    if (!origin_dir) return NULL;
     size_t l = strlen(origin_dir);
-    const char *base_end = NULL;
+    /* rootfs base = prefix pred PRVNIM /usr, /lib nebo /bin komponentou.
+     * Plati pro exe (/distro/usr/bin) i pro sdilene knihovny
+     * (/distro/usr/lib/aarch64-linux-gnu/systemd/libfoo.so), takze i jejich
+     * transitivni deps (libacl, libblkid, ...) se najdou v standardnim libdiru. */
+    size_t bl = 0;
+    for (size_t i = 0; i < l; i++) {
+        if ((i == 0 || origin_dir[i - 1] == '/') &&
+            ((origin_dir[i] == 'u' && strncmp(origin_dir + i, "usr", 3) == 0 &&
+              (origin_dir[i + 3] == '/' || origin_dir[i + 3] == 0)) ||
+             (origin_dir[i] == 'l' && strncmp(origin_dir + i, "lib", 3) == 0 &&
+              (origin_dir[i + 3] == '/' || origin_dir[i + 3] == 0)) ||
+             (origin_dir[i] == 'b' && strncmp(origin_dir + i, "bin", 3) == 0 &&
+              (origin_dir[i + 3] == '/' || origin_dir[i + 3] == 0)))) {
+            bl = i;
+            break;
+        }
+    }
+    if (bl == 0)
+        bl = l; /* zadna standardni komponenta -> cely adresar */
 
-    if (l >= 8 && strcmp(origin_dir + l - 8, "/usr/bin") == 0)
-        base_end = origin_dir + l - 8;
-    else if (l >= 4 && strcmp(origin_dir + l - 4, "/bin") == 0)
-        base_end = origin_dir + l - 4;
-    if (!base_end)
-        return NULL;
-
-    size_t bl = (size_t)(base_end - origin_dir);
-    if (bl + 128 >= sizeof buf) return NULL;
+    if (bl + 256 >= sizeof buf) return NULL;
     memcpy(buf, origin_dir, bl); buf[bl] = 0;
 
     /* pořadí: multiarch, lib, usr/lib, lib — nejlepší match první */
@@ -1980,9 +2014,10 @@ int elf_relocate(elf_object_t *obj) {
         if (ELF64_R_TYPE(r->r_info) != R_AARCH64_IRELATIVE)
             continue;
         uint64_t *where = (uint64_t *)(base + (r->r_offset - mbv));
+        void *res = call_ifunc_resolver(va(obj, r->r_addend));
         if (getenv("ELF_LOADER_DBG_IREL"))
-            printf("[irel] %s addend=%#lx off=%#lx\n", obj->soname, (unsigned long)r->r_addend, (unsigned long)r->r_offset);
-        *where = (uint64_t)call_ifunc_resolver(va(obj, r->r_addend));
+            printf("[irel] %s addend=%#lx off=%#lx -> %p\n", obj->soname, (unsigned long)r->r_addend, (unsigned long)r->r_offset, res);
+        *where = (uint64_t)res;
         count++;
     }
     for (size_t off = 0; jmp_rela && off < jmp_size; off += sizeof(Elf64_Rela)) {
@@ -1990,7 +2025,10 @@ int elf_relocate(elf_object_t *obj) {
         if (ELF64_R_TYPE(r->r_info) != R_AARCH64_IRELATIVE)
             continue;
         uint64_t *where = (uint64_t *)(base + (r->r_offset - mbv));
-        *where = (uint64_t)call_ifunc_resolver(va(obj, r->r_addend));
+        void *res2 = call_ifunc_resolver(va(obj, r->r_addend));
+        if (getenv("ELF_LOADER_DBG_IREL"))
+            printf("[irel.plt] %s addend=%#lx off=%#lx -> %p\n", obj->soname, (unsigned long)r->r_addend, (unsigned long)r->r_offset, res2);
+        *where = (uint64_t)res2;
         count++;
     }
 
