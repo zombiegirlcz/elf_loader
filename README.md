@@ -39,7 +39,9 @@ elroot --ownall <prikaz>             # vynutit non-root (elf_loader --ownall)
 elroot zsh                            # ROOT (auto) -> plny interaktivni zsh 5.9 (ZLE/completion/barvy)
 elroot --chroot zsh                  # ROOT -> zsh v chrootu (plny zsh)
 elroot --ownall zsh                   # POZOR: non-root -> zsh nenajde moduly (ZLE nefunguje),
-                                     #         pro non-root shell pouzij gbsh
+                                     #         pro non-root shell spust gbsh PRIMO (je nativni)
+# gbsh se spousti PRIMO (bionicky non-root shell, deploynuty vedle rootfs):
+#   ROOTFS=/cesta/k/distro $ROOTFS/../usr/bin/gbsh      # interaktivni non-root shell
 ```
 
 Přímo přes loader (bez elrootu):
