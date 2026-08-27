@@ -45,6 +45,9 @@ static size_t lazy_obj_count = 0;
 
 int elf_own_deps = 0;
 elf_scope_t *elf_own_scope = NULL;
+/* Pro fault handler: scope načtených modulů, aby šel pc/lr mapovat na soname+off. */
+static elf_scope_t *g_crash_scope = NULL;
+void elf_set_crash_scope(elf_scope_t *s) { g_crash_scope = s; }
 
 int elf_init_argc = 0;
 char **elf_init_argv = NULL;
@@ -1059,7 +1062,16 @@ static int load_needed(elf_object_t *obj) {
     return 0;
 }
 
+static int is_android_stub(const char *path);
+
 elf_object_t *elf_load(const char *path) {
+    if (is_android_stub(path)) {
+        fprintf(stderr,
+                "[-] %s: Android stub (symlink to /bin/true) — not a runnable binary.\n"
+                "    Use the real distro binary, or run via: gbsh --chroot <rootfs> <bin>\n",
+                path);
+        return NULL;
+    }
     int fd = open(path, O_RDONLY);
     if (fd < 0) {
         fprintf(stderr, "[-] open(%s): %s\n", path ? path : "(null)", strerror(errno));
@@ -1513,7 +1525,35 @@ static void run_module_init(elf_object_t *m) {
     }
 }
 
+/* Android stub detection: a dependency symlinked to /bin/true (or
+   /system/bin/true) is an Android stub placeholder, not a real shared
+   object. Loading it crashes with a cryptic SIGSYS/SEGV. Detect and
+   report clearly so the user knows to use gbsh --chroot or provide the
+   real distro library. */
+static int is_android_stub(const char *path) {
+    if (!path)
+        return 0;
+    /* Android's stub libs are symlinks to /bin/true (the stub marker).
+       A real /bin/true is a normal executable, not a stub, so we only
+       flag actual symlinks whose target is a *true binary. */
+    char linkbuf[PATH_MAX];
+    ssize_t n = readlink(path, linkbuf, sizeof(linkbuf) - 1);
+    if (n <= 0)
+        return 0;
+    linkbuf[n] = '\0';
+    const char *lb = strrchr(linkbuf, '/');
+    lb = lb ? lb + 1 : linkbuf;
+    return strcmp(lb, "true") == 0;
+}
+
 elf_object_t *elf_load_shared(const char *path, elf_scope_t *scope) {
+    if (is_android_stub(path)) {
+        fprintf(stderr,
+                "[-] %s: Android stub (symlink to /bin/true) — cannot own-load.\n"
+                "    Use the real distro library, or run via: gbsh --chroot <rootfs> <bin>\n",
+                path);
+        return NULL;
+    }
     int fd = open(path, O_RDONLY);
     if (fd < 0) {
         fprintf(stderr, "[-] open(%s): %s\n", path ? path : "(null)", strerror(errno));
@@ -2283,6 +2323,50 @@ static void install_legacy_syscall_filter_impl(void) {
     (void)pr;
 }
 
+/* Mapuje adresu na soname+offset (+ nejbližší dynsym) přes g_crash_scope. */
+static void elf_fault_map_one(uintptr_t addr) {
+    if (!g_crash_scope || addr < 0x1000)
+        return;
+    static const char hx[] = "0123456789abcdef";
+    for (size_t i = 0; i < g_crash_scope->count; i++) {
+        elf_object_t *m = g_crash_scope->mods[i];
+        if (!m || !m->base_addr)
+            continue;
+        uintptr_t b = (uintptr_t)m->base_addr;
+        if (addr >= b && addr < b + m->total_size) {
+            uintptr_t off = addr - b;
+            char b2[256]; char *p = b2;
+            const char *q = "  @"; for (; *q; q++) *p++ = *q;
+            const char *nm = m->soname ? m->soname : "EXE";
+            for (; *nm; nm++) *p++ = *nm;
+            *p++ = '+'; *p++ = '0'; *p++ = 'x';
+            for (int s = 60; s >= 0; s -= 4) *p++ = hx[(off >> s) & 0xf];
+            const char *sym = NULL; uintptr_t symoff = 0;
+            if (m->dynsym && m->dynstr) {
+                for (size_t j = 0; j < m->dynsym_count; j++) {
+                    const Elf64_Sym *s = &m->dynsym[j];
+                    if (s->st_shndx == SHN_UNDEF || s->st_name == 0)
+                        continue;
+                    if (s->st_value <= off && s->st_value > symoff) {
+                        symoff = s->st_value;
+                        sym = m->dynstr + s->st_name;
+                    }
+                }
+            }
+            if (sym) {
+                *p++ = ' '; *p++ = '(';
+                for (; *sym; sym++) *p++ = *sym;
+                *p++ = '+'; *p++ = '0'; *p++ = 'x';
+                for (int s = 60; s >= 0; s -= 4) *p++ = hx[((off - symoff) >> s) & 0xf];
+                *p++ = ')';
+            }
+            *p++ = '\n';
+            sys_write(2, b2, (size_t)(p - b2));
+            return;
+        }
+    }
+}
+
 static void fault_handler(int sig, siginfo_t *si, void *ctx) {
     ucontext_t *uc = (ucontext_t *)ctx;
 
@@ -2334,6 +2418,8 @@ static void fault_handler(int sig, siginfo_t *si, void *ctx) {
         __asm__ volatile("svc #0" : "+r"(x0) : "r"(x8), "r"(x1), "r"(x2)
                          : "memory", "cc");
     }
+    elf_fault_map_one(uc->uc_mcontext.pc);
+    elf_fault_map_one(uc->uc_mcontext.regs[30]); /* lr */
 
     /* Dumpy musejí jit pres sys_write: fprintf (bionic stdio) pod parrot TP
      * sam spadne (bionic cte pthread self pres x18 -> guard page) a buffered
@@ -2443,6 +2529,32 @@ void elf_install_fault_handlers(void) {
     sigaction(SIGSEGV, &sa, NULL);
     sigaction(SIGILL, &sa, NULL);
     sigaction(SIGBUS, &sa, NULL);
+}
+
+/* DEBUG (ELF_LOADER_DEBUG_PC): zablokuj rt_sigaction(SIGSEGV) -> EPERM,
+ * aby target nemohl prepsat loaderuv fault handler a my videli skutecny
+ * PC jeho crashi (napr. procps instaluje vlastni SIGSEGV handler). */
+static void elf_install_debug_sigaction_block(void) {
+    struct sock_filter prog[8];
+    size_t n = 0;
+    prog[n++] = (struct sock_filter)BPF_STMT(BPF_LD | BPF_W | BPF_ABS,
+                                            offsetof(struct seccomp_data, nr));
+    prog[n++] = (struct sock_filter)BPF_JUMP(BPF_JMP | BPF_JEQ | BPF_K,
+                                            134 /* rt_sigaction aarch64 */, 0, 4);
+    prog[n++] = (struct sock_filter)BPF_STMT(BPF_LD | BPF_W | BPF_ABS,
+                                            offsetof(struct seccomp_data, args[0]));
+    prog[n++] = (struct sock_filter)BPF_JUMP(BPF_JMP | BPF_JEQ | BPF_K, 11 /* SIGSEGV */, 0, 1);
+    prog[n++] = (struct sock_filter)BPF_STMT(BPF_RET | BPF_K, SECCOMP_RET_ERRNO | EPERM);
+    prog[n++] = (struct sock_filter)BPF_STMT(BPF_RET | BPF_K, SECCOMP_RET_ALLOW);
+    prog[n++] = (struct sock_filter)BPF_STMT(BPF_RET | BPF_K, SECCOMP_RET_ALLOW);
+    struct sock_fprog fprog = { .len = (unsigned short)n, .filter = prog };
+    long r = syscall((long)277, 1UL, 0UL, &fprog);
+    { char b[48]; char *p = b; const char *q = "[dbg-sa-block] ret=";
+      for (; *q; q++) *p++ = *q;
+      long v = r; if (v < 0) v = -v;
+      static const char hx[] = "0123456789abcdef";
+      for (int s = 28; s >= 0; s -= 4) *p++ = hx[(v >> s) & 0xf];
+      *p++ = '\n'; sys_write(2, b, (size_t)(p - b)); }
 }
 
 int elf_run(elf_object_t *obj, int argc, char **argv, char **envp) {
@@ -2577,6 +2689,8 @@ static __attribute__((noreturn)) void elf_run_final(void *sp, void *entry,
      * handler → náš fault dump se nezobrazí; flag umožní reinstalaci */
     if (getenv("ELF_LOADER_KEEP_HANDLERS"))
         elf_install_fault_handlers();
+    if (getenv("ELF_LOADER_DEBUG_PC"))
+        elf_install_debug_sigaction_block();
     fflush(stderr);
     extern void elf_final_jump(void *, void *, uintptr_t, void (*)(void));
     elf_final_jump(sp, entry, g_tls_new_tp, elf_run_pending_inits);

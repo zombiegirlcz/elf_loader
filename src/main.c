@@ -9,6 +9,7 @@
 #include <unistd.h>
 #include <sys/resource.h>
 extern int elf_debug(void);
+void elf_set_crash_scope(elf_scope_t *s);
 
 static const char *status_str(sym_status_t st) {
     switch (st) {
@@ -143,6 +144,7 @@ static int run_ownall(const char *path, int argc, char **argv, char **envp) {
 
     elf_object_t *obj = elf_load(path);
     elf_own_scope = NULL;
+    elf_set_crash_scope(scope);
     if (!obj) {
         elf_scope_destroy(scope);
         return 1;
