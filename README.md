@@ -36,8 +36,10 @@ elroot <prikaz> [args]               # AUTO: je-li su dostupné (ROOT), spustí 
                                      #        jinak elf_loader --ownall (NON-ROOT)
 elroot --chroot <prikaz>             # vynutit root chroot (plný fs, žádný seccomp)
 elroot --ownall <prikaz>             # vynutit non-root (elf_loader --ownall)
-elroot zsh                            # na root. telefonu = ROOT chroot; pro NON-ROOT: elroot --ownall zsh
-elroot --chroot zsh                  # zsh nativně v chrootu (vyžaduje root)
+elroot zsh                            # ROOT (auto) -> plny interaktivni zsh 5.9 (ZLE/completion/barvy)
+elroot --chroot zsh                  # ROOT -> zsh v chrootu (plny zsh)
+elroot --ownall zsh                   # POZOR: non-root -> zsh nenajde moduly (ZLE nefunguje),
+                                     #         pro non-root shell pouzij gbsh
 ```
 
 Přímo přes loader (bez elrootu):
