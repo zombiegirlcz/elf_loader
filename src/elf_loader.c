@@ -2524,6 +2524,13 @@ static void sigsys_handler(int sig, siginfo_t *si, void *uc) {
         case 218: emu = -38; break;       /* request_key    -> -ENOSYS */
         case 219: emu = -38; break;       /* keyctl         -> -ENOSYS */
         case 236: emu = -38; break;       /* get_mempolicy  -> -ENOSYS */
+        case 116: emu = -38; break;       /* syslog (dmesg) -> -ENOSYS */
+        case 264: emu = -38; break;       /* name_to_handle_at -> -ENOSYS */
+        case 439: emu = -38; break;       /* faccessat2 (systemd) -> -ENOSYS */
+        case 180 ... 185: emu = -38; break;  /* mq_* (POSIX queues) -> -ENOSYS */
+        case 186 ... 189: emu = -38; break;  /* msg* (SysV) -> -ENOSYS */
+        case 190 ... 193: emu = -38; break;  /* sem* (SysV) -> -ENOSYS */
+        case 194: case 195: case 198: case 199: emu = -38; break; /* shm* (SysV) -> -ENOSYS */
         default: break;
     }
     if (emu != -999) {
