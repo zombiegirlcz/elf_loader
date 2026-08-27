@@ -79,10 +79,13 @@ while IFS= read -r C; do
     first=0
     idx=$((idx+1))
 done < /tmp/.push.lines
-ashell -c "/system/bin/base64 -d $DST.b64 | /system/bin/gunzip > $DST && /system/bin/chmod $PERMS $DST" >/dev/null 2>&1
+# dekódovat do .new a atomicky rename (mv -f funguje i když je $DST prave
+# spusteny / busy -> vyhne se ETXTBSY pri > $DST truncate)
+ashell -c "/system/bin/base64 -d $DST.b64 | /system/bin/gunzip > $DST.new && /system/bin/mv -f $DST.new $DST && /system/bin/chmod $PERMS $DST" >/dev/null 2>&1
 GOT2=$(ashell -c "/system/bin/wc -c $DST" 2>/dev/null | awk '{print $1}')
 ORIG=$(stat -c%s "$SRC")
 if [ "$GOT2" = "$ORIG" ]; then
+    ashell -c "/system/bin/rm -f $DST.b64" >/dev/null 2>&1
     echo "OK: $DST ($GOT2 B, $idx chunků, $FAILURES retry)"
 else
     echo "FAIL: $DST má $GOT2 B, očekáváno $ORIG B"; exit 1

@@ -3,11 +3,21 @@
 
 MODDIR=${0%/*}
 
+# univerzalni detekce rootfs (bez hardcoded jmena aplikace)
+detect_rootfs() {
+    for base in /data/user/0/*/files /data/data/*/files /data/adb/*/files; do
+        if [ -d "$base/nh/distro/parrot" ]; then
+            echo "$base/nh/distro/parrot"; return 0
+        fi
+    done
+    return 1
+}
+
 # 1) Rootfs konfigurace: /data/adb/parrot_root obsahuje cestu k rootfs.
 if [ ! -f /data/adb/parrot_root ]; then
     mkdir -p /data/adb
-    if [ -d /data/user/0/com.linux_core/files/nh/distro/parrot ]; then
-        echo "/data/user/0/com.linux_core/files/nh/distro/parrot" > /data/adb/parrot_root
+    if RF=$(detect_rootfs); then
+        echo "$RF" > /data/adb/parrot_root
     else
         echo "/data/adb/parrot" > /data/adb/parrot_root
     fi

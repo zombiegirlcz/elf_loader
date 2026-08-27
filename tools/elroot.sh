@@ -1,14 +1,23 @@
 #!/system/bin/sh
-# elroot - PRoot-like launcher pro parrot rootfs (vyuziva elf_loader + gbsh).
-# Spusti prikaz z parrot rootfs:
-#   - preferovane pres ROOT chroot (plny parrot fs + zadny seccomp) -> vse funguje
-#   - fallback na elf_loader --ownall (non-root, 409/412 binarek v provozu)
+# elroot - PRoot-like launcher pro libovolny glibc rootfs (vyuziva elf_loader + gbsh).
+# Spusti prikaz z rootfs:
+#   - preferovane pres ROOT chroot (plny fs + zadny seccomp) -> vse funguje
+#   - fallback na elf_loader --ownall (non-root)
+# Vse se bere z ENV (univerzalni, bez hardcoded cest k aplikaci):
+#   ROOTFS     cesta k distro rootfs (napr. /data/.../nh/distro/parrot)
+#   ELF_LOADER cesta k elf_loader binarce (vychozi: $ROOTFS/../usr/bin/elf_loader, pak /system/bin/elf_loader)
+#   GBSH       cesta k gbsh (vychozi: $ROOTFS/../usr/bin/gbsh, pak /system/bin/gbsh)
+#   SU         cesta k su (vychozi /product/bin/su)
 # Pouziti: elroot [--ownall|-n] [--chroot|-r] [--rootfs DIR] <prikaz> [args...]
-F=/data/user/0/com.linux_core/files
-R=${ROOTFS:-$F/nh/distro/parrot}
-L=$F/usr/bin/elf_loader
-G=$F/usr/bin/gbsh
-SU=/product/bin/su
+R="${ROOTFS:-}"
+if [ -z "$R" ]; then
+  echo "elroot: ROOTFS není nastaven — export ROOTFS=/cesta/k/distro (nebo --rootfs DIR)"; exit 1
+fi
+L="${ELF_LOADER:-$R/../usr/bin/elf_loader}"
+[ -x "$L" ] || L=/system/bin/elf_loader
+G="${GBSH:-$R/../usr/bin/gbsh}"
+[ -x "$G" ] || G=/system/bin/gbsh
+SU="${SU:-/product/bin/su}"
 
 # cista cesta pro interni prikazy (ashell ma v PATH parrot cesty)
 export PATH=/system/bin:/system/xbin

@@ -7,12 +7,23 @@
 #    even before reboot applies the Magisk mounts.
 MODDIR=${0%/*}
 
+# univerzalni detekce rootfs: prvni adresar obsahujici nh/distro/parrot
+# pod beznyma app cestama (bez hardcoded jmena aplikace)
+detect_rootfs() {
+    for base in /data/user/0/*/files /data/data/*/files /data/adb/*/files; do
+        if [ -d "$base/nh/distro/parrot" ]; then
+            echo "$base/nh/distro/parrot"; return 0
+        fi
+    done
+    return 1
+}
+
 mkdir -p /data/adb 2>/dev/null
 
 if [ ! -f /data/adb/parrot_root ]; then
-    if [ -d /data/user/0/com.linux_core/files/nh/distro/parrot ]; then
-        echo "/data/user/0/com.linux_core/files/nh/distro/parrot" > /data/adb/parrot_root
-        echo "parrot: using existing app rootfs"
+    if RF=$(detect_rootfs); then
+        echo "$RF" > /data/adb/parrot_root
+        echo "parrot: using detected rootfs $RF"
     else
         echo "/data/adb/parrot" > /data/adb/parrot_root
         echo "parrot: default rootfs /data/adb/parrot"

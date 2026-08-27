@@ -1587,20 +1587,26 @@ static void print_prompt(void) {
 /* ─────────────────────────── init ─────────────────────────── */
 
 static void detect_env(void) {
+    /* ROOTFS musí přijít z ENV (univerzální — žádná hardcoded cesta k aplikaci).
+       Nastaví ho launcher (elroot) nebo uživatel:
+         export ROOTFS=/cesta/k/distro   (např. parrot rootfs) */
     const char *rf = getenv("ROOTFS");
-    if (!rf || !rf[0]) rf = "/data/user/0/com.linux_core/files/nh/distro/parrot";
+    if (!rf || !rf[0]) {
+        fprintf(stderr, "gbsh: ROOTFS není nastaven — export ROOTFS=/cesta/k/distro "
+                        "(např. parrot rootfs) a spusť znovu\n");
+        exit(1);
+    }
     snprintf(g_rootfs, sizeof g_rootfs, "%s", rf);
     /* host entry point: kam se dostaneš cd .. z "/" rootfs světa */
     snprintf(g_host_entry, sizeof g_host_entry, "%s",
-             env_or("HOST_ENTRY", env_or("HOME", "/data")));
-
+             env_or("HOST_ENTRY", env_or("HOME", "/")));
 
     const char *elf = getenv("ELF_LOADER");
     if (elf && elf[0])
         snprintf(g_elfloader, sizeof g_elfloader, "%s", elf);
     else {
-        const char *home = env_or("HOME", "/data/data/com.linux_core/files");
-        snprintf(g_elfloader, sizeof g_elfloader, "%s/usr/bin/elf_loader", home);
+        /* výchozí: elf_loader leží vedle rootfs (../usr/bin), jinak systemová cesta */
+        snprintf(g_elfloader, sizeof g_elfloader, "%s/../usr/bin/elf_loader", g_rootfs);
         if (access(g_elfloader, X_OK) != 0)
             snprintf(g_elfloader, sizeof g_elfloader, "/system/bin/elf_loader");
     }
@@ -1684,6 +1690,17 @@ static int setup_chroot(void) {
     return 0;
 }
 
+/* výchozí barvy (pokud je uživatel nepřepsal v ~/.gbshrc)
+   — gbsh spouští parrot ls/grep přes ownall, které barvy umí,
+     jen chybí --color alias jako v běžném shellu */
+static void set_default_aliases(void) {
+    if (!alias_lookup("ls"))    alias_set("ls",   "ls --color=auto");
+    if (!alias_lookup("grep"))  alias_set("grep", "grep --color=auto");
+    if (!alias_lookup("fgrep")) alias_set("fgrep","fgrep --color=auto");
+    if (!alias_lookup("egrep")) alias_set("egrep","egrep --color=auto");
+    if (!alias_lookup("diff"))  alias_set("diff", "diff --color=auto");
+}
+
 int main(int argc, char **argv) {
     const char *cmd_string = NULL;
     /* CLI flags: --double-world/-dw, -c <command>, --version */
@@ -1741,6 +1758,7 @@ int main(int argc, char **argv) {
     }
 
     load_rc();
+    set_default_aliases();
 
     /* gbsh -c <command>: spustit příkaz a skončit s jeho statusem.
        Rc se načítá (na rozdíl od bashe), aby měl příkaz k dispozici
