@@ -2505,14 +2505,31 @@ static void sigsys_handler(int sig, siginfo_t *si, void *uc) {
     (void)sig;
     ucontext_t *ctx = (ucontext_t *)uc;
     long nr = si->si_syscall;
-    /* Emulovatelné syscally zakazané Androidím seccompem:
-     * 151 setfsuid, 152 setfsgid. Binarky je volaji best-effort (app nemeni
-     * UID), navratovou hodnotu obvykle ignoruji. Vratime soucasne UID a
-     * preskocime svc #0 -> binarka pokracuje, jako by syscall "prosel". */
-    if (nr == 151 || nr == 152) {
-        ctx->uc_mcontext.pc += 4;              /* preskoc svc #0 */
-        ctx->uc_mcontext.regs[0] = getuid();   /* navrat = fsuid */
-        return;                                /* sigreturn -> pokracovani */
+    /* Emulovatelné syscally zakazané Androidím seccompem.
+     * Handler se spusti POUZE pri SIGSYS = syscall zablokovaný seccomp filtrem;
+     * povolené syscally jdou na reálné jádro a sem vubec nedojdou.
+     * Vracíme benigní hodnotu a preskocíme svc #0 -> binárka pokracuje.
+     * (futex_waitv 444 apod. vyžadují reálné jádro -> neemulovatelné.) */
+    long emu = -999;  /* -999 = nemáme emulaci pro tento nr */
+    switch (nr) {
+        case 151: emu = getuid(); break;  /* setfsuid  (best-effort, navrat ignorovan) */
+        case 152: emu = getuid(); break;  /* setfsgid  (best-effort, navrat ignorovan) */
+        case 140: emu = 0; break;         /* setpriority (best-effort) */
+        case 141: emu = 0; break;         /* getpriority (best-effort) */
+        case 235: emu = 0; break;         /* mbind */
+        case 237: emu = 0; break;         /* set_mempolicy */
+        case 238: emu = 0; break;         /* migrate_pages */
+        case 239: emu = 0; break;         /* move_pages */
+        case 217: emu = -38; break;       /* add_key        -> -ENOSYS */
+        case 218: emu = -38; break;       /* request_key    -> -ENOSYS */
+        case 219: emu = -38; break;       /* keyctl         -> -ENOSYS */
+        case 236: emu = -38; break;       /* get_mempolicy  -> -ENOSYS */
+        default: break;
+    }
+    if (emu != -999) {
+        ctx->uc_mcontext.pc += 4;             /* preskoc svc #0 */
+        ctx->uc_mcontext.regs[0] = emu;       /* emulovaná navratová hodnota */
+        return;                               /* sigreturn -> pokracovani */
     }
     char buf[64];
     const char *pre = "[SIGSYS] denied syscall nr=";
