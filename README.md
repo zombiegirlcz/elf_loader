@@ -103,21 +103,33 @@ loader načte host binárku (bionic) i guest glibc rootfs, při JUMP_SLOT /
 import resolvenutí dává F2 override (vlastní `open`/`open64`/`openat`/
 `openat64`/`statx`/`fstatat`/`symlink`/`rename`/`unlink`/`mkdir`/`rmdir` shimy)
 přednost před host symbolem. Shimy překládají absolutní `/…` cesty na
-`$ROOTFS/…` (exclude list `/proc /sys /dev /system /data …` se nepřekládá)
-a volají původní glibc funkci přes `g_orig_*`.
+`$ROOTFS/…` a volají původní glibc funkci přes `g_orig_*`.
 
-**Status (testováno na device):**
-- ✅ Stabilní (žádné pády; `maps-begin=0` pro všechny příkazy).
+**Seccomp proot-lite (syscall-level path translation):** kromě PLT/GOT override
+instaluje F2 před `elf_load` seccomp filtr, který pro path-syscally
+(`openat=56`, `statx=291`, `newfstatat=79`, `readlinkat=78`, `faccessat=48`)
+vrací `SECCOMP_RET_TRAP`. SIGSYS handler přeloží cestu (x1) na `$ROOTFS/…` a
+**vyřeší symlinkové řetězy** (proot-lite `f2_realpath`: `newfstatat`+
+`readlinkat` smyčka, absolutní cíle přeložené na `$ROOTFS`), pak zemuluje
+syscall raw `svc #0` s `F2_SENTINEL` v `x5` (filtr jej pustí → zabrání
+zacyklení). To chytí i glibc IFUNC-resolved `open64`/`__openat64`, jejichž
+GOT je předplněný při loadu a PLT-override je nechytí (viz historie níže).
+Handler běží v parrot TLS → používá jen ruční `sys_write`/`raw_syscall6`.
+
+**Status (testováno na device, 23+ příkazů, `maps-begin=0` = žádný pád):**
 - ✅ Funguje: `cat head wc ls stat find realpath dirname basename
-  python3 --version apt apt-get ldconfig` (vč. symlink/rename hooků pro
-  dpkg/ldconfig — `ldconfig` už nehlásí `Can't link`).
-- ⚠️ `sed`/`sort`/`awk` (a další GNU textutils) **neotevřou** soubory: jejich
-  `fopen` → glibc IFUNC-resolved `open64`/`__openat64` má GOT předplněný při
-  loadu, takže PLT-override ho nechytí (raw syscall jde na nepřeloženou host
-  cestu → ENOENT). Inline-hook na kód glibc by to vyřešil, ale na tomto device
-  mají všechny glibc funkce **BTI** entry → trampolína faultne. Kompletní
-  řešení = seccomp proot-lite (zachycení open/openat/statx v SIGSYS) — zatím
-  není implementováno.
+  sed sort awk mawk grep cut tr uniq python3 --version apt apt-get ldconfig`.
+- ✅ Symlinkové řetězy se řeší: `awk` je `/usr/bin/awk → /etc/alternatives/
+  awk → /usr/bin/gawk`; `ls -l` správně ukazuje `→` šipky.
+- ✅ `ldconfig`/`dpkg` symlink/rename hooky (žádné `Can't link`).
+- ⚠️ `statx` má `AT_SYMLINK_NOFOLLOW` v `x2` (ne `x3`) → handler čte flagy dle
+  syscallu (openat/statx=`a2`, newfstatat/faccessat=`a3`), jinak by `lstat`
+  nechtěně vyřešil symlink.
+- ⚠️ Exclude list (host fs, který se NEPŘEKLÁDÁ) je `/proc /sys /dev /system
+  /apex /vendor /product /odm /mnt /metadata` — **`/data` tam není**, protože
+  `$ROOTFS` žije pod `/data/…`; kdyby v exclude byl, ROOTFS cesta by se
+  shodovala s `/data`+`/` a `f2_realpath` by ji vyloučil → symlinky pod
+  ROOTFS by se nerozvinuly (ENOENT, např. právě `awk`).
 - Build: `modal run finale_loader_build.py` (flagy `-O0 -g`, bez `-Werror`).
 
 Spuštění přes `elroot --shim <cmd>` (viz `tools/elroot.sh`).

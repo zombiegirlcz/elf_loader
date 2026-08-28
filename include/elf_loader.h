@@ -64,6 +64,8 @@ void elf_unload(elf_object_t *obj);
 
 void elf_install_fault_handlers(void);
 void elf_install_compat(void);
+void f2_set_root(const char *r);          /* F2: nastav ROOTFS pro seccomp path-translaci */
+void install_f2_path_filter(void);     /* F2: stackovany RET_TRAP filtr pro openat/statx/... */
 elf_tls_ctx_t elf_setup_own_tls(elf_object_t *exe, elf_scope_t *scope);
 void elf_teardown_own_tls(elf_tls_ctx_t *ctx);
 void ldso_install_exe_linkmap(elf_object_t *exe, const char *name);

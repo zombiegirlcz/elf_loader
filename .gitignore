@@ -28,3 +28,4 @@ magisk-module/*.zip
 .pi/
 .qmd/index.sqlite
 *.log
+files/

@@ -86,69 +86,12 @@ static int run(const char *path, int argc, char **argv, char **envp) {
 
 static int run_ownall(const char *path, int argc, char **argv, char **envp);
 
-/* F2: nainstalujeme seccomp filtr, ktery pro Androidem blokovane syscally
- * vraci -errno misto SIGSYS (RET_TRAP). Filtr se dedi pres execve do glibc
- * procesu (signal handler naopak po execve zmizi, a glibc init vola
- * setfsuid jeste pred konstruktorem LD_PRELOAD .so -> handler by nezasahl).
- * RET_ERRNO ma vyssi prioritu nez appuv RET_TRAP, takze ho prebije.
- * setfsuid/setfsgid/setpriority/getpriority/mbind/... -> errno 0 (uspech),
- * keyctl/syslog/name_to_handle_at/faccessat2/mq/msg/sem/shm -> ENOSYS. */
-static void install_f2_seccomp(void) {
-    struct sock_filter f[96];
-    int n = 0;
-    f[n++] = (struct sock_filter)BPF_STMT(BPF_LD | BPF_W | BPF_ABS,
-                                          offsetof(struct seccomp_data, nr));
-#define F2_ADD(nr, eno) do { \
-        f[n++] = (struct sock_filter)BPF_JUMP(BPF_JMP | BPF_JEQ | BPF_K, (nr), 0, 1); \
-        f[n++] = (struct sock_filter)BPF_STMT(BPF_RET | BPF_K, \
-                  SECCOMP_RET_ERRNO | ((eno) & SECCOMP_RET_DATA)); \
-    } while (0)
-    /* best-effort: vrat 0 (uspech) */
-    F2_ADD(151, 0);  /* setfsuid */
-    F2_ADD(152, 0);  /* setfsgid */
-    F2_ADD(140, 0);  /* setpriority */
-    F2_ADD(141, 0);  /* getpriority */
-    F2_ADD(235, 0);  /* mbind */
-    F2_ADD(237, 0);  /* set_mempolicy */
-    F2_ADD(238, 0);  /* migrate_pages */
-    F2_ADD(239, 0);  /* move_pages */
-    /* ENOSYS */
-    F2_ADD(217, 38); /* add_key */
-    F2_ADD(218, 38); /* request_key */
-    F2_ADD(219, 38); /* keyctl */
-    F2_ADD(236, 38); /* get_mempolicy */
-    F2_ADD(116, 38); /* syslog */
-    F2_ADD(264, 38); /* name_to_handle_at */
-    F2_ADD(439, 38); /* faccessat2 */
-    /* nove syscally, ktere glibc zkousi a pri ENOSYS fallbackne: */
-    F2_ADD(435, 38); /* clone3 -> ENOSYS => glibc pouzije clone */
-    F2_ADD(436, 38); /* close_range */
-    F2_ADD(437, 38); /* openat2 */
-    F2_ADD(434, 38); /* pidfd_open */
-    F2_ADD(424, 38); /* pidfd_send_signal */
-    F2_ADD(438, 38); /* pidfd_getfd */
-    F2_ADD(444, 38); /* futex_waitv */
-    F2_ADD(442, 38); /* landlock_create_ruleset */
-    F2_ADD(443, 38); /* landlock_add_rule */
-    F2_ADD(444, 38); /* futex_waitv */
-    /* mq_* */
-    F2_ADD(180, 38); F2_ADD(181, 38); F2_ADD(182, 38); F2_ADD(183, 38);
-    F2_ADD(184, 38); F2_ADD(185, 38);
-    /* msg* (SysV) */
-    F2_ADD(186, 38); F2_ADD(187, 38); F2_ADD(188, 38); F2_ADD(189, 38);
-    /* sem* (SysV) */
-    F2_ADD(190, 38); F2_ADD(191, 38); F2_ADD(192, 38); F2_ADD(193, 38);
-    /* shm* (SysV) */
-    F2_ADD(194, 38); F2_ADD(195, 38); F2_ADD(198, 38); F2_ADD(199, 38);
-#undef F2_ADD
-    f[n++] = (struct sock_filter)BPF_STMT(BPF_RET | BPF_K, SECCOMP_RET_ALLOW);
-    struct sock_fprog p = { .len = (unsigned short)n, .filter = f };
-    long pr = prctl(PR_SET_NO_NEW_PRIVS, 1, 0, 0, 0);
-    long sc = syscall(__NR_seccomp, SECCOMP_SET_MODE_FILTER, 0, &p);
-    if (elf_debug()) {
-        fprintf(stderr, "[F2-seccomp] prctl_nnp=%ld seccomp=%ld (n=%d)\n", pr, sc, n);
-    }
-}
+/* F2: path-translatni seccomp (non-root) je implementovan v elf_loader.c
+ * (install_f2_path_filter + sigsys_handler): pro path-syscally (openat/statx/
+ * newfstatat/readlinkat/faccessat) vraci SIGSYS, handler prelozi cestu a
+ * zemuluje syscall pomoci SENTINEL v x5 (filtr jej pusti, zabrani zacykleni).
+ * Stejna sada plati i pro Androidem blokovane emulovatelne syscally
+ * (setfsuid/keyctl/... viz sigsys_handler). */
 
 /* ===== F2: path-translation shim (non-root, fakechroot-style) =====
  * Prepend $ROOTFS k absolutnim cestam ("/" -> "$ROOTFS/") pro parrot binarky
@@ -370,7 +313,6 @@ static int hook_install(f2_hook_t *h) {
 
 typedef int (*fp_open)(const char *, int, ...);
 static int g_loader_active = 0;        /* 1 = loaderuv vlastni kod (bionic TLS) */
-static fp_open g_bionic_open = NULL;   /* zachytny bionic open (pred override) */
 typedef int (*fp_openat)(int, const char *, int, ...);
 static int shim_open(const char *p, int flags, ...) {
     char buf[8192]; const char *path = p;
@@ -712,6 +654,10 @@ static int run_ownall(const char *path, int argc, char **argv, char **envp) {
     elf_init_envp = envp;
 
     g_loader_active = 1;  /* loaderuv kod (bionic TLS): jeho open = bionicky */
+    /* F2 seccomp filtr MUSI byt nainstalovan pred elf_load, aby loader oteviral
+     * i symlinkovane guest binarky (awk -> /etc/alternatives/awk -> gawk):
+     * bez filtru by kernel resil symlink proti realnemu rootu -> ENOENT. */
+    if (g_f2_active) { f2_set_root(g_shim_root); install_f2_path_filter(); }
     elf_object_t *obj = elf_load(path);
     elf_own_scope = NULL;
     elf_set_crash_scope(scope);

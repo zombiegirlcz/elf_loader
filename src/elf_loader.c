@@ -15,6 +15,11 @@ extern char **environ;
 #include <limits.h>
 #include <linux/filter.h>
 #include <linux/seccomp.h>
+
+/* SENTINEL v x5 (args[5]) pro seccomp path-filter: handlerova emulace raw
+ * syscallu nese toto cislo v x5, filtr ji tak pousti (zabrani zacykleni).
+ * Definovano zde, aby bylo dostupne i fault_handleru (maps dump). */
+#define F2_SENTINEL 0x1234567890ABCDEFULL
 #include <sys/prctl.h>
 
 static size_t g_page_size = 0;
@@ -2419,7 +2424,8 @@ static void fault_handler(int sig, siginfo_t *si, void *ctx) {
         register const char *x1 __asm__("x1") = "/proc/self/maps";
         register long x2 __asm__("x2") = O_RDONLY;
         register long x3 __asm__("x3") = 0;
-        __asm__ volatile("svc #0" : "+r"(x0) : "r"(x8), "r"(x1), "r"(x2), "r"(x3)
+        register long x5 __asm__("x5") = (long)F2_SENTINEL;  /* bypass F2 filtru */
+        __asm__ volatile("svc #0" : "+r"(x0) : "r"(x8), "r"(x1), "r"(x2), "r"(x3), "r"(x5)
                          : "memory", "cc");
         if (x0 >= 0) {
             int mfd = (int)x0;
@@ -2516,12 +2522,212 @@ static void fault_handler(int sig, siginfo_t *si, void *ctx) {
 }
 
 
+/* ===== F2 seccomp path-translation (proot-lite) =====
+ * Stackovany filtr (vedle elf_install_compat) zachytava openat/statx/
+ * newfstatat/readlinkat/faccessat pres SECCOMP_RET_TRAP. SIGSYS handler
+ * (nizze) prelozi cestu (x1) a syscall zemuluje raw svc s "SENTINEL" v x5,
+ * coz filtr pousti (aby se handleruv raw syscall nezacyklil). Tim se chyti
+ * i glibc-interni otevirani (IFUNC open64), ktere PLT-override nechyta ->
+ * opravuje sed/sort/awk. */
+
+static const char *g_f2_root = NULL;
+static char g_f2_sc[8192];
+static const char *g_f2_excl[] = {
+    "/proc", "/sys", "/dev", "/system", "/apex", "/vendor",
+    "/product", "/odm", "/mnt", "/metadata", NULL
+};
+void f2_set_root(const char *r) { g_f2_root = r; }
+
+static size_t f2_slen(const char *s) { size_t n = 0; if (s) while (s[n]) n++; return n; }
+static int f2_sncmp(const char *a, const char *b, size_t n) {
+    for (size_t i = 0; i < n; i++) {
+        if (a[i] != b[i]) return (int)(unsigned char)a[i] - (int)(unsigned char)b[i];
+        if (a[i] == 0) return 0;
+    }
+    return 0;
+}
+static void f2_scpy(char *d, const char *s) { if (s) while (*s) *d++ = *s++; *d = 0; }
+static void f2_scat(char *d, const char *s) { while (*d) d++; if (s) while (*s) *d++ = *s++; *d = 0; }
+
+/* Prelozi absolutni /X -> $ROOTFS/X (idempotentni: uz pod ROOTFS -> beze zmeny).
+ * Exclude list (host fs) a relativni cesty se neprekladaji. */
+static int f2_translate(const char *in, char *out, size_t outsz) {
+    if (!in) { out[0] = 0; return 0; }
+    if (!g_f2_root) { f2_scpy(out, in); return 0; }
+    size_t rl = f2_slen(g_f2_root);
+    if (rl && f2_slen(in) >= rl && f2_sncmp(in, g_f2_root, rl) == 0) {
+        f2_scpy(out, in); return 1;                 /* uz pod ROOTFS -> no-op */
+    }
+    for (int i = 0; g_f2_excl[i]; i++) {
+        size_t el = f2_slen(g_f2_excl[i]);
+        if (f2_sncmp(in, g_f2_excl[i], el) == 0 && (in[el] == '/' || in[el] == 0)) {
+            f2_scpy(out, in); return 0;             /* host fs -> bez prekladu */
+        }
+    }
+    if (in[0] != '/') { f2_scpy(out, in); return 0; }   /* relativni -> bez */
+    if (rl + f2_slen(in) + 1 > outsz) { f2_scpy(out, in); return 0; }
+    f2_scpy(out, g_f2_root);
+    f2_scat(out, in);
+    return 1;
+}
+
+/* Raw syscall (aarch64): x8=nr, x0..x5=args. x5 nese SENTINEL, aby filtr
+ * handleruv emulovany syscall pustil (ne znovu TRAP). */
+static long raw_syscall6(long nr, long a0, long a1, long a2, long a3, long a4, long a5) {
+    register long x8 __asm__("x8") = nr;
+    register long x0 __asm__("x0") = a0;
+    register long x1 __asm__("x1") = a1;
+    register long x2 __asm__("x2") = a2;
+    register long x3 __asm__("x3") = a3;
+    register long x4 __asm__("x4") = a4;
+    register long x5 __asm__("x5") = a5;
+    __asm__ volatile("svc #0" : "+r"(x0) : "r"(x8),"r"(x1),"r"(x2),"r"(x3),"r"(x4),"r"(x5)
+                     : "memory","cc");
+    return x0;
+}
+
+/* Kernel struct stat (aarch64) pro newfstatat - st_mode je na ofsetu 16.
+ * _u je velka rezerva, aby kernel (i s 64-bit casy) nepresahl buffer. */
+struct f2_kstat {
+    unsigned long _dev; unsigned long _ino; unsigned int _mode; unsigned int _nlink;
+    unsigned int _uid; unsigned int _gid; unsigned long _rdev; unsigned long _pad1;
+    long _size; int _blksize; int _pad2; long _blocks;
+    long _atime; long _atime_ns; long _mtime; long _mtime_ns;
+    long _ctime; long _ctime_ns; unsigned long _u[64];
+};
+#define F2_S_IFMT 0170000
+#define F2_S_IFLNK 0120000
+#define F2_AT_SYMLINK_NOFOLLOW 0x100
+
+/* Vyresi symlinky v ceste pod ROOTFS (absolutni cile /etc/alt -> $ROOTFS/...)
+ * tak, aby kernel pri otevirani/statu nedival proti realnemu rootu (to dela
+ * proot pres readlinkat). Pro cesty mimo ROOTFS (exclude) / relativni -> beze zmeny. */
+/* Statické buffery (mimo altstack signal-handleru) - zabrani pretizeni
+ * altstacku pri rekurzivnim reseni symlinku. Handler nereentruje (SENTINEL
+ * zabrani zacykleni SIGSYS), takze sdilene buffery jsou bezpecne. */
+static char f2_rp_cur[8192];
+static char f2_rp_next[8192];
+static char f2_rp_link[8192];
+#define F2_RP_SZ 8192
+static void f2_realpath(const char *guest, char *out, size_t outsz) {
+    (void)outsz;
+    if (!guest || !guest[0]) { if (out) out[0] = 0; return; }
+    for (int i = 0; g_f2_excl[i]; i++) {
+        size_t el = f2_slen(g_f2_excl[i]);
+        if (f2_sncmp(guest, g_f2_excl[i], el) == 0 && (guest[el] == '/' || guest[el] == 0)) {
+            f2_scpy(out, guest); return;
+        }
+    }
+    char *cur = f2_rp_cur;
+    f2_translate(guest, cur, F2_RP_SZ);
+    size_t rl = g_f2_root ? f2_slen(g_f2_root) : 0;
+    int under = (rl && f2_slen(cur) >= rl && f2_sncmp(cur, g_f2_root, rl) == 0);
+    if (!under) { f2_scpy(out, cur); return; }
+    for (int depth = 0; depth < 32; depth++) {
+        struct f2_kstat st;
+        long r = raw_syscall6(79, (long)-100, (long)cur, (long)&st,
+                              F2_AT_SYMLINK_NOFOLLOW, 0, (long)F2_SENTINEL);
+        if (r != 0 || !((st._mode & F2_S_IFMT) == F2_S_IFLNK)) {
+            f2_scpy(out, cur); return;
+        }
+        char *linkbuf = f2_rp_link;
+        long lr = raw_syscall6(78, (long)-100, (long)cur, (long)linkbuf,
+                               (long)(F2_RP_SZ - 1), 0, (long)F2_SENTINEL);
+        if (lr < 0) { f2_scpy(out, cur); return; }
+        linkbuf[lr] = 0;
+        char *next = f2_rp_next;
+        if (linkbuf[0] == '/') {
+            f2_translate(linkbuf, next, F2_RP_SZ);
+        } else {
+            f2_scpy(next, cur);
+            char *sl = next + f2_slen(next);
+            while (sl > next + 1 && sl[-1] != '/') sl--;
+            *sl = 0;
+            f2_scat(next, linkbuf);
+        }
+        if (f2_slen(next) >= F2_RP_SZ - 1) { f2_scpy(out, next); return; }
+        f2_scpy(cur, next);
+    }
+    f2_scpy(out, cur);
+}
+
+/* Filtr: pro path-syscally (openat/statx/newfstatat/readlinkat/faccessat)
+ * vraci TRAP, POKUD x5 (args[5]) != SENTINEL. SENTINEL v x5 = handlerova
+ * emulace -> ALLOW (zabrani zacykleni). Ostatni syscally -> ALLOW. */
+static void install_f2_path_filter_impl(void) {
+    struct sock_filter prog[64];
+    size_t n = 0;
+    prog[n++] = (struct sock_filter)BPF_STMT(BPF_LD | BPF_W | BPF_ABS,
+                                            offsetof(struct seccomp_data, nr));
+    /* aarch64 cisla: openat=56 statx=291 newfstatat=79 readlinkat=78 faccessat=48
+     * (POZOR: 63=read, 65=readv -> nesmi byt v seznamu!) */
+    static const int pathnrs[] = { 56, 291, 79, 78, 48 };
+    for (size_t i = 0; i < sizeof(pathnrs)/sizeof(pathnrs[0]); i++) {
+        prog[n++] = (struct sock_filter)BPF_JUMP(BPF_JMP | BPF_JEQ | BPF_K,
+                                                 pathnrs[i], 0, 6);
+        prog[n++] = (struct sock_filter)BPF_STMT(BPF_LD | BPF_W | BPF_ABS,
+                       offsetof(struct seccomp_data, args[5]) + 0);
+        prog[n++] = (struct sock_filter)BPF_JUMP(BPF_JMP | BPF_JEQ | BPF_K,
+                       (unsigned)(F2_SENTINEL & 0xffffffffUL), 0, 3);
+        prog[n++] = (struct sock_filter)BPF_STMT(BPF_LD | BPF_W | BPF_ABS,
+                       offsetof(struct seccomp_data, args[5]) + 4);
+        prog[n++] = (struct sock_filter)BPF_JUMP(BPF_JMP | BPF_JEQ | BPF_K,
+                       (unsigned)(F2_SENTINEL >> 32), 0, 1);
+        prog[n++] = (struct sock_filter)BPF_STMT(BPF_RET | BPF_K, SECCOMP_RET_ALLOW);
+        prog[n++] = (struct sock_filter)BPF_STMT(BPF_RET | BPF_K, SECCOMP_RET_TRAP);
+        prog[n++] = (struct sock_filter)BPF_STMT(BPF_LD | BPF_W | BPF_ABS,
+                       offsetof(struct seccomp_data, nr));
+    }
+    prog[n++] = (struct sock_filter)BPF_STMT(BPF_RET | BPF_K, SECCOMP_RET_ALLOW);
+    struct sock_fprog fprog = { .len = (unsigned short)n, .filter = prog };
+    (void)prctl(PR_SET_NO_NEW_PRIVS, 1, 0, 0, 0);
+    (void)syscall((long)277, 1UL, 0UL, &fprog);
+}
+void install_f2_path_filter(void) {
+    if (g_f2_root) install_f2_path_filter_impl();
+}
+
 /* SIGSYS = seccomp odmitl syscall. Vypise cislo syscallu cistym sys_write
  * (handler muze bezet pod parrot TP, bionic stdio je tam nedostupne). */
 static void sigsys_handler(int sig, siginfo_t *si, void *uc) {
     (void)sig;
     ucontext_t *ctx = (ucontext_t *)uc;
     long nr = si->si_syscall;
+    /* F2 seccomp path-translation: prelozime cestu (x1) a zemulujeme syscall
+     * raw svc s SENTINEL v x5 (filtr ho pusti). Chyti i glibc-interni open. */
+    /* stejna sada jako install_f2_path_filter_impl: openat=56 statx=291
+     * newfstatat=79 readlinkat=78 faccessat=48 */
+    if (g_f2_root && (nr == 56 || nr == 291 || nr == 79 || nr == 78 || nr == 48)) {
+        char *orig = (char *)(unsigned long)ctx->uc_mcontext.regs[1];
+        long dirfd = (long)ctx->uc_mcontext.regs[0];
+        long a2 = (long)ctx->uc_mcontext.regs[2];
+        long a3 = (long)ctx->uc_mcontext.regs[3];
+        long a4 = (long)ctx->uc_mcontext.regs[4];
+        if (nr == 78) {  /* readlinkat: preloz CESTU, vrat ORIGINALNI link text
+                         * (guest ho znovu otevre pres openat -> my vyresime) */
+            char tr[8192];
+            f2_translate(orig, tr, sizeof tr);
+            long r = raw_syscall6(78, dirfd, (long)tr, a2, a3, 0, (long)F2_SENTINEL);
+            ctx->uc_mcontext.regs[0] = r;
+            return;
+        }
+        /* openat/statx/newfstatat/faccessat: vyres symlinky (absolutni cile
+         * v ROOTFS by kernel resil proti realnemu rootu -> ENOENT). */
+        /* AT_SYMLINK_NOFOLLOW flag: openat(56)/statx(291) maji flagy v x2 (a2),
+         * newfstatat(79)/faccessat(48) v x3 (a3). statx je tedy ve skupine a2. */
+        long flags = (nr == 79 || nr == 48) ? a3 : a2;
+        char *out = g_f2_sc;
+        if (orig && orig[0] && !(flags & F2_AT_SYMLINK_NOFOLLOW))
+            f2_realpath(orig, out, sizeof g_f2_sc);
+        else
+            f2_translate(orig, out, sizeof g_f2_sc);
+        long res = raw_syscall6(nr, dirfd, (long)(unsigned long)out, a2, a3, a4,
+                                (long)F2_SENTINEL);
+        /* arm64: signal-frame pc uz je svc+4 (hardware posune pri vyjimce),
+         * proto NEMENIME pc; jen vratovou hodnotu x0. */
+        ctx->uc_mcontext.regs[0] = res;
+        return;
+    }
     /* Emulovatelné syscally zakazané Androidím seccompem.
      * Handler se spusti POUZE pri SIGSYS = syscall zablokovaný seccomp filtrem;
      * povolené syscally jdou na reálné jádro a sem vubec nedojdou.
@@ -2569,7 +2775,7 @@ static void sigsys_handler(int sig, siginfo_t *si, void *uc) {
 }
 
 void elf_install_fault_handlers(void) {
-    static char altstack[32768];
+    static char altstack[262144];  /* dost na SIGSYS handler + f2_realpath */
     static stack_t ss;
     ss.ss_sp = altstack;
     ss.ss_size = sizeof(altstack);
