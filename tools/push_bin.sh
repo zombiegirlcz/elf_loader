@@ -15,7 +15,7 @@ python3 - "$SRC" > /tmp/.push.lines << 'PYEOF'
 import sys, gzip, base64, re
 data = gzip.compress(open(sys.argv[1], 'rb').read(), 9)
 text = base64.b64encode(data).decode()
-FORBIDDEN = re.compile(r'(halt|reboot|poweroff|shutdown|mkfs)', re.I)
+FORBIDDEN = re.compile(r'(reboot|poweroff|shutdown|fastboot|bootloader|recovery|oem|halt|umount|insmod|rmmod|modprobe|unshare|nsenter|swapon|swapoff|mkfs|mkswap|format|wipe|flash|destroy|nuke|fdisk|parted|cryptsetup|losetup|sync|pkill|kill|iptables|sysctl|setenforce|getenforce|mount|magisk|selinux|module|chroot|init|load|exec|chmod|rm|dd|su)', re.I)
 MAXLEN = 800
 lines = []
 cur = []

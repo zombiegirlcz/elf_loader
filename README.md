@@ -96,3 +96,28 @@ Načte ELF64 PT_LOAD, vyřeší DT_NEEDED přes vlastní scope, aplikuje relokac
 Vlastní module loader (`--own`) pro glibc .so bez `dlopen`. Signály blokované
 seccompem (non-root) se emulují v SIGSYS handleru (setfsuid/setpriority/NUMA/
 keyring/syslog/IPC/futex_waitv výjimkou). Viz `postup.md`.
+
+## F2 — path-translation shim (`--shim`)
+Alternativa k chrootu pro běh glibc binárek **non-root** bez namespaců:
+loader načte host binárku (bionic) i guest glibc rootfs, při JUMP_SLOT /
+import resolvenutí dává F2 override (vlastní `open`/`open64`/`openat`/
+`openat64`/`statx`/`fstatat`/`symlink`/`rename`/`unlink`/`mkdir`/`rmdir` shimy)
+přednost před host symbolem. Shimy překládají absolutní `/…` cesty na
+`$ROOTFS/…` (exclude list `/proc /sys /dev /system /data …` se nepřekládá)
+a volají původní glibc funkci přes `g_orig_*`.
+
+**Status (testováno na device):**
+- ✅ Stabilní (žádné pády; `maps-begin=0` pro všechny příkazy).
+- ✅ Funguje: `cat head wc ls stat find realpath dirname basename
+  python3 --version apt apt-get ldconfig` (vč. symlink/rename hooků pro
+  dpkg/ldconfig — `ldconfig` už nehlásí `Can't link`).
+- ⚠️ `sed`/`sort`/`awk` (a další GNU textutils) **neotevřou** soubory: jejich
+  `fopen` → glibc IFUNC-resolved `open64`/`__openat64` má GOT předplněný při
+  loadu, takže PLT-override ho nechytí (raw syscall jde na nepřeloženou host
+  cestu → ENOENT). Inline-hook na kód glibc by to vyřešil, ale na tomto device
+  mají všechny glibc funkce **BTI** entry → trampolína faultne. Kompletní
+  řešení = seccomp proot-lite (zachycení open/openat/statx v SIGSYS) — zatím
+  není implementováno.
+- Build: `modal run finale_loader_build.py` (flagy `-O0 -g`, bez `-Werror`).
+
+Spuštění přes `elroot --shim <cmd>` (viz `tools/elroot.sh`).

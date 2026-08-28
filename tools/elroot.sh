@@ -27,8 +27,9 @@ while [ $# -gt 0 ]; do
   case "$1" in
     --ownall|-n) MODE=ownall; shift ;;
     --chroot|-r) MODE=chroot; shift ;;
+    --shim|-s)    MODE=shim; shift ;;
     --rootfs)    R="$2"; shift 2 ;;
-    --help|-h)   echo "elroot [--ownall|--chroot] [--rootfs DIR] <prikaz> [args]"; exit 0 ;;
+    --help|-h)   echo "elroot [--ownall|-n|--chroot|-r|--shim|-s] [--rootfs DIR] <prikaz> [args]"; exit 0 ;;
     *) break ;;
   esac
 done
@@ -50,19 +51,19 @@ if [ "$MODE" != "ownall" ] && [ -x "$SU" ]; then
   if "$SU" -c '/system/bin/id -u' 2>/dev/null | /system/bin/grep -q '^0$'; then ROOT_OK=1; fi
 fi
 
-if [ "$MODE" = "ownall" ]; then
-  :
-elif [ "$MODE" = "chroot" ] && [ "$ROOT_OK" -eq 0 ]; then
+if [ "$MODE" = "chroot" ] && [ "$ROOT_OK" -eq 0 ]; then
   echo "elroot: --chroot vyžaduje root (su není dostupný)"; exit 1
-elif [ "$ROOT_OK" -eq 1 ]; then
-  MODE=chroot
-else
-  MODE=ownall
+fi
+# ownall/shim zustavaji jak jsou; jinak auto -> chroot (root) / ownall
+if [ "$MODE" != "ownall" ] && [ "$MODE" != "shim" ]; then
+  if [ "$ROOT_OK" -eq 1 ]; then MODE=chroot; else MODE=ownall; fi
 fi
 
 if [ "$MODE" = "chroot" ]; then
   ARGS="$@"
   exec "$SU" -c "ROOTFS=$R '$G' --chroot -c '$PBIN $ARGS'"
+elif [ "$MODE" = "shim" ]; then
+  ROOTFS="$R" TERMINFO="$R/usr/share/terminfo" ELF_LOADER="$L" exec "$L" --shim "$BIN" "$@"
 else
-  TERMINFO="$R/usr/share/terminfo" exec "$L" --ownall "$BIN" "$@"
+  TERMINFO="$R/usr/share/terminfo" ELF_LOADER="$L" exec "$L" --ownall "$BIN" "$@"
 fi

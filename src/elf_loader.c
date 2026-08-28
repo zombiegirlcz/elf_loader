@@ -634,6 +634,8 @@ static void *resolve_import_ldso(const char *name) {
     return ldso_lookup(name);
 }
 
+static void *override_lookup(const char *name);  /* definováno níže; potřeba pro F2 lazy override */
+
 static void *resolve_jmp_symbol(elf_object_t *obj, Elf64_Rela *r) {
     void *addr = NULL;
     size_t sym_idx = ELF64_R_SYM(r->r_info);
@@ -642,17 +644,25 @@ static void *resolve_jmp_symbol(elf_object_t *obj, Elf64_Rela *r) {
         const char *name = obj->dynstr + s->st_name;
         int is_ifunc = 0;
         if (s->st_shndx == SHN_UNDEF) {
-            if (obj && obj->scope) {
-                const Elf64_Sym *fs = NULL;
-                elf_object_t *m = elf_scope_find(obj->scope, name, &fs);
-                if (m && fs) {
-                    if (ELF64_ST_TYPE(fs->st_info) == STT_GNU_IFUNC)
-                        is_ifunc = 1;
-                    addr = (char *)m->base_addr + (fs->st_value - map_base_vaddr(m));
+            /* F2 override ma prioritu i v lazy resolvovani: explicitne
+             * zaregistrovany shim (open/openat/stat/...) musi prebirat i
+             * realny glibc symbol nalezny pres elf_scope_find. Bez toho by
+             * lazy JUMP_SLOT sel rovnou na glibc a shim se nikdy nezavolal. */
+            void *ov = override_lookup(name);
+            addr = ov;
+            if (!addr) {
+                if (obj && obj->scope) {
+                    const Elf64_Sym *fs = NULL;
+                    elf_object_t *m = elf_scope_find(obj->scope, name, &fs);
+                    if (m && fs) {
+                        if (ELF64_ST_TYPE(fs->st_info) == STT_GNU_IFUNC)
+                            is_ifunc = 1;
+                        addr = (char *)m->base_addr + (fs->st_value - map_base_vaddr(m));
+                    }
                 }
+                if (!addr)
+                    addr = elf_resolve_import(obj, name);
             }
-            if (!addr)
-                addr = elf_resolve_import(obj, name);
         } else {
             addr = va(obj, s->st_value);
         }
@@ -718,6 +728,9 @@ void elf_register_override(const char *name, void *fn) {
     overrides[override_count].name = name;
     overrides[override_count].fn = fn;
     override_count++;
+    if (elf_debug())
+        fprintf(stderr, "[dbg] override+ %s -> %p (count=%zu)\n",
+                name, fn, override_count);
 }
 
 static void *override_lookup(const char *name) {
@@ -1782,10 +1795,14 @@ static sym_status_t lookup_table(const Elf64_Sym *symtab, const char *strtab,
 }
 
 void *elf_resolve_import(elf_object_t *obj, const char *name) {
-    void *sym = resolve_import_ldso(name);
+    void *sym = override_lookup(name);
+    /* Override ma prioritu pred host/resolvovanim: explicitne zaregistrovany
+     * shim (F2 path-translation) musi prebirat i host ld.so symboly jako
+     * "open". Bez toho by resolve_import_ldso vracel bionicky open a shim
+     * se nikdy nezavolal. */
     if (sym)
         return sym;
-    sym = override_lookup(name);
+    sym = resolve_import_ldso(name);
     if (sym)
         return sym;
     if (obj && obj->scope) {
