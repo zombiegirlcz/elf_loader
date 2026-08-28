@@ -45,9 +45,11 @@ case "$cmd" in
 esac
 BIN="$R$PBIN"                       # device cesta (pro loader mod)
 
-# detekce rootu (magisk su)
+# detekce rootu (magisk su) - JEN pro auto/chroot rozhodnuti. --shim i --ownall
+# bezi non-root a su NEpotrebuji; kdyby se detekce spoustela i pro ne, kazdy
+# 'elroot --shim' by vyvolal root 'su -c /system/bin/id -u' (notifikace su/root).
 ROOT_OK=0
-if [ "$MODE" != "ownall" ] && [ -x "$SU" ]; then
+if { [ "$MODE" = "auto" ] || [ "$MODE" = "chroot" ]; } && [ -x "$SU" ]; then
   if "$SU" -c '/system/bin/id -u' 2>/dev/null | /system/bin/grep -q '^0$'; then ROOT_OK=1; fi
 fi
 
