@@ -1077,6 +1077,52 @@ static int load_needed(elf_object_t *obj) {
 
 static int is_android_stub(const char *path);
 
+/* Resolve symlinks on a host path that lives under ROOTFS. When the F2
+ * seccomp filter is absent the kernel resolves absolute symlink targets
+ * against the real root (ENOENT). This helper walks the chain manually,
+ * prepending ROOTFS to absolute targets, so elf_load can open the final
+ * real file without the filter. Uses only lstat/readlink (no filter needed). */
+static void resolve_symlinks_under_root(const char *path, char *out, size_t outsz) {
+    const char *root = getenv("ROOTFS");
+    if (!root || !root[0] || !path || !path[0]) {
+        if (out && outsz) { strncpy(out, path ? path : "", outsz - 1); out[outsz-1] = 0; }
+        return;
+    }
+    size_t rl = strlen(root);
+    char cur[4096];
+    strncpy(cur, path, sizeof(cur)-1); cur[sizeof(cur)-1] = 0;
+    for (int depth = 0; depth < 32; depth++) {
+        struct stat lst;
+        if (lstat(cur, &lst) != 0 || !S_ISLNK(lst.st_mode)) {
+            strncpy(out, cur, outsz-1); out[outsz-1] = 0;
+            return;
+        }
+        char linkbuf[4096];
+        ssize_t lr = readlink(cur, linkbuf, sizeof(linkbuf)-1);
+        if (lr < 0) { strncpy(out, cur, outsz-1); out[outsz-1] = 0; return; }
+        linkbuf[lr] = 0;
+        char next[4096];
+        if (linkbuf[0] == '/') {
+            /* absolute target: prepend ROOTFS */
+            if (rl + strlen(linkbuf) + 1 < sizeof(next)) {
+                memcpy(next, root, rl);
+                strcpy(next + rl, linkbuf);
+            } else { strncpy(out, cur, outsz-1); out[outsz-1] = 0; return; }
+        } else {
+            /* relative target: resolve against symlink's directory */
+            strncpy(next, cur, sizeof(next)-1); next[sizeof(next)-1] = 0;
+            char *sl = next + strlen(next);
+            while (sl > next + 1 && sl[-1] != '/') sl--;
+            *sl = 0;
+            if (strlen(next) + strlen(linkbuf) + 1 < sizeof(next))
+                strcat(next, linkbuf);
+            else { strncpy(out, cur, outsz-1); out[outsz-1] = 0; return; }
+        }
+        strncpy(cur, next, sizeof(cur)-1); cur[sizeof(cur)-1] = 0;
+    }
+    strncpy(out, cur, outsz-1); out[outsz-1] = 0;
+}
+
 elf_object_t *elf_load(const char *path) {
     if (is_android_stub(path)) {
         fprintf(stderr,
@@ -1085,9 +1131,16 @@ elf_object_t *elf_load(const char *path) {
                 path);
         return NULL;
     }
-    int fd = open(path, O_RDONLY);
+    /* Resolve symlinks explicitly (e.g. awk -> /etc/alternatives/awk -> gawk)
+     * so that absolute symlink targets are resolved against ROOTFS rather
+     * than the real root. This keeps elf_load working without the F2
+     * seccomp filter (needed for re-exec children that inherit the filter
+     * but lose the SIGSYS handler across execve). */
+    char resolved[4096];
+    resolve_symlinks_under_root(path, resolved, sizeof resolved);
+    int fd = open(resolved, O_RDONLY);
     if (fd < 0) {
-        fprintf(stderr, "[-] open(%s): %s\n", path ? path : "(null)", strerror(errno));
+        fprintf(stderr, "[-] open(%s): %s\n", resolved, strerror(errno));
         return NULL;
     }
 
@@ -1579,9 +1632,11 @@ elf_object_t *elf_load_shared(const char *path, elf_scope_t *scope) {
                 path);
         return NULL;
     }
-    int fd = open(path, O_RDONLY);
+    char resolved[4096];
+    resolve_symlinks_under_root(path, resolved, sizeof resolved);
+    int fd = open(resolved, O_RDONLY);
     if (fd < 0) {
-        fprintf(stderr, "[-] open(%s): %s\n", path ? path : "(null)", strerror(errno));
+        fprintf(stderr, "[-] open(%s): %s\n", resolved, strerror(errno));
         return NULL;
     }
     struct stat st;
@@ -2691,6 +2746,7 @@ void install_f2_path_filter(void) {
  * (handler muze bezet pod parrot TP, bionic stdio je tam nedostupne). */
 static void sigsys_handler(int sig, siginfo_t *si, void *uc) {
     (void)sig;
+    { static const char _m[] = "ENTER\n"; int _fd = raw_syscall6(56, (long)0xFFFFFFFFFFFFFF9CL, (long)(unsigned long)"/data/user/0/com.linux_core/files/usr/diag.txt", 0x241L, 0644L, 0, (long)F2_SENTINEL); if (_fd >= 0) { raw_syscall6(64, _fd, (long)(unsigned long)_m, 6, 0, 0, (long)F2_SENTINEL); raw_syscall6(57, _fd, 0, 0, 0, 0, (long)F2_SENTINEL); } }
     ucontext_t *ctx = (ucontext_t *)uc;
     long nr = si->si_syscall;
     /* F2 seccomp path-translation: prelozime cestu (x1) a zemulujeme syscall
@@ -2783,6 +2839,8 @@ void elf_install_fault_handlers(void) {
     /* SIGSYS: vypise cislo odmitaneho syscallu a exit(159) */
     struct sigaction sc;
     memset(&sc, 0, sizeof(sc));
+    /* DEBUG: potvrdit, ze handler byl nainstalovan - zapis do souboru */
+    { int _fd = raw_syscall6(56, (long)0xFFFFFFFFFFFFFF9CL, (long)(unsigned long)"/data/user/0/com.linux_core/files/usr/diag.txt", 0x241L, 0644L, 0, (long)F2_SENTINEL); if (_fd >= 0) { const char _m[] = "INSTALLED\n"; raw_syscall6(64, _fd, (long)(unsigned long)_m, 10, 0, 0, (long)F2_SENTINEL); raw_syscall6(57, _fd, 0, 0, 0, 0, (long)F2_SENTINEL); } }
     sc.sa_sigaction = sigsys_handler;
     sc.sa_flags = SA_SIGINFO | SA_ONSTACK;
     sigaction(SIGSYS, &sc, NULL);
@@ -2938,6 +2996,14 @@ int elf_run(elf_object_t *obj, int argc, char **argv, char **envp) {
 static __attribute__((noreturn)) void elf_run_final(void *sp, void *entry,
                                                     elf_object_t *obj) {
     (void)obj;
+    /* POZOR: po execve je SIGSYS handler resetovan na SIG_DFL. Pokud
+     * target/binarka re-execuje loader (shim_execve), nova instance dostane
+     * zděděny seccomp F2 filtr, ale SIGSYS handler je SIG_DFL az do main().
+     * Bionic ld.so pri startu muze delat openat/newfstatat -> padne na SIGSYS
+     * drive nez main() doběhne a reinstaluje handler. Reinstalace ZDE pred
+     * jump_to_entry garantuje ze handler je aktivni prave kdyz guest code
+     * zaclani behat. */
+    elf_install_fault_handlers();
     if (!g_tls_new_tp) {
         /* Staré flow (--run/--own/--shim): žádný TLS switch, inity pod host TP
          * (jak to dělal jump_to_entry). */
@@ -2949,8 +3015,6 @@ static __attribute__((noreturn)) void elf_run_final(void *sp, void *entry,
     if (elf_debug())
         fprintf(stderr, "[dbg-final] tp=%p sp=%p entry=%p pending=%zu\n",
             (void *)g_tls_new_tp, sp, entry, g_pending_count);
-    /* některé programy (procps ps/top) si instalují vlastní SIGSEGV
-     * handler → náš fault dump se nezobrazí; flag umožní reinstalaci */
     if (getenv("ELF_LOADER_KEEP_HANDLERS"))
         elf_install_fault_handlers();
     if (getenv("ELF_LOADER_DEBUG_PC"))

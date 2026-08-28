@@ -86,6 +86,16 @@ static int run(const char *path, int argc, char **argv, char **envp) {
 
 static int run_ownall(const char *path, int argc, char **argv, char **envp);
 
+/* F2 seccomp path-filter je volitelny: pri re-execu (shim_execve) dedi dite
+ * filtr, ale SIGSYS handler je po execve SIG_DFL a bionic ld.so ditete dela
+ * openat jeste pred main() -> SIGSYS -> pad. Proto je filtr defaultne VYPNUTY
+ * v --shim rezimu; preklad cest zajistuji PLT override + inline hooky +
+ * explicitni reseni symlinku v elf_load. F2_FILTER=1 filtr zapne (bez re-execu). */
+static int f2_should_filter(void) {
+    const char *v = getenv("F2_FILTER");
+    return v && v[0] && v[0] != '0';
+}
+
 /* F2: path-translatni seccomp (non-root) je implementovan v elf_loader.c
  * (install_f2_path_filter + sigsys_handler): pro path-syscally (openat/statx/
  * newfstatat/readlinkat/faccessat) vraci SIGSYS, handler prelozi cestu a
@@ -462,7 +472,16 @@ typedef int (*fp_execvp)(const char *, char *const[]);
 static int shim_execve(const char *p, char *const argv[], char *const envp[]) {
     char b[8192]; const char *path = p; int tr = shim_translate(p, b, sizeof b);
     if (tr) path = b;
-    if (tr) {
+    /* Re-exec pres loader pro kazdou guestovskou absolutni cestu — budto
+     * prelozenou (tr) nebo uz pod ROOTFS. Bez re-execu by se glibc binarka
+     * spustila naprimo (kernel nenajde /lib/ld-linux-aarch64.so.1 -> ENOENT,
+     * pripadne zděděny F2 filtr bez SIGSYS handleru -> SIGSYS).
+     * Excluded cesty (/system /proc /dev ...) = Android/host binarky -> real
+     * execve. */
+    size_t rl = g_shim_root ? shim_strlen(g_shim_root) : 0;
+    int already_under_root = (rl && p && shim_strncmp(p, g_shim_root, rl) == 0
+                              && (p[rl] == '/' || p[rl] == 0));
+    if (p && p[0] == '/' && (tr || already_under_root)) {
         char *na[256]; int n = 0;
         na[n++] = (char *)g_shim_loader; na[n++] = (char *)"--shim"; na[n++] = (char *)path;
         for (int i = 1; argv && argv[i] && n < 255; i++) na[n++] = argv[i];
@@ -654,10 +673,17 @@ static int run_ownall(const char *path, int argc, char **argv, char **envp) {
     elf_init_envp = envp;
 
     g_loader_active = 1;  /* loaderuv kod (bionic TLS): jeho open = bionicky */
-    /* F2 seccomp filtr MUSI byt nainstalovan pred elf_load, aby loader oteviral
-     * i symlinkovane guest binarky (awk -> /etc/alternatives/awk -> gawk):
-     * bez filtru by kernel resil symlink proti realnemu rootu -> ENOENT. */
-    if (g_f2_active) { f2_set_root(g_shim_root); install_f2_path_filter(); }
+    /* F2 seccomp filtr je volitelny (F2_FILTER=1). Pri re-execu (shim_execve)
+     * dedi dite filtr, ale SIGSYS handler je po execve SIG_DFL a bionic ld.so
+     * ditete dela openat jeste pred main() -> SIGSYS -> pad. Proto je filtr
+     * defaultne VYPNUTY; preklad cest zajistuji PLT override + inline hooky +
+     * explicitni reseni symlinku v elf_load (resolve_symlinks_under_root). */
+    if (g_f2_active) {
+        f2_set_root(g_shim_root);
+        if (f2_should_filter()) {
+            install_f2_path_filter();
+        }
+    }
     elf_object_t *obj = elf_load(path);
     elf_own_scope = NULL;
     elf_set_crash_scope(scope);

@@ -13,14 +13,32 @@ R="${ROOTFS:-}"
 if [ -z "$R" ]; then
   echo "elroot: ROOTFS není nastaven — export ROOTFS=/cesta/k/distro (nebo --rootfs DIR)"; exit 1
 fi
-L="${ELF_LOADER:-$R/../usr/bin/elf_loader}"
+L="${ELF_LOADER:-}"
+# Hledame loader v nekolika kandidatch (zavisi na deployment layoutu):
+#  - $R/../usr/bin/elf_loader      ... rootfs a usr jsou siblingove (puvodni predpoklad)
+#  - $R/../../../usr/bin/elf_loader ... files/ layout: rootfs v nh/distro/parrot, loader v usr/bin
+#  - $R/usr/bin/elf_loader         ... loader primo uvnitr rootfs
+#  - /system/bin/elf_loader        ... Magisk modul fallback
+if [ -z "$L" ]; then
+  for cand in "$R/../usr/bin/elf_loader" "$R/../../../usr/bin/elf_loader" "$R/usr/bin/elf_loader" "/system/bin/elf_loader"; do
+    if [ -x "$cand" ]; then L="$cand"; break; fi
+  done
+fi
 [ -x "$L" ] || L=/system/bin/elf_loader
-G="${GBSH:-$R/../usr/bin/gbsh}"
+G="${GBSH:-}"
+if [ -z "$G" ]; then
+  for cand in "$R/../usr/bin/gbsh" "$R/../../../usr/bin/gbsh" "$R/usr/bin/gbsh" "/system/bin/gbsh"; do
+    if [ -x "$cand" ]; then G="$cand"; break; fi
+  done
+fi
 [ -x "$G" ] || G=/system/bin/gbsh
 SU="${SU:-/product/bin/su}"
 
-# cista cesta pro interni prikazy (ashell ma v PATH parrot cesty)
-export PATH=/system/bin:/system/xbin
+# cesta: pro shim/ownall preferujeme ROOTFS bin (parrot binarky), aby guest
+# prikazy resil /usr/bin/ls (ne Android /system/bin/ls, ktery by pod dedicenym
+# seccomp filtrem SIGSYSnul a nedostal by SIGSYS handler pres re-exec loaderu).
+# /system/bin nechavame jako fallback. Pro --chroot si PATH resi chroot sam.
+export PATH="$R/usr/bin:$R/bin:/system/bin:/system/xbin"
 
 MODE=auto
 while [ $# -gt 0 ]; do
@@ -65,6 +83,14 @@ if [ "$MODE" = "chroot" ]; then
   ARGS="$@"
   exec "$SU" -c "ROOTFS=$R '$G' --chroot -c '$PBIN $ARGS'"
 elif [ "$MODE" = "shim" ]; then
+  # F2 seccomp path-filter se ZDE vypina: pri --shim re-execu dedi dite
+  # (napr. bash spousti kazdy prikaz pres execve) zdedy filtr, ale SIGSYS
+  # handler je po execve SIG_DFL -> dite umre na SIGSYS ("badsyscall", RC=159).
+  # Preklad cest v --shim rezimu zajistuji PLT override + inline hooky +
+  # explicitni reseni symlinku v elf_load (bez F2 filtru). F2_FILTER=1 lze
+  # pouzit jen pro jednoprocesove spusteni mimo elroot --shim (prime volani
+  # elf_loader --shim bez re-execu potomku).
+  unset F2_FILTER
   ROOTFS="$R" TERMINFO="$R/usr/share/terminfo" ELF_LOADER="$L" exec "$L" --shim "$BIN" "$@"
 else
   TERMINFO="$R/usr/share/terminfo" ELF_LOADER="$L" exec "$L" --ownall "$BIN" "$@"
