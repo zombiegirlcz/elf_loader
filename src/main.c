@@ -178,8 +178,11 @@ static void *g_orig_symlink = NULL, *g_orig_symlinkat = NULL, *g_orig_link = NUL
             *g_orig_rename = NULL, *g_orig_unlink = NULL, *g_orig_mkdir = NULL,
             *g_orig_mkdirat = NULL, *g_orig_rmdir = NULL;
 static void *g_orig_execve = NULL, *g_orig_execv = NULL, *g_orig_execvp = NULL,
-            *g_orig_execvpe = NULL, *g_orig_execveat = NULL,
-            *g_orig_posix_spawn = NULL, *g_orig_posix_spawnp = NULL;
+            *g_orig_execvpe = NULL, *g_orig_execveat = NULL;
+static void *g_orig_fopen = NULL, *g_orig_fopen64 = NULL,
+            *g_orig___xstat64 = NULL, *g_orig___lxstat64 = NULL, *g_orig___fxstatat64 = NULL,
+            *g_orig_faccessat2 = NULL,
+            *g_orig_getrlimit = NULL, *g_orig_prlimit64 = NULL;
 static void *g_orig_opendir = NULL, *g_orig_readlink = NULL, *g_orig_readlinkat = NULL,
             *g_orig_realpath = NULL, *g_orig_dlopen = NULL, *g_orig_chdir = NULL;
 
@@ -478,6 +481,58 @@ typedef int (*fp_execvp)(const char *, char *const[]);
 typedef int (*fp_execvpe)(const char *, char *const[], char *const[]);
 typedef int (*fp_execveat)(int, const char *, char *const[], char *const[], int);
 
+static const char *get_env_val(const char *key, char *const envp[]) {
+    size_t klen = shim_strlen(key);
+    if (envp) {
+        for (int i = 0; envp[i]; i++) {
+            if (shim_strncmp(envp[i], key, klen) == 0 && envp[i][klen] == '=')
+                return envp[i] + klen + 1;
+        }
+    }
+    return getenv(key);
+}
+
+static int search_guest_path(const char *p, char *const envp[], char *out, size_t out_cap) {
+    size_t rl = g_shim_root ? shim_strlen(g_shim_root) : 0;
+    const char *pth = get_env_val("PATH", envp);
+    if (pth && pth[0]) {
+        char buf[4096];
+        snprintf(buf, sizeof(buf), "%s", pth);
+        char *save = NULL;
+        for (char *d = strtok_r(buf, ":", &save); d; d = strtok_r(NULL, ":", &save)) {
+            if (!d[0]) continue;
+            char cand[8192];
+            if (rl && shim_strncmp(d, g_shim_root, rl) == 0) {
+                snprintf(cand, sizeof(cand), "%s/%s", d, p);
+            } else if (rl && d[0] == '/') {
+                snprintf(cand, sizeof(cand), "%s%s/%s", g_shim_root, d, p);
+            } else {
+                snprintf(cand, sizeof(cand), "%s/%s", d, p);
+            }
+            if (access(cand, X_OK) == 0) {
+                snprintf(out, out_cap, "%s", cand);
+                return 1;
+            }
+        }
+    }
+
+    static const char *dirs[] = {
+        "/usr/local/bin", "/usr/bin", "/bin",
+        "/usr/local/sbin", "/usr/sbin", "/sbin", NULL
+    };
+    if (rl) {
+        for (int i = 0; dirs[i]; i++) {
+            char candidate[8192];
+            snprintf(candidate, sizeof(candidate), "%s%s/%s", g_shim_root, dirs[i], p);
+            if (access(candidate, X_OK) == 0) {
+                snprintf(out, out_cap, "%s", candidate);
+                return 1;
+            }
+        }
+    }
+    return 0;
+}
+
 static int shim_execve(const char *p, char *const argv[], char *const envp[]) {
     if (!p || !p[0]) return -1;
 
@@ -525,23 +580,7 @@ static int shim_execve(const char *p, char *const argv[], char *const envp[]) {
             }
         } else {
             /* Bare name, e.g. "ls" or "bash" -> Search guest PATH */
-            static const char *dirs[] = {
-                "/usr/local/bin", "/usr/bin", "/bin",
-                "/usr/local/sbin", "/usr/sbin", "/sbin", NULL
-            };
-            int found = 0;
-            if (rl) {
-                for (int i = 0; dirs[i]; i++) {
-                    char candidate[8192];
-                    snprintf(candidate, sizeof(candidate), "%s%s/%s", g_shim_root, dirs[i], p);
-                    if (access(candidate, X_OK) == 0) {
-                        snprintf(resolved, sizeof(resolved), "%s", candidate);
-                        found = 1;
-                        break;
-                    }
-                }
-            }
-            if (!found) {
+            if (!search_guest_path(p, envp, resolved, sizeof(resolved))) {
                 snprintf(resolved, sizeof(resolved), "%s", p);
             }
         }
@@ -579,24 +618,10 @@ static int shim_execve(const char *p, char *const argv[], char *const envp[]) {
             }
 
             if (strcmp(line, "/usr/bin/env") == 0 && interp_arg[0]) {
-                static const char *dirs[] = {
-                    "/usr/local/bin", "/usr/bin", "/bin",
-                    "/usr/local/sbin", "/usr/sbin", "/sbin", NULL
-                };
-                int found = 0;
-                if (rl) {
-                    for (int i = 0; dirs[i]; i++) {
-                        char cand[8192];
-                        snprintf(cand, sizeof(cand), "%s%s/%s", g_shim_root, dirs[i], interp_arg);
-                        if (access(cand, X_OK) == 0) {
-                            snprintf(interp, sizeof(interp), "%s", cand);
-                            found = 1;
-                            break;
-                        }
-                    }
+                if (!search_guest_path(interp_arg, envp, interp, sizeof(interp))) {
+                    if (rl) snprintf(interp, sizeof(interp), "%s/usr/bin/%s", g_shim_root, interp_arg);
+                    else snprintf(interp, sizeof(interp), "%s", interp_arg);
                 }
-                if (!found && rl) snprintf(interp, sizeof(interp), "%s/usr/bin/%s", g_shim_root, interp_arg);
-                else if (!found) snprintf(interp, sizeof(interp), "%s", interp_arg);
                 interp_arg[0] = 0;
             } else if (rl && line[0] == '/') {
                 snprintf(interp, sizeof(interp), "%s%s", g_shim_root, line);
@@ -641,25 +666,35 @@ static int shim_execvp(const char *p, char *const argv[]) {
 static int shim_execvpe(const char *p, char *const argv[], char *const envp[]) {
     return shim_execve(p, argv, envp);
 }
+
+#ifndef AT_FDCWD
+#define AT_FDCWD -100
+#endif
+#ifndef AT_EMPTY_PATH
+#define AT_EMPTY_PATH 0x1000
+#endif
+
 static int shim_execveat(int dirfd, const char *p, char *const argv[], char *const envp[], int flags) {
-    (void)dirfd; (void)flags;
-    return shim_execve(p, argv, envp);
-}
-static int shim_posix_spawn(pid_t *pid, const char *path, const void *file_actions,
-                            const void *attrp, char *const argv[], char *const envp[]) {
-    (void)file_actions; (void)attrp;
-    pid_t child = fork();
-    if (child < 0) return errno;
-    if (child == 0) {
-        shim_execve(path, argv, envp);
-        _exit(127);
+    if ((!p || !p[0]) && (flags & AT_EMPTY_PATH) && dirfd >= 0) {
+        char fpath[64], target[8192];
+        snprintf(fpath, sizeof(fpath), "/proc/self/fd/%d", dirfd);
+        ssize_t n = readlink(fpath, target, sizeof(target) - 1);
+        if (n > 0) {
+            target[n] = '\0';
+            return shim_execve(target, argv, envp);
+        }
     }
-    if (pid) *pid = child;
-    return 0;
-}
-static int shim_posix_spawnp(pid_t *pid, const char *file, const void *file_actions,
-                             const void *attrp, char *const argv[], char *const envp[]) {
-    return shim_posix_spawn(pid, file, file_actions, attrp, argv, envp);
+    if (dirfd != AT_FDCWD && dirfd >= 0 && p && p[0] != '/') {
+        char fpath[64], dtarget[8192], combined[8192];
+        snprintf(fpath, sizeof(fpath), "/proc/self/fd/%d", dirfd);
+        ssize_t n = readlink(fpath, dtarget, sizeof(dtarget) - 1);
+        if (n > 0) {
+            dtarget[n] = '\0';
+            snprintf(combined, sizeof(combined), "%s/%s", dtarget, p);
+            return shim_execve(combined, argv, envp);
+        }
+    }
+    return shim_execve(p, argv, envp);
 }
 
 typedef void *(*fp_opendir)(const char *);
@@ -713,6 +748,46 @@ static int shim_chdir(const char *p) {
     fp_chdir f = (fp_chdir)g_orig_chdir; return f ? f(path) : -1;
 }
 
+static FILE *shim_fopen(const char *p, const char *mode) {
+    char b[8192]; const char *path = p; if (shim_translate(p, b, sizeof b)) path = b;
+    FILE *(*f)(const char *, const char *) = (FILE *(*)(const char *, const char *))g_orig_fopen;
+    return f ? f(path, mode) : NULL;
+}
+static FILE *shim_fopen64(const char *p, const char *mode) {
+    char b[8192]; const char *path = p; if (shim_translate(p, b, sizeof b)) path = b;
+    FILE *(*f)(const char *, const char *) = (FILE *(*)(const char *, const char *))g_orig_fopen64;
+    return f ? f(path, mode) : NULL;
+}
+static int shim___xstat64(int v, const char *p, void *st) {
+    char b[8192]; const char *path = p; if (shim_translate(p, b, sizeof b)) path = b;
+    fp_xstat f = (fp_xstat)g_orig___xstat64; return f ? f(v, path, st) : -1;
+}
+static int shim___lxstat64(int v, const char *p, void *st) {
+    char b[8192]; const char *path = p; if (shim_translate(p, b, sizeof b)) path = b;
+    fp_lxstat f = (fp_lxstat)g_orig___lxstat64; return f ? f(v, path, st) : -1;
+}
+static int shim___fxstatat64(int dfd, const char *p, void *st, int flags) {
+    char b[8192]; const char *path = p;
+    if (dfd == -100 && p && p[0] == '/') { if (shim_translate(p, b, sizeof b)) path = b; }
+    fp_fstatat f = (fp_fstatat)g_orig___fxstatat64; return f ? f(dfd, path, st, flags) : -1;
+}
+static int shim_faccessat2(int dfd, const char *p, int m, int ff) {
+    char b[8192]; const char *path = p;
+    if (dfd == -100 && p && p[0] == '/') { if (shim_translate(p, b, sizeof b)) path = b; }
+    fp_faccessat f = (fp_faccessat)g_orig_faccessat2; return f ? f(dfd, path, m, ff) : -1;
+}
+typedef int (*fp_getrlimit)(int, struct rlimit *);
+static int shim_getrlimit(int resource, struct rlimit *rl) {
+    fp_getrlimit f = (fp_getrlimit)g_orig_getrlimit;
+    int res = f ? f(resource, rl) : -1;
+    if (res == 0 && resource == 3 /* RLIMIT_STACK */ && rl) {
+        if (rl->rlim_cur == 0 || rl->rlim_cur == RLIM_INFINITY || rl->rlim_cur < 8 * 1024 * 1024) {
+            rl->rlim_cur = 8 * 1024 * 1024;
+        }
+    }
+    return res;
+}
+
 static f2_hook_t g_f2_hooks[] = {
     {"open",(void*)shim_open,&g_orig_open},{"open64",(void*)shim_open64,&g_orig_open64},
     {"__open",(void*)shim_open,&g_orig_open},{"__open64",(void*)shim_open64,&g_orig_open64},
@@ -731,12 +806,15 @@ static f2_hook_t g_f2_hooks[] = {
     {"execve",(void*)shim_execve,&g_orig_execve},{"execv",(void*)shim_execv,&g_orig_execv},
     {"execvp",(void*)shim_execvp,&g_orig_execvp},{"execvpe",(void*)shim_execvpe,&g_orig_execvpe},
     {"execveat",(void*)shim_execveat,&g_orig_execveat},
-    {"posix_spawn",(void*)shim_posix_spawn,&g_orig_posix_spawn},
-    {"posix_spawnp",(void*)shim_posix_spawnp,&g_orig_posix_spawnp},
     {"opendir",(void*)shim_opendir,&g_orig_opendir},
     {"readlink",(void*)shim_readlink,&g_orig_readlink},{"readlinkat",(void*)shim_readlinkat,&g_orig_readlinkat},
     {"realpath",(void*)shim_realpath,&g_orig_realpath},{"dlopen",(void*)shim_dlopen,&g_orig_dlopen},
     {"chdir",(void*)shim_chdir,&g_orig_chdir},
+    {"fopen",(void*)shim_fopen,&g_orig_fopen},{"fopen64",(void*)shim_fopen64,&g_orig_fopen64},
+    {"__xstat64",(void*)shim___xstat64,&g_orig___xstat64},{"__lxstat64",(void*)shim___lxstat64,&g_orig___lxstat64},
+    {"__fxstatat64",(void*)shim___fxstatat64,&g_orig___fxstatat64},{"faccessat2",(void*)shim_faccessat2,&g_orig_faccessat2},
+    {"getrlimit",(void*)shim_getrlimit,&g_orig_getrlimit},{"__getrlimit",(void*)shim_getrlimit,&g_orig_getrlimit},
+    {"prlimit64",(void*)shim_getrlimit,&g_orig_prlimit64},
 };
 
 static int f2_only_match(const char *name) {
@@ -902,6 +980,11 @@ static int run_ownall(const char *path, int argc, char **argv, char **envp) {
         if (scope->mods[mi]->soname && strstr(scope->mods[mi]->soname, "libc.so.6"))
             libc_obj = scope->mods[mi]->base_addr;
     g_libc_base = (uintptr_t)libc_obj;
+
+    void *stacksize_sym = elf_scope_lookup(scope, "__default_stacksize");
+    if (stacksize_sym) {
+        *(size_t *)stacksize_sym = 8 * 1024 * 1024;
+    }
 
     if (elf_relocate(obj) != 0) {
         fprintf(stderr, "[-] Relocation failed\n");
