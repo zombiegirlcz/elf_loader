@@ -686,8 +686,27 @@ static char *shim_realpath(const char *p, char *b) {
     fp_realpath f = (fp_realpath)g_orig_realpath; return f ? f(path, b) : NULL;
 }
 static void *shim_dlopen(const char *p, int f) {
-    char b[8192]; const char *path = p; if (shim_translate(p, b, sizeof b)) path = b;
-    fp_dlopen ff = (fp_dlopen)g_orig_dlopen; return ff ? ff(path, f) : NULL;
+    char b[8192]; const char *path = p;
+    if (p && p[0] == '/') {
+        if (shim_translate(p, b, sizeof b)) path = b;
+    } else if (p && strchr(p, '/')) {
+        if (g_shim_root && g_shim_root[0]) {
+            snprintf(b, sizeof(b), "%s/usr/lib/aarch64-linux-gnu/%s", g_shim_root, p);
+            if (access(b, F_OK) == 0) {
+                path = b;
+            } else {
+                snprintf(b, sizeof(b), "%s/lib/aarch64-linux-gnu/%s", g_shim_root, p);
+                if (access(b, F_OK) == 0) {
+                    path = b;
+                } else {
+                    snprintf(b, sizeof(b), "%s/%s", g_shim_root, p);
+                    if (access(b, F_OK) == 0) path = b;
+                }
+            }
+        }
+    }
+    fp_dlopen ff = (fp_dlopen)g_orig_dlopen;
+    return ff ? ff(path, f) : NULL;
 }
 static int shim_chdir(const char *p) {
     char b[8192]; const char *path = p; if (shim_translate(p, b, sizeof b)) path = b;
@@ -838,6 +857,10 @@ static int run_ownall(const char *path, int argc, char **argv, char **envp) {
     if (!g_exec_mode) g_exec_mode = "--ownall";
     g_shim_root = getenv("ROOTFS");
     g_shim_loader = getenv("ELF_LOADER");
+    if (g_shim_root && g_shim_root[0]) {
+        g_f2_active = 1;
+        setenv("ROOTFS", g_shim_root, 1);
+    }
     if (!g_shim_loader || !g_shim_loader[0]) {
         static char self_exe[1024];
         ssize_t n = readlink("/proc/self/exe", self_exe, sizeof(self_exe) - 1);
@@ -848,7 +871,6 @@ static int run_ownall(const char *path, int argc, char **argv, char **envp) {
             g_shim_loader = "/proc/self/exe";
         }
     }
-    if (g_shim_root && g_shim_root[0]) setenv("ROOTFS", g_shim_root, 1);
     if (g_shim_loader && g_shim_loader[0]) setenv("ELF_LOADER", g_shim_loader, 1);
 
     shim_register_overrides();
@@ -919,6 +941,19 @@ int main(int argc, char **argv, char **envp) {
     /* ELF_DEBUG → unbuffered stdout, ať trace při SIGSEGV nekončí v bufferu */
     if (getenv("ELF_DEBUG"))
         setvbuf(stdout, NULL, _IONBF, 0);
+
+    /* Ensure a valid RLIMIT_STACK (at least 8MB) so glibc NPTL pthread_create
+     * does not fail in allocate_stack with size == 0 on Android host */
+    struct rlimit rl_stack;
+    if (getrlimit(RLIMIT_STACK, &rl_stack) == 0) {
+        if (rl_stack.rlim_cur == 0 || rl_stack.rlim_cur == RLIM_INFINITY ||
+            rl_stack.rlim_cur < 8 * 1024 * 1024) {
+            rl_stack.rlim_cur = 8 * 1024 * 1024;
+            if (rl_stack.rlim_max != RLIM_INFINITY && rl_stack.rlim_max < rl_stack.rlim_cur)
+                rl_stack.rlim_max = rl_stack.rlim_cur;
+            setrlimit(RLIMIT_STACK, &rl_stack);
+        }
+    }
     /* seccomp stacked filtr: nove syscalls (clone3/close_range/...) -> ENOSYS,
      * aby fungovaly glibc fallbacky pod app profilem jadra 4.14 */
     elf_install_compat();
