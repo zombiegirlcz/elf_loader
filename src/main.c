@@ -481,6 +481,44 @@ typedef int (*fp_execvp)(const char *, char *const[]);
 typedef int (*fp_execvpe)(const char *, char *const[], char *const[]);
 typedef int (*fp_execveat)(int, const char *, char *const[], char *const[], int);
 
+#ifndef SYS_faccessat
+#define SYS_faccessat 48
+#endif
+#ifndef SYS_openat
+#define SYS_openat 56
+#endif
+#ifndef SYS_read
+#define SYS_read 63
+#endif
+#ifndef SYS_close
+#define SYS_close 57
+#endif
+#ifndef SYS_prlimit64
+#define SYS_prlimit64 261
+#endif
+
+static int raw_access(const char *path, int mode) {
+    if (!path) return -1;
+    long r = syscall(SYS_faccessat, -100 /* AT_FDCWD */, path, mode, 0);
+    return (int)r;
+}
+
+static int raw_open(const char *path, int flags) {
+    if (!path) return -1;
+    long r = syscall(SYS_openat, -100 /* AT_FDCWD */, path, flags, 0);
+    return (int)r;
+}
+
+static ssize_t raw_read(int fd, void *buf, size_t count) {
+    long r = syscall(SYS_read, fd, buf, count);
+    return (ssize_t)r;
+}
+
+static int raw_close(int fd) {
+    long r = syscall(SYS_close, fd);
+    return (int)r;
+}
+
 static const char *get_env_val(const char *key, char *const envp[]) {
     size_t klen = shim_strlen(key);
     if (envp) {
@@ -509,7 +547,7 @@ static int search_guest_path(const char *p, char *const envp[], char *out, size_
             } else {
                 snprintf(cand, sizeof(cand), "%s/%s", d, p);
             }
-            if (access(cand, X_OK) == 0) {
+            if (raw_access(cand, X_OK) == 0) {
                 snprintf(out, out_cap, "%s", cand);
                 return 1;
             }
@@ -524,7 +562,7 @@ static int search_guest_path(const char *p, char *const envp[], char *out, size_
         for (int i = 0; dirs[i]; i++) {
             char candidate[8192];
             snprintf(candidate, sizeof(candidate), "%s%s/%s", g_shim_root, dirs[i], p);
-            if (access(candidate, X_OK) == 0) {
+            if (raw_access(candidate, X_OK) == 0) {
                 snprintf(out, out_cap, "%s", candidate);
                 return 1;
             }
@@ -594,11 +632,11 @@ static int shim_execve(const char *p, char *const argv[], char *const envp[]) {
     int is_script = 0;
 
     const char *chkpath = resolved[0] ? resolved : p;
-    int fd = open(chkpath, O_RDONLY);
+    int fd = raw_open(chkpath, O_RDONLY);
     if (fd >= 0) {
         char header[256];
-        ssize_t n = read(fd, header, sizeof(header) - 1);
-        close(fd);
+        ssize_t n = raw_read(fd, header, sizeof(header) - 1);
+        raw_close(fd);
         if (n >= 2 && header[0] == '#' && header[1] == '!') {
             header[n] = 0;
             char *line = header + 2;
@@ -727,15 +765,15 @@ static void *shim_dlopen(const char *p, int f) {
     } else if (p && strchr(p, '/')) {
         if (g_shim_root && g_shim_root[0]) {
             snprintf(b, sizeof(b), "%s/usr/lib/aarch64-linux-gnu/%s", g_shim_root, p);
-            if (access(b, F_OK) == 0) {
+            if (raw_access(b, F_OK) == 0) {
                 path = b;
             } else {
                 snprintf(b, sizeof(b), "%s/lib/aarch64-linux-gnu/%s", g_shim_root, p);
-                if (access(b, F_OK) == 0) {
+                if (raw_access(b, F_OK) == 0) {
                     path = b;
                 } else {
                     snprintf(b, sizeof(b), "%s/%s", g_shim_root, p);
-                    if (access(b, F_OK) == 0) path = b;
+                    if (raw_access(b, F_OK) == 0) path = b;
                 }
             }
         }
@@ -1027,16 +1065,8 @@ int main(int argc, char **argv, char **envp) {
 
     /* Ensure a valid RLIMIT_STACK (at least 8MB) so glibc NPTL pthread_create
      * does not fail in allocate_stack with size == 0 on Android host */
-    struct rlimit rl_stack;
-    if (getrlimit(RLIMIT_STACK, &rl_stack) == 0) {
-        if (rl_stack.rlim_cur == 0 || rl_stack.rlim_cur == RLIM_INFINITY ||
-            rl_stack.rlim_cur < 8 * 1024 * 1024) {
-            rl_stack.rlim_cur = 8 * 1024 * 1024;
-            if (rl_stack.rlim_max != RLIM_INFINITY && rl_stack.rlim_max < rl_stack.rlim_cur)
-                rl_stack.rlim_max = rl_stack.rlim_cur;
-            setrlimit(RLIMIT_STACK, &rl_stack);
-        }
-    }
+    struct rlimit rl_stack = { 8 * 1024 * 1024, 8 * 1024 * 1024 };
+    syscall(SYS_prlimit64, 0, 3 /* RLIMIT_STACK */, &rl_stack, NULL);
     /* seccomp stacked filtr: nove syscalls (clone3/close_range/...) -> ENOSYS,
      * aby fungovaly glibc fallbacky pod app profilem jadra 4.14 */
     elf_install_compat();
