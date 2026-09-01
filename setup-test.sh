@@ -5,7 +5,7 @@ ARCH="amd64"
 UBUNTU_CODENAME="bionic"
 UBUNTU_VERSION="18.04.5"
 BASE_URL="https://cdimage.ubuntu.com/ubuntu-base/releases/${UBUNTU_VERSION}/release/ubuntu-base-${UBUNTU_VERSION}-base-${ARCH}.tar.gz"
-ROOTFS_DIR="$(cd "$(dirname "$0")/testrootfs" && pwd)"
+ROOTFS_DIR="$(cd "$(dirname "$0")" && pwd)/testrootfs"
 TMP_TAR="$(mktemp -u).tar.gz"
 
 cleanup() {
