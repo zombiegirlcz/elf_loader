@@ -5,8 +5,8 @@ ARCH="amd64"
 UBUNTU_CODENAME="bionic"
 UBUNTU_VERSION="18.04.5"
 BASE_URL="https://cdimage.ubuntu.com/ubuntu-base/releases/${UBUNTU_VERSION}/release/ubuntu-base-${UBUNTU_VERSION}-base-${ARCH}.tar.gz"
-ROOTFS_DIR="$(cd "$(dirname "$0")/testrootfs" && pwd)"
-TMP_TAR="$(mktemp -u).tar.gz"
+ROOTFS_DIR="$(cd "$(dirname "$0")" && pwd)/testrootfs"
+TMP_TAR="$(mktemp)"
 IMAGE_NAME="proot-bionic:latest"
 
 cleanup() {
@@ -27,8 +27,15 @@ require_cmd tar
 if [ ! -d "$ROOTFS_DIR/bin" ]; then
   echo "[*] Stahuji Ubuntu ${UBUNTU_VERSION} ${ARCH} base rootfs..."
   mkdir -p "$ROOTFS_DIR"
-  curl -LOk "$BASE_URL" -o "$TMP_TAR"
+  if ! curl -L --fail -k "$BASE_URL" -o "$TMP_TAR"; then
+    echo "[!] Stahování selhalo: $BASE_URL" >&2
+    exit 1
+  fi
   echo "[*] Rozbaluji do: $ROOTFS_DIR"
+  if ! tar -tzf "$TMP_TAR" >/dev/null 2>&1; then
+    echo "[!] Stažený soubor není platný tar.gz: $TMP_TAR" >&2
+    exit 1
+  fi
   tar -xzf "$TMP_TAR" -C "$ROOTFS_DIR"
 else
   echo "[*] Rootfs už existuje: $ROOTFS_DIR (přeskakuji rozbalování)"

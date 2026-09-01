@@ -26,8 +26,15 @@ require_cmd tar
 if [ ! -d "$ROOTFS_DIR/bin" ]; then
   echo "[*] Stahuji Ubuntu ${UBUNTU_VERSION} ${ARCH} base rootfs..."
   mkdir -p "$ROOTFS_DIR"
-  curl -LOk "$BASE_URL" -o "$TMP_TAR"
+  if ! curl -L --fail -k "$BASE_URL" -o "$TMP_TAR"; then
+    echo "[!] Stahování selhalo: $BASE_URL" >&2
+    exit 1
+  fi
   echo "[*] Rozbaluji do: $ROOTFS_DIR"
+  if ! tar -tzf "$TMP_TAR" >/dev/null 2>&1; then
+    echo "[!] Stažený soubor není platný tar.gz: $TMP_TAR" >&2
+    exit 1
+  fi
   tar -xzf "$TMP_TAR" -C "$ROOTFS_DIR"
 else
   echo "[*] Rootfs už existuje: $ROOTFS_DIR (přeskakuji rozbalování)"
