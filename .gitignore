@@ -1,2 +1,4 @@
 testrootfs/
 ubuntu-base-*.tar.gz
+__pycache__/
+.pi/
