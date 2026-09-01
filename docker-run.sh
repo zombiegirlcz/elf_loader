@@ -16,7 +16,10 @@ fi
 
 if ! docker image inspect "$IMAGE_NAME" >/dev/null 2>&1; then
   echo "[*] Building Docker image: $IMAGE_NAME"
-  docker build -t "$IMAGE_NAME" .
+  if ! DOCKER_BUILDKIT=0 docker build -t "$IMAGE_NAME" .; then
+    echo "[!] BuildKit build selhal, zkusím bez BuildKit..." >&2
+    docker build --no-cache -t "$IMAGE_NAME" .
+  fi
 fi
 
 echo "[*] Spouštím proot v Dockeru..."

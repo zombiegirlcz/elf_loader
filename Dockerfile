@@ -8,7 +8,6 @@ RUN apt-get update && \
       ca-certificates \
       curl \
       bash \
-      tzdata && \
-    rm -rf /var/lib/apt/lists/*
+      tzdata
 
 CMD ["/bin/bash", "-l"]
