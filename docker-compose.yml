@@ -1,0 +1,23 @@
+version: "3.8"
+
+services:
+  proot-bionic:
+    build:
+      context: .
+      dockerfile: Dockerfile
+    container_name: proot-bionic-rootfs
+    privileged: true
+    volumes:
+      - ./testrootfs:/rootfs:rw
+      - /dev:/dev
+      - /proc:/proc
+      - /sys:/sys
+    environment:
+      - ROOTFS=/rootfs
+    entrypoint: ["/bin/bash", "-c"]
+    command:
+      - |
+        proot -r /rootfs -0 -b /:/parrot -b /dev -b /proc -b /sys /bin/bash -l
+    stdin_open: true
+    tty: true
+    restart: "no"
