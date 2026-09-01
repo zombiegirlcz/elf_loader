@@ -2806,6 +2806,9 @@ static void sigsys_handler(int sig, siginfo_t *si, void *uc) {
         case 116: emu = -38; break;       /* syslog (dmesg) -> -ENOSYS */
         case 264: emu = -38; break;       /* name_to_handle_at -> -ENOSYS */
         case 439: emu = -38; break;       /* faccessat2 (systemd) -> -ENOSYS */
+        case 435: emu = -38; break;       /* clone3 -> -ENOSYS (glibc falls back to clone) */
+        case 436: emu = -38; break;       /* close_range -> -ENOSYS */
+        case 437: emu = -38; break;       /* openat2 -> -ENOSYS (glibc falls back to openat) */
         case 180 ... 185: emu = -38; break;  /* mq_* (POSIX queues) -> -ENOSYS */
         case 186 ... 189: emu = -38; break;  /* msg* (SysV) -> -ENOSYS */
         case 190 ... 193: emu = -38; break;  /* sem* (SysV) -> -ENOSYS */
@@ -2828,6 +2831,25 @@ static void sigsys_handler(int sig, siginfo_t *si, void *uc) {
     *p++ = '\n';
     sys_write(2, buf, (size_t)(p - buf));
     _exit(159);
+}
+
+/* Early SIGSYS handler installation via constructor: after re-exec the child
+ * inherits seccomp filters but SIGSYS is SIG_DFL. The constructor runs before
+ * main(), closing the window where bionic ld.so or early init could hit a
+ * TRAP'd syscall and die. Only installs SIGSYS (not SIGSEGV/SIGILL/SIGBUS)
+ * to avoid interfering with linker fault handling. */
+__attribute__((constructor(101)))
+static void early_install_sigsys(void) {
+    static char early_altstack[262144];
+    static stack_t ess;
+    ess.ss_sp = early_altstack;
+    ess.ss_size = sizeof(early_altstack);
+    sigaltstack(&ess, NULL);
+    struct sigaction sc;
+    __builtin_memset(&sc, 0, sizeof(sc));
+    sc.sa_sigaction = sigsys_handler;
+    sc.sa_flags = SA_SIGINFO | SA_ONSTACK;
+    sigaction(SIGSYS, &sc, NULL);
 }
 
 void elf_install_fault_handlers(void) {
