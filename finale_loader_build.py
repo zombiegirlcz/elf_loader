@@ -28,7 +28,7 @@ image = (
         f"unzip -q /tmp/ndk.zip -d /opt/",
         f"test -x {TC}/aarch64-linux-android24-clang",
     )
-    .add_local_dir("/root/elf_loader", "/src",
+    .add_local_dir(".", "/src",
                    ignore=modal.FilePatternMatcher(".git", "*.o", "elf_loader",
                                                    "test", "*.py", "*.md"))
 )

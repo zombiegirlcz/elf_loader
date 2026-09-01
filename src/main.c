@@ -8,6 +8,8 @@
 #include <malloc.h>
 #include <unistd.h>
 #include <stdarg.h>
+#include <fcntl.h>
+#include <errno.h>
 #include <sys/stat.h>
 #include <sys/mman.h>
 #include <sys/resource.h>
@@ -113,6 +115,8 @@ static int f2_should_filter(void) {
  * Android fs). */
 static const char *g_shim_root = NULL;
 static const char *g_shim_loader = NULL;
+static const char *g_exec_mode = "--ownall";
+static int g_f2_active = 0;  /* 1 = F2 rezim (--shim), povol inline-hooky */
 static elf_scope_t *g_shim_scope = NULL;  /* platny scope behem F2 behu */
 
 /* Rucni string copy bez bionic libc (v parrot TLS kontextu by strncmp/snprintf
@@ -173,7 +177,12 @@ static void *g_orig_statx = NULL, *g_orig_fstatat = NULL, *g_orig_newfstatat = N
 static void *g_orig_symlink = NULL, *g_orig_symlinkat = NULL, *g_orig_link = NULL,
             *g_orig_rename = NULL, *g_orig_unlink = NULL, *g_orig_mkdir = NULL,
             *g_orig_mkdirat = NULL, *g_orig_rmdir = NULL;
-static void *g_orig_execve = NULL, *g_orig_execv = NULL, *g_orig_execvp = NULL;
+static void *g_orig_execve = NULL, *g_orig_execv = NULL, *g_orig_execvp = NULL,
+            *g_orig_execvpe = NULL, *g_orig_execveat = NULL;
+static void *g_orig_fopen = NULL, *g_orig_fopen64 = NULL,
+            *g_orig___xstat64 = NULL, *g_orig___lxstat64 = NULL, *g_orig___fxstatat64 = NULL,
+            *g_orig_faccessat2 = NULL,
+            *g_orig_getrlimit = NULL, *g_orig_prlimit64 = NULL;
 static void *g_orig_opendir = NULL, *g_orig_readlink = NULL, *g_orig_readlinkat = NULL,
             *g_orig_realpath = NULL, *g_orig_dlopen = NULL, *g_orig_chdir = NULL;
 
@@ -469,33 +478,261 @@ static int shim_rmdir(const char *p) {
 typedef int (*fp_execve)(const char *, char *const[], char *const[]);
 typedef int (*fp_execv)(const char *, char *const[]);
 typedef int (*fp_execvp)(const char *, char *const[]);
-static int shim_execve(const char *p, char *const argv[], char *const envp[]) {
-    char b[8192]; const char *path = p; int tr = shim_translate(p, b, sizeof b);
-    if (tr) path = b;
-    /* Re-exec pres loader pro kazdou guestovskou absolutni cestu — budto
-     * prelozenou (tr) nebo uz pod ROOTFS. Bez re-execu by se glibc binarka
-     * spustila naprimo (kernel nenajde /lib/ld-linux-aarch64.so.1 -> ENOENT,
-     * pripadne zděděny F2 filtr bez SIGSYS handleru -> SIGSYS).
-     * Excluded cesty (/system /proc /dev ...) = Android/host binarky -> real
-     * execve. */
-    size_t rl = g_shim_root ? shim_strlen(g_shim_root) : 0;
-    int already_under_root = (rl && p && shim_strncmp(p, g_shim_root, rl) == 0
-                              && (p[rl] == '/' || p[rl] == 0));
-    if (p && p[0] == '/' && (tr || already_under_root)) {
-        char *na[256]; int n = 0;
-        na[n++] = (char *)g_shim_loader; na[n++] = (char *)"--shim"; na[n++] = (char *)path;
-        for (int i = 1; argv && argv[i] && n < 255; i++) na[n++] = argv[i];
-        na[n] = NULL;
-        fp_execve f = (fp_execve)g_orig_execve;
-        return f ? f((char *)g_shim_loader, na, envp) : -1;
-    }
-    fp_execve f = (fp_execve)g_orig_execve;
-    return f ? f(path, argv, envp) : -1;
+typedef int (*fp_execvpe)(const char *, char *const[], char *const[]);
+typedef int (*fp_execveat)(int, const char *, char *const[], char *const[], int);
+
+#ifndef SYS_faccessat
+#define SYS_faccessat 48
+#endif
+#ifndef SYS_openat
+#define SYS_openat 56
+#endif
+#ifndef SYS_read
+#define SYS_read 63
+#endif
+#ifndef SYS_close
+#define SYS_close 57
+#endif
+#ifndef SYS_prlimit64
+#define SYS_prlimit64 261
+#endif
+
+static int raw_access(const char *path, int mode) {
+    if (!path) return -1;
+    long r = syscall(SYS_faccessat, -100 /* AT_FDCWD */, path, mode, 0);
+    return (int)r;
 }
-static int shim_execv(const char *p, char *const argv[]) { return shim_execve(p, argv, environ); }
+
+static int raw_open(const char *path, int flags) {
+    if (!path) return -1;
+    long r = syscall(SYS_openat, -100 /* AT_FDCWD */, path, flags, 0);
+    return (int)r;
+}
+
+static ssize_t raw_read(int fd, void *buf, size_t count) {
+    long r = syscall(SYS_read, fd, buf, count);
+    return (ssize_t)r;
+}
+
+static int raw_close(int fd) {
+    long r = syscall(SYS_close, fd);
+    return (int)r;
+}
+
+static const char *get_env_val(const char *key, char *const envp[]) {
+    size_t klen = shim_strlen(key);
+    if (envp) {
+        for (int i = 0; envp[i]; i++) {
+            if (shim_strncmp(envp[i], key, klen) == 0 && envp[i][klen] == '=')
+                return envp[i] + klen + 1;
+        }
+    }
+    return getenv(key);
+}
+
+static int search_guest_path(const char *p, char *const envp[], char *out, size_t out_cap) {
+    size_t rl = g_shim_root ? shim_strlen(g_shim_root) : 0;
+    const char *pth = get_env_val("PATH", envp);
+    if (pth && pth[0]) {
+        char buf[4096];
+        snprintf(buf, sizeof(buf), "%s", pth);
+        char *save = NULL;
+        for (char *d = strtok_r(buf, ":", &save); d; d = strtok_r(NULL, ":", &save)) {
+            if (!d[0]) continue;
+            char cand[8192];
+            if (rl && shim_strncmp(d, g_shim_root, rl) == 0) {
+                snprintf(cand, sizeof(cand), "%s/%s", d, p);
+            } else if (rl && d[0] == '/') {
+                snprintf(cand, sizeof(cand), "%s%s/%s", g_shim_root, d, p);
+            } else {
+                snprintf(cand, sizeof(cand), "%s/%s", d, p);
+            }
+            if (raw_access(cand, X_OK) == 0) {
+                snprintf(out, out_cap, "%s", cand);
+                return 1;
+            }
+        }
+    }
+
+    static const char *dirs[] = {
+        "/usr/local/bin", "/usr/bin", "/bin",
+        "/usr/local/sbin", "/usr/sbin", "/sbin", NULL
+    };
+    if (rl) {
+        for (int i = 0; dirs[i]; i++) {
+            char candidate[8192];
+            snprintf(candidate, sizeof(candidate), "%s%s/%s", g_shim_root, dirs[i], p);
+            if (raw_access(candidate, X_OK) == 0) {
+                snprintf(out, out_cap, "%s", candidate);
+                return 1;
+            }
+        }
+    }
+    return 0;
+}
+
+static int shim_execve(const char *p, char *const argv[], char *const envp[]) {
+    if (!p || !p[0]) return -1;
+
+    /* Excluded / host binaries (/system, /vendor, /apex, /product, /odm) -> real execve */
+    if (shim_excluded(p) || shim_strncmp(p, "/system", 7) == 0 ||
+        shim_strncmp(p, "/vendor", 7) == 0 || shim_strncmp(p, "/apex", 5) == 0 ||
+        shim_strncmp(p, "/product", 8) == 0 || shim_strncmp(p, "/odm", 4) == 0) {
+        fp_execve f = (fp_execve)g_orig_execve;
+        return f ? f(p, argv, envp) : -1;
+    }
+
+    char resolved[8192];
+    resolved[0] = 0;
+    size_t rl = g_shim_root ? shim_strlen(g_shim_root) : 0;
+
+    /* Path resolution */
+    if (rl && shim_strncmp(p, g_shim_root, rl) == 0 && (p[rl] == '/' || p[rl] == 0)) {
+        /* Already prefixed with $ROOTFS */
+        snprintf(resolved, sizeof(resolved), "%s", p);
+    } else if (p[0] == '/') {
+        /* Absolute guest path, e.g. /bin/ls or /usr/bin/gcc */
+        if (g_f2_active && shim_translate(p, resolved, sizeof(resolved))) {
+            /* shim translated */
+        } else if (rl) {
+            snprintf(resolved, sizeof(resolved), "%s%s", g_shim_root, p);
+        } else {
+            snprintf(resolved, sizeof(resolved), "%s", p);
+        }
+    } else {
+        /* Relative path or bare command name */
+        if (strchr(p, '/')) {
+            if (rl) {
+                char cwd[1024];
+                if (getcwd(cwd, sizeof(cwd))) {
+                    if (shim_strncmp(cwd, g_shim_root, rl) == 0) {
+                        snprintf(resolved, sizeof(resolved), "%s/%s", cwd, p);
+                    } else {
+                        snprintf(resolved, sizeof(resolved), "%s%s/%s", g_shim_root, cwd, p);
+                    }
+                } else {
+                    snprintf(resolved, sizeof(resolved), "%s/%s", g_shim_root, p);
+                }
+            } else {
+                snprintf(resolved, sizeof(resolved), "%s", p);
+            }
+        } else {
+            /* Bare name, e.g. "ls" or "bash" -> Search guest PATH */
+            if (!search_guest_path(p, envp, resolved, sizeof(resolved))) {
+                snprintf(resolved, sizeof(resolved), "%s", p);
+            }
+        }
+    }
+
+    /* Check for Shebang (#!) in resolved file */
+    char interp[8192];
+    interp[0] = 0;
+    char interp_arg[8192];
+    interp_arg[0] = 0;
+    int is_script = 0;
+
+    const char *chkpath = resolved[0] ? resolved : p;
+    int fd = raw_open(chkpath, O_RDONLY);
+    if (fd >= 0) {
+        char header[256];
+        ssize_t n = raw_read(fd, header, sizeof(header) - 1);
+        raw_close(fd);
+        if (n >= 2 && header[0] == '#' && header[1] == '!') {
+            header[n] = 0;
+            char *line = header + 2;
+            while (*line == ' ' || *line == '\t') line++;
+            char *eol = strchr(line, '\n');
+            if (eol) *eol = 0;
+            char *eol2 = strchr(line, '\r');
+            if (eol2) *eol2 = 0;
+
+            char *arg1 = line;
+            while (*arg1 && *arg1 != ' ' && *arg1 != '\t') arg1++;
+            if (*arg1) {
+                *arg1 = 0;
+                arg1++;
+                while (*arg1 == ' ' || *arg1 == '\t') arg1++;
+                if (*arg1) snprintf(interp_arg, sizeof(interp_arg), "%s", arg1);
+            }
+
+            if (strcmp(line, "/usr/bin/env") == 0 && interp_arg[0]) {
+                if (!search_guest_path(interp_arg, envp, interp, sizeof(interp))) {
+                    if (rl) snprintf(interp, sizeof(interp), "%s/usr/bin/%s", g_shim_root, interp_arg);
+                    else snprintf(interp, sizeof(interp), "%s", interp_arg);
+                }
+                interp_arg[0] = 0;
+            } else if (rl && line[0] == '/') {
+                snprintf(interp, sizeof(interp), "%s%s", g_shim_root, line);
+            } else {
+                snprintf(interp, sizeof(interp), "%s", line);
+            }
+            is_script = 1;
+        }
+    }
+
+    char *na[512];
+    int narg = 0;
+    const char *loader_bin = g_shim_loader && g_shim_loader[0] ? g_shim_loader : "/proc/self/exe";
+    const char *mode_str = g_exec_mode ? g_exec_mode : "--ownall";
+
+    na[narg++] = (char *)loader_bin;
+    na[narg++] = (char *)mode_str;
+
+    if (is_script && interp[0]) {
+        na[narg++] = interp;
+        if (interp_arg[0]) na[narg++] = interp_arg;
+        na[narg++] = (char *)chkpath;
+    } else {
+        na[narg++] = (char *)chkpath;
+    }
+
+    for (int i = 1; argv && argv[i] && narg < 510; i++) {
+        na[narg++] = argv[i];
+    }
+    na[narg] = NULL;
+
+    fp_execve f = (fp_execve)g_orig_execve;
+    return f ? f(loader_bin, na, envp) : -1;
+}
+
+static int shim_execv(const char *p, char *const argv[]) {
+    return shim_execve(p, argv, environ);
+}
 static int shim_execvp(const char *p, char *const argv[]) {
-    char b[8192]; const char *path = p; if (shim_translate(p, b, sizeof b)) path = b;
-    fp_execvp f = (fp_execvp)g_orig_execvp; return f ? f(path, argv) : -1;
+    return shim_execve(p, argv, environ);
+}
+static int shim_execvpe(const char *p, char *const argv[], char *const envp[]) {
+    return shim_execve(p, argv, envp);
+}
+
+#ifndef AT_FDCWD
+#define AT_FDCWD -100
+#endif
+#ifndef AT_EMPTY_PATH
+#define AT_EMPTY_PATH 0x1000
+#endif
+
+static int shim_execveat(int dirfd, const char *p, char *const argv[], char *const envp[], int flags) {
+    if ((!p || !p[0]) && (flags & AT_EMPTY_PATH) && dirfd >= 0) {
+        char fpath[64], target[8192];
+        snprintf(fpath, sizeof(fpath), "/proc/self/fd/%d", dirfd);
+        ssize_t n = readlink(fpath, target, sizeof(target) - 1);
+        if (n > 0) {
+            target[n] = '\0';
+            return shim_execve(target, argv, envp);
+        }
+    }
+    if (dirfd != AT_FDCWD && dirfd >= 0 && p && p[0] != '/') {
+        char fpath[64], dtarget[8192], combined[8192];
+        snprintf(fpath, sizeof(fpath), "/proc/self/fd/%d", dirfd);
+        ssize_t n = readlink(fpath, dtarget, sizeof(dtarget) - 1);
+        if (n > 0) {
+            dtarget[n] = '\0';
+            snprintf(combined, sizeof(combined), "%s/%s", dtarget, p);
+            return shim_execve(combined, argv, envp);
+        }
+    }
+    return shim_execve(p, argv, envp);
 }
 
 typedef void *(*fp_opendir)(const char *);
@@ -522,12 +759,71 @@ static char *shim_realpath(const char *p, char *b) {
     fp_realpath f = (fp_realpath)g_orig_realpath; return f ? f(path, b) : NULL;
 }
 static void *shim_dlopen(const char *p, int f) {
-    char b[8192]; const char *path = p; if (shim_translate(p, b, sizeof b)) path = b;
-    fp_dlopen ff = (fp_dlopen)g_orig_dlopen; return ff ? ff(path, f) : NULL;
+    char b[8192]; const char *path = p;
+    if (p && p[0] == '/') {
+        if (shim_translate(p, b, sizeof b)) path = b;
+    } else if (p && strchr(p, '/')) {
+        if (g_shim_root && g_shim_root[0]) {
+            snprintf(b, sizeof(b), "%s/usr/lib/aarch64-linux-gnu/%s", g_shim_root, p);
+            if (raw_access(b, F_OK) == 0) {
+                path = b;
+            } else {
+                snprintf(b, sizeof(b), "%s/lib/aarch64-linux-gnu/%s", g_shim_root, p);
+                if (raw_access(b, F_OK) == 0) {
+                    path = b;
+                } else {
+                    snprintf(b, sizeof(b), "%s/%s", g_shim_root, p);
+                    if (raw_access(b, F_OK) == 0) path = b;
+                }
+            }
+        }
+    }
+    fp_dlopen ff = (fp_dlopen)g_orig_dlopen;
+    return ff ? ff(path, f) : NULL;
 }
 static int shim_chdir(const char *p) {
     char b[8192]; const char *path = p; if (shim_translate(p, b, sizeof b)) path = b;
     fp_chdir f = (fp_chdir)g_orig_chdir; return f ? f(path) : -1;
+}
+
+static FILE *shim_fopen(const char *p, const char *mode) {
+    char b[8192]; const char *path = p; if (shim_translate(p, b, sizeof b)) path = b;
+    FILE *(*f)(const char *, const char *) = (FILE *(*)(const char *, const char *))g_orig_fopen;
+    return f ? f(path, mode) : NULL;
+}
+static FILE *shim_fopen64(const char *p, const char *mode) {
+    char b[8192]; const char *path = p; if (shim_translate(p, b, sizeof b)) path = b;
+    FILE *(*f)(const char *, const char *) = (FILE *(*)(const char *, const char *))g_orig_fopen64;
+    return f ? f(path, mode) : NULL;
+}
+static int shim___xstat64(int v, const char *p, void *st) {
+    char b[8192]; const char *path = p; if (shim_translate(p, b, sizeof b)) path = b;
+    fp_xstat f = (fp_xstat)g_orig___xstat64; return f ? f(v, path, st) : -1;
+}
+static int shim___lxstat64(int v, const char *p, void *st) {
+    char b[8192]; const char *path = p; if (shim_translate(p, b, sizeof b)) path = b;
+    fp_lxstat f = (fp_lxstat)g_orig___lxstat64; return f ? f(v, path, st) : -1;
+}
+static int shim___fxstatat64(int dfd, const char *p, void *st, int flags) {
+    char b[8192]; const char *path = p;
+    if (dfd == -100 && p && p[0] == '/') { if (shim_translate(p, b, sizeof b)) path = b; }
+    fp_fstatat f = (fp_fstatat)g_orig___fxstatat64; return f ? f(dfd, path, st, flags) : -1;
+}
+static int shim_faccessat2(int dfd, const char *p, int m, int ff) {
+    char b[8192]; const char *path = p;
+    if (dfd == -100 && p && p[0] == '/') { if (shim_translate(p, b, sizeof b)) path = b; }
+    fp_faccessat f = (fp_faccessat)g_orig_faccessat2; return f ? f(dfd, path, m, ff) : -1;
+}
+typedef int (*fp_getrlimit)(int, struct rlimit *);
+static int shim_getrlimit(int resource, struct rlimit *rl) {
+    fp_getrlimit f = (fp_getrlimit)g_orig_getrlimit;
+    int res = f ? f(resource, rl) : -1;
+    if (res == 0 && resource == 3 /* RLIMIT_STACK */ && rl) {
+        if (rl->rlim_cur == 0 || rl->rlim_cur == RLIM_INFINITY || rl->rlim_cur < 8 * 1024 * 1024) {
+            rl->rlim_cur = 8 * 1024 * 1024;
+        }
+    }
+    return res;
 }
 
 static f2_hook_t g_f2_hooks[] = {
@@ -546,10 +842,17 @@ static f2_hook_t g_f2_hooks[] = {
     {"unlink",(void*)shim_unlink,&g_orig_unlink},{"mkdir",(void*)shim_mkdir,&g_orig_mkdir},
     {"mkdirat",(void*)shim_mkdirat,&g_orig_mkdirat},{"rmdir",(void*)shim_rmdir,&g_orig_rmdir},
     {"execve",(void*)shim_execve,&g_orig_execve},{"execv",(void*)shim_execv,&g_orig_execv},
-    {"execvp",(void*)shim_execvp,&g_orig_execvp},{"opendir",(void*)shim_opendir,&g_orig_opendir},
+    {"execvp",(void*)shim_execvp,&g_orig_execvp},{"execvpe",(void*)shim_execvpe,&g_orig_execvpe},
+    {"execveat",(void*)shim_execveat,&g_orig_execveat},
+    {"opendir",(void*)shim_opendir,&g_orig_opendir},
     {"readlink",(void*)shim_readlink,&g_orig_readlink},{"readlinkat",(void*)shim_readlinkat,&g_orig_readlinkat},
     {"realpath",(void*)shim_realpath,&g_orig_realpath},{"dlopen",(void*)shim_dlopen,&g_orig_dlopen},
     {"chdir",(void*)shim_chdir,&g_orig_chdir},
+    {"fopen",(void*)shim_fopen,&g_orig_fopen},{"fopen64",(void*)shim_fopen64,&g_orig_fopen64},
+    {"__xstat64",(void*)shim___xstat64,&g_orig___xstat64},{"__lxstat64",(void*)shim___lxstat64,&g_orig___lxstat64},
+    {"__fxstatat64",(void*)shim___fxstatat64,&g_orig___fxstatat64},{"faccessat2",(void*)shim_faccessat2,&g_orig_faccessat2},
+    {"getrlimit",(void*)shim_getrlimit,&g_orig_getrlimit},{"__getrlimit",(void*)shim_getrlimit,&g_orig_getrlimit},
+    {"prlimit64",(void*)shim_getrlimit,&g_orig_prlimit64},
 };
 
 static int f2_only_match(const char *name) {
@@ -608,17 +911,12 @@ static void shim_resolve_fallback(void) {
  * (fopen->open). Loader zustava v procesu, takze jeho SIGSYS handler funguje
  * (vyhneme se parrot ld.so, ktery na tomto zarizeni narazi na app-seccomp
  * RET_KILL a zabije proces). Zadny ptrace, zadna syscall translace. */
-static int g_f2_active = 0;  /* 1 = F2 rezim (--shim), povol inline-hooky */
 static int run_shim(const char *path, int argc, char **argv, char **envp) {
     g_f2_active = 1;
-    shim_register_overrides();
+    g_exec_mode = "--shim";
     if (elf_debug())
         fprintf(stderr, "[+] F2 path-translation shim (ROOTFS=%s)\n",
                 g_shim_root ? g_shim_root : "(unset)");
-    /* Override se registruji pred elf_load (shim_register_overrides v run_shim),
-     * takze cat i libc se zrelokuji s prekladem. Glibc leaf funkce se patchuji
-     * az po elf_load (shim_install_hooks nize), az je libc nactena.
-     * pres zachytny bionic open, ne prekladany glibc open). */
     return run_ownall(path, argc, argv, envp);
 }
 
@@ -672,6 +970,27 @@ static int run_ownall(const char *path, int argc, char **argv, char **envp) {
     elf_init_argv = argv;
     elf_init_envp = envp;
 
+    if (!g_exec_mode) g_exec_mode = "--ownall";
+    g_shim_root = getenv("ROOTFS");
+    g_shim_loader = getenv("ELF_LOADER");
+    if (g_shim_root && g_shim_root[0]) {
+        g_f2_active = 1;
+        setenv("ROOTFS", g_shim_root, 1);
+    }
+    if (!g_shim_loader || !g_shim_loader[0]) {
+        static char self_exe[1024];
+        ssize_t n = readlink("/proc/self/exe", self_exe, sizeof(self_exe) - 1);
+        if (n > 0) {
+            self_exe[n] = '\0';
+            g_shim_loader = self_exe;
+        } else {
+            g_shim_loader = "/proc/self/exe";
+        }
+    }
+    if (g_shim_loader && g_shim_loader[0]) setenv("ELF_LOADER", g_shim_loader, 1);
+
+    shim_register_overrides();
+
     g_loader_active = 1;  /* loaderuv kod (bionic TLS): jeho open = bionicky */
     /* F2 seccomp filtr je volitelny (F2_FILTER=1). Pri re-execu (shim_execve)
      * dedi dite filtr, ale SIGSYS handler je po execve SIG_DFL a bionic ld.so
@@ -691,14 +1010,19 @@ static int run_ownall(const char *path, int argc, char **argv, char **envp) {
         elf_scope_destroy(scope);
         return 1;
     }
-    if (g_f2_active) shim_install_hooks();  /* patch glibc leaf funkci (F2) */
-    if (g_f2_active) shim_resolve_fallback(); /* fallback real funkci (W^X) */
+    shim_install_hooks();    /* patch glibc leaf funkci (F2 / re-exec) */
+    shim_resolve_fallback(); /* fallback real funkci (W^X) */
 
     void *libc_obj = NULL;
     for (size_t mi = 0; mi < scope->count; mi++)
         if (scope->mods[mi]->soname && strstr(scope->mods[mi]->soname, "libc.so.6"))
             libc_obj = scope->mods[mi]->base_addr;
     g_libc_base = (uintptr_t)libc_obj;
+
+    void *stacksize_sym = elf_scope_lookup(scope, "__default_stacksize");
+    if (stacksize_sym) {
+        *(size_t *)stacksize_sym = 8 * 1024 * 1024;
+    }
 
     if (elf_relocate(obj) != 0) {
         fprintf(stderr, "[-] Relocation failed\n");
@@ -738,6 +1062,11 @@ int main(int argc, char **argv, char **envp) {
     /* ELF_DEBUG → unbuffered stdout, ať trace při SIGSEGV nekončí v bufferu */
     if (getenv("ELF_DEBUG"))
         setvbuf(stdout, NULL, _IONBF, 0);
+
+    /* Ensure a valid RLIMIT_STACK (at least 8MB) so glibc NPTL pthread_create
+     * does not fail in allocate_stack with size == 0 on Android host */
+    struct rlimit rl_stack = { 8 * 1024 * 1024, 8 * 1024 * 1024 };
+    syscall(SYS_prlimit64, 0, 3 /* RLIMIT_STACK */, &rl_stack, NULL);
     /* seccomp stacked filtr: nove syscalls (clone3/close_range/...) -> ENOSYS,
      * aby fungovaly glibc fallbacky pod app profilem jadra 4.14 */
     elf_install_compat();
