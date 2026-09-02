@@ -1068,25 +1068,7 @@ static int shim_getrlimit(int resource, struct rlimit *rl) {
     return res;
 }
 
-typedef int (*fp_fileno_unlocked)(FILE *);
-typedef int (*fp_fileno)(FILE *);
 
-static int shim_fileno_unlocked(FILE *fp) {
-    if (elf_debug()) fprintf(stderr, "[dbg] fileno_unlocked called with fp=%p\n", fp);
-    fp_fileno_unlocked f = (fp_fileno_unlocked)g_orig_fileno_unlocked;
-    if (!f) {
-        /* Fallback: use fileno if fileno_unlocked not found */
-        fp_fileno f2 = (fp_fileno)g_orig_fileno;
-        return f2 ? f2(fp) : -1;
-    }
-    return f(fp);
-}
-
-static int shim_fileno(FILE *fp) {
-    if (elf_debug()) fprintf(stderr, "[dbg] fileno called with fp=%p\n", fp);
-    fp_fileno f = (fp_fileno)g_orig_fileno;
-    return f ? f(fp) : -1;
-}
 
 static f2_hook_t g_f2_hooks[] = {
     {"open",(void*)shim_open,&g_orig_open},{"open64",(void*)shim_open64,&g_orig_open64},
@@ -1116,6 +1098,7 @@ static f2_hook_t g_f2_hooks[] = {
     {"getrlimit",(void*)shim_getrlimit,&g_orig_getrlimit},{"__getrlimit",(void*)shim_getrlimit,&g_orig_getrlimit},
     {"prlimit64",(void*)shim_getrlimit,&g_orig_prlimit64},
     {"fileno_unlocked",(void*)shim_fileno_unlocked,&g_orig_fileno_unlocked},{"fileno",(void*)shim_fileno,&g_orig_fileno},
+    {"flockfile",(void*)shim_flockfile,&g_orig_flockfile},
 };
 
 static int f2_only_match(const char *name) {
