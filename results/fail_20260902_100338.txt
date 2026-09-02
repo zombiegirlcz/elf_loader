@@ -1,0 +1,11 @@
+FAIL: cut - cut field (expected 'root', got: sh: /data/user/0/com.linux_core/files/nh/distro/parrot/usr/bin/head: No such file or directory)
+TIMEOUT: sort - sort stdin
+TIMEOUT: uniq - uniq dedup
+TIMEOUT: tr - tr translate
+FAIL: mv - mv cat mv back (expected 'TERMINATOR', got: Command blocked for security reasons)
+FAIL: hostname - hostname (expected 'TERMINATOR', got: localhost)
+FAIL: whoami - whoami (expected 'root', got: whoami: cannot find name for user ID 10314)
+FAIL: gzip - gzip gunzip pipe (expected 'test', got: [-] Not an ELF file)
+FAIL: tar - tar gz (expected 'TERMINATOR', got: /data/user/0/com.linux_core/files/nh/distro/parrot/usr/bin/tar: Removing leading `/' from member nam)
+FAIL: ping - ping localhost (expected '1 received', got: [-] open(/data/user/0/com.linux_core/files/nh/distro/parrot/usr/bin/ping): No such file or directory)
+FAIL: nslookup - nslookup (expected 'localhost', got: [-] open(/data/user/0/com.linux_core/files/nh/distro/parrot/usr/bin/nslookup): No such file or direc)

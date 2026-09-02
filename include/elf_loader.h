@@ -94,4 +94,23 @@ elf_object_t *elf_scope_find(const elf_scope_t *s, const char *name,
                              const Elf64_Sym **out_sym);
 elf_object_t *elf_load_shared(const char *path, elf_scope_t *scope);
 
+/* Debug levels */
+#define ELF_DEBUG_LEVEL_NONE    0
+#define ELF_DEBUG_LEVEL_ERROR   1
+#define ELF_DEBUG_LEVEL_WARN    2
+#define ELF_DEBUG_LEVEL_INFO    3
+#define ELF_DEBUG_LEVEL_DEBUG   4
+#define ELF_DEBUG_LEVEL_VERBOSE 5
+
+/* Debug functions */
+void elf_debug_init(void);
+void elf_debug_log(const char *fmt, ...);
+void elf_debug_trace(const char *fmt, ...);
+void elf_debug_dump_maps(void);
+void elf_debug_dump_symbols(elf_object_t *obj);
+void elf_debug_dump_relocations(elf_object_t *obj);
+void elf_debug_dump_memory(void *addr, size_t len);
+void elf_debug_set_level(int level);
+int elf_debug_get_level(void);
+
 #endif

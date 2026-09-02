@@ -224,10 +224,9 @@ static void *g_orig_fopen = NULL, *g_orig_fopen64 = NULL,
             *g_orig___xstat64 = NULL, *g_orig___lxstat64 = NULL, *g_orig___fxstatat64 = NULL,
             *g_orig_faccessat2 = NULL,
             *g_orig_getrlimit = NULL, *g_orig_prlimit64 = NULL;
-typedef int (*fp_fileno_unlocked)(FILE *);
-static fp_fileno_unlocked g_orig_fileno_unlocked = NULL;
-typedef int (*fp_fileno)(FILE *);
-static fp_fileno g_orig_fileno = NULL;
+static void *g_orig_fileno_unlocked = NULL;
+static void *g_orig_fileno = NULL;
+static void *g_orig_flockfile = NULL;
 static void *g_orig_opendir = NULL, *g_orig_readlink = NULL, *g_orig_readlinkat = NULL,
             *g_orig_realpath = NULL, *g_orig_dlopen = NULL, *g_orig_chdir = NULL;
 
@@ -1068,7 +1067,35 @@ static int shim_getrlimit(int resource, struct rlimit *rl) {
     return res;
 }
 
+typedef int (*fp_fileno_unlocked)(FILE *);
+typedef int (*fp_fileno)(FILE *);
+typedef void (*fp_flockfile)(FILE *);
 
+static int shim_fileno_unlocked(FILE *fp) {
+    if (elf_debug()) fprintf(stderr, "[dbg] fileno_unlocked called with fp=%p\n", fp);
+    if (!fp) {
+        errno = EBADF;
+        return -1;
+    }
+    fp_fileno_unlocked f = (fp_fileno_unlocked)g_orig_fileno_unlocked;
+    return f ? f(fp) : -1;
+}
+
+static int shim_fileno(FILE *fp) {
+    if (elf_debug()) fprintf(stderr, "[dbg] fileno called with fp=%p\n", fp);
+    if (!fp) {
+        errno = EBADF;
+        return -1;
+    }
+    fp_fileno f = (fp_fileno)g_orig_fileno;
+    return f ? f(fp) : -1;
+}
+
+static void shim_flockfile(FILE *fp) {
+    if (elf_debug()) fprintf(stderr, "[dbg] flockfile called with fp=%p\n", fp);
+    fp_flockfile f = (fp_flockfile)g_orig_flockfile;
+    if (f) f(fp);
+}
 
 static f2_hook_t g_f2_hooks[] = {
     {"open",(void*)shim_open,&g_orig_open},{"open64",(void*)shim_open64,&g_orig_open64},

@@ -1,0 +1,342 @@
+PASS: [ - [ -f /etc/hostname ] && echo ok
+PASS: appres - --help
+PASS: arch - --help
+PASS: b2sum - --help
+PASS: base32 - --help
+PASS: base64 - --help
+PASS: basename - basename /etc/hostname
+PASS: basenc - --help
+PASS: bashbug - --help
+PASS: batcat - --help
+PASS: busctl - --help
+PASS: busybox - --help
+PASS: bzdiff - --help
+PASS: bzexe - --help
+PASS: bzgrep - --help
+PASS: bzip2 - echo test | bzip2 | bunzip2
+PASS: bzip2recover - --help
+PASS: bzmore - --help
+PASS: c89-gcc - --help
+PASS: c99-gcc - --help
+PASS: c_rehash - --help
+PASS: cat - cat /etc/hostname
+PASS: catman - --help
+PASS: chage - --help
+PASS: chattr - --help
+PASS: chcon - --help
+PASS: chfn - --help
+PASS: chgrp - chgrp --help
+PASS: chmod - chmod +x /etc/hostname && ls -l /etc/hostname | head -1
+PASS: choom - --help
+PASS: chown - chown --help
+PASS: chrt - --help
+PASS: chsh - --help
+PASS: cksum - --help
+PASS: clear - --help
+PASS: clear_console - --help
+PASS: cmp - --help
+PASS: col - --help
+PASS: colcrt - --help
+PASS: colrm - --help
+PASS: column - --help
+PASS: comm - --help
+PASS: corelist - --help
+PASS: cp - cp /etc/hostname /tmp/test_cp_747 && cat /tmp/test_cp_747 && rm /tmp/test_cp_747
+PASS: cpan - --help
+PASS: csplit - --help
+PASS: cut - cut -d: -f1 /etc/passwd | head -1
+PASS: cvtsudoers - --help
+PASS: date - date
+PASS: dbclient - --help
+PASS: deb-systemd-helper - --help
+PASS: deb-systemd-invoke - --help
+PASS: debconf - --help
+PASS: debconf-apt-progress - --help
+PASS: debconf-communicate - --help
+PASS: debconf-copydb - --help
+PASS: debconf-escape - --help
+PASS: debconf-set-selections - --help
+PASS: debconf-show - --help
+PASS: desktop-file-install - --help
+PASS: desktop-file-validate - --help
+PASS: df - df -h /
+PASS: dh_bash-completion - --help
+PASS: dh_installxmlcatalogs - --help
+PASS: diff - diff /etc/hostname /etc/hostname
+PASS: diff3 - --help
+PASS: dir - --help
+PASS: dircolors - --help
+PASS: dirmngr-client - --help
+PASS: dirname - dirname /etc/hostname
+PASS: dmesg - --help
+PASS: dropbearconvert - --help
+PASS: dropbearkey - --help
+PASS: du - du -sh /etc
+PASS: echo - echo 'hello world'
+PASS: editres - --help
+PASS: egrep - --help
+PASS: elf_loader - --help
+PASS: enc2xs - --help
+PASS: encguess - --help
+PASS: env - --help
+PASS: eqn - --help
+PASS: expand - --help
+PASS: expiry - --help
+PASS: expr - expr 1 + 2
+PASS: eza - --help
+PASS: factor - factor 12
+PASS: faked-sysv - --help
+PASS: faked-tcp - --help
+PASS: fakeroot-sysv - --help
+PASS: fakeroot-tcp - --help
+PASS: fallocate - --help
+PASS: false - --help
+PASS: fgrep - --help
+PASS: find - find /etc -maxdepth 1 -type f | head -3
+PASS: findmnt - --help
+PASS: findrule - --help
+PASS: flock - --help
+PASS: fmt - --help
+PASS: fold - --help
+PASS: free - free -h
+PASS: fuser - --help
+PASS: fzf - --help
+PASS: fzf-tmux - --help
+PASS: gencat - --help
+PASS: getconf - --help
+PASS: getent - --help
+PASS: getopt - --help
+PASS: gh - --help
+PASS: git - --help
+PASS: git-lfs - --help
+PASS: git-shell - --help
+PASS: gpasswd - --help
+PASS: gpg-connect-agent - --help
+PASS: gpg-mail-tube - --help
+PASS: gpg-wks-client - --help
+PASS: gpgconf - --help
+PASS: gpgparsemail - --help
+PASS: gpgsplit - --help
+PASS: gpgtar - --help
+PASS: gpgv - --help
+PASS: gprofng - --help
+PASS: gprofng-archive - --help
+PASS: gprofng-collect-app - --help
+PASS: gprofng-display-html - --help
+PASS: gprofng-display-src - --help
+PASS: gprofng-display-text - --help
+PASS: grep - grep -q root /etc/passwd
+PASS: groff - --help
+PASS: grog - --help
+PASS: grops - --help
+PASS: grotty - --help
+PASS: groups - --help
+PASS: gunzip - echo test | gzip | gunzip
+PASS: gzexe - --help
+PASS: gzip - echo test | gzip | gunzip
+PASS: h2ph - --help
+PASS: h2xs - --help
+PASS: hardlink - --help
+PASS: head - head -n 3 /etc/passwd
+PASS: hexdump - hexdump -C /etc/hostname | head -1
+PASS: hostid - --help
+PASS: hostname - hostname
+PASS: hostnamectl - --help
+PASS: iconv - iconv -l | head -1
+PASS: id - id -u
+PASS: infocmp - --help
+PASS: install - install --help
+PASS: instmodsh - --help
+PASS: ionice - --help
+PASS: ipcmk - --help
+PASS: ipcrm - --help
+PASS: ipcs - --help
+PASS: ischroot - --help
+PASS: join - join -t: /etc/passwd /etc/passwd 2>/dev/null | head -1
+PASS: journalctl.distrib - --help
+PASS: jq - --help
+PASS: json_pp - --help
+PASS: kbxutil - --help
+PASS: kernel-install - --help
+PASS: kill - kill --help
+PASS: killall - killall --help
+PASS: ldd - --help
+PASS: lessecho - --help
+PASS: lesskey - --help
+PASS: lesspipe - --help
+PASS: lexgrog - --help
+PASS: libnetcfg - --help
+PASS: link - --help
+PASS: listres - --help
+PASS: ln - ln -sf /etc/hostname /tmp/test_ln_747 && ls -l /tmp/test_ln_747
+PASS: locale - --help
+PASS: localectl - --help
+PASS: localedef - --help
+PASS: logger - --help
+PASS: login - --help
+PASS: loginctl - --help
+PASS: logname - logname
+PASS: look - --help
+PASS: ls - ls /etc | head -5
+PASS: lsattr - --help
+PASS: lsblk - --help
+PASS: lscpu - --help
+PASS: lsipc - --help
+PASS: lslocks - --help
+PASS: lslogins - --help
+PASS: lsmem - --help
+PASS: lsns - --help
+PASS: lsof - --help
+PASS: lspgpot - --help
+PASS: luit - --help
+PASS: lzmainfo - --help
+PASS: make - --help
+PASS: make-first-existing-target - --help
+PASS: man-recode - --help
+PASS: mandb - --help
+PASS: manpath - --help
+PASS: mawk - awk 'BEGIN{print 1+2}'
+PASS: mcookie - --help
+PASS: md5sum - echo test | md5sum
+PASS: mesa-overlay-control.py - --help
+PASS: migrate-pubring-from-classic-gpg - --help
+PASS: mkdir - mkdir /tmp/test_mkdir_747 && rmdir /tmp/test_mkdir_747
+PASS: mkfifo - --help
+PASS: mknod - --help
+PASS: mktemp - --help
+PASS: mount - --help
+PASS: mountpoint - --help
+PASS: mv - mv --help
+PASS: namei - --help
+PASS: neofetch - --help
+PASS: neqn - --help
+PASS: networkctl - --help
+PASS: newgrp - --help
+PASS: nice - --help
+PASS: nl - nl -nln /etc/hostname
+PASS: nohup - --help
+PASS: nproc - --help
+PASS: nroff - --help
+PASS: nsenter - --help
+PASS: numfmt - --help
+PASS: od - od -c /etc/hostname | head -1
+PASS: partx - --help
+PASS: passwd - --help
+PASS: paste - paste -d: - - < /etc/passwd
+PASS: patch - patch --help
+PASS: pathchk - --help
+PASS: peekfd - --help
+PASS: pgrep - pgrep bash
+PASS: pic - --help
+PASS: piconv - --help
+PASS: pidwait - --help
+PASS: pinentry-curses - --help
+PASS: pinky - --help
+PASS: pip - --help
+PASS: pip3 - --help
+PASS: pkaction - --help
+PASS: pkcheck - --help
+PASS: pkttyagent - --help
+PASS: pl2pm - --help
+PASS: pldd - --help
+PASS: pmap - --help
+PASS: pod2html - --help
+PASS: pod2man - --help
+PASS: pod2text - --help
+PASS: pod2usage - --help
+PASS: podchecker - --help
+PASS: pr - --help
+PASS: preconv - --help
+PASS: printenv - --help
+PASS: printf - printf 'test %d %s' 42 foo
+PASS: prlimit - --help
+PASS: prove - --help
+PASS: prtstat - --help
+PASS: ps - ps aux | head -5
+PASS: pslog - --help
+PASS: pstree - --help
+PASS: ptar - --help
+PASS: ptardiff - --help
+PASS: ptargrep - --help
+PASS: ptx - --help
+PASS: pwd - --help
+PASS: pwdx - --help
+PASS: py3clean - --help
+PASS: py3compile - --help
+PASS: pydoc3.13 - --help
+PASS: pygettext3.13 - --help
+PASS: readlink - readlink /etc/hostname
+PASS: realpath - realpath /etc/hostname
+PASS: rename.ul - --help
+PASS: renice - --help
+PASS: rev - --help
+PASS: rg - --help
+PASS: rgrep - --help
+PASS: rm - rm --help
+PASS: rmdir - rmdir --help
+PASS: rpcgen - --help
+PASS: run-parts - --help
+PASS: runcon - --help
+PASS: savelog - --help
+PASS: scalar - --help
+PASS: script - --help
+PASS: scriptlive - --help
+PASS: scriptreplay - --help
+PASS: sdiff - sdiff --help
+PASS: sed - sed -n '1p' /etc/hostname
+PASS: select-editor - --help
+PASS: sensible-browser - --help
+PASS: sensible-editor - --help
+PASS: sensible-pager - --help
+PASS: sensible-terminal - --help
+PASS: seq - seq 1 5
+PASS: setarch - --help
+PASS: setpriv - --help
+PASS: setsid - --help
+PASS: setterm - --help
+PASS: sha1sum - echo test | sha1sum
+PASS: sha224sum - --help
+PASS: sha256sum - echo test | sha256sum
+PASS: sha384sum - --help
+PASS: sha512sum - --help
+PASS: shasum - --help
+PASS: shred - --help
+PASS: shuf - --help
+PASS: skill - --help
+PASS: slabtop - --help
+PASS: sleep - --help
+PASS: soelim - --help
+PASS: sort - sort
+PASS: splain - --help
+PASS: split - split --help
+PASS: sq - --help
+PASS: sqv - --help
+PASS: ssh-add - --help
+PASS: ssh-agent - --help
+PASS: ssh-argv0 - --help
+PASS: ssh-copy-id - --help
+PASS: ssh-keygen - --help
+PASS: ssh-keyscan - --help
+PASS: starship - --help
+PASS: stat - stat /etc/hostname
+PASS: stdbuf - --help
+PASS: streamzip - --help
+PASS: stty - --help
+PASS: su - --help
+PASS: su.orig - --help
+PASS: sudo.orig - --help
+PASS: sudoreplay - --help
+PASS: sum - sum --help
+PASS: sync - sync
+PASS: systemctl.distrib - --help
+PASS: tabs - --help
+PASS: tac - --help
+PASS: tail - tail -n 3 /etc/passwd
+PASS: tar - tar -tzf /etc/hostname 2>&1 | head -1
+PASS: taskset - --help
+PASS: tbl - --help
+PASS: tee - --help
+PASS: tempfile - --help
+PASS: test - test -f /etc/hostname && echo ok
+PASS: tic - --help
+PASS: timedatectl - --help

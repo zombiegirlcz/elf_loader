@@ -1,0 +1,9 @@
+=== top ===
+FAIL top: tmux session died
+=== htop ===
+FAIL htop: tmux session died
+=== btop ===
+FAIL btop: tmux session died
+=== btm ===
+FAIL btm: tmux session died
+PASS=0 FAIL=4

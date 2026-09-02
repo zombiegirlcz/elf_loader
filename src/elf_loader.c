@@ -4,6 +4,7 @@
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
+#include <stdarg.h>
 #include <fcntl.h>
 #include <unistd.h>
 extern char **environ;
@@ -98,13 +99,112 @@ static const char *sys_libdirs(void) {
 /* Verbose loader logging: default TICHY (cisty vystup spustene binarky).
  * ELF_DEBUG=<cokoli krome "0"> zapne [+] / [dbg] trace zpet na stderr.
  * getenv nealokuje -> bezpecne i pro malloc-free resolve path. */
+static int g_debug_level = 0;
+
 int elf_debug(void) {
     static int cached = -1;
     if (cached < 0) {
         const char *d = getenv("ELF_DEBUG");
         cached = (d && d[0] && strcmp(d, "0") != 0) ? 1 : 0;
+        g_debug_level = cached;
     }
     return cached;
+}
+
+void elf_debug_init(void) {
+    elf_debug(); /* Initialize debug level from environment */
+}
+
+void elf_debug_set_level(int level) {
+    g_debug_level = level;
+}
+
+int elf_debug_get_level(void) {
+    return g_debug_level;
+}
+
+void elf_debug_log(const char *fmt, ...) {
+    if (g_debug_level < ELF_DEBUG_LEVEL_INFO) return;
+    va_list args;
+    va_start(args, fmt);
+    fprintf(stderr, "[dbg] ");
+    vfprintf(stderr, fmt, args);
+    fprintf(stderr, "\n");
+    va_end(args);
+}
+
+void elf_debug_trace(const char *fmt, ...) {
+    if (g_debug_level < ELF_DEBUG_LEVEL_DEBUG) return;
+    va_list args;
+    va_start(args, fmt);
+    fprintf(stderr, "[trc] ");
+    vfprintf(stderr, fmt, args);
+    fprintf(stderr, "\n");
+    va_end(args);
+}
+
+void elf_debug_dump_maps(void) {
+    if (g_debug_level < ELF_DEBUG_LEVEL_DEBUG) return;
+    FILE *f = fopen("/proc/self/maps", "r");
+    if (!f) return;
+    char line[256];
+    fprintf(stderr, "[dbg] === /proc/self/maps ===\n");
+    while (fgets(line, sizeof(line), f)) {
+        fprintf(stderr, "[dbg] %s", line);
+    }
+    fclose(f);
+    fprintf(stderr, "[dbg] =========================\n");
+}
+
+void elf_debug_dump_symbols(elf_object_t *obj) {
+    if (g_debug_level < ELF_DEBUG_LEVEL_DEBUG) return;
+    if (!obj || !obj->dynsym || !obj->dynstr) return;
+    fprintf(stderr, "[dbg] Symbols for %s:\n", obj->soname ? obj->soname : "<unknown>");
+    for (size_t i = 0; i < obj->dynsym_count; i++) {
+        Elf64_Sym *sym = &obj->dynsym[i];
+        const char *name = obj->dynstr + sym->st_name;
+        const char *type = "?";
+        switch (ELF64_ST_TYPE(sym->st_info)) {
+            case STT_FUNC: type = "FUNC"; break;
+            case STT_OBJECT: type = "OBJ"; break;
+            case STT_SECTION: type = "SEC"; break;
+            case STT_FILE: type = "FILE"; break;
+            case STT_NOTYPE: type = "NOTYPE"; break;
+        }
+        fprintf(stderr, "[dbg]   %4zu: %s @ 0x%lx (%s)\n", i, name, (unsigned long)sym->st_value, type);
+    }
+}
+
+void elf_debug_dump_relocations(elf_object_t *obj) {
+    if (g_debug_level < ELF_DEBUG_LEVEL_DEBUG) return;
+    if (!obj || !obj->jmp_rela) return;
+    fprintf(stderr, "[dbg] JMP_RELA for %s:\n", obj->soname ? obj->soname : "<unknown>");
+    for (size_t i = 0; i < obj->jmp_size / sizeof(Elf64_Rela); i++) {
+        Elf64_Rela *rela = &obj->jmp_rela[i];
+        fprintf(stderr, "[dbg]   [%zu] offset=0x%lx type=%lu sym=%lu addend=%ld\n",
+                i, (unsigned long)rela->r_offset, 
+                (unsigned long)ELF64_R_TYPE(rela->r_info), 
+                (unsigned long)ELF64_R_SYM(rela->r_info), 
+                (long)rela->r_addend);
+    }
+}
+
+void elf_debug_dump_memory(void *addr, size_t len) {
+    if (g_debug_level < ELF_DEBUG_LEVEL_VERBOSE) return;
+    unsigned char *p = (unsigned char *)addr;
+    fprintf(stderr, "[dbg] Memory dump at %p (%zu bytes):\n", addr, len);
+    for (size_t i = 0; i < len; i += 16) {
+        fprintf(stderr, "[dbg] %p: ", p + i);
+        for (size_t j = 0; j < 16 && i + j < len; j++) {
+            fprintf(stderr, "%02x ", p[i + j]);
+        }
+        fprintf(stderr, "  ");
+        for (size_t j = 0; j < 16 && i + j < len; j++) {
+            char c = p[i + j];
+            fprintf(stderr, "%c", (c >= 32 && c < 127) ? c : '.');
+        }
+        fprintf(stderr, "\n");
+    }
 }
 
 static size_t map_base_vaddr(const elf_object_t *obj);
