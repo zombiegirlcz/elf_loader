@@ -213,7 +213,7 @@ static void *g_orig_open = NULL, *g_orig_open64 = NULL, *g_orig_openat = NULL,
             *g_orig_openat64 = NULL;
 static void *g_orig_stat = NULL, *g_orig_stat64 = NULL, *g_orig___xstat = NULL,
             *g_orig_lstat = NULL, *g_orig___lxstat = NULL;
-static void *g_orig_access = NULL, *g_orig_faccessat = NULL;
+static void *g_orig_access = NULL, *g_orig_euidaccess = NULL, *g_orig_faccessat = NULL;
 static void *g_orig_statx = NULL, *g_orig_fstatat = NULL, *g_orig_newfstatat = NULL;
 static void *g_orig_symlink = NULL, *g_orig_symlinkat = NULL, *g_orig_link = NULL,
             *g_orig_rename = NULL, *g_orig_unlink = NULL, *g_orig_mkdir = NULL,
@@ -374,6 +374,7 @@ static int hook_install(f2_hook_t *h) {
 typedef int (*fp_open)(const char *, int, ...);
 static int g_loader_active = 0;        /* 1 = loaderuv vlastni kod (bionic TLS) */
 typedef int (*fp_openat)(int, const char *, int, ...);
+static int shim_resolve_symlinks(const char *path, char *out, size_t outsz);
 static int shim_open(const char *p, int flags, ...) {
     char buf[8192]; const char *path = p;
     if (shim_translate(p, buf, sizeof buf)) path = buf;
@@ -427,6 +428,7 @@ typedef int (*fp_xstat)(int, const char *, struct stat *);
 typedef int (*fp_lstat)(const char *, struct stat *);
 typedef int (*fp_lxstat)(int, const char *, struct stat *);
 typedef int (*fp_access)(const char *, int);
+typedef int (*fp_euidaccess)(const char *, int);
 typedef int (*fp_faccessat)(int, const char *, int, int);
 
 /* Forward declaration */
@@ -468,6 +470,16 @@ static int shim_access(const char *p, int m) {
         path = resolved;
     }
     fp_access f = (fp_access)g_orig_access; return f ? f(path, m) : -1;
+}
+static int shim_euidaccess(const char *p, int m) {
+    char b[8192]; const char *path = p; if (shim_translate(p, b, sizeof b)) path = b;
+    /* Resolve symlinks under ROOTFS so kernel doesn't follow guest-absolute
+     * symlink targets against the host root (e.g. awk -> /etc/alternatives/awk) */
+    char resolved[8192];
+    if (shim_resolve_symlinks(path, resolved, sizeof(resolved))) {
+        path = resolved;
+    }
+    fp_euidaccess f = (fp_euidaccess)g_orig_euidaccess; return f ? f(path, m) : -1;
 }
 static int shim_faccessat(int dfd, const char *p, int m, int ff) {
     char b[8192]; const char *path = p;
@@ -1060,7 +1072,7 @@ static f2_hook_t g_f2_hooks[] = {
     {"stat",(void*)shim_stat,&g_orig_stat},{"stat64",(void*)shim_stat64,&g_orig_stat64},
     {"__xstat",(void*)shim___xstat,&g_orig___xstat},{"lstat",(void*)shim_lstat,&g_orig_lstat},
     {"__lxstat",(void*)shim___lxstat,&g_orig___lxstat},
-    {"access",(void*)shim_access,&g_orig_access},{"faccessat",(void*)shim_faccessat,&g_orig_faccessat},
+    {"access",(void*)shim_access,&g_orig_access},{"euidaccess",(void*)shim_euidaccess,&g_orig_euidaccess},{"faccessat",(void*)shim_faccessat,&g_orig_faccessat},
     {"statx",(void*)shim_statx,&g_orig_statx},{"fstatat",(void*)shim_fstatat,&g_orig_fstatat},
     {"newfstatat",(void*)shim_newfstatat,&g_orig_newfstatat},{"__fxstatat",(void*)shim_fstatat,&g_orig_fstatat},
     {"symlink",(void*)shim_symlink,&g_orig_symlink},{"symlinkat",(void*)shim_symlinkat,&g_orig_symlinkat},
