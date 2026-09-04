@@ -29,3 +29,4 @@ magisk-module/*.zip
 .qmd/index.sqlite
 *.log
 files/
+*.txt
