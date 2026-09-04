@@ -1277,21 +1277,325 @@ static int run_ownall(const char *path, int argc, char **argv, char **envp) {
         }
     }
     elf_object_t *obj = elf_load(path);
-    elf_own_scope = NULL;
-    elf_set_crash_scope(scope);
     if (!obj) {
         elf_scope_destroy(scope);
         return 1;
     }
-    shim_install_hooks();    /* patch glibc leaf funkci (F2 / re-exec) */
-    shim_resolve_fallback(); /* fallback real funkci (W^X) */
+    elf_set_crash_scope(scope);
+
+    // Load all dependencies into obj->scope
+    if (load_needed(obj) != 0) {
+        fprintf(stderr, "[-] Failed to load dependencies\n");
+        elf_scope_destroy(scope);
+        elf_unload(obj);
+        return 1;
+    }
 
     void *libc_obj = NULL;
     for (size_t mi = 0; mi < scope->count; mi++)
         if (scope->mods[mi]->soname && strstr(scope->mods[mi]->soname, "libc.so.6"))
             libc_obj = scope->mods[mi]->base_addr;
     g_libc_base = (uintptr_t)libc_obj;
+    elf_object_t *obj = elf_load(path);
+    if (!obj) {
+        elf_scope_destroy(scope);
+        return 1;
+    }
+    elf_set_crash_scope(scope);
 
+    // Load all dependencies into obj->scope
+    if (load_needed(obj) != 0) {
+        fprintf(stderr, "[-] Failed to load dependencies\n");
+        elf_scope_destroy(scope);
+        elf_unload(obj);
+        return 1;
+    }
+
+    void *libc_obj = NULL;
+    for (size_t mi = 0; mi < scope->count; mi++)
+        if (scope->mods[mi]->soname && strstr(scope->mods[mi]->soname, "libc.so.6"))
+            libc_obj = scope->mods[mi]->base_addr;
+    g_libc_base = (uintptr_t)libc_obj;
+    elf_object_t *obj = elf_load(path);
+    if (!obj) {
+        elf_scope_destroy(scope);
+        return 1;
+    }
+    elf_set_crash_scope(scope);
+
+    // Load all dependencies into obj->scope
+    if (load_needed(obj) != 0) {
+        fprintf(stderr, "[-] Failed to load dependencies\n");
+        elf_scope_destroy(scope);
+        elf_unload(obj);
+        return 1;
+    }
+
+    void *libc_obj = NULL;
+    for (size_t mi = 0; mi < scope->count; mi++)
+        if (scope->mods[mi]->soname && strstr(scope->mods[mi]->soname, "libc.so.6"))
+            libc_obj = scope->mods[mi]->base_addr;
+    g_libc_base = (uintptr_t)libc_obj;
+    elf_object_t *obj = elf_load(path);
+    if (!obj) {
+        elf_scope_destroy(scope);
+        return 1;
+    }
+    elf_set_crash_scope(scope);
+
+    // Load all dependencies into obj->scope
+    if (load_needed(obj) != 0) {
+        fprintf(stderr, "[-] Failed to load dependencies\n");
+        elf_scope_destroy(scope);
+        elf_unload(obj);
+        return 1;
+    }
+
+    void *libc_obj = NULL;
+    for (size_t mi = 0; mi < scope->count; mi++)
+        if (scope->mods[mi]->soname && strstr(scope->mods[mi]->soname, "libc.so.6"))
+            libc_obj = scope->mods[mi]->base_addr;
+    g_libc_base = (uintptr_t)libc_obj;
+    elf_object_t *obj = elf_load(path);
+    if (!obj) {
+        elf_scope_destroy(scope);
+        return 1;
+    }
+    elf_set_crash_scope(scope);
+
+    // Load all dependencies into obj->scope
+    if (load_needed(obj) != 0) {
+        fprintf(stderr, "[-] Failed to load dependencies\n");
+        elf_scope_destroy(scope);
+        elf_unload(obj);
+        return 1;
+    }
+
+    void *libc_obj = NULL;
+    for (size_t mi = 0; mi < scope->count; mi++)
+        if (scope->mods[mi]->soname && strstr(scope->mods[mi]->soname, "libc.so.6"))
+            libc_obj = scope->mods[mi]->base_addr;
+    g_libc_base = (uintptr_t)libc_obj;
+    elf_object_t *obj = elf_load(path);
+    if (!obj) {
+        elf_scope_destroy(scope);
+        return 1;
+    }
+    elf_set_crash_scope(scope);
+
+    // Load all dependencies into obj->scope
+    if (load_needed(obj) != 0) {
+        fprintf(stderr, "[-] Failed to load dependencies\n");
+        elf_scope_destroy(scope);
+        elf_unload(obj);
+        return 1;
+    }
+
+    void *libc_obj = NULL;
+    for (size_t mi = 0; mi < scope->count; mi++)
+        if (scope->mods[mi]->soname && strstr(scope->mods[mi]->soname, "libc.so.6"))
+            libc_obj = scope->mods[mi]->base_addr;
+    g_libc_base = (uintptr_t)libc_obj;
+    elf_object_t *obj = elf_load(path);
+    if (!obj) {
+        elf_scope_destroy(scope);
+        return 1;
+    }
+    elf_set_crash_scope(scope);
+
+    // Load all dependencies into obj->scope
+    if (load_needed(obj) != 0) {
+        fprintf(stderr, "[-] Failed to load dependencies\n");
+        elf_scope_destroy(scope);
+        elf_unload(obj);
+        return 1;
+    }
+
+    void *libc_obj = NULL;
+    for (size_t mi = 0; mi < scope->count; mi++)
+        if (scope->mods[mi]->soname && strstr(scope->mods[mi]->soname, "libc.so.6"))
+            libc_obj = scope->mods[mi]->base_addr;
+    g_libc_base = (uintptr_t)libc_obj;
+    elf_object_t *obj = elf_load(path);
+    if (!obj) {
+        elf_scope_destroy(scope);
+        return 1;
+    }
+    elf_set_crash_scope(scope);
+
+    // Load all dependencies into obj->scope
+    if (load_needed(obj) != 0) {
+        fprintf(stderr, "[-] Failed to load dependencies\n");
+        elf_scope_destroy(scope);
+        elf_unload(obj);
+        return 1;
+    }
+
+    void *libc_obj = NULL;
+    for (size_t mi = 0; mi < scope->count; mi++)
+        if (scope->mods[mi]->soname && strstr(scope->mods[mi]->soname, "libc.so.6"))
+            libc_obj = scope->mods[mi]->base_addr;
+    g_libc_base = (uintptr_t)libc_obj;
+    elf_object_t *obj = elf_load(path);
+    if (!obj) {
+        elf_scope_destroy(scope);
+        return 1;
+    }
+    elf_set_crash_scope(scope);
+
+    // Load all dependencies into obj->scope
+    if (load_needed(obj) != 0) {
+        fprintf(stderr, "[-] Failed to load dependencies\n");
+        elf_scope_destroy(scope);
+        elf_unload(obj);
+        return 1;
+    }
+
+    void *libc_obj = NULL;
+    for (size_t mi = 0; mi < scope->count; mi++)
+        if (scope->mods[mi]->soname && strstr(scope->mods[mi]->soname, "libc.so.6"))
+            libc_obj = scope->mods[mi]->base_addr;
+    g_libc_base = (uintptr_t)libc_obj;
+    elf_object_t *obj = elf_load(path);
+    if (!obj) {
+        elf_scope_destroy(scope);
+        return 1;
+    }
+    elf_set_crash_scope(scope);
+
+    // Load all dependencies into obj->scope
+    if (load_needed(obj) != 0) {
+        fprintf(stderr, "[-] Failed to load dependencies\n");
+        elf_scope_destroy(scope);
+        elf_unload(obj);
+        return 1;
+    }
+
+    void *libc_obj = NULL;
+    for (size_t mi = 0; mi < scope->count; mi++)
+        if (scope->mods[mi]->soname && strstr(scope->mods[mi]->soname, "libc.so.6"))
+            libc_obj = scope->mods[mi]->base_addr;
+    g_libc_base = (uintptr_t)libc_obj;
+    elf_object_t *obj = elf_load(path);
+    if (!obj) {
+        elf_scope_destroy(scope);
+        return 1;
+    }
+    elf_set_crash_scope(scope);
+
+    // Load all dependencies into obj->scope
+    if (load_needed(obj) != 0) {
+        fprintf(stderr, "[-] Failed to load dependencies\n");
+        elf_scope_destroy(scope);
+        elf_unload(obj);
+        return 1;
+    }
+
+    void *libc_obj = NULL;
+    for (size_t mi = 0; mi < scope->count; mi++)
+        if (scope->mods[mi]->soname && strstr(scope->mods[mi]->soname, "libc.so.6"))
+            libc_obj = scope->mods[mi]->base_addr;
+    g_libc_base = (uintptr_t)libc_obj;
+    elf_object_t *obj = elf_load(path);
+    if (!obj) {
+        elf_scope_destroy(scope);
+        return 1;
+    }
+    elf_set_crash_scope(scope);
+
+    // Load all dependencies into obj->scope
+    if (load_needed(obj) != 0) {
+        fprintf(stderr, "[-] Failed to load dependencies\n");
+        elf_scope_destroy(scope);
+        elf_unload(obj);
+        return 1;
+    }
+
+    void *libc_obj = NULL;
+    for (size_t mi = 0; mi < scope->count; mi++)
+        if (scope->mods[mi]->soname && strstr(scope->mods[mi]->soname, "libc.so.6"))
+            libc_obj = scope->mods[mi]->base_addr;
+    g_libc_base = (uintptr_t)libc_obj;
+    elf_object_t *obj = elf_load(path);
+    if (!obj) {
+        elf_scope_destroy(scope);
+        return 1;
+    }
+    elf_set_crash_scope(scope);
+
+    // Load all dependencies into obj->scope
+    if (load_needed(obj) != 0) {
+        fprintf(stderr, "[-] Failed to load dependencies\n");
+        elf_scope_destroy(scope);
+        elf_unload(obj);
+        return 1;
+    }
+
+    void *libc_obj = NULL;
+    for (size_t mi = 0; mi < scope->count; mi++)
+        if (scope->mods[mi]->soname && strstr(scope->mods[mi]->soname, "libc.so.6"))
+            libc_obj = scope->mods[mi]->base_addr;
+    g_libc_base = (uintptr_t)libc_obj;
+    elf_object_t *obj = elf_load(path);
+    if (!obj) {
+        elf_scope_destroy(scope);
+        return 1;
+    }
+    elf_set_crash_scope(scope);
+
+    // Load all dependencies into obj->scope
+    if (load_needed(obj) != 0) {
+        fprintf(stderr, "[-] Failed to load dependencies\n");
+        elf_scope_destroy(scope);
+        elf_unload(obj);
+        return 1;
+    }
+
+    void *libc_obj = NULL;
+    for (size_t mi = 0; mi < scope->count; mi++)
+        if (scope->mods[mi]->soname && strstr(scope->mods[mi]->soname, "libc.so.6"))
+            libc_obj = scope->mods[mi]->base_addr;
+    g_libc_base = (uintptr_t)libc_obj;
+    elf_object_t *obj = elf_load(path);
+    if (!obj) {
+        elf_scope_destroy(scope);
+        return 1;
+    }
+    elf_set_crash_scope(scope);
+
+    // Load all dependencies into obj->scope
+    if (load_needed(obj) != 0) {
+        fprintf(stderr, "[-] Failed to load dependencies\n");
+        elf_scope_destroy(scope);
+        elf_unload(obj);
+        return 1;
+    }
+
+    void *libc_obj = NULL;
+    for (size_t mi = 0; mi < scope->count; mi++)
+        if (scope->mods[mi]->soname && strstr(scope->mods[mi]->soname, "libc.so.6"))
+            libc_obj = scope->mods[mi]->base_addr;
+    g_libc_base = (uintptr_t)libc_obj;
+    elf_object_t *obj = elf_load(path);
+    if (!obj) {
+        elf_scope_destroy(scope);
+        return 1;
+    }
+    elf_set_crash_scope(scope);
+
+    // Load all dependencies into obj->scope
+    if (load_needed(obj) != 0) {
+        fprintf(stderr, "[-] Failed to load dependencies\n");
+        elf_scope_destroy(scope);
+        elf_unload(obj);
+        return 1;
+    }
+
+    void *libc_obj = NULL;
+    for (size_t mi = 0; mi < scope->count; mi++)
+        if (scope->mods[mi]->soname && strstr(scope->mods[mi]->soname, "libc.so.6"))
+            libc_obj = scope->mods[mi]->base_addr;
+    g_libc_base = (uintptr_t)libc_obj;
     void *stacksize_sym = elf_scope_lookup(scope, "__default_stacksize");
     if (stacksize_sym) {
         *(size_t *)stacksize_sym = 8 * 1024 * 1024;
