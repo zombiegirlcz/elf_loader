@@ -265,6 +265,17 @@ TEST_CASES[unzip]="echo test > /tmp/test.txt && zip /tmp/test.zip /tmp/test.txt 
 
 # extended re-exec / runtime
 TEST_CASES[file]="file /etc/hostname"
+TEST_CASES[gdb]="gdb --help 2>&1 | head -1"
+TEST_CASES[strace]="strace --help 2>&1 | head -1"
+TEST_CASES[ltrace]="ltrace --help 2>&1 | head -1"
+TEST_CASES[perf]="perf --help 2>&1 | head -1"
+TEST_CASES[numactl]="numactl --help 2>&1 | head -1"
+TEST_CASES[ping6]="ping6 -c 1 -W 1 127.0.0.1"
+TEST_CASES[zipgrep]="echo test > /tmp/test.txt && zip /tmp/test.zip /tmp/test.txt && zipgrep test /tmp/test.zip"
+TEST_CASES[zipdetails]="zipdetails /tmp/test.zip 2>/dev/null | head -5"
+TEST_CASES[pmap]="pmap -x 1 2>/dev/null | head -5"
+TEST_CASES[gdbus]="gdbus --version 2>&1 | head -1"
+TEST_CASES[hostnamectl]="hostnamectl status 2>&1 | head -5"
 TEST_CASES[gawk]="gawk 'BEGIN{print 1+2}'"
 TEST_CASES[mawk]="mawk 'BEGIN{print 1+2}'"
 TEST_CASES[xargs]="echo 'a' | xargs echo"
@@ -376,7 +387,7 @@ category_archive() {
 category_extended() {
     echo ""
     echo "=== extended ==="
-    for tool in file timeout gawk mawk xargs shuf paste join jq lsof ps pgrep; do
+    for tool in file timeout gawk mawk xargs shuf paste join jq lsof ps pgrep pmap gdbus hostnamectl ping6 zipgrep zipdetails gdb strace ltrace perf numactl; do
         [ -f "$R/usr/bin/$tool" ] && run_test "$R/usr/bin/$tool" "usr/bin/$tool" "extended $tool ${TEST_CASES[$tool]:-test}"
     done
 }
@@ -402,6 +413,17 @@ category_python() {
         run_test "$py_bin" "$py -c 'import subprocess,sys; r=subprocess.run([\"id\",\"-u\"], capture_output=True, text=True); sys.stdout.write(r.stdout.strip()+\"\\n\")'" "python3 subprocess id -u"
     else
         echo "SKIP python3: not found"
+    fi
+
+    echo ""
+    echo "=== python-tools ==="
+    py_bin=$(find "$R/bin" "$R/usr/bin" -name 'python3*' -type f 2>/dev/null | head -1 || true)
+    if [ -n "${py_bin:-}" ] && [ -f "$py_bin" ]; then
+        local py
+        py=$(basename "$py_bin")
+        for mod in kaggle modal yt_dlp huggingface_hub; do
+            run_test "$py_bin" "$py -m $mod --help" "python -m $mod"
+        done
     fi
 }
 
