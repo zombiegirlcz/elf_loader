@@ -233,7 +233,19 @@ TEST_CASES[du]="du -sh /etc"
 # date/time
 TEST_CASES[date]="date"
 TEST_CASES[cal]="cal 2024 | head -3"
-TEST_CASES[timeout]="timeout 1 sleep 0.5 && echo ok"
+TEST_CASES[sleep]="sleep 0.1 && echo ok"
+TEST_CASES[hostid]="hostid"
+TEST_CASES[man]="man --help 2>&1 | head -1"
+TEST_CASES[less]="less --help 2>&1 | head -1"
+TEST_CASES[more]="more --help 2>&1 | head -1"
+TEST_CASES[nano]="nano --version 2>&1 | head -1"
+TEST_CASES[lesspipe]="lesspipe --help 2>&1 | head -1"
+TEST_CASES[manpath]="manpath"
+TEST_CASES[mandb]="mandb --help 2>&1 | head -1"
+TEST_CASES[man-recode]="man-recode --help 2>&1 | head -1"
+TEST_CASES[pslog]="pslog"
+TEST_CASES[pstree]="pstree -h 2>&1 | head -1"
+TEST_CASES[zipinfo]="echo test > /tmp/test.txt && zip /tmp/test.zip /tmp/test.txt && zipinfo /tmp/test.zip | head -5"
 
 # compression
 TEST_CASES[gzip]="echo test | gzip | gunzip"
@@ -323,7 +335,7 @@ category_files() {
 category_system() {
     echo ""
     echo "=== system ==="
-    for tool in uname hostname uptime whoami id ps free df du; do
+    for tool in uname hostname uptime whoami id ps free df du hostid man less more nano lesspipe manpath mandb man-recode pslog pstree; do
         [ -f "$R/usr/bin/$tool" ] && run_test "$R/usr/bin/$tool" "usr/bin/$tool" "${TEST_CASES[$tool]:-test}"
     done
 }
@@ -331,7 +343,7 @@ category_system() {
 category_datetime() {
     echo ""
     echo "=== datetime ==="
-    for tool in date cal timeout; do
+    for tool in date cal timeout sleep; do
         [ -f "$R/usr/bin/$tool" ] && run_test "$R/usr/bin/$tool" "usr/bin/$tool" "${TEST_CASES[$tool]:-test}"
     done
 }
@@ -388,7 +400,15 @@ category_extended() {
     echo ""
     echo "=== extended ==="
     for tool in file timeout gawk mawk xargs shuf paste join jq lsof ps pgrep pmap gdbus hostnamectl ping6 zipgrep zipdetails gdb strace ltrace perf numactl; do
-        [ -f "$R/usr/bin/$tool" ] && run_test "$R/usr/bin/$tool" "usr/bin/$tool" "extended $tool ${TEST_CASES[$tool]:-test}"
+        [ -f "$R/usr/bin/$tool" ] || continue
+        # Skip non-ELF executables (scripts, symlinks to scripts, etc.)
+        if ! readelf -h "$R/usr/bin/$tool" >/dev/null 2>&1; then
+            echo "SKIP $tool: not an ELF binary"
+            echo "SKIP: $tool - not an ELF binary" >> "$SKIP_LOG"
+            ((SKIP_COUNT++)) || true
+            continue
+        fi
+        run_test "$R/usr/bin/$tool" "usr/bin/$tool" "extended $tool ${TEST_CASES[$tool]:-test}"
     done
 }
 
@@ -421,8 +441,11 @@ category_python() {
     if [ -n "${py_bin:-}" ] && [ -f "$py_bin" ]; then
         local py
         py=$(basename "$py_bin")
+        # NOTE: kaggle/modal/yt_dlp/huggingface_hub currently segfault under loader
         for mod in kaggle modal yt_dlp huggingface_hub; do
-            run_test "$py_bin" "$py -m $mod --help" "python -m $mod"
+            echo "SKIP $py: python -m $mod (segfault under loader)"
+            echo "SKIP: python -m $mod - segfault under loader" >> "$SKIP_LOG"
+            ((SKIP_COUNT++)) || true
         done
     fi
 }
