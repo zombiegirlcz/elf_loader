@@ -1,5 +1,51 @@
 #define _GNU_SOURCE 1
+#define ELF_LOADER_VERSION "0.1-dev"
+#include <stdio.h>
 #include "../include/elf_loader.h"
+
+static void print_help(const char *prog) {
+    fprintf(stdout,
+        "elf_loader - own-loading glibc launcher for Android (aarch64)\n"
+        "\n"
+        "Usage:\n"
+        "  %s --help | -h\n"
+        "  %s --version | -V\n"
+        "  %s --check <file>\n"
+        "  %s [--lazy] --run <elf> [args..]\n"
+        "  %s [--lazy] --own <elf> <shared.so> [args..]\n"
+        "  %s [--lazy] --ownall <elf> [args..]\n"
+        "  %s [--lazy] --shim <elf> [args..]\n"
+        "  %s <elf>                        (introspect)\n"
+        "\n"
+        "Modes:\n"
+        "  --run         host-loader mode: execute ELF with host libc\n"
+        "  --own         own-load one shared module into a private scope\n"
+        "  --ownall      own-load all distro deps + guest binary (parrot glibc)\n"
+        "  --shim        F2 path-translation shim for chroot-less guest paths\n"
+        "  <elf>         introspect base/entry/symbols without execution\n"
+        "\n"
+        "Options:\n"
+        "  --lazy        lazy PLT binding (faster startup, more traps)\n"
+        "  --help/-h     this help\n"
+        "  --version/-V  print loader version\n"
+        "  --check <f>   validate ELF file and print base/entry/deps\n"
+        "\n"
+        "Environment:\n"
+        "  ROOTFS        guest rootfs for --ownall/--shim\n"
+        "  ELF_LOADER    loader binary path (default /proc/self/exe)\n"
+        "  ELF_DEBUG     enable debug trace\n"
+        "  F2_FILTER     enable seccomp path filter in --shim mode\n"
+        "\n"
+        "Examples:\n"
+        "  %s --check /data/.../parrot/bin/ls\n"
+        "  %s --run /data/.../parrot/bin/true\n"
+        "  ROOTFS=/data/.../parrot %s --ownall /data/.../parrot/bin/ls -la /etc\n"
+        "  ROOTFS=/data/.../parrot %s --shim /data/.../parrot/usr/bin/awk 'BEGIN{print 1+2}'\n"
+        "  %s /data/.../parrot/bin/cat /etc/hostname\n",
+        prog, prog, prog, prog, prog, prog, prog, prog,
+        prog, prog, prog, prog, prog);
+}
+
 
 #include <stdio.h>
 #include <stdlib.h>
@@ -1357,10 +1403,7 @@ int main(int argc, char **argv, char **envp) {
 #endif
 
     if (argc < 2) {
-        fprintf(stderr, "Usage: %s <elf_binary>        (introspect)\n", argv[0]);
-        fprintf(stderr, "       %s --run <elf> [args..] (execute)\n", argv[0]);
-        fprintf(stderr, "       %s --lazy --run <elf> [args..]\n", argv[0]);
-        fprintf(stderr, "       %s --own <elf> <shared.so> [args..]\n", argv[0]);
+        print_help(argv[0]);
         return 1;
     }
 
@@ -1374,6 +1417,40 @@ int main(int argc, char **argv, char **envp) {
     if (lazy_was_set)
         if (elf_debug())
             fprintf(stderr, "[+] lazy PLT binding enabled\n");
+
+    if (strcmp(argv[ai], "--help") == 0 || strcmp(argv[ai], "-h") == 0) {
+        print_help(argv[0]);
+        return 0;
+    }
+
+    if (strcmp(argv[ai], "--version") == 0 || strcmp(argv[ai], "-V") == 0) {
+        puts("elf_loader " ELF_LOADER_VERSION "\n"
+             "  own-loading glibc launcher for Android (aarch64)\n"
+             "  (c) elf_loader project");
+        return 0;
+    }
+
+    if (strcmp(argv[ai], "--check") == 0) {
+        if (ai + 1 >= argc) {
+            fprintf(stderr, "Usage: %s --check <file>\n", argv[0]);
+            return 1;
+        }
+        const char *path = argv[ai + 1];
+        elf_object_t *obj = elf_load(path);
+        if (!obj) {
+            fprintf(stderr, "elf_loader: %s: not a loadable ELF (missing, wrong arch, or corrupted)\n", path);
+            return 2;
+        }
+        printf("elf_loader: %s: ELF%d %s, machine=%s, entry=%p, deps=%zu\n",
+               path,
+               obj->ehdr && (obj->ehdr->e_ident[EI_CLASS] == ELFCLASS64) ? 64 : 32,
+               obj->ehdr ? (obj->ehdr->e_type == ET_EXEC ? "ET_EXEC" : obj->ehdr->e_type == ET_DYN ? "ET_DYN" : "ET_OTHER") : "unknown",
+               obj->ehdr && obj->ehdr->e_machine == EM_AARCH64 ? "AArch64" : "unknown",
+               obj->entry_point,
+               obj->handle_count);
+        elf_unload(obj);
+        return 0;
+    }
 
     if (strcmp(argv[ai], "--run") == 0) {
         if (ai + 1 >= argc) {

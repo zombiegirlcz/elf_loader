@@ -1,1 +1,0 @@
-PASS: grep - grep root in passwd

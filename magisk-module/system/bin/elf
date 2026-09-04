@@ -2,6 +2,61 @@
 # elf - spustí glibc binárku z parrot rootfs na Androidu
 # Použití: elf ls -la /etc          (binárka najde v PATH)
 #          elf /cesta/k/binarce     (nebo přímo cesta)
+#          elf --help
+#          elf --version
+#          elf --check /cesta/k/binarce
+
+if [ "${1:-}" = "--help" ] || [ "${1:-}" = "-h" ]; then
+    cat <<'EOF'
+elf - glibc launcher wrapper for Android (non-root)
+Usage:
+  elf <command> [args...]
+  elf /path/to/binary [args...]
+  elf --help | -h
+  elf --version | -V
+  elf --check <file>
+Modes:
+  <command>        resolve command from ROOTFS and run via elf_loader --ownall
+  /path/to/binary  run binary directly via elf_loader --ownall
+  --check <file>   validate ELF file (interpreter/architecture)
+  --help/-h        show this help
+  --version/-V     show wrapper version
+Environment:
+  ROOTFS           guest rootfs (required)
+  ELF_LOADER       loader binary path (default: same dir as this wrapper)
+Examples:
+  ROOTFS=/data/.../parrot elf ls -la /etc
+  ROOTFS=/data/.../parrot elf /data/.../parrot/bin/cat /etc/hostname
+  ROOTFS=/data/.../parrot elf --check /data/.../parrot/bin/ls
+EOF
+    exit 0
+fi
+
+if [ "${1:-}" = "--version" ] || [ "${1:-}" = "-V" ]; then
+    echo "elf wrapper 1.0"
+    echo "  loader: elf_loader (bionic NDK build)"
+    echo "  mode:   non-root own-loading"
+    exit 0
+fi
+
+if [ "${1:-}" = "--check" ]; then
+    if [ -z "${2:-}" ]; then
+        echo "elf: --check requires a file path" >&2
+        exit 1
+    fi
+    if [ ! -f "$2" ]; then
+        echo "elf: $2: No such file" >&2
+        exit 1
+    fi
+    if command -v readelf >/dev/null 2>&1; then
+        echo "elf: checking $2"
+        readelf -h "$2" 2>/dev/null | grep -E 'Class|Machine|Type' || true
+        readelf -l "$2" 2>/dev/null | grep -i interpreter || true
+    else
+        echo "elf: readelf not available, skipping detailed check"
+    fi
+    exit 0
+fi
 
 if [ -z "$ROOTFS" ]; then
     echo "elf: Neni nastavena ROOTFS. Spustte: export ROOTFS=/cesta/k/rootfs" >&2
@@ -10,6 +65,17 @@ fi
 
 # bionic knihovny prvni (pro elf_loader samotny), parrot glibc az za nimi
 export LD_LIBRARY_PATH="/system/lib64:/system/lib:$LD_LIBRARY_PATH:$ROOTFS/usr/lib/aarch64-linux-gnu:$ROOTFS/lib"
+
+# Resolve loader path: prefer same directory as this wrapper, fallback to PATH
+if [ -z "${ELF_LOADER:-}" ]; then
+    _elf_dir="${0%/*}"
+    if [ -x "$_elf_dir/elf_loader" ]; then
+        ELF_LOADER="$_elf_dir/elf_loader"
+    else
+        ELF_LOADER="elf_loader"
+    fi
+    export ELF_LOADER
+fi
 
 # První argument BEZ "/" (např. "nmap") -> najít skutečnou cestu.
 # elf_loader totiž umí otevřít jen cestu k souboru, ne hledat v PATH.
@@ -34,5 +100,4 @@ case "$1" in
         ;;
 esac
 
-# elf_loader se hledá v PATH
 exec elf_loader --ownall "$@"
