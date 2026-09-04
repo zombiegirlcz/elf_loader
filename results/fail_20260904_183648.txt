@@ -1,0 +1,37 @@
+FAIL: sed - sed print first line (expected 'TERMINATOR', got:   [maps-begin]
+5f83a48000-5f83a4f000 r--p 00000000 fd:29 843554                         /data/user/0)
+FAIL: cut - cut field (expected 'root', got: sh: /data/user/0/com.linux_core/files/nh/distro/parrot/usr/bin/head: No such file or directory
+  [ma)
+FAIL: cat - cat file (expected 'TERMINATOR', got:   [maps-begin]
+6493e47000-6493e4e000 r--p 00000000 fd:29 843554                         /data/user/0)
+FAIL: dirname - dirname (expected 'etc', got:   [maps-begin]
+6026568000-602656f000 r--p 00000000 fd:29 843554                         /data/user/0)
+FAIL: basename - basename (expected 'hostname', got:   [maps-begin]
+5944ae4000-5944aeb000 r--p 00000000 fd:29 843554                         /data/user/0)
+FAIL: cp - cp cat rm (expected 'TERMINATOR', got:   [maps-begin]
+56eb9a8000-56eb9af000 r--p 00000000 fd:29 843554                         /data/user/0)
+FAIL: mv - mv cat mv back (expected 'TERMINATOR', got: Command blocked for security reasons)
+FAIL: uname - uname -a (expected 'Linux', got:   [maps-begin]
+5e5bc14000-5e5bc1b000 r--p 00000000 fd:29 843554                         /data/user/0)
+FAIL: hostname - hostname (expected 'TERMINATOR', got:   [maps-begin]
+5c97695000-5c9769c000 r--p 00000000 fd:29 843554                         /data/user/0)
+FAIL: whoami - whoami (expected 'root', got:   [maps-begin]
+6252ac2000-6252ac9000 r--p 00000000 fd:29 843554                         /data/user/0)
+FAIL: date - date (expected '2026', got:   [maps-begin]
+5f4d26a000-5f4d271000 r--p 00000000 fd:29 843554                         /data/user/0)
+FAIL: gzip - gzip gunzip pipe (expected 'test', got: [-] Not an ELF file
+  [maps-begin]
+5945d16000-5945d1d000 r--p 00000000 fd:29 843554                 )
+FAIL: tar - tar gz (expected 'TERMINATOR', got:   [maps-begin]
+5bd6cf2000-5bd6cf9000 r--p 00000000 fd:29 843554                         /data/user/0)
+FAIL: ping - ping localhost (expected '1 received', got:   [maps-begin]
+5fc0f2c000-5fc0f33000 r--p 00000000 fd:29 843554                         /data/user/0)
+FAIL: nslookup - nslookup (expected 'localhost', got: [-] open(/data/user/0/com.linux_core/files/nh/distro/parrot/usr/bin/nslookup): No such file or direc)
+FAIL: echo - echo (expected 'hello world', got:   [maps-begin]
+646bbdb000-646bbe2000 r--p 00000000 fd:29 843554                         /data/user/0)
+FAIL: printf - printf (expected 'test 42 foo', got:   [maps-begin]
+5e51a5a000-5e51a61000 r--p 00000000 fd:29 843554                         /data/user/0)
+FAIL: sh - sh -c (expected 'shell works', got:   [maps-begin]
+6212150000-6212157000 r--p 00000000 fd:29 843554                         /data/user/0)
+FAIL: bash - bash -c (expected 'bash works', got:   [maps-begin]
+56357f8000-56357ff000 r--p 00000000 fd:29 843554                         /data/user/0)

@@ -1,0 +1,22 @@
+PASS: grep - grep root in passwd
+PASS: awk - awk math
+PASS: wc - wc count chars
+PASS: sort - sort stdin
+PASS: uniq - uniq dedup
+PASS: tr - tr translate
+PASS: head - head chars
+PASS: tail - tail chars
+PASS: ls - ls directory
+PASS: stat - stat file
+PASS: find - find files
+PASS: realpath - realpath
+PASS: mkdir - mkdir rmdir
+PASS: touch - touch rm
+PASS: id - id -u
+PASS: uptime - uptime
+PASS: seq - seq
+PASS: yes - yes head
+PASS: diff - diff same
+PASS: true - true
+PASS: false - false (exit 1)
+PASS: sleep - sleep

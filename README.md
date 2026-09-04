@@ -8,6 +8,22 @@ launcher (`elroot`). Kompatibilní s jakoukoli aplikací a jakýmkoli rootfs:
 > Podrobné vývojové poznámky (certifikace, seccomp emulace, historie) jsou v
 > [`postup.md`](postup.md) — ten soubor záměrně zůstává jako deník.
 
+## Rychlý start (Quick Start)
+
+```bash
+# 1. Nastavení rootfs (Parrot GNU/Linux)
+export ROOTFS=/data/user/0/com.linux_core/files/nh/distro/parrot
+
+# 2. Spuštění binárky z guest rootfs
+elf_loader --ownall "$ROOTFS/bin/ls" -la
+
+# 3. Nebo interaktivní shell
+gbsh
+```
+
+> **Tip:** Všechny příkazy mají `--help` pro nápovědu:
+> `elf_loader --help` · `gbsh --help` · `elroot --help`
+
 ## Co je v repo
 | soubor | účel |
 |---|---|
@@ -18,79 +34,154 @@ launcher (`elroot`). Kompatibilní s jakoukoli aplikací a jakýmkoli rootfs:
 | `finale_loader_build.py`, `gbsh_build.py`, `Makefile` | build přes Modal (NDK) |
 | `magisk-module/` | Magisk modul (univerzální detekce rootfs) |
 
-## Spuštění (univerzální — přes ENV)
+## elf_loader — přímé použití
 
-Všechny cesty se předávají přes prostředí, takže to může použít kdokoliv,
-kdekoliv. Minimální nastavení pro launcher (tvoje „custom launcher" / .rc):
+### Základní příkazy
 
-```sh
-export ROOTFS=/cesta/k/distro        # např. /data/.../nh/distro/parrot
-export ELF_LOADER="$ROOTFS/../usr/bin/elf_loader"   # volitelné, má výchozí
-export GBSH="$ROOTFS/../usr/bin/gbsh"               # volitelné, má výchozí
-export SU="${SU:-/product/bin/su}"                  # volitelné
+```bash
+# Introspekce ELF souboru (ukáže base, entry point, symboly)
+elf_loader /bin/ls
+
+# Spuštění programu s argumenty
+elf_loader --run /bin/ls -la /data
+
+# Spuštění s vlastními knihovnami
+elf_loader --own /bin/myprog /path/to/libfoo.so
+
+# Spuštění se všemi závislostmi z guest rootfs (doporučeno)
+elf_loader --ownall "$ROOTFS/bin/bash"
+
+# Spuštění s F2 path-translation shimem (non-root, bez namespaces)
+elf_loader --shim "$ROOTFS/bin/ls"
+
+# Lazy PLT binding (rychlejší start, pozdější resoluce)
+elf_loader --lazy --run /bin/grep -r .
+
+# Nápověda
+elf_loader --help
+elf_loader -h
 ```
 
-Pak:
-```sh
-elroot <prikaz> [args]               # AUTO: je-li su dostupné (ROOT), spustí přes chroot (ROOT);
-                                     #        jinak elf_loader --ownall (NON-ROOT)
-elroot --chroot <prikaz>             # vynutit root chroot (plný fs, žádný seccomp)
-elroot --ownall <prikaz>             # vynutit non-root (elf_loader --ownall)
-elroot zsh                            # ROOT (auto) -> plny interaktivni zsh 5.9 (ZLE/completion/barvy)
-elroot --chroot zsh                  # ROOT -> zsh v chrootu (plny zsh)
-elroot --ownall zsh                   # POZOR: non-root -> zsh nenajde moduly (ZLE nefunguje),
-                                     #         pro non-root shell spust gbsh PRIMO (je nativni)
-# gbsh se spousti PRIMO (bionicky non-root shell, deploynuty vedle rootfs):
-#   ROOTFS=/cesta/k/distro $ROOTFS/../usr/bin/gbsh      # interaktivni non-root shell
-```
+### Volby a přepínače
 
-Přímo přes loader (bez elrootu):
-```sh
-export ROOTFS=/cesta/k/distro
-elf_loader --ownall "$ROOTFS/bin/ls" -l     # spustí parrot ls
-gbsh                                     # interaktivní shell (vyžaduje ROOTFS)
-```
+| Přepínač | Popis |
+|---|---|
+| `<elf_binary>` | Introspekce ELF souboru (bez spuštění) |
+| `--run <elf> [args...]` | Spustí ELF binárku s argumenty |
+| `--own <elf> <shared.so> [args...]` | Spustí s konkrétní sdílenou knihovnou |
+| `--ownall <elf> [args...]` | Spustí se všemi závislostmi z guest rootfs |
+| `--shim <elf> [args...]` | Spustí s F2 path-translation shimem (non-root) |
+| `--lazy` | Povolí lazy PLT binding (před `--run`) |
+| `--help, -h` | Zobrazí tuto nápovědu |
 
-### Proměnné prostředí
-| proměnná | význam | výchozí |
+### Proměnné prostředí (elf_loader)
+
+| Proměnná | Význam | Výchozí |
 |---|---|---|
-| `ROOTFS` | cesta k distro rootfs (povinná pro gbsh) | — (gbsh skončí s chybou, pokud není) |
-| `ELF_LOADER` | cesta k elf_loader binárce | `$ROOTFS/../usr/bin/elf_loader`, pak `/system/bin/elf_loader` |
-| `GBSH` | cesta k gbsh | `$ROOTFS/../usr/bin/gbsh`, pak `/system/bin/gbsh` |
-| `SU` | cesta k `su` (root detekce) | `/product/bin/su` |
-| `TERMINFO` | terminfo DB (pro barvy v terminálu) | elroot nastaví na `$ROOTFS/usr/share/terminfo` |
-| `GBSHRC` | gbsh config (místo `~/.gbshrc`) | — |
-| `GBSH_PROMPT` / `GBSH_PROMPT_MODE` | vzhled/prompt gbsh | výchozí |
+| `ROOTFS` | Cesta k guest rootfs (Parrot) | — |
+| `ELF_LOADER` | Cesta k elf_loader binárce | `$ROOTFS/../usr/bin/elf_loader` |
+| `ELF_DEBUG` | Úroveň debugu: 0=NONE, 1=ERROR, 2=WARN, 3=INFO, 4=DEBUG, 5=VERBOSE | 0 |
+| `ELF_LOADER_DUMP_MAPS` | Vypíše memory mapy po spuštění | — |
+| `ELF_LOADER_SKIP_RELOC` | Přeskočí relokace (ladění) | — |
+| `F2_FILTER=1` | Zapne F2 seccomp path filter | — |
+| `F2_ONLY=seznam` | Čárkami oddělený seznam F2 hooků | — |
+| `F2_DISABLE` | Vypne F2 path-translation shim | — |
+
+### Příklady použití
+
+```bash
+# Základní introspekce
+elf_loader /bin/ls
+
+# Spuštění s argumenty
+elf_loader --run /bin/ls -la /data
+
+# Spuštění bash se všemi závislostmi
+elf_loader --ownall "$ROOTFS/bin/bash"
+
+# F2 shim pro non-root běh
+elf_loader --shim "$ROOTFS/bin/ls"
+
+# Lazy binding pro rychlejší start
+elf_loader --lazy --run /bin/grep -r "pattern" /etc
+
+# Debug výstup
+ELF_DEBUG=4 elf_loader --run /bin/cat /etc/issue
+
+# S vlastním rootfs
+ROOTFS=/data/parrot elf_loader --ownall /bin/zsh
+
+# Dump memory map
+ELF_LOADER_DUMP_MAPS=1 elf_loader --run /bin/ls
+```
 
 ## gbsh (interaktivní shell)
-Vlastní line editor (nezávislý na zsh/bash):
-- zalamování dlouhých řádků bez duplicit (save/restore kurzoru + smazání oblasti),
-- detekce šířky terminálu přes `TIOCGWINSZ` (fallback `$COLUMNS`/80),
-- bracketed paste (`\x1b[200~`/`201~`) — víceřádkový vklad,
-- Ctrl-A/E (začátek/konec), Ctrl-K (smazat do konce), Ctrl-W (slovo),
-- barvy: `ls`/`grep`/`diff` `--color=auto`, syntax highlighting vstupu,
-- dual-world navigace (`cd ..` z `/` překlopí na host), `--chroot` režim.
 
-Pro **plný zsh zážitek** stačí `elroot zsh` (parrot zsh 5.9 běží pod loaderem).
+Nativní bionic shell s vlastním line editorem — **nevyžaduje root**.
+
+```bash
+# Spuštění interaktivního shellu
+export ROOTFS=/cesta/k/distro
+gbsh
+```
+
+**Vlastnosti:**
+- Zalamování dlouhých řádků, detekce šířky terminálu (`TIOCGWINSZ`)
+- Bracketed paste, Ctrl-A/E/K/W, barevný výstup, syntax highlighting
+- Dual-world navigace (`cd ..` z `/` překlopí na host), `--chroot` režim
+
+Pro **plný zsh zážitek** (ZLE/completion/barvy) stačí `elroot zsh` (parrot zsh 5.9 běží pod loaderem).
+
+## elroot — PRoot-like launcher
+
+Automatický výběr režimu podle dostupnosti root:
+
+```bash
+export ROOTFS=/cesta/k/distro
+export ELF_LOADER="$ROOTFS/../usr/bin/elf_loader"
+export GBSH="$ROOTFS/../usr/bin/gbsh"
+
+# Auto: ROOT -> chroot, NON-ROOT -> elf_loader --ownall
+elroot <prikaz> [args]
+
+# Vynutit root chroot (plný fs, žádný seccomp)
+elroot --chroot <prikaz>
+
+# Vynutit non-root (elf_loader --ownall)
+elroot --ownall <prikaz>
+
+# Interaktivní shelly
+elroot zsh                    # ROOT -> plný zsh 5.9 (ZLE/completion/barvy)
+elroot --chroot zsh           # ROOT -> zsh v chrootu
+elroot --ownall zsh           # NON-ROOT -> zsh bez modulů (pro non-root použij gbsh)
+
+# Spuštění gbsh přímo (bionic non-root shell)
+ROOTFS=/cesta/k/distro $ROOTFS/../usr/bin/gbsh
+```
 
 ## Build
+
 Přes Modal (NDK r28):
-```sh
+```bash
 modal run finale_loader_build.py     # -> /tmp/elf_loader
 modal run gbsh_build.py             # -> /tmp/gbsh (+ /tmp/gbsh_static)
-# nasazení na zařízení:
+
+# Nasazení na zařízení:
 ./tools/push_bin.sh /tmp/elf_loader /cesta/usr/bin/elf_loader 755
 ./tools/push_bin.sh /tmp/gbsh       /cesta/usr/bin/gbsh       755
 ```
+
 Lokálně (vyžaduje NDK): `make`.
 
 ## Magisk modul
+
 `magisk-module/` se instaluje do `/data/adb/modules/…`. Rootfs detekuje
 **univerzálně** (skenuje `/data/user/0/*/files`, `/data/data/*/files`,
 `/data/adb/*/files` po `nh/distro/parrot`) — žádné jméno aplikace není
 natvrdo. Cestu uloží do `/data/adb/parrot_root`.
 
 ## Co umí loader (stručně)
+
 Načte ELF64 PT_LOAD, vyřeší DT_NEEDED přes vlastní scope, aplikuje relokace
 (vč. `R_AARCH64_IRELATIVE`/ifunc), sestaví stack + auxv, skočí na entry.
 Vlastní module loader (`--own`) pro glibc .so bez `dlopen`. Signály blokované
@@ -98,6 +189,7 @@ seccompem (non-root) se emulují v SIGSYS handleru (setfsuid/setpriority/NUMA/
 keyring/syslog/IPC/futex_waitv výjimkou). Viz `postup.md`.
 
 ## F2 — path-translation shim (`--shim`)
+
 Alternativa k chrootu pro běh glibc binárek **non-root** bez namespaců:
 loader načte host binárku (bionic) i guest glibc rootfs, při JUMP_SLOT /
 import resolvenutí dává F2 override (vlastní `open`/`open64`/`openat`/

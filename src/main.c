@@ -1331,6 +1331,43 @@ static int run_ownall(const char *path, int argc, char **argv, char **envp) {
     return ret;
 }
 
+static void print_usage(const char *prog) {
+    fprintf(stderr,
+        "Usage: %s [OPTIONS] <command> [args...]\n\n"
+        "Commands:\n"
+        "  <elf_binary>                    Introspect ELF file (show base, entry, symbols)\n"
+        "  --run <elf> [args...]           Execute ELF binary with arguments\n"
+        "  --own <elf> <shared.so> [args..] Execute ELF with specific shared library\n"
+        "  --ownall <elf> [args...]        Execute ELF with all dependencies from guest rootfs\n"
+        "  --shim <elf> [args...]          Execute with F2 path-translation shim (non-root)\n"
+        "  --lazy --run <elf> [args..]     Execute with lazy PLT binding\n"
+        "  --help, -h                      Show this help message\n\n"
+        "Options:\n"
+        "  --lazy                          Enable lazy PLT binding\n"
+        "  --help, -h                      Show this help message and exit\n\n"
+        "Environment Variables:\n"
+        "  ROOTFS          Path to guest rootfs (e.g., /data/.../parrot)\n"
+        "  ELF_LOADER      Path to elf_loader binary (default: $ROOTFS/../usr/bin/elf_loader)\n"
+        "  ELF_DEBUG       Debug level: 0=NONE, 1=ERROR, 2=WARN, 3=INFO, 4=DEBUG, 5=VERBOSE\n"
+        "  ELF_LOADER_DUMP_MAPS            Dump memory maps after execution\n"
+        "  ELF_LOADER_SKIP_RELOC           Skip relocations (for debugging)\n"
+        "  F2_FILTER=1                     Enable F2 seccomp path filter\n"
+        "  F2_ONLY=<list>                  Comma-separated list of F2 hooks to enable\n"
+        "  F2_DISABLE                      Disable F2 path-translation shim\n"
+        "  MALLOC_*                        Memory allocator tunables\n\n"
+        "Examples:\n"
+        "  %s /bin/ls                      # Introspect /bin/ls\n"
+        "  %s --run /bin/ls -la            # Execute /bin/ls with arguments\n"
+        "  %s --ownall /bin/bash           # Run bash with all guest dependencies\n"
+        "  %s --shim /bin/ls               # Run with path-translation shim\n"
+        "  %s --lazy --run /bin/grep -r .  # Run with lazy binding\n"
+        "  ELF_DEBUG=4 %s --run /bin/cat   # Run with verbose debug output\n"
+        "  ROOTFS=/data/parrot %s --ownall /bin/zsh  # Run zsh with guest rootfs\n"
+        "\n"
+        "For more information, see README.md and postup.md\n",
+        prog, prog, prog, prog, prog, prog, prog, prog);
+}
+
 int main(int argc, char **argv, char **envp) {
     /* ELF_DEBUG → unbuffered stdout, ať trace při SIGSEGV nekončí v bufferu */
     if (getenv("ELF_DEBUG"))
@@ -1357,11 +1394,13 @@ int main(int argc, char **argv, char **envp) {
 #endif
 
     if (argc < 2) {
-        fprintf(stderr, "Usage: %s <elf_binary>        (introspect)\n", argv[0]);
-        fprintf(stderr, "       %s --run <elf> [args..] (execute)\n", argv[0]);
-        fprintf(stderr, "       %s --lazy --run <elf> [args..]\n", argv[0]);
-        fprintf(stderr, "       %s --own <elf> <shared.so> [args..]\n", argv[0]);
+        print_usage(argv[0]);
         return 1;
+    }
+
+    if (strcmp(argv[1], "--help") == 0 || strcmp(argv[1], "-h") == 0) {
+        print_usage(argv[0]);
+        return 0;
     }
 
     int ai = 1;

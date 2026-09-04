@@ -269,6 +269,9 @@ static int ldso_setup_done;
 static uint64_t ldso_exe_linkmap[0x100];
 static char ldso_exe_name[256];
 
+static Elf64_Dyn *find_dynamic(const elf_object_t *obj);
+static void ldso_fill_link_map_info(unsigned char *lm, Elf64_Dyn *dyn);
+
 void ldso_install_exe_linkmap(elf_object_t *exe, const char *name) {
     memset(ldso_exe_linkmap, 0, sizeof ldso_exe_linkmap);
     unsigned char *lm = (unsigned char *)ldso_exe_linkmap;
@@ -279,13 +282,15 @@ void ldso_install_exe_linkmap(elf_object_t *exe, const char *name) {
         ldso_exe_name[sizeof ldso_exe_name - 1] = 0;
     }
     *(uintptr_t *)(lm + 0x08) = (uintptr_t)ldso_exe_name;   /* l_name */
+    *(uintptr_t *)(lm + 0x10) = (uintptr_t)find_dynamic(exe); /* l_ld */
     *(uintptr_t *)(lm + 0x28) = (uintptr_t)ldso_exe_linkmap;/* l_real = self */
     *(uintptr_t *)(lm + 0x2f0) = (uintptr_t)exe->phdr;      /* l_phdr */
     *(uint16_t *)(lm + 0x300) = (uint16_t)exe->phdr_count;  /* l_phnum */
     lm[0x366] = 0x8;                                        /* l_contiguous */
     *(uintptr_t *)(lm + 0x398) = base;                      /* l_map_start */
     *(uintptr_t *)(lm + 0x3a0) = base + exe->total_size;    /* l_map_end */
-    /* l_tls_modid (+0x498) left 0: loader resolves TLS directly */
+    *(uintptr_t *)(lm + 0x498) = 1;                         /* l_tls_modid: exe = 1 */
+    ldso_fill_link_map_info(lm, find_dynamic(exe));
     ((uint64_t *)ldso_global)[0] = (uintptr_t)ldso_exe_linkmap;
 }
 
@@ -315,13 +320,31 @@ void ldso_install_module_list(elf_object_t *const *mods, size_t count) {
         ldso_module_names[ldso_module_count][sizeof ldso_module_names[0] - 1] = 0;
         *(uintptr_t *)(b + 0x00) = base;                          /* l_addr */
         *(uintptr_t *)(b + 0x08) = (uintptr_t)ldso_module_names[ldso_module_count];
+        *(uintptr_t *)(b + 0x10) = (uintptr_t)find_dynamic(m);    /* l_ld */
+        *(uintptr_t *)(b + 0x18) = 0;                             /* l_next (will link below) */
+        *(uintptr_t *)(b + 0x20) = 0;                             /* l_prev (will link below) */
         *(uintptr_t *)(b + 0x28) = (uintptr_t)lm;                 /* l_real */
         *(uintptr_t *)(b + 0x2f0) = (uintptr_t)m->phdr;           /* l_phdr */
         *(uint16_t *)(b + 0x300) = (uint16_t)m->phdr_count;       /* l_phnum */
         b[0x366] = 0x8;                                           /* l_contiguous */
         *(uintptr_t *)(b + 0x398) = base;                         /* l_map_start */
         *(uintptr_t *)(b + 0x3a0) = base + m->total_size;         /* l_map_end */
+        *(uintptr_t *)(b + 0x498) = ldso_module_count + 2;        /* l_tls_modid: modules start at 2 */
+        ldso_fill_link_map_info(b, find_dynamic(m));
         ldso_module_count++;
+    }
+    /* Link all modules into a doubly-linked list so dl_iterate_phdr can walk them */
+    for (size_t i = 0; i < ldso_module_count; i++) {
+        unsigned char *b = (unsigned char *)ldso_module_linkmaps[i];
+        if (i + 1 < ldso_module_count)
+            *(uintptr_t *)(b + 0x18) = (uintptr_t)ldso_module_linkmaps[i + 1]; /* l_next */
+        if (i > 0)
+            *(uintptr_t *)(b + 0x20) = (uintptr_t)ldso_module_linkmaps[i - 1]; /* l_prev */
+    }
+    /* Link exe -> first module */
+    if (ldso_module_count > 0) {
+        *(uintptr_t *)((unsigned char *)ldso_exe_linkmap + 0x18) = (uintptr_t)ldso_module_linkmaps[0];
+        *(uintptr_t *)((unsigned char *)ldso_module_linkmaps[0] + 0x20) = (uintptr_t)ldso_exe_linkmap;
     }
     ldso_modules_built = 1;
 }
@@ -951,6 +974,17 @@ static Elf64_Dyn *find_dynamic(const elf_object_t *obj) {
             return (Elf64_Dyn *)va(obj, obj->phdr[i].p_vaddr);
     }
     return NULL;
+}
+
+/* Populate l_info array (DT_* tag pointers) in fake link_map at offset 0xa0. */
+static void ldso_fill_link_map_info(unsigned char *lm, Elf64_Dyn *dyn) {
+    if (!dyn)
+        return;
+    uint64_t *l_info = (uint64_t *)(lm + 0xa0);
+    for (Elf64_Dyn *d = dyn; d->d_tag != DT_NULL; d++) {
+        if (d->d_tag < 64)  /* standard tags only */
+            l_info[d->d_tag] = (uintptr_t)d;
+    }
 }
 
 static char *expand_dirs(const char *list, const char *origin_dir) {
@@ -1992,6 +2026,20 @@ void *elf_resolve_import(elf_object_t *obj, const char *name) {
 sym_status_t elf_resolve_symbol(elf_object_t *obj, const char *name, void **out_addr) {
     if (!obj || !name)
         return SYM_NOT_FOUND;
+
+    /* Intercept _rtld_global and _rtld_global_ro BEFORE searching object's
+     * own symbol tables, because parrot libc defines these in its own .bss
+     * but they must point to our fake structures, not its zeroed copies. */
+    if (strcmp(name, "_rtld_global") == 0) {
+        if (out_addr)
+            *out_addr = ldso_global;
+        return SYM_IMPORT;
+    }
+    if (strcmp(name, "_rtld_global_ro") == 0) {
+        if (out_addr)
+            *out_addr = ldso_ro;
+        return SYM_IMPORT;
+    }
 
     sym_status_t st = lookup_table(obj->symtab, obj->strtab, obj->symtab_count,
                                    name, out_addr, obj);
