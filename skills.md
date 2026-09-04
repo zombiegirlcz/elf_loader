@@ -1,5 +1,41 @@
 # Testing loop in this environment (skills.md)
 
+## ⚠️ POVINNÁ PRAVIDLA PŘED KAŽDÝM "funguje"/"opraveno" TVRZENÍM
+
+Tohle jsou dvě nejčastější příčiny falešně pozitivních testů v tomhle projektu. Před tím, než
+cokoliv prohlásíš za funkční/opravené, projdi obě:
+
+1. **VŽDY testuj bionic binárku, NIKDY glibc build.**
+   Ověř interpreter PŘED testem, ne až po chybě:
+   ```sh
+   readelf -h /tmp/elf_loader_ndk | grep Machine        # musí být AArch64
+   readelf -l /tmp/elf_loader_ndk | grep -i interpreter  # musí být /system/bin/linker64
+   ```
+   Pokud vidíš `/lib/ld-linux-aarch64.so.1` → je to glibc build z proot toolchainu
+   (`aarch64-linux-gnu-gcc`), NE výstup z `modal run finale_loader_build.py`. Na device
+   spadne s `RC=126 / No such file or directory` — a tahle hláška vypadá jako "binárka
+   neexistuje", i když existuje, jen ji kernel nemá čím spustit. Nikdy nedeployuj/netestuj
+   binárku, u které jsi tohle neověřil.
+
+2. **VŽDY testuj přes `ashell -c '...'`, NIKDY uvnitř proot session.**
+   Proot je jen editor/kompilační sandbox (`/root/elf_loader`) — NENÍ to prostředí, ve kterém
+   uživatel binárku skutečně spouští. Proot má vlastní glibc userland, jiný resolving cest,
+   jinou seccomp/namespace situaci než skutečný device kontext (app uid 10310, žádný `su`).
+   Test spuštěný uvnitř proot session (`bash`, přímé volání binárky bez `ashell -c`) **nic
+   neříká o tom, jestli to funguje na device** — může projít v proot a spadnout v ashell, nebo
+   naopak. Jediný platný test je:
+   ```sh
+   ashell -c '<přesný device příkaz, absolutní cesty>'
+   ```
+   Než napíšeš "funguje"/"opraveno", vlož SEM doslovný výstup + `RC=$?` z tohoto konkrétního
+   `ashell -c` volání. "Zkompilovalo se to" nebo "proběhlo to v prootu" není důkaz.
+
+3. **Nikdy nevolej `elf_loader` přímo s holým jménem binárky.**
+   `elf_loader --ownall ls` hledá `ls` v aktuálním cwd, ne v `$ROOTFS` — selže s
+   `open(ls): No such file or directory`, což vypadá jako regrese, ale je to jen špatná
+   invokace. Buď použij plnou device cestu (`$L --ownall $R/usr/bin/ls`), nebo `elroot`
+   wrapper, co dělá resolving za tebe.
+
 ## Prostředí — co kde je
 
 - **Proot (lokální workspace agenta)**: `/root/elf_loader`. Tady píšu kód, tady běží `modal`, `bash`, kompilace.
@@ -28,11 +64,15 @@ Krok po kroku:
 1. **Kód** edituješ lokálně v `/root/elf_loader/src/`. Žádný vzdálený editor.
 2. **Kompilace** běží přes `modal` (NDK není lokálně; Modal postaví debian_slim + android‑ndk‑r28
    a cross‑compiluje `aarch64-linux-android24-clang`). Výstupní binárka přistane v prootu
-   (`/tmp/elf_loader_ndk`). Musí být **bionic** (interpreter `/system/bin/linker64`).
-   Glibc build (`aarch64-linux-gnu-gcc`, interpreter `/lib/ld-linux-aarch64.so.1`) na device
-   padá s `RC=126 / No such file or directory` (kernel nenajde glibc loader).
+   (`/tmp/elf_loader_ndk`). Musí být **bionic** (interpreter `/system/bin/linker64`) — over to
+   pokaždé přes `readelf -l /tmp/elf_loader_ndk | grep -i interpreter` PŘED deployem, ne až
+   ve chvíli, kdy to na device spadne. Glibc build (`aarch64-linux-gnu-gcc`, interpreter
+   `/lib/ld-linux-aarch64.so.1`) na device padá s `RC=126 / No such file or directory`
+   (kernel nenajde glibc loader) — snadno se to splete se skutečnou regresí.
 3. **Deploy** = prosté `cp` do `files/usr/bin/`. Mount to zapíše na device. Žádný `su`.
-4. **Test** přes `ashell -c`. Device cesty jsou absolutní:
+4. **Test VÝHRADNĚ přes `ashell -c`** — nikdy přímým voláním binárky v proot session (proot
+   je jen kompilační sandbox, ne testovací prostředí; viz "POVINNÁ PRAVIDLA" výše). Device
+   cesty jsou absolutní:
    `/data/user/0/com.linux_core/files/usr/bin/elf_loader`.
    Loader se obvykle řídí přes `elroot`:
    `ROOTFS=… ELF_LOADER=… GBSH=… /data/…/elroot --shim <guest-cmd>`.
