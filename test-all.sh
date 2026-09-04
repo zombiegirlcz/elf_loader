@@ -82,7 +82,7 @@ should_skip() {
         # Destructive
         killall*|kill*|pkill*|dd|mkfs*|fdisk*|parted*|mkswap*|swapon*|swapoff*) return 0 ;;
         # Síťové démona / nástroje
-        *ssh*|*scp*|*sftp*|*rsync*|*wget*|*curl*|*ftp*|*telnet*|*nc*|*netcat*) return 0 ;;
+        *sftp*|*rsync*|*ftp*|*telnet*|*nc*|*netcat*) return 0 ;;
         # X11
         *X11*|*xterm*|*xvfb*|*Xorg*|*xset*|*xrandr*|*xclock*) return 0 ;;
         # Crypto
@@ -282,6 +282,15 @@ TEST_CASES[strace]="strace --help 2>&1 | head -1"
 TEST_CASES[ltrace]="ltrace --help 2>&1 | head -1"
 TEST_CASES[perf]="perf --help 2>&1 | head -1"
 TEST_CASES[numactl]="numactl --help 2>&1 | head -1"
+TEST_CASES[curl]="curl -V 2>&1 | head -1"
+TEST_CASES[wget]="wget --version 2>&1 | head -1"
+TEST_CASES[ssh]="ssh -V 2>&1 | head -1"
+TEST_CASES[scp]="scp -V 2>&1 | head -1"
+TEST_CASES[gdb]="gdb --help 2>&1 | head -1"
+TEST_CASES[strace]="strace --help 2>&1 | head -1"
+TEST_CASES[ltrace]="ltrace --help 2>&1 | head -1"
+TEST_CASES[perf]="perf --help 2>&1 | head -1"
+TEST_CASES[numactl]="numactl --help 2>&1 | head -1"
 TEST_CASES[ping6]="ping6 -c 1 -W 1 127.0.0.1"
 TEST_CASES[zipgrep]="echo test > /tmp/test.txt && zip /tmp/test.zip /tmp/test.txt && zipgrep test /tmp/test.zip"
 TEST_CASES[zipdetails]="zipdetails /tmp/test.zip 2>/dev/null | head -5"
@@ -399,7 +408,7 @@ category_archive() {
 category_extended() {
     echo ""
     echo "=== extended ==="
-    for tool in file timeout gawk mawk xargs shuf paste join jq lsof ps pgrep pmap gdbus hostnamectl ping6 zipgrep zipdetails gdb strace ltrace perf numactl; do
+    for tool in file timeout gawk mawk xargs shuf paste join jq lsof ps pgrep pmap gdbus hostnamectl ping6 zipgrep zipdetails gdb strace ltrace perf numactl curl wget ssh scp; do
         [ -f "$R/usr/bin/$tool" ] || continue
         # Skip non-ELF executables (scripts, symlinks to scripts, etc.)
         if ! readelf -h "$R/usr/bin/$tool" >/dev/null 2>&1; then
