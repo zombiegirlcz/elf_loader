@@ -363,6 +363,10 @@ TEST_CASES[mt]="mt -f /dev/null status 2>&1 | head -1"
 TEST_CASES[mountpoint]="mountpoint -q /tmp || mountpoint /tmp 2>&1 | head -1"
 TEST_CASES[partx]="partx --version 2>&1 | head -1"
 TEST_CASES[logger]="logger --version 2>&1 | head -1"
+TEST_CASES[tty]="tty 2>&1 | head -1"
+TEST_CASES[who]="who 2>&1 | head -1"
+TEST_CASES[users]="users 2>&1 | head -1"
+TEST_CASES[busybox]="busybox --help 2>&1 | head -1"
 TEST_CASES[getent]="getent passwd root 2>/dev/null | head -1"
 TEST_CASES[iconv]="echo test | iconv -f UTF-8 -t ASCII 2>&1 | head -1"
 TEST_CASES[localedef]="localedef --version 2>&1 | head -1"
@@ -501,7 +505,7 @@ category_extended() {
 category_extra() {
     echo ""
     echo "=== extra ==="
-    for tool in zipinfo column expand unexpand fold fmt nl comm sdiff cmp md5sum sha1sum sha256sum cksum base64 split csplit tee script stty tput clear reset tset wall systemctl service journalctl loginctl timedatectl localectl findmnt lsblk fallocate truncate shred fuser nice renice nohup watch factor xxd getconf getent iconv localedef zdump gencat strings logger dmesg pr rlwrap tmux zcat zless zmore zfgrep zegrep zgrep bunzip2 bzcat bzmore bzless bzgrep test mt mountpoint partx; do
+    for tool in zipinfo column expand unexpand fold fmt nl comm sdiff cmp md5sum sha1sum sha256sum cksum base64 split csplit tee script stty tput clear reset tset wall systemctl service journalctl loginctl timedatectl localectl findmnt lsblk fallocate truncate shred fuser nice renice nohup watch factor xxd getconf getent iconv localedef zdump gencat strings logger dmesg pr rlwrap tmux zcat zless zmore zfgrep zegrep zgrep bunzip2 bzcat bzmore bzless bzgrep test mt mountpoint partx tty who users busybox; do
         [ -f "$R/usr/bin/$tool" ] || continue
         # Skip non-ELF executables (scripts, symlinks to scripts, etc.)
         if ! readelf -h "$R/usr/bin/$tool" >/dev/null 2>&1; then
