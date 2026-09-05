@@ -342,6 +342,28 @@ TEST_CASES[localedef]="localedef --version 2>&1 | head -1"
 TEST_CASES[zdump]="zdump --version 2>&1 | head -1"
 TEST_CASES[gencat]="gencat --version 2>&1 | head -1 || true"
 TEST_CASES[strings]="strings /etc/hostname | head -1"
+TEST_CASES[logger]="logger --version 2>&1 | head -1"
+TEST_CASES[dmesg]="dmesg --version 2>&1 | head -1"
+TEST_CASES[pr]="echo test | pr | head -1"
+TEST_CASES[rlwrap]="rlwrap --version 2>&1 | head -1 || true"
+TEST_CASES[tmux]="tmux -V 2>&1 | head -1"
+TEST_CASES[zcat]="echo test | zcat 2>/dev/null || gzip -c /etc/hostname | zcat | head -1"
+TEST_CASES[zless]="gzip -c /etc/hostname > /tmp/test.gz && zless /tmp/test.gz | head -1"
+TEST_CASES[zmore]="gzip -c /etc/hostname > /tmp/test.gz && zmore /tmp/test.gz | head -1"
+TEST_CASES[zfgrep]="gzip -c /etc/hostname > /tmp/test.gz && zfgrep host /tmp/test.gz"
+TEST_CASES[zegrep]="gzip -c /etc/hostname > /tmp/test.gz && zegrep host /tmp/test.gz"
+TEST_CASES[zgrep]="gzip -c /etc/hostname > /tmp/test.gz && zgrep host /tmp/test.gz"
+TEST_CASES[bunzip2]="bzip2 -c /etc/hostname | bunzip2 | head -1"
+TEST_CASES[bzcat]="bzip2 -c /etc/hostname | bzcat | head -1"
+TEST_CASES[bzmore]="bzip2 -c /etc/hostname | bzmore 2>&1 | head -1"
+TEST_CASES[bzless]="bzip2 -c /etc/hostname | bzless 2>&1 | head -1"
+TEST_CASES[bzgrep]="bzip2 -c /etc/hostname | bzgrep host"
+TEST_CASES[getent]="getent passwd root 2>/dev/null | head -1"
+TEST_CASES[iconv]="echo test | iconv -f UTF-8 -t ASCII 2>&1 | head -1"
+TEST_CASES[localedef]="localedef --version 2>&1 | head -1"
+TEST_CASES[zdump]="zdump --version 2>&1 | head -1"
+TEST_CASES[gencat]="gencat --version 2>&1 | head -1 || true"
+TEST_CASES[strings]="strings /etc/hostname | head -1"
 TEST_CASES[zipgrep]="echo test > /tmp/test.txt && zip /tmp/test.zip /tmp/test.txt && zipgrep test /tmp/test.zip"
 TEST_CASES[zipdetails]="zipdetails /tmp/test.zip 2>/dev/null | head -5"
 TEST_CASES[pmap]="pmap -x 1 2>/dev/null | head -5"
@@ -474,7 +496,7 @@ category_extended() {
 category_extra() {
     echo ""
     echo "=== extra ==="
-    for tool in zipinfo column expand unexpand fold fmt nl comm sdiff cmp md5sum sha1sum sha256sum cksum base64 split csplit tee script stty tput clear reset tset wall systemctl service journalctl loginctl timedatectl localectl findmnt lsblk fallocate truncate shred fuser nice renice nohup watch factor xxd getconf getent iconv localedef zdump gencat strings; do
+    for tool in zipinfo column expand unexpand fold fmt nl comm sdiff cmp md5sum sha1sum sha256sum cksum base64 split csplit tee script stty tput clear reset tset wall systemctl service journalctl loginctl timedatectl localectl findmnt lsblk fallocate truncate shred fuser nice renice nohup watch factor xxd getconf getent iconv localedef zdump gencat strings logger dmesg pr rlwrap tmux zcat zless zmore zfgrep zegrep zgrep bunzip2 bzcat bzmore bzless bzgrep; do
         [ -f "$R/usr/bin/$tool" ] || continue
         # Skip non-ELF executables (scripts, symlinks to scripts, etc.)
         if ! readelf -h "$R/usr/bin/$tool" >/dev/null 2>&1; then
