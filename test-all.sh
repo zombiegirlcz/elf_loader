@@ -292,6 +292,49 @@ TEST_CASES[ltrace]="ltrace --help 2>&1 | head -1"
 TEST_CASES[perf]="perf --help 2>&1 | head -1"
 TEST_CASES[numactl]="numactl --help 2>&1 | head -1"
 TEST_CASES[ping6]="ping6 -c 1 -W 1 127.0.0.1"
+TEST_CASES[zipinfo]="zipinfo /tmp/test.zip 2>/dev/null | head -3"
+TEST_CASES[column]="printf 'a:b\nc:d\n' | column -t -s:"
+TEST_CASES[expand]="printf 'a\tb\n' | expand"
+TEST_CASES[unexpand]="printf 'a b\n' | unexpand"
+TEST_CASES[fold]="printf 'abcdefghijklmnopqrstuvwxyz\n' | fold -w 10"
+TEST_CASES[fmt]="printf 'a b c d e f g h i j k l m n o p\n' | fmt"
+TEST_CASES[nl]="printf 'line1\nline2\n' | nl"
+TEST_CASES[comm]="printf 'a\nb\nc\n' > /tmp/c1.txt && printf 'b\nc\nd\n' > /tmp/c2.txt && comm /tmp/c1.txt /tmp/c2.txt"
+TEST_CASES[sdiff]="echo test > /tmp/s1.txt && echo test > /tmp/s2.txt && sdiff /tmp/s1.txt /tmp/s2.txt"
+TEST_CASES[cmp]="echo test > /tmp/cmp1.txt && echo test > /tmp/cmp2.txt && cmp /tmp/cmp1.txt /tmp/cmp2.txt"
+TEST_CASES[md5sum]="echo test | md5sum"
+TEST_CASES[sha1sum]="echo test | sha1sum"
+TEST_CASES[sha256sum]="echo test | sha256sum"
+TEST_CASES[cksum]="echo test | cksum"
+TEST_CASES[base64]="echo test | base64"
+TEST_CASES[split]="printf 'abcdefghijklmnopqrstuvwxyz\n' | split -b 5 - /tmp/split_out && cat /tmp/split_out*"
+TEST_CASES[csplit]="printf 'a\nb\nc\nd\ne\n' > /tmp/cs.txt && csplit /tmp/cs.txt 2 4 >/dev/null 2>&1 && cat xx*"
+TEST_CASES[tee]="echo test | tee /tmp/tee_out"
+TEST_CASES[script]="script -q -c 'echo test' /tmp/script_out 2>/dev/null && cat /tmp/script_out"
+TEST_CASES[stty]="stty size 2>/dev/null || stty -a 2>&1 | head -1"
+TEST_CASES[tput]="tput cols"
+TEST_CASES[clear]="true"
+TEST_CASES[reset]="true"
+TEST_CASES[tset]="tset -Q 2>&1 | head -1"
+TEST_CASES[wall]="echo test | wall -n 2>&1 | head -1 || true"
+TEST_CASES[systemctl]="systemctl --version 2>&1 | head -1"
+TEST_CASES[service]="service --version 2>&1 | head -1"
+TEST_CASES[journalctl]="journalctl --version 2>&1 | head -1"
+TEST_CASES[loginctl]="loginctl --version 2>&1 | head -1"
+TEST_CASES[timedatectl]="timedatectl --version 2>&1 | head -1"
+TEST_CASES[localectl]="localectl --version 2>&1 | head -1"
+TEST_CASES[findmnt]="findmnt --version 2>&1 | head -1"
+TEST_CASES[lsblk]="lsblk --version 2>&1 | head -1"
+TEST_CASES[fallocate]="fallocate -l 1 /tmp/fallocate_test 2>/dev/null && rm -f /tmp/fallocate_test"
+TEST_CASES[truncate]="truncate -s 1 /tmp/truncate_test 2>/dev/null && rm -f /tmp/truncate_test"
+TEST_CASES[shred]="shred -n 1 -s 1 /tmp/shred_test 2>/dev/null && rm -f /tmp/shred_test"
+TEST_CASES[fuser]="fuser -m /tmp 2>&1 | head -1"
+TEST_CASES[nice]="nice -n 10 true"
+TEST_CASES[renice]="renice -n 10 -p \$\$ 2>&1 | head -1 || true"
+TEST_CASES[nohup]="nohup true /tmp/nohup_test 2>/dev/null && rm -f /tmp/nohup_test"
+TEST_CASES[watch]="watch -n 1 -t true 2>&1 | head -1"
+TEST_CASES[factor]="factor 42"
+TEST_CASES[xxd]="echo test | xxd | head -1"
 TEST_CASES[zipgrep]="echo test > /tmp/test.txt && zip /tmp/test.zip /tmp/test.txt && zipgrep test /tmp/test.zip"
 TEST_CASES[zipdetails]="zipdetails /tmp/test.zip 2>/dev/null | head -5"
 TEST_CASES[pmap]="pmap -x 1 2>/dev/null | head -5"
@@ -421,6 +464,22 @@ category_extended() {
     done
 }
 
+category_extra() {
+    echo ""
+    echo "=== extra ==="
+    for tool in zipinfo column expand unexpand fold fmt nl comm sdiff cmp md5sum sha1sum sha256sum cksum base64 split csplit tee script stty tput clear reset tset wall systemctl service journalctl loginctl timedatectl localectl findmnt lsblk fallocate truncate shred fuser nice renice nohup watch factor xxd; do
+        [ -f "$R/usr/bin/$tool" ] || continue
+        # Skip non-ELF executables (scripts, symlinks to scripts, etc.)
+        if ! readelf -h "$R/usr/bin/$tool" >/dev/null 2>&1; then
+            echo "SKIP $tool: not an ELF binary"
+            echo "SKIP: $tool - not an ELF binary" >> "$SKIP_LOG"
+            ((SKIP_COUNT++)) || true
+            continue
+        fi
+        run_test "$R/usr/bin/$tool" "usr/bin/$tool" "extra $tool ${TEST_CASES[$tool]:-test}"
+    done
+}
+
 category_shell() {
     echo ""
     echo "=== shell ==="
@@ -523,6 +582,10 @@ case "${1:-all}" in
         category_extended
         print_summary
         ;;
+    extra)
+        category_extra
+        print_summary
+        ;;
     shell)
         category_shell
         print_summary
@@ -544,6 +607,7 @@ case "${1:-all}" in
         category_diff
         category_archive
         category_extended
+        category_extra
         category_shell
         category_python
         print_summary
