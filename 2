@@ -1,0 +1,197 @@
+
+=== basic ===
+PASS echo: basic echo
+PASS true: basic true
+PASS false: basic false
+
+=== reexec ===
+PASS tar: re-exec tar tar -czf /tmp/test.tar.gz /etc/hostname && tar -xzf /tmp/test.tar.gz -O
+PASS gzip: re-exec gzip echo test | gzip | gunzip
+PASS gunzip: re-exec gunzip echo test | gzip | gunzip
+PASS bzip2: re-exec bzip2 echo test | bzip2 | bunzip2
+PASS bunzip2: re-exec bunzip2 bzip2 -c /etc/hostname | bunzip2 | head -1
+PASS xz: re-exec xz echo test | xz | unxz
+PASS unxz: re-exec unxz echo test | xz | unxz
+
+=== text ===
+TIMEOUT grep: grep -q root /etc/passwd
+PASS sed: sed -n '1p' /etc/hostname
+TIMEOUT awk: awk 'BEGIN{print 1+2}'
+PASS wc: wc -c /etc/hostname
+PASS cut: cut -d: -f1 /etc/passwd | head -1
+PASS sort: printf 'b\na\nc\n' | sort
+PASS uniq: printf 'a\na\nb\n' | uniq
+PASS tr: echo 'hello' | tr a-z A-Z
+PASS head: head -c 5 /etc/hostname
+PASS tail: tail -c 5 /etc/hostname
+PASS cat: cat /etc/hostname
+
+=== files ===
+PASS ls: ls /etc | head -5
+PASS cp: cp /etc/hostname /tmp/test_cp && cat /tmp/test_cp && rm /tmp/test_cp
+PASS mv: echo test > /tmp/test_mv_src && mv /tmp/test_mv_src /tmp/test_mv_dst && cat /tmp/test_mv_dst && rm /tmp/test_mv_dst
+PASS rm: echo test > /tmp/test_rm && rm /tmp/test_rm
+PASS mkdir: mkdir /tmp/test_mkdir && rmdir /tmp/test_mkdir
+PASS stat: stat /etc/hostname
+PASS find: find /etc -maxdepth 1 -type f | head -3
+PASS realpath: realpath /etc/hostname
+PASS dirname: dirname /etc/hostname
+PASS basename: basename /etc/hostname
+
+=== system ===
+PASS uname: uname -a
+PASS hostname: hostname
+PASS uptime: uptime
+PASS whoami: whoami
+PASS id: id -u
+PASS ps: ps -o pid,comm | head -3
+PASS free: free -h
+PASS df: df -h /
+PASS du: du -sh /etc
+PASS hostid: hostid
+SKIP man: man --help 2>&1 | head -1
+SKIP less: less --help 2>&1 | head -1
+SKIP more: more --help 2>&1 | head -1
+SKIP nano: nano --version 2>&1 | head -1
+SKIP lesspipe: lesspipe --help 2>&1 | head -1
+SKIP manpath: manpath
+SKIP mandb: mandb --help 2>&1 | head -1
+SKIP man-recode: man-recode --help 2>&1 | head -1
+PASS pslog: pslog
+PASS pstree: pstree -h 2>&1 | head -1
+
+=== datetime ===
+PASS date: date
+PASS timeout: test
+PASS sleep: sleep 0.1 && echo ok
+
+=== compression ===
+PASS gzip: echo test | gzip | gunzip
+PASS gunzip: echo test | gzip | gunzip
+PASS bzip2: echo test | bzip2 | bunzip2
+PASS bunzip2: bzip2 -c /etc/hostname | bunzip2 | head -1
+PASS xz: echo test | xz | unxz
+PASS unxz: echo test | xz | unxz
+PASS tar: tar -czf /tmp/test.tar.gz /etc/hostname && tar -xzf /tmp/test.tar.gz -O
+
+=== networking ===
+PASS ping: ping -c 1 -W 1 127.0.0.1
+
+=== math ===
+PASS expr: expr 1 + 2
+
+=== diff ===
+PASS diff: diff /etc/hostname /etc/hostname
+TIMEOUT patch: echo test > /tmp/test_patch && patch -p0 < /dev/null
+
+=== archive ===
+PASS unzip: echo test > /tmp/test.txt && zip /tmp/test.zip /tmp/test.txt && unzip -p /tmp/test.zip
+
+=== extended ===
+PASS file: extended file file /etc/hostname
+PASS timeout: extended timeout test
+TIMEOUT gawk: extended gawk gawk 'BEGIN{print 1+2}'
+TIMEOUT mawk: extended mawk mawk 'BEGIN{print 1+2}'
+TIMEOUT xargs: extended xargs echo 'a' | xargs echo
+PASS shuf: extended shuf printf 'a\nb\nc\n' | shuf | head -1
+PASS paste: extended paste paste -d: - - < /etc/passwd | head -1
+PASS join: extended join join -t: /etc/passwd /etc/passwd 2>/dev/null | head -1
+PASS jq: extended jq echo '{"a":1}' | jq '.a'
+PASS lsof: extended lsof lsof --help 2>/dev/null | head -1
+PASS ps: extended ps ps -o pid,comm | head -3
+PASS pgrep: extended pgrep pgrep -l init 2>/dev/null | head -1
+PASS pmap: extended pmap pmap -x 1 2>/dev/null | head -5
+PASS gdbus: extended gdbus gdbus --version 2>&1 | head -1
+PASS hostnamectl: extended hostnamectl hostnamectl status 2>&1 | head -5
+PASS ping6: extended ping6 ping6 -c 1 -W 1 127.0.0.1
+SKIP zipgrep: not an ELF binary
+SKIP zipdetails: not an ELF binary
+PASS curl: extended curl curl -V 2>&1 | head -1
+PASS wget: extended wget wget --version 2>&1 | head -1
+PASS ssh: extended ssh ssh -V 2>&1 | head -1
+PASS scp: extended scp scp -V 2>&1 | head -1
+
+=== extra ===
+PASS zipinfo: extra zipinfo zipinfo /tmp/test.zip 2>/dev/null | head -3
+PASS column: extra column printf 'a:b\nc:d\n' | column -t -s:
+PASS expand: extra expand printf 'a\tb\n' | expand
+PASS unexpand: extra unexpand printf 'a b\n' | unexpand
+PASS fold: extra fold printf 'abcdefghijklmnopqrstuvwxyz\n' | fold -w 10
+PASS fmt: extra fmt printf 'a b c d e f g h i j k l m n o p\n' | fmt
+PASS nl: extra nl printf 'line1\nline2\n' | nl
+PASS comm: extra comm printf 'a\nb\nc\n' > /tmp/c1.txt && printf 'b\nc\nd\n' > /tmp/c2.txt && comm /tmp/c1.txt /tmp/c2.txt
+PASS sdiff: extra sdiff echo test > /tmp/s1.txt && echo test > /tmp/s2.txt && sdiff /tmp/s1.txt /tmp/s2.txt
+PASS cmp: extra cmp echo test > /tmp/cmp1.txt && echo test > /tmp/cmp2.txt && cmp /tmp/cmp1.txt /tmp/cmp2.txt
+PASS md5sum: extra md5sum echo test | md5sum
+PASS sha1sum: extra sha1sum echo test | sha1sum
+PASS sha256sum: extra sha256sum echo test | sha256sum
+PASS cksum: extra cksum echo test | cksum
+PASS base64: extra base64 echo test | base64
+PASS split: extra split printf 'abcdefghijklmnopqrstuvwxyz\n' | split -b 5 - /tmp/split_out && cat /tmp/split_out*
+PASS csplit: extra csplit printf 'a\nb\nc\nd\ne\n' > /tmp/cs.txt && csplit /tmp/cs.txt 2 4 >/dev/null 2>&1 && cat xx*
+TIMEOUT tee: extra tee echo test | tee /tmp/tee_out
+PASS script: extra script script -q -c 'echo test' /tmp/script_out 2>/dev/null && cat /tmp/script_out
+PASS stty: extra stty stty size 2>/dev/null || stty -a 2>&1 | head -1
+PASS tput: extra tput tput cols
+PASS clear: extra clear true
+PASS reset: extra reset true
+PASS tset: extra tset tset -Q 2>&1 | head -1
+PASS wall: extra wall echo test | wall -n 2>&1 | head -1 || true
+PASS systemctl: extra systemctl systemctl --version 2>&1 | head -1
+SKIP service: extra service service --version 2>&1 | head -1
+PASS journalctl: extra journalctl journalctl --version 2>&1 | head -1
+SKIP loginctl: extra loginctl loginctl --version 2>&1 | head -1
+PASS timedatectl: extra timedatectl timedatectl --version 2>&1 | head -1
+PASS localectl: extra localectl localectl --version 2>&1 | head -1
+PASS findmnt: extra findmnt findmnt --version 2>&1 | head -1
+PASS lsblk: extra lsblk lsblk --version 2>&1 | head -1
+PASS fallocate: extra fallocate fallocate -l 1 /tmp/fallocate_test 2>/dev/null && rm -f /tmp/fallocate_test
+SKIP truncate: extra truncate truncate -s 1 /tmp/truncate_test 2>/dev/null && rm -f /tmp/truncate_test
+PASS shred: extra shred shred -n 1 -s 1 /tmp/shred_test 2>/dev/null && rm -f /tmp/shred_test
+PASS fuser: extra fuser fuser -m /tmp 2>&1 | head -1
+PASS nice: extra nice nice -n 10 true
+PASS renice: extra renice renice -n 10 -p $$ 2>&1 | head -1 || true
+PASS nohup: extra nohup nohup true /tmp/nohup_test 2>/dev/null && rm -f /tmp/nohup_test
+TIMEOUT watch: extra watch watch --version 2>&1 | head -1
+PASS factor: extra factor factor 42
+PASS xxd: extra xxd echo test | xxd | head -1
+PASS getconf: extra getconf getconf LONG_BIT 2>/dev/null || getconf -a 2>&1 | head -1
+PASS getent: extra getent getent passwd root 2>/dev/null | head -1
+PASS iconv: extra iconv echo test | iconv -f UTF-8 -t ASCII 2>&1 | head -1
+PASS localedef: extra localedef localedef --version 2>&1 | head -1
+PASS zdump: extra zdump zdump --version 2>&1 | head -1
+SKIP gencat: extra gencat gencat --version 2>&1 | head -1 || true
+PASS strings: extra strings strings /etc/hostname | head -1
+PASS logger: extra logger logger --version 2>&1 | head -1
+PASS dmesg: extra dmesg dmesg --version 2>&1 | head -1
+PASS pr: extra pr echo test | pr | head -1
+PASS rlwrap: extra rlwrap rlwrap --version 2>&1 | head -1 || true
+PASS tmux: extra tmux tmux -V 2>&1 | head -1
+SKIP zcat: not an ELF binary
+SKIP zless: not an ELF binary
+SKIP zmore: not an ELF binary
+SKIP zfgrep: not an ELF binary
+SKIP zegrep: not an ELF binary
+SKIP zgrep: not an ELF binary
+PASS bunzip2: extra bunzip2 bzip2 -c /etc/hostname | bunzip2 | head -1
+PASS bzcat: extra bzcat bzip2 -c /etc/hostname | bzcat | head -1
+SKIP bzmore: not an ELF binary
+SKIP bzless: not an ELF binary
+SKIP bzgrep: not an ELF binary
+PASS test: extra test test -f /etc/hostname
+PASS mt: extra mt mt -f /dev/null status 2>&1 | head -1
+SKIP mountpoint: extra mountpoint mountpoint -q /tmp || mountpoint /tmp 2>&1 | head -1
+PASS partx: extra partx partx --version 2>&1 | head -1
+PASS tty: extra tty tty 2>&1 | head -1
+PASS who: extra who who 2>&1 | head -1
+PASS users: extra users users 2>&1 | head -1
+PASS busybox: extra busybox busybox --help 2>&1 | head -1
+PASS link: extra link link --version 2>&1 | head -1
+PASS ln: extra ln ln --version 2>&1 | head -1
+PASS mknod: extra mknod mknod --version 2>&1 | head -1
+PASS mkfifo: extra mkfifo mkfifo --version 2>&1 | head -1
+PASS chattr: extra chattr chattr --version 2>&1 | head -1
+PASS lsattr: extra lsattr lsattr --version 2>&1 | head -1
+PASS seq: extra seq seq 5
+EXIT=1 yes: extra yes printf 'yes\n'
+PASS printf: extra printf printf 'test\n'
