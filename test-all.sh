@@ -367,6 +367,12 @@ TEST_CASES[tty]="tty 2>&1 | head -1"
 TEST_CASES[who]="who 2>&1 | head -1"
 TEST_CASES[users]="users 2>&1 | head -1"
 TEST_CASES[busybox]="busybox --help 2>&1 | head -1"
+TEST_CASES[link]="link --version 2>&1 | head -1"
+TEST_CASES[ln]="ln --version 2>&1 | head -1"
+TEST_CASES[mknod]="mknod --version 2>&1 | head -1"
+TEST_CASES[mkfifo]="mkfifo --version 2>&1 | head -1"
+TEST_CASES[chattr]="chattr --version 2>&1 | head -1"
+TEST_CASES[lsattr]="lsattr --version 2>&1 | head -1"
 TEST_CASES[getent]="getent passwd root 2>/dev/null | head -1"
 TEST_CASES[iconv]="echo test | iconv -f UTF-8 -t ASCII 2>&1 | head -1"
 TEST_CASES[localedef]="localedef --version 2>&1 | head -1"
@@ -505,7 +511,7 @@ category_extended() {
 category_extra() {
     echo ""
     echo "=== extra ==="
-    for tool in zipinfo column expand unexpand fold fmt nl comm sdiff cmp md5sum sha1sum sha256sum cksum base64 split csplit tee script stty tput clear reset tset wall systemctl service journalctl loginctl timedatectl localectl findmnt lsblk fallocate truncate shred fuser nice renice nohup watch factor xxd getconf getent iconv localedef zdump gencat strings logger dmesg pr rlwrap tmux zcat zless zmore zfgrep zegrep zgrep bunzip2 bzcat bzmore bzless bzgrep test mt mountpoint partx tty who users busybox; do
+    for tool in zipinfo column expand unexpand fold fmt nl comm sdiff cmp md5sum sha1sum sha256sum cksum base64 split csplit tee script stty tput clear reset tset wall systemctl service journalctl loginctl timedatectl localectl findmnt lsblk fallocate truncate shred fuser nice renice nohup watch factor xxd getconf getent iconv localedef zdump gencat strings logger dmesg pr rlwrap tmux zcat zless zmore zfgrep zegrep zgrep bunzip2 bzcat bzmore bzless bzgrep test mt mountpoint partx tty who users busybox link ln mknod mkfifo chattr lsattr; do
         [ -f "$R/usr/bin/$tool" ] || continue
         # Skip non-ELF executables (scripts, symlinks to scripts, etc.)
         if ! readelf -h "$R/usr/bin/$tool" >/dev/null 2>&1; then
