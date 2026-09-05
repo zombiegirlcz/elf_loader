@@ -111,15 +111,21 @@ run_test() {
         return 0
     fi
 
+    # Zaznamenej PIDy elf_loader pred testem
+    local pids_before pids_after
+    pids_before=$(pgrep -x elf_loader 2>/dev/null | tr '\n' ',' || echo "")
+
     local rc out
     rc=$(ashell_rc "$L --ownall $bin $cmd") || true
     rc=${rc:-0}
     out=$(ashell_out "$L --ownall $bin $cmd") || true
 
+    pids_after=$(pgrep -x elf_loader 2>/dev/null | tr '\n' ',' || echo "")
+
     # Omez výstup do ALL_LOG na 200 bajtů, zabrání OOM v host aplikaci
     local out_summary
     out_summary=$(printf '%s' "$out" | head -c 200 | tr '\n' ' ')
-    echo "TEST: $bin_name | RC=$rc | $out_summary" >> "$ALL_LOG"
+    echo "TEST: $bin_name | RC=$rc | PIDS_BEFORE=$pids_before PIDS_AFTER=$pids_after | $out_summary" >> "$ALL_LOG"
 
     case "$rc" in
         0)
@@ -383,6 +389,7 @@ TEST_CASES[yes]="printf 'yes\n'";
 TEST_CASES[printf]="printf 'test\\n'"
 TEST_CASES[od]="echo test | od -An -tx1 | head -1"
 TEST_CASES[hexdump]="echo test | hexdump -C | head -1"
+TEST_CASES[dd]="dd if=/dev/zero bs=1 count=1 2>&1 | head -1"
 TEST_CASES[getent]="getent passwd root 2>/dev/null | head -1"
 TEST_CASES[iconv]="echo test | iconv -f UTF-8 -t ASCII 2>&1 | head -1"
 TEST_CASES[localedef]="localedef --version 2>&1 | head -1"
@@ -521,7 +528,7 @@ category_extended() {
 category_extra() {
     echo ""
     echo "=== extra ==="
-    for tool in zipinfo column expand unexpand fold fmt nl comm sdiff cmp md5sum sha1sum sha256sum cksum base64 split csplit tee script stty tput clear reset tset wall systemctl service journalctl loginctl timedatectl localectl findmnt lsblk fallocate truncate shred fuser nice renice nohup watch factor xxd getconf getent iconv localedef zdump gencat strings logger dmesg pr rlwrap tmux zcat zless zmore zfgrep zegrep zgrep bunzip2 bzcat bzmore bzless bzgrep test mt mountpoint partx tty who users busybox link ln mknod mkfifo chattr lsattr seq yes printf od hexdump; do
+    for tool in zipinfo column expand unexpand fold fmt nl comm sdiff cmp md5sum sha1sum sha256sum cksum base64 split csplit tee script stty tput clear reset tset wall systemctl service journalctl loginctl timedatectl localectl findmnt lsblk fallocate truncate shred fuser nice renice nohup watch factor xxd getconf getent iconv localedef zdump gencat strings logger dmesg pr rlwrap tmux zcat zless zmore zfgrep zegrep zgrep bunzip2 bzcat bzmore bzless bzgrep test mt mountpoint partx tty who users busybox link ln mknod mkfifo chattr lsattr seq yes printf od hexdump dd; do
         [ -f "$R/usr/bin/$tool" ] || continue
         # Skip non-ELF executables (scripts, symlinks to scripts, etc.)
         if ! readelf -h "$R/usr/bin/$tool" >/dev/null 2>&1; then
