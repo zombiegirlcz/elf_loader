@@ -308,6 +308,8 @@ TEST_CASES[nslookup]="nslookup localhost"
 # text utilities
 TEST_CASES[printf]="printf 'test %d %s\n' 42 foo"
 TEST_CASES[seq]="seq 1 5"
+TEST_CASES[yes]="printf 'yes\n'";
+# yes can produce unbounded output if pipe/SIGPIPE handling fails under loader
 TEST_CASES[expr]="expr 1 + 2"
 TEST_CASES[bc]="echo '2+2' | bc"
 
@@ -418,6 +420,8 @@ TEST_CASES[mkfifo]="mkfifo --version 2>&1 | head -1"
 TEST_CASES[chattr]="chattr --version 2>&1 | head -1"
 TEST_CASES[lsattr]="lsattr --version 2>&1 | head -1"
 TEST_CASES[seq]="seq 5"
+TEST_CASES[yes]="printf 'yes\n'";
+# Removed: yes can produce unbounded output if pipe handling fails
 TEST_CASES[printf]="printf 'test\\n'"
 TEST_CASES[od]="echo test | od -An -tx1 | head -1"
 TEST_CASES[hexdump]="echo test | hexdump -C | head -1"
@@ -562,7 +566,7 @@ category_extra() {
     echo ""
     echo "=== extra ==="
     echo "R=$R" >&2
-    for tool in zipinfo column expand unexpand fold fmt nl comm sdiff cmp md5sum sha1sum sha256sum cksum base64 split csplit tee script stty tput clear reset tset wall systemctl service journalctl loginctl timedatectl localectl findmnt lsblk fallocate truncate shred fuser nice renice nohup watch factor xxd getconf getent iconv localedef zdump gencat strings logger dmesg pr rlwrap tmux zcat zless zmore zfgrep zegrep zgrep bunzip2 bzcat bzmore bzless bzgrep test mt mountpoint partx tty who users busybox link ln mknod mkfifo chattr lsattr seq printf od hexdump dd; do
+    for tool in zipinfo column expand unexpand fold fmt nl comm sdiff cmp md5sum sha1sum sha256sum cksum base64 split csplit tee script stty tput clear reset tset wall systemctl service journalctl loginctl timedatectl localectl findmnt lsblk fallocate truncate shred fuser nice renice nohup watch factor xxd getconf getent iconv localedef zdump gencat strings logger dmesg pr rlwrap tmux zcat zless zmore zfgrep zegrep zgrep bunzip2 bzcat bzmore bzless bzgrep test mt mountpoint partx tty who users busybox link ln mknod mkfifo chattr lsattr seq yes printf od hexdump dd; do
         [ -f "$R/usr/bin/$tool" ] || continue
         # Skip non-ELF executables (scripts, symlinks to scripts, etc.)
         if ! readelf -h "$R/usr/bin/$tool" >/dev/null 2>&1; then
