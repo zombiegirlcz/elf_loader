@@ -1,20 +1,70 @@
-# ~/.gbshrc — gbsh konfigurace
-#
-# ═══ OBRÁCENÝ SVĚT ═══ (aktivace: gbsh --double-world nebo -dw)
-#   /           = kořen distro (parrot)            [start]
-#   cd .. z "/" = překlopí tě do FYZICKÉHO RODIČE rootfs
-#                 ($ROOTFS=/data/…/nh/distro/parrot → cd .. = …/nh/distro)
-#   cd $ROOTFS  = návrat dovnitř do distra (funguje odkudkoli,
-#                 i s hloubkou: cd $ROOTFS/usr/bin)
-#   V host světě prompt ukazuje skutečnou Android cestu.
-#
-# Prompt: \e = escape, \n \t, \\xNN hex; %u %h %~ \$
+# ~/.gbshrc — Ghost/Bionic Shell Configuration
+# Styled & featured for a rich zsh-like experience in Android/Parrot distro.
+
+# ═══ ENVIRONMENT ═══
+export EDITOR=nano
+export PAGER=less
+export HISTSIZE=1000
+export GBSH_EXEC_MODE=shim
+export GBSH_PROMPT_MODE=fancy
+
+# Terminal info & config paths for rootfs tools
+[ -n "$ROOTFS" ] && [ -d "$ROOTFS/usr/share/terminfo" ] && export TERMINFO="$ROOTFS/usr/share/terminfo"
+
+[ -z "$STARSHIP_CONFIG" ] && [ -f "$HOME/.config/starship.toml" ] && export STARSHIP_CONFIG="$HOME/.config/starship.toml"
+[ -z "$STARSHIP_CONFIG" ] && [ -n "$ROOTFS" ] && [ -f "$ROOTFS/root/.config/starship.toml" ] && export STARSHIP_CONFIG="$ROOTFS/root/.config/starship.toml"
+[ -z "$STARSHIP_CONFIG" ] && [ -n "$ROOTFS" ] && [ -f "$ROOTFS/etc/starship.toml" ] && export STARSHIP_CONFIG="$ROOTFS/etc/starship.toml"
+
+# ═══ ZSH COMPATIBILITY & PROMPT INIT ═══
+# zsh-style option stubs (silently processed by gbsh)
+setopt AUTO_CD
+setopt PROMPT_SUBST
+unsetopt BEEP
+zstyle ':completion:*' completer _complete _ignored
+
+# Starship prompt integration
+command -v starship >/dev/null 2>&1 && eval "$(starship init zsh 2>/dev/null)"
+
+# Auto-source zsh plugins if present under $ROOTFS
+[ -n "$ROOTFS" ] && [ -f "$ROOTFS/usr/share/zsh-syntax-highlighting/zsh-syntax-highlighting.zsh" ] && source "$ROOTFS/usr/share/zsh-syntax-highlighting/zsh-syntax-highlighting.zsh"
+[ -n "$ROOTFS" ] && [ -f "$ROOTFS/usr/share/zsh-autosuggestions/zsh-autosuggestions.zsh" ] && source "$ROOTFS/usr/share/zsh-autosuggestions/zsh-autosuggestions.zsh"
+
+# Fallback Prompt
 export GBSH_PROMPT='\e[1;32m%u@%h\e[0m:\e[36m%~\e[0m$ '
 
-export EDITOR=vi
-export PAGER=less
-
+# ═══ ALIASES ═══
+alias ls='ls --color=auto'
 alias ll='ls -la'
-alias la='ls -a'
+alias la='ls -A'
+alias l='ls -CF'
 alias grep='grep --color=auto'
+alias fgrep='fgrep --color=auto'
+alias egrep='egrep --color=auto'
+alias diff='diff --color=auto'
+
+# Navigation
 alias ..='cd ..'
+alias ...='cd ../..'
+alias ....='cd ../../..'
+alias .....='cd ../../../..'
+
+# Convenience
+alias h='history'
+alias j='jobs'
+alias md='mkdir -p'
+alias rd='rmdir'
+alias reload='source ~/.gbshrc'
+
+# ═══ FUNCTIONS ═══
+# Create directory and enter it
+mkcd() {
+    mkdir -p "$1"
+    cd "$1"
+}
+
+# Display system info summary
+sysinfo() {
+    echo "OS Kernel : $(uname -s -r -m)"
+    echo "Shell     : gbsh $GBSH_VERSION"
+    echo "RootFS    : ${ROOTFS:-/}"
+}

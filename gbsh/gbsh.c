@@ -64,7 +64,7 @@ static int g_alias_count = 0;
 #define WORLD_ROOTFS 1
 static int  g_world = WORLD_ROOTFS;
 static int  g_dual_world = 0;
-static int  g_chroot_mode = 0;  /* --chroot: běžet uvnitř chroot(rootfs) */   /* --double-world / -dw */
+   /* --double-world / -dw */
 static char g_vpath[1024];            /* virtuální cesta uvnitř rootfs ("/") */
 static char g_host_entry[600];        /* kam ses dostane cd .. z "/" */
 
@@ -128,6 +128,85 @@ static void hist_add(const char *line) {
     g_history[g_hist_count++] = xstrdup(line);
 }
 
+
+#define MAX_FUNCS 64
+struct shell_func {
+    char name[64];
+    char *body;
+};
+static struct shell_func g_funcs[MAX_FUNCS];
+static int g_func_count = 0;
+
+static char *g_positional_args[MAX_ARGS];
+static int   g_positional_count = 0;
+
+static const struct shell_func *func_lookup(const char *name) {
+    for (int i = 0; i < g_func_count; i++) {
+        if (strcmp(g_funcs[i].name, name) == 0)
+            return &g_funcs[i];
+    }
+    return NULL;
+}
+
+static void func_set(const char *name, const char *body) {
+    for (int i = 0; i < g_func_count; i++) {
+        if (strcmp(g_funcs[i].name, name) == 0) {
+            free(g_funcs[i].body);
+            g_funcs[i].body = xstrdup(body);
+            return;
+        }
+    }
+    if (g_func_count < MAX_FUNCS) {
+        snprintf(g_funcs[g_func_count].name, 64, "%s", name);
+        g_funcs[g_func_count].body = xstrdup(body);
+        g_func_count++;
+    }
+}
+
+static int try_parse_func_header(const char *line, char *func_name, size_t name_cap, const char **body_start) {
+    const char *p = line;
+    while (isspace((unsigned char)*p)) p++;
+    if (!*p || *p == '#') return 0;
+
+    char name[64] = "";
+    if (strncmp(p, "function ", 9) == 0) {
+        p += 9;
+        while (isspace((unsigned char)*p)) p++;
+        size_t ni = 0;
+        while ((isalnum((unsigned char)*p) || *p == '_' || *p == '-') && ni + 1 < sizeof name) {
+            name[ni++] = *p++;
+        }
+        name[ni] = 0;
+        while (isspace((unsigned char)*p)) p++;
+        if (p[0] == '(' && p[1] == ')') { p += 2; while (isspace((unsigned char)*p)) p++; }
+        if (*p == '{') {
+            snprintf(func_name, name_cap, "%s", name);
+            *body_start = p + 1;
+            return 1;
+        }
+    } else {
+        size_t ni = 0;
+        const char *s = p;
+        while ((isalnum((unsigned char)*s) || *s == '_' || *s == '-') && ni + 1 < sizeof name) {
+            name[ni++] = *s++;
+        }
+        name[ni] = 0;
+        if (ni > 0) {
+            while (isspace((unsigned char)*s)) s++;
+            if (s[0] == '(' && s[1] == ')') {
+                s += 2;
+                while (isspace((unsigned char)*s)) s++;
+                if (*s == '{') {
+                    snprintf(func_name, name_cap, "%s", name);
+                    *body_start = s + 1;
+                    return 1;
+                }
+            }
+        }
+    }
+    return 0;
+}
+
 /* ─────────────────────────── alias ─────────────────────────── */
 
 static const char *alias_lookup(const char *name) {
@@ -183,6 +262,43 @@ static void expand_vars(const char *line, char *out, size_t cap) {
             if (o + hl + 2 >= cap) break;
             memcpy(out + o, home, hl); o += hl; i++;
             continue;
+        }
+        if (line[i] == '$') {
+            if (isdigit((unsigned char)line[i+1])) {
+                int idx = line[i+1] - '0';
+                i += 2;
+                if (idx == 0) {
+                    const char *v = env_or("0", "gbsh");
+                    size_t vl = strlen(v);
+                    if (o + vl + 2 < cap) { memcpy(out + o, v, vl); o += vl; }
+                } else if (idx <= g_positional_count && g_positional_args[idx - 1]) {
+                    const char *v = g_positional_args[idx - 1];
+                    size_t vl = strlen(v);
+                    if (o + vl + 2 < cap) { memcpy(out + o, v, vl); o += vl; }
+                }
+                continue;
+            }
+            if (line[i+1] == '#') {
+                i += 2;
+                char num[16];
+                snprintf(num, sizeof num, "%d", g_positional_count);
+                size_t vl = strlen(num);
+                if (o + vl + 2 < cap) { memcpy(out + o, num, vl); o += vl; }
+                continue;
+            }
+            if (line[i+1] == '@' || line[i+1] == '*') {
+                i += 2;
+                for (int k = 0; k < g_positional_count; k++) {
+                    if (!g_positional_args[k]) continue;
+                    size_t vl = strlen(g_positional_args[k]);
+                    if (o + vl + 2 < cap) {
+                        memcpy(out + o, g_positional_args[k], vl);
+                        o += vl;
+                        if (k + 1 < g_positional_count && o + 2 < cap) out[o++] = ' ';
+                    }
+                }
+                continue;
+            }
         }
         if (line[i] == '$' && (isalpha((unsigned char)line[i+1]) || line[i+1]=='_')) {
             char name[128]; size_t ni = 0; i++;
@@ -418,7 +534,7 @@ static int bi_cd(char **argv, int argc) {
         }
         if (strcmp(target, "..") == 0 && strcmp(g_vpath, "/") == 0) {
             if (!g_dual_world) {
-                /* single world: / je strop — zůstaneme (chroot-like) */
+                /* single world: / je strop — zůstaneme */
                 return 0;
             }
             /* ─── PŘEKLOP NA DRUHOU STRANU ───
@@ -487,6 +603,38 @@ static int bi_cd(char **argv, int argc) {
         return 1;
     }
     return 0;
+}
+
+
+static int check_autocd(char **argv, int argc) {
+    if (argc != 1 || !argv[0] || !argv[0][0]) return -1;
+    const char *target = argv[0];
+    char targetbuf[MAX_LINE];
+    if (starts_with(target, "~")) {
+        snprintf(targetbuf, sizeof targetbuf, "%s%s", env_or("HOME", "/"), target + 1);
+        target = targetbuf;
+    }
+    struct stat st;
+    if (g_world == WORLD_ROOTFS) {
+        char chk[2048];
+        if (target[0] == '/') {
+            snprintf(chk, sizeof chk, "%s%s", g_rootfs, strcmp(target, "/") == 0 ? "" : target);
+        } else {
+            char combined[2048];
+            snprintf(combined, sizeof combined, "%s/%s", g_vpath, target);
+            char nv[1024];
+            vpath_normalize(combined, nv, sizeof nv);
+            snprintf(chk, sizeof chk, "%s%s", g_rootfs, strcmp(nv, "/") == 0 ? "" : nv);
+        }
+        if (stat(chk, &st) == 0 && S_ISDIR(st.st_mode)) {
+            return bi_cd(argv, argc);
+        }
+    } else {
+        if (stat(target, &st) == 0 && S_ISDIR(st.st_mode)) {
+            return bi_cd(argv, argc);
+        }
+    }
+    return -1;
 }
 
 static int bi_pwd(char **argv, int argc) {
@@ -585,20 +733,128 @@ static int bi_help(char **argv, int argc);
 /* source / . — proveď soubor stejným parserem */
 static int bi_source(char **argv, int argc);
 
+
+int gbsh_eval_line(const char *raw);
+static int word_is_builtin(const char *w);
+
+
+struct command;
+static int run_pipeline(struct command *cmds, int ncmd);
+static int bi_type(char **argv, int argc);
+
+struct command {
+    char *argv[MAX_ARGS];
+    int   argc;
+    char *infile, *outfile;
+    int   append;
+    int   out_fd;   /* cilovy fd pro output redirect (default 1; 2 = 2>) */
+};
+
+static int bi_command(char **argv, int argc) {
+    if (argc < 2) return 0;
+    if (strcmp(argv[1], "-v") == 0 || strcmp(argv[1], "-V") == 0) {
+        if (argc < 3) return 1;
+        return bi_type(&argv[1], argc - 1);
+    }
+    struct command cmd;
+    memset(&cmd, 0, sizeof cmd);
+    cmd.out_fd = STDOUT_FILENO;
+    cmd.argc = argc - 1;
+    for (int i = 1; i < argc; i++) cmd.argv[i - 1] = argv[i];
+    return run_pipeline(&cmd, 1);
+}
+
+static int bi_eval(char **argv, int argc) {
+    if (argc < 2) return 0;
+    char eval_buf[MAX_LINE * 4] = "";
+    size_t pos = 0;
+    for (int i = 1; i < argc; i++) {
+        size_t len = strlen(argv[i]);
+        if (pos + len + 2 < sizeof eval_buf) {
+            memcpy(eval_buf + pos, argv[i], len);
+            pos += len;
+            if (i + 1 < argc) eval_buf[pos++] = ' ';
+        }
+    }
+    eval_buf[pos] = 0;
+    return gbsh_eval_line(eval_buf);
+}
+
+static int bi_noop(char **argv, int argc) {
+    (void)argv; (void)argc;
+    return 0;
+}
+
+static int bi_type(char **argv, int argc) {
+    if (argc < 2) {
+        fprintf(stderr, "type: missing argument\n");
+        return 1;
+    }
+    int status = 0;
+    for (int i = 1; i < argc; i++) {
+        const char *cmd = argv[i];
+        if (word_is_builtin(cmd)) {
+            printf("%s is a shell builtin\n", cmd);
+            continue;
+        }
+        const struct shell_func *fn = func_lookup(cmd);
+        if (fn) {
+            printf("%s is a function\n%s ()\n{\n%s\n}\n", cmd, cmd, fn->body);
+            continue;
+        }
+        const char *al = alias_lookup(cmd);
+        if (al) {
+            printf("%s is an alias for %s\n", cmd, al);
+            continue;
+        }
+        char rfpath[1200];
+        int src = resolve_source(cmd, rfpath, sizeof rfpath);
+        if (src == SRC_ROOTFS) {
+            printf("%s is %s\n", cmd, rfpath);
+            continue;
+        }
+        if (src == SRC_HOST) {
+            printf("%s is %s\n", cmd, cmd);
+            continue;
+        }
+        fprintf(stderr, "type: %s: not found\n", cmd);
+        status = 1;
+    }
+    return status;
+}
+
 static struct { const char *name; int (*fn)(char **, int); } builtins[] = {
-    { "cd",      bi_cd },
-    { "pwd",     bi_pwd },
-    { "echo",    bi_echo },
-    { "export",  bi_export },
-    { "unset",   bi_unset },
-    { "env",     bi_env },
-    { "exit",    bi_exit },
-    { "history", bi_history },
-    { "alias",   bi_alias },
-    { "unalias", bi_unalias },
-    { "source",  bi_source },
-    { ".",       bi_source },
-    { "help",    bi_help },
+    { "cd",       bi_cd },
+    { "pwd",      bi_pwd },
+    { "echo",     bi_echo },
+    { "command",  bi_command },
+    { "eval",     bi_eval },
+    { "export",   bi_export },
+    { "unset",    bi_unset },
+    { "env",      bi_env },
+    { "exit",     bi_exit },
+    { "history",  bi_history },
+    { "alias",    bi_alias },
+    { "unalias",  bi_unalias },
+    { "source",   bi_source },
+    { ".",        bi_source },
+    { "type",     bi_type },
+    { "which",    bi_type },
+    { "setopt",   bi_noop },
+    { "unsetopt", bi_noop },
+    { "bindkey",  bi_noop },
+    { "zstyle",   bi_noop },
+    { "compdef",  bi_noop },
+    { "if",       bi_noop },
+    { "then",     bi_noop },
+    { "else",     bi_noop },
+    { "elif",     bi_noop },
+    { "fi",       bi_noop },
+    { "for",      bi_noop },
+    { "do",       bi_noop },
+    { "done",     bi_noop },
+    { "local",    bi_noop },
+    { "help",     bi_help },
 };
 
 static int builtin_count = (int)(sizeof builtins / sizeof builtins[0]);
@@ -616,13 +872,9 @@ static void print_usage(void) {
            GBSH_VERSION);
     printf("POUŽITÍ:\n");
     printf("  gbsh [FLAGY] [-c \"příkaz\" ]\n");
-    printf("  su -c 'ROOTFS=<rootfs> gbsh --chroot'   # cizí rootfs\n\n");
     printf("FLAGY:\n");
     printf("  -dw, --double-world  cd .. z rootfs / překlopí na fyzický Android,\n"
            "                       cd $ROOTFS se vrátí zpět\n");
-    printf("  -C,  --chroot        běžet uvnitř chroot(rootfs) — vyžaduje root;\n"
-           "                       100 %% kompatibilita (kernel PT_INTERP), vhodné\n"
-           "                       pro cizí/starší rootfy (např. glibc 2.28)\n");
     printf("  -c  \"příkaz\"         spustit příkaz a skončit s jeho statusem\n");
     printf("  --version            verze\n");
     printf("  --help               tato nápověda\n\n");
@@ -642,7 +894,7 @@ static void print_usage(void) {
     printf("  gbsh                                  # interaktivní shell (own-loading)\n");
     printf("  gbsh -dw                              # + obrácený svět (cd .. z /)\n");
     printf("  gbsh -c \"uname -m | wc -c\"             # jeden příkaz, exit status propagován\n");
-    printf("  su -c 'ROOTFS=$T gbsh --chroot'        # chroot shell do cizího rootfs\n");
+
 }
 
 static int bi_help(char **argv, int argc) {
@@ -660,7 +912,28 @@ static int bi_source(char **argv, int argc) {
         fprintf(stderr, "source: missing filename\n");
         return 1;
     }
-    FILE *f = fopen(argv[1], "r");
+    const char *target = argv[1];
+    char targetbuf[MAX_LINE];
+    if (starts_with(target, "~")) {
+        snprintf(targetbuf, sizeof targetbuf, "%s%s", env_or("HOME", "/"), target + 1);
+        target = targetbuf;
+    }
+
+    char openpath[1200];
+    snprintf(openpath, sizeof openpath, "%s", target);
+
+    if (g_world == WORLD_ROOTFS && target[0] == '/') {
+        size_t rflen = strlen(g_rootfs);
+        if (strncmp(target, g_rootfs, rflen) != 0) {
+            snprintf(openpath, sizeof openpath, "%s%s", g_rootfs, strcmp(target, "/") == 0 ? "" : target);
+        }
+    }
+
+    FILE *f = fopen(openpath, "r");
+    if (!f && strcmp(openpath, target) != 0) {
+        f = fopen(target, "r");
+    }
+
     if (!f) {
         fprintf(stderr, "source: %s: %s\n", argv[1], strerror(errno));
         return 1;
@@ -680,6 +953,18 @@ static int bi_source(char **argv, int argc) {
 
 
 /* otevři soubor respektující svět: v rootfs světě se /X mapuje pod $ROOTFS */
+
+static const char *get_exec_mode(const char *rootfs_path) {
+    const char *env_mode = getenv("GBSH_EXEC_MODE");
+    if (env_mode && env_mode[0]) {
+        if (strcmp(env_mode, "ownall") == 0) return "--ownall";
+        if (strcmp(env_mode, "run") == 0) return "--run";
+        if (strcmp(env_mode, "own") == 0) return "--own";
+        if (strcmp(env_mode, "shim") == 0) return "--shim";
+    }
+    return "--shim";
+}
+
 static int open_world(const char *path, int flags, int mode) {
     char full[1200];
     if (g_world == WORLD_ROOTFS && path[0] == '/') {
@@ -692,17 +977,11 @@ static int open_world(const char *path, int flags, int mode) {
 
 /* spustit parrot binárku přes elf_loader (ownall) */
 static int exec_rootfs(const char *rootfs_path, char **argv) {
-    if (g_chroot_mode) {
-        /* jsme fyzicky uvnitř chroot(rootfs): kernel spustí PT_INTERP
-           (ld.so v rootfs), žádný own-loading ani LD_LIBRARY_PATH hack */
-        execv(rootfs_path[0] == '/' ? rootfs_path + 1 : rootfs_path, argv);
-        fprintf(stderr, "gbsh: exec %s: %s\n", rootfs_path, strerror(errno));
-        _exit(127);
-    }
+    const char *mode = get_exec_mode(rootfs_path);
     char *eargv[MAX_ARGS];
     int n = 0;
     eargv[n++] = (char *)g_elfloader;
-    eargv[n++] = (char *)"--ownall";
+    eargv[n++] = (char *)mode;
     eargv[n++] = (char *)rootfs_path;
     for (int i = 1; argv[i] && n < MAX_ARGS - 1; i++)
         eargv[n++] = argv[i];
@@ -753,13 +1032,7 @@ static pid_t launch_external(char **argv, int src, const char *rootfs_path,
 /* ─────────────────────────── pipeline / segmenty ─────────────────────────── */
 
 /* jeden segment (= oddělený ; && ||): pole pipelines, každou tvoří commands */
-struct command {
-    char *argv[MAX_ARGS];
-    int   argc;
-    char *infile, *outfile;
-    int   append;
-    int   out_fd;   /* cilovy fd pro output redirect (default 1; 2 = 2>) */
-};
+
 
 static int wait_all(pid_t *pids, int count) {
     int status = 0;
@@ -773,13 +1046,38 @@ static int wait_all(pid_t *pids, int count) {
 }
 
 /* proveď jednu pipeline (commands spojené |) */
+
+static int run_function(char **argv, int argc) {
+    if (argc < 1 || !argv[0]) return -1;
+    const struct shell_func *fn = func_lookup(argv[0]);
+    if (!fn) return -1;
+
+    char *old_args[MAX_ARGS];
+    int old_count = g_positional_count;
+    for (int i = 0; i < old_count; i++) old_args[i] = g_positional_args[i];
+
+    g_positional_count = argc - 1;
+    for (int i = 1; i < argc; i++) g_positional_args[i - 1] = argv[i];
+
+    int status = gbsh_eval_line(fn->body);
+
+    g_positional_count = old_count;
+    for (int i = 0; i < old_count; i++) g_positional_args[i] = old_args[i];
+
+    return status;
+}
+
 static int run_pipeline(struct command *cmds, int ncmd) {
     if (ncmd == 0) return g_last_status;
 
-    /* čistě builtin bez pipe → spusť inline (aby cd/export měly efekt) */
+    /* čistě builtin nebo autocd bez pipe → spusť inline */
     if (ncmd == 1 && !cmds[0].infile && !cmds[0].outfile) {
         int bi = run_builtin(cmds[0].argv, cmds[0].argc);
         if (bi >= 0) return bi;
+        int acd = check_autocd(cmds[0].argv, cmds[0].argc);
+        if (acd >= 0) return acd;
+        int fn = run_function(cmds[0].argv, cmds[0].argc);
+        if (fn >= 0) return fn;
     }
 
     pid_t pids[MAX_PIPES];
@@ -961,18 +1259,55 @@ static int eval_tokens(struct token *toks, int nt) {
 /* ─────────────────────────── veřejný eval (pro source/rc) ─────────────────────────── */
 
 int gbsh_eval_line(const char *raw) {
-    char expanded[MAX_LINE];
-    expand_vars(raw, expanded, sizeof expanded);
+    char raw_copy[MAX_LINE];
+    snprintf(raw_copy, sizeof raw_copy, "%s", raw);
 
-    /* rozděl na řádky (víceřádkový vklad / skript) */
     char *save = NULL;
-    char *line = strtok_r(expanded, "\n", &save);
+    char *line = strtok_r(raw_copy, "\n", &save);
     int status = g_last_status;
+
+    char in_func_name[64] = "";
+    char func_body[MAX_LINE * 2] = "";
+    int collecting_func = 0;
+
     while (line) {
         if (line[0]) {
-            struct token toks[MAX_ARGS];
-            int nt = tokenize(line, toks, MAX_ARGS);
-            if (nt > 0) status = eval_tokens(toks, nt);
+            if (collecting_func) {
+                const char *close_brace = strchr(line, '}');
+                if (close_brace) {
+                    size_t pre_len = close_brace - line;
+                    strncat(func_body, line, pre_len);
+                    func_set(in_func_name, func_body);
+                    collecting_func = 0;
+                    in_func_name[0] = 0;
+                    func_body[0] = 0;
+                } else {
+                    strcat(func_body, line);
+                    strcat(func_body, "\n");
+                }
+            } else {
+                char fname[64];
+                const char *bstart = NULL;
+                if (try_parse_func_header(line, fname, sizeof fname, &bstart)) {
+                    const char *close_brace = strchr(bstart, '}');
+                    if (close_brace) {
+                        char inline_body[MAX_LINE];
+                        size_t blen = close_brace - bstart;
+                        snprintf(inline_body, sizeof inline_body, "%.*s", (int)blen, bstart);
+                        func_set(fname, inline_body);
+                    } else {
+                        snprintf(in_func_name, sizeof in_func_name, "%s", fname);
+                        snprintf(func_body, sizeof func_body, "%s\n", bstart);
+                        collecting_func = 1;
+                    }
+                } else {
+                    char expanded[MAX_LINE];
+                    expand_vars(line, expanded, sizeof expanded);
+                    struct token toks[MAX_ARGS];
+                    int nt = tokenize(expanded, toks, MAX_ARGS);
+                    if (nt > 0) status = eval_tokens(toks, nt);
+                }
+            }
         }
         line = strtok_r(NULL, "\n", &save);
     }
@@ -991,7 +1326,7 @@ int gbsh_eval_line(const char *raw) {
 #define C_BGRN   "\x1b[1;32m"
 #define C_YELLOW "\x1b[33m"
 #define C_CYAN   "\x1b[36m"
-#define C_MAGENTA"\x1b[35m"
+#define C_MAGENTA "\x1b[35m"
 #define C_RED    "\x1b[91m"
 #define C_GRAY   "\x1b[90m"
 
@@ -1598,6 +1933,23 @@ static void detect_env(void) {
     }
     snprintf(g_rootfs, sizeof g_rootfs, "%s", rf);
     /* host entry point: kam se dostaneš cd .. z "/" rootfs světa */
+    if (!getenv("STARSHIP_CONFIG")) {
+        char cfg[1200];
+        snprintf(cfg, sizeof cfg, "%s/.config/starship.toml", env_or("HOME", "/"));
+        if (access(cfg, R_OK) == 0) {
+            setenv("STARSHIP_CONFIG", cfg, 1);
+        } else {
+            snprintf(cfg, sizeof cfg, "%s/root/.config/starship.toml", g_rootfs);
+            if (access(cfg, R_OK) == 0) {
+                setenv("STARSHIP_CONFIG", cfg, 1);
+            } else {
+                snprintf(cfg, sizeof cfg, "%s/etc/starship.toml", g_rootfs);
+                if (access(cfg, R_OK) == 0) {
+                    setenv("STARSHIP_CONFIG", cfg, 1);
+                }
+            }
+        }
+    }
     snprintf(g_host_entry, sizeof g_host_entry, "%s",
              env_or("HOST_ENTRY", env_or("HOME", "/")));
 
@@ -1614,13 +1966,34 @@ static void detect_env(void) {
 
 static void load_rc(void) {
     const char *rc = getenv("GBSHRC");
-    char path[600];
+    char path[1200] = "";
+    FILE *f = NULL;
+
     if (rc && rc[0]) {
         snprintf(path, sizeof path, "%s", rc);
+        f = fopen(path, "r");
     } else {
-        snprintf(path, sizeof path, "%s/.gbshrc", env_or("HOME", "/"));
+        const char *candidates[4];
+        char c0[1200], c1[1200], c2[1200], c3[1200];
+        snprintf(c0, sizeof c0, "%s/.gbshrc", env_or("HOME", "/"));
+        snprintf(c1, sizeof c1, "%s/root/.gbshrc", g_rootfs);
+        snprintf(c2, sizeof c2, "%s/etc/gbshrc", g_rootfs);
+        snprintf(c3, sizeof c3, "%s/etc/zsh/zshrc", g_rootfs);
+        candidates[0] = c0;
+        candidates[1] = c1;
+        candidates[2] = c2;
+        candidates[3] = c3;
+
+        for (int i = 0; i < 4; i++) {
+            f = fopen(candidates[i], "r");
+            if (f) {
+                snprintf(path, sizeof path, "%s", candidates[i]);
+                setenv("GBSHRC", path, 0);
+                break;
+            }
+        }
     }
-    FILE *f = fopen(path, "r");
+
     if (!f) return;
     char line[MAX_LINE];
     while (fgets(line, sizeof line, f)) {
@@ -1638,57 +2011,6 @@ static void sigint_handler(int sig) {
     write(STDOUT_FILENO, "\n", 1);
 }
 
-/* ─────────────────────── chroot režim (--chroot) ────────────────────────────
- * Pro CIZÍ/starší rootfs (např. termux proot-distro, glibc 2.28), kde
- * own-loading loader nemusí fungovat. Vyžaduje root.
- * unshare(CLONE_NEWNS) → make-rprivate → bind proc/dev/sys do rootfs
- * (vše v privátním NS — po smrti procesu zmizí) → chroot(rootfs).
- * Externí binárky pak execv PŘÍMO — kernel spustí PT_INTERP uvnitř. */
-static int setup_chroot(void) {
-    if (geteuid() != 0) {
-        fprintf(stderr, "gbsh: --chroot vyžaduje root. Spustit:\n"
-                        "  su -c 'ROOTFS=<cesta> gbsh --chroot'\n");
-        return -1;
-    }
-    const unsigned long CLONE_NEWNS_ = 0x00020000UL;
-    const unsigned long MS_BIND_    = 4096UL;
-    const unsigned long MS_REC_     = 16384UL;
-    const unsigned long MS_PRIVATE_ = 262144UL;
-    if (unshare((int)CLONE_NEWNS_) != 0) {
-        perror("gbsh: unshare");
-        return -1;
-    }
-    /* propagace mountů zůstane v tomto NS */
-    if (mount(NULL, "/", NULL, MS_REC_ | MS_PRIVATE_, NULL) != 0)
-        perror("gbsh: varování: make-rprivate");
-    char p[1200];
-    static const char *const dirs[] = { "proc", "dev", "sys" };
-    for (size_t k = 0; k < sizeof dirs / sizeof dirs[0]; k++) {
-        snprintf(p, sizeof p, "%s/%s", g_rootfs, dirs[k]);
-        mkdir(p, 0755); /* best effort */
-    }
-    snprintf(p, sizeof p, "%s/proc", g_rootfs);
-    if (mount("proc", p, "proc", 0, NULL) != 0)
-        fprintf(stderr, "gbsh: varování: mount proc: %s\n", strerror(errno));
-    snprintf(p, sizeof p, "%s/dev", g_rootfs);
-    if (mount("/dev", p, NULL, MS_BIND_, NULL) != 0)
-        fprintf(stderr, "gbsh: varování: bind /dev: %s\n", strerror(errno));
-    snprintf(p, sizeof p, "%s/sys", g_rootfs);
-    if (mount("/sys", p, NULL, MS_BIND_, NULL) != 0)
-        fprintf(stderr, "gbsh: varování: bind /sys: %s\n", strerror(errno));
-    if (chroot(g_rootfs) != 0) {
-        perror("gbsh: chroot");
-        return -1;
-    }
-    if (chdir("/") != 0) perror("gbsh: chdir");
-    g_world = WORLD_ROOTFS;
-    snprintf(g_vpath, sizeof g_vpath, "/");
-    setenv("PWD", "/", 1);
-    setenv("HOME", "/root", 1);
-    setenv("PATH",
-           "/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin", 1);
-    return 0;
-}
 
 /* výchozí barvy (pokud je uživatel nepřepsal v ~/.gbshrc)
    — gbsh spouští parrot ls/grep přes ownall, které barvy umí,
@@ -1708,9 +2030,15 @@ int main(int argc, char **argv) {
         if (strcmp(argv[i], "--double-world") == 0 ||
             strcmp(argv[i], "-dw") == 0)
             g_dual_world = 1;
-        else if (strcmp(argv[i], "--chroot") == 0 ||
-                 strcmp(argv[i], "-C") == 0)
-            g_chroot_mode = 1;
+        else if (strcmp(argv[i], "--shim") == 0 || strcmp(argv[i], "-s") == 0)
+            setenv("GBSH_EXEC_MODE", "shim", 1);
+        else if (strcmp(argv[i], "--ownall") == 0 || strcmp(argv[i], "-n") == 0)
+            setenv("GBSH_EXEC_MODE", "ownall", 1);
+        else if (strcmp(argv[i], "--run") == 0)
+            setenv("GBSH_EXEC_MODE", "run", 1);
+        else if (strcmp(argv[i], "--own") == 0)
+            setenv("GBSH_EXEC_MODE", "own", 1);
+
         else if (strcmp(argv[i], "--version") == 0) {
             printf("gbsh %s\n", GBSH_VERSION);
             return 0;
@@ -1729,7 +2057,7 @@ int main(int argc, char **argv) {
                    !(strcmp(argv[i], "-dw") == 0 ||
                      strcmp(argv[i], "--double-world") == 0)) {
             fprintf(stderr, "gbsh: unknown option: %s\n"
-                    "usage: gbsh [--double-world|-dw] [--chroot|-C] [-c command]\n", argv[i]);
+                    "usage: gbsh [--double-world|-dw] [-c command]\n", argv[i]);
             return 2;
         }
     }
@@ -1738,20 +2066,13 @@ int main(int argc, char **argv) {
     signal(SIGQUIT, SIG_IGN);
 
     detect_env();
-    if (g_chroot_mode) {
-        if (setup_chroot() != 0)
-            return 1;
-    }
     if (getcwd(g_cwd, sizeof g_cwd) == NULL) g_cwd[0] = 0;
     setenv("SHELL", "gbsh", 1);
     /* startujeme uvnitř distro světa: / == rootfs
        (--double-world umožní cd .. z "/" překlopit na host)
-       v chroot režimu jsme fyzicky uvnitř — enter_rootfs netřeba */
-    if (g_chroot_mode) {
-        snprintf(g_vpath, sizeof g_vpath, "/");
-    } else if (enter_rootfs("/") != 0)
-        fprintf(stderr, "gbsh: varování: rootfs %s nedostupné, startuji na hostu\n",
-                g_rootfs);
+       */
+    if (enter_rootfs("/") != 0)
+        fprintf(stderr, "gbsh: varování: rootfs %s nedostupné, startuji na hostu\n", g_rootfs);
     {
         char vn[32]; snprintf(vn, sizeof vn, "%s", GBSH_VERSION);
         setenv("GBSH_VERSION", vn, 0);
