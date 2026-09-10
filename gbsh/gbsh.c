@@ -1974,17 +1974,15 @@ static void load_rc(void) {
         f = fopen(path, "r");
     } else {
         const char *candidates[4];
-        char c0[1200], c1[1200], c2[1200], c3[1200];
+        char c0[1200], c1[1200], c2[1200];
         snprintf(c0, sizeof c0, "%s/.gbshrc", env_or("HOME", "/"));
         snprintf(c1, sizeof c1, "%s/root/.gbshrc", g_rootfs);
         snprintf(c2, sizeof c2, "%s/etc/gbshrc", g_rootfs);
-        snprintf(c3, sizeof c3, "%s/etc/zsh/zshrc", g_rootfs);
         candidates[0] = c0;
         candidates[1] = c1;
         candidates[2] = c2;
-        candidates[3] = c3;
 
-        for (int i = 0; i < 4; i++) {
+        for (int i = 0; i < 3; i++) {
             f = fopen(candidates[i], "r");
             if (f) {
                 snprintf(path, sizeof path, "%s", candidates[i]);

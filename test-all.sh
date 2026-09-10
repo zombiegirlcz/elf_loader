@@ -12,8 +12,8 @@ set -euo pipefail
 
 # ─── Device paths ───────────────────────────────────────────────────────────
 D=/data/user/0/com.linux_core/files
-R=$D/nh/distro/parrot
 L=$D/usr/bin/elf_loader
+R=$D/nh/distro/parrot
 E=$D/usr/bin/elroot
 G=$D/usr/bin/gbsh
 
@@ -38,14 +38,12 @@ check_interpreter() {
         echo "ELF_LOADER_MISSING=$f" >&2
         exit 1
     fi
-    echo "DEBUG after should_skip fi" >&2
     local interp
     interp=$(readelf -l "$f" 2>/dev/null | grep -o '/system/bin/linker64' | head -1)
     if [ "$interp" != "/system/bin/linker64" ]; then
         echo "ELF_LOADER_WRONG_INTERP=${interp:-<none>} (expected /system/bin/linker64)" >&2
         exit 1
     fi
-    echo "DEBUG after should_skip fi" >&2
 }
 check_interpreter "$L"
 
@@ -100,13 +98,11 @@ should_skip() {
 }
 
 run_test() {
-    set +e
     local bin="$1"
     local cmd="$2"
     local desc="$3"
     local bin_name
     bin_name=$(basename "$bin")
-    echo "DEBUG run_test: $bin_name" >&2
 
     if should_skip "$bin_name"; then
         echo "SKIP $bin_name: $desc"
@@ -114,7 +110,6 @@ run_test() {
         ((SKIP_COUNT++)) || true
         return 0
     fi
-    echo "DEBUG after should_skip fi" >&2
 
     # Zaznamenej PIDy elf_loader pred testem
     local pids_before pids_after
@@ -122,27 +117,22 @@ run_test() {
 
     local rc out
     rc=$(ashell_rc "$L --ownall $bin $cmd") || true
-    echo "DEBUG after rc" >&2
     rc=${rc:-0}
-    echo "DEBUG after rc fixup" >&2
     out=$(ashell_out "$L --ownall $bin $cmd") || true
-    echo "DEBUG after out" >&2
 
     pids_after=$(pgrep -x elf_loader 2>/dev/null | tr '\n' ',' || echo "")
     # Zaznamenej případný nárůst sirotků po tomto testu
     local count_before count_after
-    count_before=$(echo "$pids_before" | tr ',' '\n' | grep -c '^[0-9][0-9]*$')
-    count_after=$(echo "$pids_after" | tr ',' '\n' | grep -c '^[0-9][0-9]*$')
+    count_before=$(echo "$pids_before" | tr ',' '\n' | grep -c '^[0-9][0-9]*$') || true
+    count_after=$(echo "$pids_after" | tr ',' '\n' | grep -c '^[0-9][0-9]*$') || true
     if [ "$count_after" -gt "$count_before" ]; then
         echo "[ORPHAN-INCREASE] $bin_name: +$((count_after - count_before)) elf_loader procesů" >> "$ALL_LOG"
         echo "[ORPHAN-INCREASE] $bin_name: +$((count_after - count_before)) elf_loader procesů" >&2
     fi
-    echo "DEBUG after should_skip fi" >&2
 
     # Omez výstup do ALL_LOG na 200 bajtů, zabrání OOM v host aplikaci
     local out_summary
     out_summary=$(printf '%s' "$out" | head -c 200 | tr '\n' ' ')
-    echo "TEST: $bin_name | RC=$rc | PIDS_BEFORE=$pids_before PIDS_AFTER=$pids_after | $out_summary" >> "$ALL_LOG"
 
     case "$rc" in
         0)
@@ -152,19 +142,19 @@ run_test() {
             ;;
         124)
             echo "TIMEOUT $bin_name: $desc"
-            echo "TIMEOUT: $bin_name - $desc" >> "$FAIL_LOG"
+            echo "TIMEOUT: $bin_name - $desc | $out_summary" >> "$FAIL_LOG"
             ((FAIL_COUNT++)) || true
             ;;
         128|129|130|131|132|133|134|135|136|137|138|139|140|141|142|143|144|145)
             local sig=$((rc - 128))
             echo "CRASH(SIG$sig) $bin_name: $desc"
-            echo "CRASH(SIG$sig): $bin_name - $desc" >> "$FAIL_LOG"
+            echo "CRASH(SIG$sig): $bin_name - $desc | $out_summary" >> "$FAIL_LOG"
             ((FAIL_COUNT++)) || true
             ;;
         *)
             echo "EXIT=$rc $bin_name: $desc"
-            echo "EXIT=$rc: $bin_name - $desc" >> "$PASS_LOG"
-            ((PASS_COUNT++)) || true
+            echo "EXIT=$rc: $bin_name - $desc | $out_summary" >> "$FAIL_LOG"
+            ((FAIL_COUNT++)) || true
             ;;
     esac
 }
@@ -176,7 +166,6 @@ run_test_output() {
     local desc="$4"
     local bin_name
     bin_name=$(basename "$bin")
-    echo "DEBUG run_test: $bin_name" >&2
 
     if should_skip "$bin_name"; then
         echo "SKIP $bin_name: $desc"
@@ -184,28 +173,22 @@ run_test_output() {
         ((SKIP_COUNT++)) || true
         return 0
     fi
-    echo "DEBUG after should_skip fi" >&2
     local pids_before pids_after
     pids_before=$(pgrep -x elf_loader 2>/dev/null | tr '\n' ',' || echo "")
 
     local out rc
-    echo "DEBUG after local out rc" >&2
     out=$(ashell_out "$L --ownall $bin $cmd") || true
-    echo "DEBUG after out" >&2
     rc=$(ashell_rc "$L --ownall $bin $cmd") || true
-    echo "DEBUG after rc" >&2
     rc=${rc:-0}
-    echo "DEBUG after rc fixup" >&2
     pids_after=$(pgrep -x elf_loader 2>/dev/null | tr '\n' ',' || echo "")
     # Zaznamenej případný nárůst sirotků po tomto testu
     local count_before count_after
-    count_before=$(echo "$pids_before" | tr ',' '\n' | grep -c '^[0-9][0-9]*$')
-    count_after=$(echo "$pids_after" | tr ',' '\n' | grep -c '^[0-9][0-9]*$')
+    count_before=$(echo "$pids_before" | tr ',' '\n' | grep -c '^[0-9][0-9]*$') || true
+    count_after=$(echo "$pids_after" | tr ',' '\n' | grep -c '^[0-9][0-9]*$') || true
     if [ "$count_after" -gt "$count_before" ]; then
         echo "[ORPHAN-INCREASE] $bin_name: +$((count_after - count_before)) elf_loader procesů" >> "$ALL_LOG"
         echo "[ORPHAN-INCREASE] $bin_name: +$((count_after - count_before)) elf_loader procesů" >&2
     fi
-    echo "DEBUG after should_skip fi" >&2
 
     echo "TEST: $bin_name | RC=$rc | $desc" >> "$ALL_LOG"
 
@@ -218,7 +201,6 @@ run_test_output() {
         echo "FAIL: $bin_name - $desc (expected '$expected', got: $out)" >> "$FAIL_LOG"
         ((FAIL_COUNT++)) || true
     fi
-    echo "DEBUG after should_skip fi" >&2
 }
 
 # ─── Test cases ─────────────────────────────────────────────────────────────
@@ -558,11 +540,11 @@ category_extended() {
 }
 
 category_extra() {
-    echo "DEBUG: entering category_extra" >&2
+    echo "EXTRA START" >&2
     echo ""
     echo "=== extra ==="
-    echo "R=$R" >&2
     for tool in zipinfo column expand unexpand fold fmt nl comm sdiff cmp md5sum sha1sum sha256sum cksum base64 split csplit tee script stty tput clear reset tset wall systemctl service journalctl loginctl timedatectl localectl findmnt lsblk fallocate truncate shred fuser nice renice nohup watch factor xxd getconf getent iconv localedef zdump gencat strings logger dmesg pr rlwrap tmux zcat zless zmore zfgrep zegrep zgrep bunzip2 bzcat bzmore bzless bzgrep test mt mountpoint partx tty who users busybox link ln mknod mkfifo chattr lsattr seq printf od hexdump dd; do
+        echo "TESTING: $tool" >&2
         [ -f "$R/usr/bin/$tool" ] || continue
         # Skip non-ELF executables (scripts, symlinks to scripts, etc.)
         if ! readelf -h "$R/usr/bin/$tool" >/dev/null 2>&1; then
@@ -581,7 +563,6 @@ category_shell() {
     if [ -f "$R/usr/bin/bash" ]; then
         run_test_output "$R/usr/bin/bash" "usr/bin/bash -c 'echo test'" "test" "bash -c"
     fi
-    echo "DEBUG after should_skip fi" >&2
 }
 
 category_python() {
@@ -598,7 +579,6 @@ category_python() {
     else
         echo "SKIP python3: not found"
     fi
-    echo "DEBUG after should_skip fi" >&2
 
     echo ""
     echo "=== python-tools ==="
@@ -613,7 +593,6 @@ category_python() {
             ((SKIP_COUNT++)) || true
         done
     fi
-    echo "DEBUG after should_skip fi" >&2
 }
 
 print_summary() {
@@ -631,6 +610,29 @@ print_summary() {
 }
 
 # ─── Dispatch ───────────────────────────────────────────────────────────────
+
+category_discovered() {
+    echo ""
+    echo "=== discovered ==="
+    local dirs=("$R/bin" "$R/usr/bin" "$R/sbin" "$R/usr/sbin")
+    local dir bin name cmd
+    for dir in "${dirs[@]}"; do
+        [ -d "$dir" ] || continue
+        # Use process substitution to avoid subshell for while loop
+        while IFS= read -r -d '' bin; do
+            name=$(basename "$bin")
+            # Determine a safe test command: try --version first, fallback to true
+            if { "$bin" --version >/dev/null 2>&1; } 2>/dev/null; then
+                cmd="$name --version"
+            else
+                cmd="true"
+            fi
+            run_test "$bin" "$cmd" "discovered $name"
+        done < <(find "$dir" -maxdepth 1 -type f -print0 2>/dev/null)
+    done
+    check_orphans "discovered"
+}
+
 case "${1:-all}" in
     basic)
         category_basic
@@ -692,6 +694,10 @@ case "${1:-all}" in
         category_python
         print_summary
         ;;
+        discovered)
+            category_discovered
+            print_summary
+            ;;
     all|*)
         category_basic
         category_reexec
