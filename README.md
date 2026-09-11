@@ -15,7 +15,7 @@ launcher (`elroot`). Kompatibilní s jakoukoli aplikací a jakýmkoli rootfs:
 | `gbsh/gbsh.c` | nativní interaktivní shell (bionic) s vlastním line editorem |
 | `tools/elroot.sh` | PRoot-like launcher nad elf_loader + gbsh |
 | `elf_loader`, `gbsh` | předpřipravené binárky |
-| `finale_loader_build.py`, `gbsh_build.py`, `Makefile` | build přes Modal (NDK) |
+| `finale_loader_build.py`, `gbsh_combined_static_build.py`, `Makefile` | build přes Modal (NDK) |
 | `magisk-module/` | Magisk modul (univerzální detekce rootfs) |
 
 ## Spuštění (univerzální — přes ENV)
@@ -76,13 +76,26 @@ Pro **plný zsh zážitek** stačí `elroot zsh` (parrot zsh 5.9 běží pod loa
 ## Build
 Přes Modal (NDK r28):
 ```sh
-modal run finale_loader_build.py     # -> /tmp/elf_loader
-modal run gbsh_build.py             # -> /tmp/gbsh (+ /tmp/gbsh_static)
-# nasazení na zařízení:
-./tools/push_bin.sh /tmp/elf_loader /cesta/usr/bin/elf_loader 755
-./tools/push_bin.sh /tmp/gbsh       /cesta/usr/bin/gbsh       755
+modal run finale_loader_build.py     # -> /tmp/elf_loader (bionic dynamic, PT_INTERP linker64)
+modal run gbsh_combined_static_build.py  # -> /root/elf_loader/files/usr/bin/gbsh
+# (statický combined binary: elf_loader + gbsh v jednom, ET_EXEC ~2.3 MB)
 ```
-Lokálně (vyžaduje NDK): `make`.
+
+Build artefakty:
+- `elf_loader` — dynamický bionic (PT_INTERP `/system/bin/linker64`)
+- `gbsh` — statický combined binary (ET_EXEC, ~2.3 MB, zero NEEDED) obsahující
+  jak elf_loader, tak gbsh shell; dispatcher automaticky přepíná režimy
+  (loader flagy → elf_loader, shell/`-c` → gbsh)
+
+> Pozn.: static-pie (`-fPIE -static-pie`) **nefunguje na tomto zařízení** (kernel
+> 4.14, RC=139 i u triviálních testů). Proto se používá `-static` (non-PIE),
+> což na tomto zařízení běží stabilně.
+
+Nasazení na zařízení:
+```sh
+cp /tmp/elf_loader /root/elf_loader/files/usr/bin/elf_loader && chmod 755 /root/elf_loader/files/usr/bin/elf_loader
+# gbsh je už po buildu v files/usr/bin/gbsh
+```
 
 ## Magisk modul
 `magisk-module/` se instaluje do `/data/adb/modules/…`. Rootfs detekuje

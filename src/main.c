@@ -1377,6 +1377,39 @@ static int run_ownall(const char *path, int argc, char **argv, char **envp) {
     return ret;
 }
 
+/* Inject a guest-only LD_PRELOAD (ELF_LOADER_PRELOAD) into the envp handed to
+ * the own-loaded guest. bionic linker64 (which starts elf_loader itself) would
+ * abort on a glibc .so in LD_PRELOAD ("CANNOT LINK EXECUTABLE ... libc.so.6
+ * not found"), so the launcher passes the preload in a separate variable and
+ * we turn it into LD_PRELOAD only for the guest ld.so. */
+static char **elf_guest_envp(char **envp) {
+    const char *preload = getenv("ELF_LOADER_PRELOAD");
+    if (elf_debug())
+        fprintf(stderr, "[dbg] elf_guest_envp: ELF_LOADER_PRELOAD=%s\n",
+                preload ? preload : "(unset)");
+    if (!preload || !preload[0]) return envp;
+
+    int n = 0;
+    for (int i = 0; envp[i]; i++) n++;
+    char **ne = calloc((size_t)n + 2, sizeof(char *));
+    if (!ne) return envp;
+
+    int o = 0, have_preload = 0;
+    char ld[4096];
+    snprintf(ld, sizeof ld, "LD_PRELOAD=%s", preload);
+    for (int i = 0; envp[i]; i++) {
+        if (strncmp(envp[i], "LD_PRELOAD=", 11) == 0) {
+            ne[o++] = strdup(ld);
+            have_preload = 1;
+            continue;
+        }
+        ne[o++] = envp[i];
+    }
+    if (!have_preload) ne[o++] = strdup(ld);
+    ne[o] = NULL;
+    return ne;
+}
+
 int main(int argc, char **argv, char **envp) {
     /* ELF_DEBUG → unbuffered stdout, ať trace při SIGSEGV nekončí v bufferu */
     if (getenv("ELF_DEBUG"))
@@ -1401,6 +1434,10 @@ int main(int argc, char **argv, char **envp) {
     mallopt(M_TRIM_THRESHOLD, 0x7fffffff);
     mallopt(M_TOP_PAD, 8388608);
 #endif
+
+    /* guest-only LD_PRELOAD injection (ELF_LOADER_PRELOAD) — must happen
+     * before dispatch so run()/run_ownall()/run_shim() see the patched envp */
+    envp = elf_guest_envp(envp);
 
     if (argc < 2) {
         print_help(argv[0]);

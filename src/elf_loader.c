@@ -397,6 +397,99 @@ static void *ldso_tls_get_addr_soft(void *l) {
     return NULL;
 }
 
+/* Map an elf_object_t back to its fake link_map (built by
+ * ldso_install_module_list / ldso_install_exe_linkmap). Falls back to the exe
+ * link_map if the module is not in the list (e.g. the main executable). */
+static void *ldso_linkmap_for(elf_object_t *m) {
+    if (!m)
+        return NULL;
+    uintptr_t base = (uintptr_t)m->base_addr;
+    if (*(uintptr_t *)((unsigned char *)ldso_exe_linkmap + 0x00) == base)
+        return ldso_exe_linkmap;
+    for (size_t i = 0; i < ldso_module_count; i++) {
+        unsigned char *b = (unsigned char *)ldso_module_linkmaps[i];
+        if (*(uintptr_t *)(b + 0x00) == base)
+            return ldso_module_linkmaps[i];
+    }
+    return ldso_exe_linkmap;
+}
+
+/* glibc 2.41 _dl_lookup_symbol_x shim: resolve a symbol name in the guest
+ * scope. Returns the defining object's link_map and sets *ref to the symbol
+ * (or NULL when not found). glibc's dlsym()/dlopen() internals call this via
+ * the _rtld_global_ro function table (offset 0x268); without it the call
+ * goes through a NULL pointer -> SIGSEGV pc=0 (starship/Rust crash). */
+static void *ldso_lookup_symbol_x(const char *name, void *undef_map,
+                                  const void **ref, void **scope,
+                                  const void *version, int type_class,
+                                  int flags, void *skip_map) {
+    (void)undef_map; (void)scope; (void)version;
+    (void)type_class; (void)flags; (void)skip_map;
+    if (ref)
+        *ref = NULL;
+    if (!name || !g_crash_scope)
+        return NULL;
+    const Elf64_Sym *sym = NULL;
+    elf_object_t *m = elf_scope_find(g_crash_scope, name, &sym);
+    if (!m || !sym)
+        return NULL;
+    if (ref)
+        *ref = sym;
+    return ldso_linkmap_for(m);
+}
+
+/* _rtld_global_ro function-table shims (glibc calls these instead of going
+ * through the PLT).  Offsets follow the real glibc 2.41 layout. */
+static void ldso_debug_printf(const char *fmt, ...) {
+    va_list ap;
+    va_start(ap, fmt);
+    vfprintf(stderr, fmt, ap);
+    va_end(ap);
+}
+
+static void ldso_mcount(uintptr_t frompc, uintptr_t selfpc) {
+    (void)frompc; (void)selfpc;
+}
+
+static void ldso_dl_close(void *map) {
+    (void)map;
+}
+
+static int ldso_catch_error(const char **objname, const char **errstring,
+                            unsigned char *mallocedp,
+                            void (*operate)(void *), void *args) {
+    if (objname) *objname = NULL;
+    if (errstring) *errstring = NULL;
+    if (mallocedp) *mallocedp = 0;
+    operate(args);
+    return 0;
+}
+
+static void ldso_error_free(void *p) {
+    free(p);
+}
+
+static void ldso_libc_freeres(void) {
+}
+
+/* _dl_open: guest dlopen.  Resolve the path against ROOTFS and own-load the
+ * .so into the guest scope, then return its (fake) link_map as the handle. */
+static void *ldso_dl_open(const char *file, int mode, const void *caller,
+                          long nsid, int argc, char *argv[], char *env[]) {
+    (void)mode; (void)caller; (void)nsid; (void)argc; (void)argv; (void)env;
+    if (!file || !file[0] || !g_crash_scope)
+        return NULL;
+    char resolved[4096];
+    const char *root = getenv("ROOTFS");
+    size_t rl = root ? strlen(root) : 0;
+    if (file[0] == '/' && rl && strncmp(file, root, rl) != 0)
+        snprintf(resolved, sizeof resolved, "%s%s", root, file);
+    else
+        snprintf(resolved, sizeof resolved, "%s", file);
+    elf_object_t *m = elf_load_shared(resolved, g_crash_scope);
+    return ldso_linkmap_for(m);
+}
+
 static void ldso_noop(void) {
 }
 
@@ -436,10 +529,29 @@ static void ldso_setup(void) {
     ro[12] = getauxval(AT_HWCAP);                /* +0x60 _dl_hwcap */
     ro[13] = (uintptr_t)ldso_auxv;               /* +0x68 _dl_auxv */
     /* +0x70 midr_el1: 0 -> generic ifunc variants */
-    ro[0x270 / 8] = (uintptr_t)ldso_find_dso_for_object;  /* _dl_find_dso_for_object */
-    ro[0x280 / 8] = (uintptr_t)ldso_catch_exception;  /* _dl_catch_exception */
-    ro[0x288 / 8] = (uintptr_t)ldso_debug_state;      /* _dl_debug_state */
-    ro[0x290 / 8] = (uintptr_t)ldso_tls_get_addr_soft;/* dl_tls_get_addr_soft */
+    /* _rtld_global_ro function table (used by libc internals instead of PLT).
+     * Offsets are the REAL glibc 2.41 layout: the table starts at 0x258.
+     *   +0x258 _dl_debug_printf, +0x260 _dl_mcount,
+     *   +0x268 _dl_lookup_symbol_x, +0x270 _dl_open, +0x278 _dl_close,
+     *   +0x280 _dl_catch_error, +0x288 _dl_error_free,
+     *   +0x290 _dl_tls_get_addr_soft, +0x298 _dl_libc_freeres,
+     *   +0x2a0 _dl_find_object. */
+    /* TLS static layout.  allocate_stack reads GLRO(dl_tls_static_align)
+     * (offset 0x1d0+8) and asserts size != 0 after masking; with align=0 the
+     * mask becomes ~0xffff.. and size collapses to 0 (starship/Rust crash). */
+    ro[0x1d8 / 8] = 0;                /* _dl_tls_static_size (loader sets TLS itself) */
+    ro[0x1e0 / 8] = 16;               /* _dl_tls_static_align */
+    ro[0x1e8 / 8] = 0;                /* _dl_tls_static_surplus */
+
+    ro[0x258 / 8] = (uintptr_t)ldso_debug_printf;    /* _dl_debug_printf */
+    ro[0x260 / 8] = (uintptr_t)ldso_mcount;           /* _dl_mcount */
+    ro[0x268 / 8] = (uintptr_t)ldso_lookup_symbol_x;  /* _dl_lookup_symbol_x */
+    ro[0x270 / 8] = (uintptr_t)ldso_dl_open;          /* _dl_open */
+    ro[0x278 / 8] = (uintptr_t)ldso_dl_close;         /* _dl_close */
+    ro[0x280 / 8] = (uintptr_t)ldso_catch_error;      /* _dl_catch_error */
+    ro[0x288 / 8] = (uintptr_t)ldso_error_free;       /* _dl_error_free */
+    ro[0x290 / 8] = (uintptr_t)ldso_tls_get_addr_soft;/* _dl_tls_get_addr_soft */
+    ro[0x298 / 8] = (uintptr_t)ldso_libc_freeres;     /* _dl_libc_freeres */
     ro[0x2a0 / 8] = (uintptr_t)ldso_find_object;      /* _dl_find_object */
 
     uint64_t *g = (uint64_t *)ldso_global;
@@ -1672,6 +1784,23 @@ static void run_module_init(elf_object_t *m) {
                          "__libc_early_init", &ei, m) == SYM_DEFINED && ei &&
             m->total_size > 0x1be009 + 1) {
             *(char *)va(m, 0x1be009) = 1;
+        }
+        /* __libc_early_init normally computes __default_pthread_attr's stack
+         * size from RLIMIT_STACK; the loader skips it (it touches GLRO state
+         * we don't emulate fully), so the default stays 0 and the first
+         * pthread_create fails "allocate_stack: size != 0".  Set it directly:
+         * the field lives right after __pthread_keys (0x4050 bytes past it),
+         * verified against glibc 2.41 (Debian) disassembly. */
+        void *keys = NULL;
+        sym_status_t ks = lookup_table(m->dynsym, m->dynstr, m->dynsym_count,
+                                       "__pthread_keys", &keys, m);
+        if (elf_debug())
+            fprintf(stderr, "[dbg] __pthread_keys: st=%d addr=%p\n", ks, keys);
+        if (ks == SYM_DEFINED && keys) {
+            *(size_t *)((char *)keys + 0x4050) = 8 * 1024 * 1024;
+            if (elf_debug())
+                fprintf(stderr, "[dbg] default_stacksize set @%p = %zu\n",
+                        (char *)keys + 0x4050, *(size_t *)((char *)keys + 0x4050));
         }
         /* uselocale/__ctype_init pro TLS per-thread state (viz výše) */
         void *a = NULL;

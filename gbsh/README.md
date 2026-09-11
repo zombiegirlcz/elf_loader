@@ -1,7 +1,8 @@
 # gbsh — Ghost/Bionic Shell
 
-Nativní shell pro Android host (bionic, NDK build). Běží přímo bez loaderu;
-parrot rootfs příkazy automaticky routuje přes elf_loader own-loading.
+Nativní shell pro Android host (bionic, statický combined build). Jeden binárka
+obsahuje jak samotný shell, tak `elf_loader`; dispatcher režim automaticky
+přepíná mezi shellem a loaderem podle argumentů.
 
 ## Koncept
 | Typ příkazu | Mechanizmus |
@@ -9,6 +10,9 @@ parrot rootfs příkazy automaticky routuje přes elf_loader own-loading.
 | builtiny | inline v procesu (cd/pwd/echo/export/alias/source/history/...) |
 | host (/system/bin toybox apod.) | fork + execvp |
 | parrot rootfs ($ROOTFS/{usr/bin,bin,...}) | fork + execve **elf_loader --ownall** |
+
+Shell spouští příkazy z parrot rootfsu přímo, bez nutnosti spouštět
+samostatný `elf_loader` binárku. Pro host příkazy používá nativní exec.
 
 ## Syntaxe
 ```
@@ -23,6 +27,33 @@ cmd1 ; cmd2                    sekvenčně
 $VAR ~/                        expanze proměnných a home
 ```
 
+## Build artefakt
+Výsledkem je **jeden statický binárka** `gbsh` (ET_EXEC, ~2.3 MB, zero NEEDED).
+
+| Režim | Kdy se použije |
+|---|---|
+| **gbsh / shell** | interaktivní režim, `-c`, builtiny, aliasy, history |
+| **elf_loader** | `--ownall/--shim/--run/--own/--check/--lazy/--help/--version` |
+
+Build je prováděn na Modal (NDK r28, `aarch64-linux-android24-clang`):
+```sh
+modal run gbsh_combined_static_build.py
+# výstup: /root/elf_loader/files/usr/bin/gbsh
+```
+
+> Pozn.: static-pie (`-fPIE -static-pie`) **nefunguje na tomto zařízení**
+> (kernel 4.14, RC=139 i u triviálních testů). Používá se proto `-static`
+> (non-PIE), což na tomto zařízení běží stabilně.
+
+## Deploy
+```sh
+# po buildu je binárka už v files/usr/bin/gbsh
+chmod 755 /root/elf_loader/files/usr/bin/gbsh
+
+# na device spustit přes ashell (app uid 10310)
+ashell -c "$D/usr/bin/gbsh -c 'echo OK'"
+```
+
 ## Config — ~/.gbshrc
 Provádí se při startu stejným parserem jako interaktivní vstup:
 ```sh
@@ -32,19 +63,31 @@ alias ..='cd ..'
 ```
 Prompt proměnné: `%u` user, `%h` hostname, `%~` cwd (~ zkráceně), `%$` #/$.
 
-## Build & deploy
-```sh
-modal run gbsh_build.py          # → /tmp/gbsh (bionic dynamic, ~28 KB)
-# deploy: base64 chunky přes ashell do $FILES/usr/bin/gbsh + chmod 755
-```
+gbsh načítá config z:
+1. `$GBSHRC` (pokud je nastaveno)
+2. `$HOME/.gbshrc`
+3. `$ROOTFS/root/.gbshrc`
+4. `$ROOTFS/etc/gbshrc`
+
+> Pozn.: systémový `/etc/zsh/zshrc` z rootfsu se **ne-načítá** — gbsh není
+> zsh a zsh-specifické konstrukce by způsobovaly hluk při startu.
 
 ## Test (host i device)
 ```sh
+# lokálně (v prootu jako smoke test)
 printf 'echo A && echo B || echo C\nexit 0\n' | gbsh; echo rc=$?
+
+# na device přes ashell
+D=/data/user/0/com.linux_core/files
+R=$D/nh/distro/parrot
+ashell -c "ROOTFS=$R $D/usr/bin/gbsh -c 'echo OK'; echo RC=\$?"
 ```
 
-## Ověřeno na device (2026-08-24)
-- builtins + redirecty (včetně `2>`) ✓
+## Ověřeno na device (2026-09-08)
+- builtins + redirecty ✓
 - pipeline přes parrot binárky (elf_loader ownall) ✓
 - && / || / ; chainy ✓, exit code propagation ✓
 - $VAR/~/ expanze, aliasy, history, source ~/.gbshrc ✓
+- loader flagy (--help/--version/--check/--ownall) fungují ✓
+- statický build ET_EXEC, ~2.3 MB, zero NEEDED ✓
+- static-pie varianta **nefunguje** na kernelu 4.14 (RC=139) ✗

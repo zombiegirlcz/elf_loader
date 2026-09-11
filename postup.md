@@ -926,3 +926,42 @@ s libtinfo.so.6.5 (SONAME match splní DT_NEEDED). Rozbité symlinky EPERM trvaj
   výsledek nebo init pořadí), který je při některém memory-layoutu 0.
 - Plný seznam core crashů: results/binaries_ownall_core.txt.
 - chroot (gbsh --chroot) = 100% spolehlivý fallback pro crashující binárky.
+
+## 2026-09-11: gbsh static build — static-pie NEFUNGUJE, combined static OK
+- Cíl: zkompilovat `elf_loader` staticky pro bionic a spojit ho s `gbsh.c`
+  do jednoho statického binárky (`gbsh_combined_static_build.py`).
+- **KLÍČOVÉ ZJIŠTĚNÍ: `-static-pie` na tomto zařízení PADÁ.**
+  - I triviální `int main(void){return 0;}` s `-fPIE -static-pie` → SIGSEGV
+    (RC=139) při spuštění na device přes `ashell -c`.
+  - Systematické testy (`test_static_pie/`): 7 různých minimálních programů
+    (minimal/exit/write/malloc/string/env/fork) — VŠECHNY RC=139.
+  - Srovnání 3 variant téhož programu:
+    | varianta | výsledek |
+    |---|---|
+    | dynamic (`-O1`) | RC=0 ✅ |
+    | static (`-static`, non-PIE) | RC=0 ✅ |
+    | static-pie (`-fPIE -static-pie`) | RC=139 ❌ |
+  - Závěr: chyba je v bionic static-pie startupu na kernelu 4.14 (TLS/phdr
+    init), NE v našem kódu. `-static` (non-PIE) funguje stabilně.
+- **Řešení: combined binary s `-static`** (`gbsh_combined_static_build.py`):
+  - Dispatcher v `main()` (generovaný do `/tmp/dispatcher.c`) přepíná:
+    - `--ownall/--shim/--run/--own/--check/--lazy/--help/--version` → elf_loader
+    - interaktivní / `-c` / příkaz → gbsh shell
+  - `src/main.c` kompilován s `-Dmain=elf_loader_main`, `gbsh.c` s
+    `-Dmain=gbsh_main`, dispatcher poskytuje `main`.
+  - Výsledek: ET_EXEC, ~2.3 MB, zero NEEDED, AArch64, Android 24.
+  - Deploy: `files/usr/bin/gbsh`.
+- Ověřeno na device (`ashell -c`):
+  - `gbsh -c 'echo OK'` → RC=0 ✅
+  - `gbsh --help` / `--version` → RC=0 ✅ (loader režim)
+  - `gbsh --check <elf>` → RC=0 ✅
+  - `gbsh --ownall $R/usr/bin/ls /etc/hostname` → RC=0 ✅
+  - `gbsh -c 'ls /usr/bin | head -3'` → RC=0 ✅
+- **Oprava šumu z rc souborů:** `load_rc()` měl fallback na
+  `$ROOTFS/etc/zsh/zshrc` (systémový zsh rc z parrot rootfsu). Ten je plný
+  zsh syntaxe (`setopt`, `typeset`, `[[`, `zle`, `emulate`, `compinit`), kterou
+  gbsh neumí → desítky chyb `No such file or directory` při startu.
+  Fallback odstraněn (gbsh není zsh). Kandidáti na config teď jen:
+  `$GBSHRC`, `$HOME/.gbshrc`, `$ROOTFS/root/.gbshrc`, `$ROOTFS/etc/gbshrc`.
+- Testovací artefakty: `test_static_pie/` (minimal.c, exit_code.c, write.c,
+  malloc.c, string.c, env.c, fork.c, build_tests.py, compare.py, combined_test.py).
