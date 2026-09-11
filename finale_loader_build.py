@@ -29,8 +29,8 @@ image = (
         f"test -x {TC}/aarch64-linux-android24-clang",
     )
     .add_local_dir(".", "/src",
-                   ignore=modal.FilePatternMatcher(".git", "*.o", "elf_loader",
-                                                   "test", "*.py", "*.md"))
+                   ignore=modal.FilePatternMatcher(".git", ".pi", ".qmd", "*.o",
+                                                   "elf_loader", "test", "*.py", "*.md"))
 )
 
 
@@ -80,7 +80,7 @@ def build():
     os.chdir("/src")
 
     flags = ["-Wall", "-Wextra", "-g", "-O0", "-std=c11"]
-    srcs = ["src/main.c", "src/elf_loader.c", "src/entry.S"]
+    srcs = ["src/main.c", "src/elf_loader.c", "src/ldso_tls.c", "src/entry.S"]
 
     # dynamic variant (default bionic link) -> adb push target
     run([f"{TC}/aarch64-linux-android24-clang", *flags, *srcs,

@@ -3,8 +3,8 @@ CFLAGS = -Wall -Wextra -g -O0 -std=c11 -B/usr/bin
 LDFLAGS = -ldl
 
 TARGET = elf_loader
-SRCS = src/main.c src/elf_loader.c src/entry.S
-OBJS = src/main.o src/elf_loader.o src/entry.o
+SRCS = src/main.c src/elf_loader.c src/ldso_tls.c src/entry.S
+OBJS = src/main.o src/elf_loader.o src/ldso_tls.o src/entry.o
 
 all: $(TARGET)
 

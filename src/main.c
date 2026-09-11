@@ -1277,6 +1277,7 @@ static int run_own(const char *path, const char *mod, int argc, char **argv,
 
 static int run_ownall(const char *path, int argc, char **argv, char **envp) {
     elf_install_fault_handlers();
+    g_tls_trace = getenv("ELF_LOADER_TLS_TRACE") != NULL;
     elf_scope_t *scope = elf_scope_create();
     if (!scope) {
         fprintf(stderr, "[-] scope alloc failed\n");
@@ -1288,6 +1289,17 @@ static int run_ownall(const char *path, int argc, char **argv, char **envp) {
     elf_init_argc = argc;
     elf_init_argv = argv;
     elf_init_envp = envp;
+
+    /* Guest ld.so (parrot glibc) je zaveden jako běžná .so, ale jeho vlastní
+     * _dl_start neproběhl — interní _rtld_global (base+0x40000) a malloc cache
+     * (base+0x3fb00) jsou nuly. Když libc přes lazy JUMP_SLOT zavolá
+     * _dl_allocate_tls, resolve_jmp_symbol nejdřív zkusí scope lookup a najde
+     * guest ld.so _dl_allocate_tls@base+0xfeb0 → ta spadne na NULL.
+     * override_lookup je v resolve_jmp_symbol PRVNÍ, takže registrace těchto
+     * override zajistí, že libc (pthread_create) dostane naši funkční verzi. */
+    elf_register_override("_dl_allocate_tls", (void *)ldso_allocate_tls);
+    elf_register_override("_dl_allocate_tls_init", (void *)ldso_allocate_tls_init);
+    elf_register_override("_dl_deallocate_tls", (void *)ldso_deallocate_tls);
 
     if (!g_exec_mode) g_exec_mode = "--ownall";
     g_shim_root = getenv("ROOTFS");
@@ -1354,6 +1366,8 @@ static int run_ownall(const char *path, int argc, char **argv, char **envp) {
     g_exe_base = (uintptr_t)obj->base_addr;
     ldso_install_exe_linkmap(obj, path);
     ldso_install_module_list(scope->mods, scope->count);
+    if (g_tls_trace)
+        elf_dump_ldso_state(scope);
     if (getenv("ELF_LOADER_DUMP_MAPS")) {
         FILE *mf = fopen("/proc/self/maps", "r");
         if (mf) {
