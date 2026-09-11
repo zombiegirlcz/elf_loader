@@ -1,3 +1,4 @@
+"\342\224\202"
 # Compiled artifacts
 *.o
 *.orig
@@ -30,3 +31,4 @@ magisk-module/*.zip
 *.log
 files/
 *.txt
+|
