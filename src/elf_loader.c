@@ -558,6 +558,18 @@ static void ldso_setup(void) {
     g[0xa80 / 8] = 1;                           /* _dl_nns */
     g[0xb18 / 8] = 1;                           /* dl_load_adds */
     /* dl_load_write_lock at +0xab8 stays all-zero (unlocked initial state) */
+
+    /* The three pthread stack list heads must be self-referential (empty).
+     * memset leaves them NULL, so pthread_create iterates _dl_stack_cache and
+     * follows a NULL ->next -> SIGSEGV.  Offsets verified against glibc 2.41
+     * (Debian): _dl_stack_used @0xb98, _dl_stack_user @0xba8,
+     * _dl_stack_cache @0xbb8. */
+    static const unsigned stack_lists[] = { 0xb98, 0xba8, 0xbb8 };
+    for (size_t i = 0; i < sizeof stack_lists / sizeof stack_lists[0]; i++) {
+        uintptr_t *head = (uintptr_t *)(ldso_global + stack_lists[i]);
+        head[0] = (uintptr_t)(ldso_global + stack_lists[i]);  /* next = self */
+        head[1] = (uintptr_t)(ldso_global + stack_lists[i]);  /* prev = self */
+    }
 }
 
 #define PARROT_HEAP_SIZE 0x4000000u  /* 64 MB */
