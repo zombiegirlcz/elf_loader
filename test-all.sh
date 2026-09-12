@@ -104,6 +104,14 @@ run_test() {
     local bin_name
     bin_name=$(basename "$bin")
 
+    # TEST_CASES hodnoty zacinaji nazvem programu (napr. "wc -c /etc/hostname"),
+    # ale run_test uz binarku predava zvlast -> odstran vedouci nazev, aby guest
+    # dostal jen argumenty (jinak wc hleda soubor "wc").
+    case "$cmd" in
+        "$bin_name "*) cmd="${cmd#"$bin_name "}" ;;
+        "$bin_name") cmd="" ;;
+    esac
+
     if should_skip "$bin_name"; then
         echo "SKIP $bin_name: $desc"
         echo "SKIP: $bin_name - $desc" >> "$SKIP_LOG"
@@ -431,7 +439,7 @@ category_basic() {
     echo ""
     echo "=== basic ==="
     for cmd in echo true false; do
-        [ -f "$R/bin/$cmd" ] && run_test "$R/bin/$cmd" "bin/$cmd" "basic $cmd"
+        [ -f "$R/bin/$cmd" ] && run_test "$R/bin/$cmd" "${TEST_CASES[$cmd]:-true}" "basic $cmd"
     done
 }
 
@@ -439,7 +447,7 @@ category_reexec() {
     echo ""
     echo "=== reexec ==="
     for tool in tar gzip gunzip bzip2 bunzip2 xz unxz; do
-        [ -f "$R/usr/bin/$tool" ] && run_test "$R/usr/bin/$tool" "usr/bin/$tool" "re-exec $tool ${TEST_CASES[$tool]:-test}"
+        [ -f "$R/usr/bin/$tool" ] && run_test "$R/usr/bin/$tool" "${TEST_CASES[$tool]:-test}" "re-exec $tool ${TEST_CASES[$tool]:-test}"
     done
 }
 
@@ -447,7 +455,7 @@ category_text() {
     echo ""
     echo "=== text ==="
     for tool in grep sed awk wc cut sort uniq tr head tail cat; do
-        [ -f "$R/usr/bin/$tool" ] && run_test "$R/usr/bin/$tool" "usr/bin/$tool" "${TEST_CASES[$tool]:-test}"
+        [ -f "$R/usr/bin/$tool" ] && run_test "$R/usr/bin/$tool" "${TEST_CASES[$tool]:-test}" "${TEST_CASES[$tool]:-test}"
     done
 }
 
@@ -455,7 +463,7 @@ category_files() {
     echo ""
     echo "=== files ==="
     for tool in ls cp mv rm mkdir stat find realpath dirname basename; do
-        [ -f "$R/usr/bin/$tool" ] && run_test "$R/usr/bin/$tool" "usr/bin/$tool" "${TEST_CASES[$tool]:-test}"
+        [ -f "$R/usr/bin/$tool" ] && run_test "$R/usr/bin/$tool" "${TEST_CASES[$tool]:-test}" "${TEST_CASES[$tool]:-test}"
     done
 }
 
@@ -463,7 +471,7 @@ category_system() {
     echo ""
     echo "=== system ==="
     for tool in uname hostname uptime whoami id ps free df du hostid man less more nano lesspipe manpath mandb man-recode pslog pstree; do
-        [ -f "$R/usr/bin/$tool" ] && run_test "$R/usr/bin/$tool" "usr/bin/$tool" "${TEST_CASES[$tool]:-test}"
+        [ -f "$R/usr/bin/$tool" ] && run_test "$R/usr/bin/$tool" "${TEST_CASES[$tool]:-test}" "${TEST_CASES[$tool]:-test}"
     done
 }
 
@@ -471,7 +479,7 @@ category_datetime() {
     echo ""
     echo "=== datetime ==="
     for tool in date cal timeout sleep; do
-        [ -f "$R/usr/bin/$tool" ] && run_test "$R/usr/bin/$tool" "usr/bin/$tool" "${TEST_CASES[$tool]:-test}"
+        [ -f "$R/usr/bin/$tool" ] && run_test "$R/usr/bin/$tool" "${TEST_CASES[$tool]:-test}" "${TEST_CASES[$tool]:-test}"
     done
 }
 
@@ -479,7 +487,7 @@ category_compression() {
     echo ""
     echo "=== compression ==="
     for tool in gzip gunzip bzip2 bunzip2 xz unxz tar; do
-        [ -f "$R/usr/bin/$tool" ] && run_test "$R/usr/bin/$tool" "usr/bin/$tool" "${TEST_CASES[$tool]:-test}"
+        [ -f "$R/usr/bin/$tool" ] && run_test "$R/usr/bin/$tool" "${TEST_CASES[$tool]:-test}" "${TEST_CASES[$tool]:-test}"
     done
 }
 
@@ -489,7 +497,7 @@ category_networking() {
     for tool in ping nslookup; do
         if [ -e "$R/usr/bin/$tool" ]; then
             if [ -f "$R/usr/bin/$tool" ]; then
-                run_test "$R/usr/bin/$tool" "usr/bin/$tool" "${TEST_CASES[$tool]:-test}"
+                run_test "$R/usr/bin/$tool" "${TEST_CASES[$tool]:-test}" "${TEST_CASES[$tool]:-test}"
             else
                 echo "SKIP $tool: not a regular file"
                 echo "SKIP: $tool - not a regular file" >> "$SKIP_LOG"
@@ -503,7 +511,7 @@ category_math() {
     echo ""
     echo "=== math ==="
     for tool in expr; do
-        [ -f "$R/usr/bin/$tool" ] && run_test "$R/usr/bin/$tool" "usr/bin/$tool" "${TEST_CASES[$tool]:-test}"
+        [ -f "$R/usr/bin/$tool" ] && run_test "$R/usr/bin/$tool" "${TEST_CASES[$tool]:-test}" "${TEST_CASES[$tool]:-test}"
     done
 }
 
@@ -511,7 +519,7 @@ category_diff() {
     echo ""
     echo "=== diff ==="
     for tool in diff patch; do
-        [ -f "$R/usr/bin/$tool" ] && run_test "$R/usr/bin/$tool" "usr/bin/$tool" "${TEST_CASES[$tool]:-test}"
+        [ -f "$R/usr/bin/$tool" ] && run_test "$R/usr/bin/$tool" "${TEST_CASES[$tool]:-test}" "${TEST_CASES[$tool]:-test}"
     done
 }
 
@@ -519,7 +527,7 @@ category_archive() {
     echo ""
     echo "=== archive ==="
     for tool in zip unzip; do
-        [ -f "$R/usr/bin/$tool" ] && run_test "$R/usr/bin/$tool" "usr/bin/$tool" "${TEST_CASES[$tool]:-test}"
+        [ -f "$R/usr/bin/$tool" ] && run_test "$R/usr/bin/$tool" "${TEST_CASES[$tool]:-test}" "${TEST_CASES[$tool]:-test}"
     done
 }
 
@@ -535,7 +543,7 @@ category_extended() {
             ((SKIP_COUNT++)) || true
             continue
         fi
-        run_test "$R/usr/bin/$tool" "usr/bin/$tool" "extended $tool ${TEST_CASES[$tool]:-test}"
+        run_test "$R/usr/bin/$tool" "${TEST_CASES[$tool]:-test}" "extended $tool ${TEST_CASES[$tool]:-test}"
     done
 }
 
@@ -553,7 +561,7 @@ category_extra() {
             ((SKIP_COUNT++)) || true
             continue
         fi
-        run_test "$R/usr/bin/$tool" "usr/bin/$tool" "extra $tool ${TEST_CASES[$tool]:-test}"
+        run_test "$R/usr/bin/$tool" "${TEST_CASES[$tool]:-test}" "extra $tool ${TEST_CASES[$tool]:-test}"
     done
 }
 

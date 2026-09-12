@@ -46,6 +46,10 @@ static void tls_setup_thread(uintptr_t tp) {
     uintptr_t span = elf_tls_span();
     dtv2_t *A = (dtv2_t *)(tp + ((span + 15) & ~(uintptr_t)15));
 
+    /* rseq area (TP+0x10..0x2f) pro kazde nove vlakno: cpu_id = -1, aby
+     * glibc NEnastavilo ATTR_FLAG_DO_RSEQ a nezavolalo rseq (293, app KILL). */
+    memset((void *)(tp + ELF_RSEQ_OFFSET), 0xff, ELF_RSEQ_SIZE);
+
     memset(A, 0, (2 + n + DTV_SURPLUS) * sizeof(dtv2_t));
     A[0].u[0] = (uintptr_t)(n + 1);   /* délka DTV */
     A[1].u[0] = 1;                    /* generace */

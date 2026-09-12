@@ -109,7 +109,7 @@ char **elf_init_envp = NULL;
 #define ELF_MAX_TLS_MODS 128
 static elf_object_t *g_tls_mods[ELF_MAX_TLS_MODS];
 static size_t g_tls_mod_count;
-static uintptr_t g_tls_next = 0x10;   /* hned za tcbhead_t (16 B) */
+static uintptr_t g_tls_next = ELF_RSEQ_OFFSET + ELF_RSEQ_SIZE; /* za rseq area */
 #define ELF_TLS_DTV_RESERVE 0x1000u
 
 static void elf_tls_assign(elf_object_t *m, size_t align) {
@@ -324,8 +324,12 @@ static uintptr_t ldso_pointer_chk_guard;
 /* Statická proměnná jako __stack_chk_guard pro Parrot glibc (je UND v libc.so.6,
  * musí ji dodat ld.so; GLOB_DAT ukládá do GOT slotu ADRESU této proměnné).  */
 static uint64_t ldso_stack_guard = 0xdeadbeefcafe1234ULL;
-static int64_t ldso_rseq_offset;
-static unsigned int ldso_rseq_size;
+/* __rseq_offset MUSI ukazovat na nasu dedikovanou rseq area v TLS (TP+0x10),
+ * ktera je naplnena 0xFF => cpu_id=-1 < 0 => glibc new-thread do_rseq=false
+ * => nezavola rseq (293, app seccomp KILL). Kdyby offset byl 0, glibc by
+ * prepsala DTV pointer na TP a stejne by registrovala. */
+static int64_t ldso_rseq_offset = ELF_RSEQ_OFFSET;
+static unsigned int ldso_rseq_size = 0;
 static void *ldso_stack_end;
 static char ldso_platform[] = "aarch64";
 static char *ldso_argv_copy[8];
@@ -1078,6 +1082,57 @@ static size_t map_base_vaddr(const elf_object_t *obj) {
 
 static void *va(const elf_object_t *obj, size_t vaddr) {
     return (char *)obj->base_addr + (vaddr - map_base_vaddr(obj));
+}
+
+/* Prebije `svc #0` v guest modulu pro dany syscall nr na NOP. Slouzi pro
+ * syscally, ktere app seccomp KILLuje (KILL nejde prebit filtrem ani
+ * SIGSYS handlerem): rseq (293) a set_robust_list (99, delka 24).
+ * Hleda sekvenci `movz x8,#nr` (pripadne `mov x8,#nr` = movz) a do +32 B
+ * za ni najde `svc #0`, ktery nahradi NOP. Tim se syscall vubec neprovede.
+ * (Pro robust_list to znamena, ze kernel robustni seznam nebude mit; pokud
+ * proces umre s drzenym robustnim mutexem, kernel ho neoznaci - v nasem
+ * single-purpose loaderu akceptovatelne.) */
+void elf_patch_syscall_sites(elf_object_t *m, long nr) {
+    if (!m || nr < 0 || nr > 0xffff)
+        return;
+    const uint32_t movz_x8 = 0xd2800000u | ((uint32_t)nr << 5) | 8u;
+    int patched = 0;
+    for (int i = 0; i < m->phdr_count; i++) {
+        if (m->phdr[i].p_type != PT_LOAD)
+            continue;
+        if (!(m->phdr[i].p_flags & PF_X))
+            continue;
+        size_t seg_vaddr = m->phdr[i].p_vaddr;
+        size_t seg_sz = m->phdr[i].p_memsz;
+        uint32_t *seg = (uint32_t *)va(m, seg_vaddr);
+        size_t n_ins = seg_sz / 4;
+        for (size_t k = 0; k + 8 < n_ins; k++) {
+            if (seg[k] != movz_x8)
+                continue;
+            /* hledej svc #0 do +8 instrukci za movz (nesmi pres jinou movz) */
+            for (size_t j = k + 1; j < k + 9 && j < n_ins; j++) {
+                if (seg[j] == 0xd4000001u) {  /* svc #0 */
+                    uintptr_t ins_addr = (uintptr_t)&seg[j];
+                    uintptr_t pg = ins_addr & ~(uintptr_t)(PAGE_SIZE - 1);
+                    if (mprotect((void *)pg, PAGE_SIZE,
+                                 PROT_READ | PROT_WRITE | PROT_EXEC) == 0) {
+                        seg[j] = 0xd503201fu;  /* nop */
+                        __builtin___clear_cache((char *)&seg[j],
+                                                (char *)&seg[j] + 4);
+                        mprotect((void *)pg, PAGE_SIZE,
+                                 PROT_READ | PROT_EXEC);
+                        patched++;
+                    }
+                    break;
+                }
+                if ((seg[j] & 0xffe0001fu) == (0xd2800000u | 8u))  /* dalsi movz x8 */
+                    break;
+            }
+        }
+    }
+    if (elf_debug())
+        fprintf(stderr, "[patch] syscall %ld: prebito %d svc#0 v %s\n",
+                nr, patched, m->soname ? m->soname : "?");
 }
 
 static uintptr_t read_tp(void) {
@@ -1838,8 +1893,13 @@ static void *(*g_libc_uselocale)(void *);
 static void (*g_libc_ctype_init)(void);
 extern uintptr_t g_tls_new_tp;
 
+/* Forward declaration: raw_syscall6 defined later but used in
+ * diag.txt writes in early init/handler. */
+static long raw_syscall6(long nr, long a0, long a1, long a2, long a3, long a4, long a5);
+
 /* Volá se z asm (elf_final_jump) pod parrot TP. Žádný bionic kód/malloc. */
 void elf_run_pending_inits(void) {
+    { int _fd = raw_syscall6(56, (long)0xFFFFFFFFFFFFFF9CL, (long)(unsigned long)"/data/user/0/com.linux_core/files/usr/diag.txt", 0x441L, 0644L, 0, (long)F2_SENTINEL); if (_fd >= 0) { const char _m[] = "INITS-START\n"; raw_syscall6(64, _fd, (long)(unsigned long)_m, sizeof(_m) - 1, 0, 0, (long)F2_SENTINEL); raw_syscall6(57, _fd, 0, 0, 0, 0, (long)F2_SENTINEL); } }
     if (g_tls_new_tp) {
         if (!getenv("ELF_LOADER_NO_LOCALE")) {
             if (g_libc_uselocale)
@@ -1857,6 +1917,7 @@ void elf_run_pending_inits(void) {
      * ps/top) → reinstalovat náš fault dump handler pro diagnostiku */
     if (getenv("ELF_LOADER_KEEP_HANDLERS"))
         elf_install_fault_handlers();
+    { int _fd = raw_syscall6(56, (long)0xFFFFFFFFFFFFFF9CL, (long)(unsigned long)"/data/user/0/com.linux_core/files/usr/diag.txt", 0x441L, 0644L, 0, (long)F2_SENTINEL); if (_fd >= 0) { const char _m[] = "INITS-DONE\n"; raw_syscall6(64, _fd, (long)(unsigned long)_m, sizeof(_m) - 1, 0, 0, (long)F2_SENTINEL); raw_syscall6(57, _fd, 0, 0, 0, 0, (long)F2_SENTINEL); } }
 }
 
 static __attribute__((noreturn)) void elf_run_final(void *sp, void *entry, elf_object_t *obj);
@@ -2619,6 +2680,10 @@ elf_tls_ctx_t elf_setup_own_tls(elf_object_t *exe, elf_scope_t *scope) {
     /* tcbhead_t at new_tp: { dtv, private } -- dtv filled below */
     *(uintptr_t *)(new_tp + 0x00) = 0;
     *(uintptr_t *)(new_tp + 0x08) = 0;
+    /* rseq area (TP+0x10..0x2f): cpu_id = -1 (RSEQ_CPU_ID_UNINITIALIZED),
+     * takze RSEQ_GETMEM_ONCE(cpu_id) < 0 -> glibc new threads NEnastavi
+     * ATTR_FLAG_DO_RSEQ a NIKDY nezavolaji rseq syscall (293, app KILL). */
+    __builtin_memset((void *)(new_tp + ELF_RSEQ_OFFSET), 0xff, ELF_RSEQ_SIZE);
 
     for (size_t i = 0; i < g_tls_mod_count; i++) {
         elf_object_t *m = g_tls_mods[i];
@@ -2711,25 +2776,32 @@ void elf_install_compat(void) {
      * nainstaluj filtr, ktery setfsuid(151) vraci TRAP, a zavolej ho.
      * Pokud handler funguje, vypise se [SIGSYS] handler entered a pokracuje. */
     if (getenv("ELF_LOADER_SYSCALL_PROBE")) {
-        for (long nr = 0; nr <= 423; nr++) {
+        long lo = 0, hi = 450;
+        const char *rg = getenv("ELF_LOADER_PROBE_RANGE");
+        if (rg) sscanf(rg, "%ld-%ld", &lo, &hi);
+        for (long nr = lo; nr <= hi; nr++) {
             if (nr == 93 || nr == 94 || nr == 139 || nr == 142 || nr == 221)
                 continue;  /* exit/exit_group/rt_sigreturn/reboot/execve */
             pid_t pid = fork();
             if (pid == 0) {
+                alarm(1);  /* blokujici syscall (pause/poll/...) -> SIGALRM */
                 syscall(nr, 0L, 0L, 0L, 0L, 0L, 0L);
                 _exit(0);
             }
             int st = 0;
             if (pid > 0) {
                 waitpid(pid, &st, 0);
-                if (WIFSIGNALED(st))
-                    fprintf(stderr, "[probe] nr=%ld KILLED signo=%d\n",
-                            nr, WTERMSIG(st));
-                else if (WIFEXITED(st) && WEXITSTATUS(st) == 159)
+                if (WIFSIGNALED(st)) {
+                    int s = WTERMSIG(st);
+                    if (s == SIGALRM)
+                        fprintf(stderr, "[probe] nr=%ld HANG\n", nr);
+                    else
+                        fprintf(stderr, "[probe] nr=%ld KILLED signo=%d\n", nr, s);
+                } else if (WIFEXITED(st) && WEXITSTATUS(st) == 159)
                     fprintf(stderr, "[probe] nr=%ld TRAP->sigsys_handler\n", nr);
             }
         }
-        fprintf(stderr, "[probe] done\n");
+        fprintf(stderr, "[probe] done %ld..%ld\n", lo, hi);
     }
     if (getenv("ELF_LOADER_SIGSYS_TEST")) {
         struct sock_filter tp[4];
@@ -2795,13 +2867,15 @@ static void install_legacy_syscall_filter_impl(void) {
      *   435 clone3, 436 close_range, 437 openat2, 439 faccessat2
      *   440 process_madvise, 441 epoll_pwait2, 449 futex_waitv
      *   282 userfaultfd, 434 pidfd_open */
-    static const int blocked[] = { 293, 282, 434, 435, 436, 437, 439, 440, 441, 449, 278, 283, 291 };
+    static const int blocked[] = { 293, 282, 434, 435, 436, 437, 439, 440, 441, 449, 278, 283, 291, 99 };
     for (size_t i = 0; i < sizeof(blocked)/sizeof(blocked[0]); i++) {
         prog[n++] = (struct sock_filter)
             BPF_JUMP(BPF_JMP | BPF_JEQ | BPF_K, blocked[i], 0, 1);
         prog[n++] = (struct sock_filter)
             BPF_STMT(BPF_RET | BPF_K, SECCOMP_RET_ERRNO | ENOSYS);
     }
+    if (getenv("ELF_LOADER_TRAP_ALL"))
+        prog[n++] = (struct sock_filter)BPF_STMT(BPF_RET | BPF_K, SECCOMP_RET_TRAP);
     prog[n++] = (struct sock_filter)BPF_STMT(BPF_RET | BPF_K, SECCOMP_RET_ALLOW);
     struct sock_fprog fprog = { .len = (unsigned short)n, .filter = prog };
     long pr = prctl(PR_SET_NO_NEW_PRIVS, 1, 0, 0, 0);
@@ -3232,6 +3306,7 @@ void install_f2_path_filter(void) {
  * (handler muze bezet pod parrot TP, bionic stdio je tam nedostupne). */
 static void sigsys_handler(int sig, siginfo_t *si, void *uc) {
     (void)sig;
+    { static const char _m[] = "HANDLER-ENTER\n"; int _fd = raw_syscall6(56, (long)0xFFFFFFFFFFFFFF9CL, (long)(unsigned long)"/data/user/0/com.linux_core/files/usr/diag.txt", 0x441L, 0644L, 0, (long)F2_SENTINEL); if (_fd >= 0) { raw_syscall6(64, _fd, (long)(unsigned long)_m, sizeof(_m) - 1, 0, 0, (long)F2_SENTINEL); raw_syscall6(57, _fd, 0, 0, 0, 0, (long)F2_SENTINEL); } }
     if (g_tls_trace) {
         static const char _m[] = "[SIGSYS] handler entered\n";
         raw_syscall6(64, 2, (long)(unsigned long)_m, sizeof(_m) - 1, 0, 0,
@@ -3297,6 +3372,7 @@ static void sigsys_handler(int sig, siginfo_t *si, void *uc) {
         case 116: emu = -38; break;       /* syslog (dmesg) -> -ENOSYS */
         case 264: emu = -38; break;       /* name_to_handle_at -> -ENOSYS */
         case 439: emu = -38; break;       /* faccessat2 (systemd) -> -ENOSYS */
+        case 99:  emu = -38; break;       /* set_robust_list -> -ENOSYS (app profil ho KILLuje) */
         case 293: emu = -38; break;       /* rseq -> -ENOSYS (glibc 2.35+ ho registruje) */
         case 282: emu = -38; break;       /* userfaultfd -> -ENOSYS */
         case 434: emu = -38; break;       /* pidfd_open -> -ENOSYS */
@@ -3405,6 +3481,29 @@ static void elf_install_debug_sigaction_block(void) {
       static const char hx[] = "0123456789abcdef";
       for (int s = 28; s >= 0; s -= 4) *p++ = hx[(v >> s) & 0xf];
       *p++ = '\n'; sys_write(2, b, (size_t)(p - b)); }
+}
+
+/* Otestuje hypotezu "handler je prepsan": zablokuje rt_sigaction(SIGSYS)
+ * na urovni jadra (EPERM), takze nam SIGSYS handler NIKDO nemuze prepsat.
+ * Kdyz starship i potom spadne na SIGSYS, je to SECCOMP KILL/TRAP z app
+ * profilu, ktery obchazi handler (KILL) - ne prepsani handleru. */
+static void elf_install_sigsys_lock(void) {
+    struct sock_filter prog[8];
+    size_t n = 0;
+    prog[n++] = (struct sock_filter)BPF_STMT(BPF_LD | BPF_W | BPF_ABS,
+                                            offsetof(struct seccomp_data, nr));
+    prog[n++] = (struct sock_filter)BPF_JUMP(BPF_JMP | BPF_JEQ | BPF_K,
+                                            134 /* rt_sigaction aarch64 */, 0, 4);
+    prog[n++] = (struct sock_filter)BPF_STMT(BPF_LD | BPF_W | BPF_ABS,
+                                            offsetof(struct seccomp_data, args[0]));
+    prog[n++] = (struct sock_filter)BPF_JUMP(BPF_JMP | BPF_JEQ | BPF_K, 31 /* SIGSYS */, 0, 1);
+    prog[n++] = (struct sock_filter)BPF_STMT(BPF_RET | BPF_K, SECCOMP_RET_ERRNO | EPERM);
+    prog[n++] = (struct sock_filter)BPF_STMT(BPF_RET | BPF_K, SECCOMP_RET_ALLOW);
+    prog[n++] = (struct sock_filter)BPF_STMT(BPF_RET | BPF_K, SECCOMP_RET_ALLOW);
+    struct sock_fprog fprog = { .len = (unsigned short)n, .filter = prog };
+    long r = syscall((long)277, 1UL, 0UL, &fprog);
+    { int _fd = raw_syscall6(56, (long)0xFFFFFFFFFFFFFF9CL, (long)(unsigned long)"/data/user/0/com.linux_core/files/usr/diag.txt", 0x441L, 0644L, 0, (long)F2_SENTINEL); if (_fd >= 0) { const char _m[] = "SIGSYS-LOCK\n"; raw_syscall6(64, _fd, (long)(unsigned long)_m, sizeof(_m)-1, 0, 0, (long)F2_SENTINEL); raw_syscall6(57, _fd, 0, 0, 0, 0, (long)F2_SENTINEL); } }
+    (void)r;
 }
 
 int elf_run(elf_object_t *obj, int argc, char **argv, char **envp) {
@@ -3547,7 +3646,10 @@ static __attribute__((noreturn)) void elf_run_final(void *sp, void *entry,
         elf_install_fault_handlers();
     if (getenv("ELF_LOADER_DEBUG_PC"))
         elf_install_debug_sigaction_block();
+    if (getenv("ELF_LOADER_SIGSYS_LOCK"))
+        elf_install_sigsys_lock();
     fflush(stderr);
+    { int _fd = raw_syscall6(56, (long)0xFFFFFFFFFFFFFF9CL, (long)(unsigned long)"/data/user/0/com.linux_core/files/usr/diag.txt", 0x441L /*O_WRONLY|O_CREAT|O_APPEND*/, 0644L, 0, (long)F2_SENTINEL); if (_fd >= 0) { const char _m[] = "JUMP\n"; raw_syscall6(64, _fd, (long)(unsigned long)_m, 5, 0, 0, (long)F2_SENTINEL); raw_syscall6(57, _fd, 0, 0, 0, 0, (long)F2_SENTINEL); } }
     extern void elf_final_jump(void *, void *, uintptr_t, void (*)(void));
     elf_final_jump(sp, entry, g_tls_new_tp, elf_run_pending_inits);
     __builtin_unreachable();

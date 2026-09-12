@@ -5,6 +5,13 @@
 #include <stddef.h>
 #include <elf.h>
 
+/* Dedikovana rseq area v nasem TLS bloku (hned za tcbhead_t, ktere je 16 B
+ * na TP). Naplnime ji 0xFF, takze cpu_id = -1 < 0 -> glibc new-thread
+ * do_rseq=false -> NIKDY nezavola rseq syscall (293), ktery Android app
+ * seccomp KILLuje (KILL obchazi SIGSYS handler). */
+#define ELF_RSEQ_OFFSET 0x10u
+#define ELF_RSEQ_SIZE   0x20u
+
 typedef struct {
     void *base_addr;
     Elf64_Ehdr *ehdr;
@@ -73,6 +80,12 @@ void ldso_install_exe_linkmap(elf_object_t *exe, const char *name);
 void ldso_install_module_list(elf_object_t *const *mods, size_t count);
 
 void elf_register_override(const char *name, void *fn);
+
+/* Aplikacni Android seccomp vraci SECCOMP_RET_KILL pro nektere syscally
+ * (rseq=293, set_robust_list=99 s velikosti 24). KILL ma nejvyssi precedenci
+ * a obchazi SIGSYS handler, takze nas filtr/handler ho neprebiji. Obrana:
+ * v guest libc najdi `mov x8,#nr ; ... ; svc #0` a svc prebij na NOP. */
+void elf_patch_syscall_sites(elf_object_t *m, long nr);
 
 /* ldso_tls.c: vlastní implementace glibc ld.so TLS funkcí (guest ld.so je
  * neinicializovaný, takže jeho _dl_allocate_tls padá na NULL _rtld_global). */
