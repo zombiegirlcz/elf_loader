@@ -109,7 +109,7 @@ char **elf_init_envp = NULL;
 #define ELF_MAX_TLS_MODS 128
 static elf_object_t *g_tls_mods[ELF_MAX_TLS_MODS];
 static size_t g_tls_mod_count;
-static uintptr_t g_tls_next = ELF_RSEQ_OFFSET + ELF_RSEQ_SIZE; /* za rseq area */
+static uintptr_t g_tls_next = ELF_TLS_TCB_SIZE; /* TLS bloky od TP+0x10 (glibc TLS_TCB_SIZE) */
 #define ELF_TLS_DTV_RESERVE 0x1000u
 
 static void elf_tls_assign(elf_object_t *m, size_t align) {
@@ -128,8 +128,12 @@ elf_object_t *elf_tls_module_at(size_t i) {
     return i < g_tls_mod_count ? g_tls_mods[i] : NULL;
 }
 uintptr_t elf_tls_span(void) { return g_tls_next; }
+/* rseq area jde AZ za vsechny TLS bloky (jako glibc "extra TLS block"),
+ * aby hlavni exe (non-PIE, zapečene TPREL offsety) sedel na TP+0x10. */
+uintptr_t elf_tls_rseq_offset(void) { return ALIGN_UP(g_tls_next, 16); }
 uintptr_t elf_tls_static_size(void) {
-    return ALIGN_UP(g_tls_next, 16) + ELF_TLS_DTV_RESERVE;
+    return ALIGN_UP(elf_tls_rseq_offset() + ELF_RSEQ_SIZE, 16)
+           + ELF_TLS_DTV_RESERVE;
 }
 
 const char *loader_phase = "start";
@@ -328,7 +332,7 @@ static uint64_t ldso_stack_guard = 0xdeadbeefcafe1234ULL;
  * ktera je naplnena 0xFF => cpu_id=-1 < 0 => glibc new-thread do_rseq=false
  * => nezavola rseq (293, app seccomp KILL). Kdyby offset byl 0, glibc by
  * prepsala DTV pointer na TP a stejne by registrovala. */
-static int64_t ldso_rseq_offset = ELF_RSEQ_OFFSET;
+static int64_t ldso_rseq_offset = ELF_TLS_TCB_SIZE;
 static unsigned int ldso_rseq_size = 0;
 static void *ldso_stack_end;
 static char ldso_platform[] = "aarch64";
@@ -2408,6 +2412,52 @@ static void apply_relr(elf_object_t *obj) {
     }
 }
 
+/* R_AARCH64_COPY: symbol je v exe definovan jen jako rezervace v .bss
+ * (stdin/stdout/stderr/__environ/__stack_chk_guard). Skutecna definice je
+ * v libc (nebo v ldso override). Zkopiruj obsah do ciloveho slotu, aby exe
+ * videl platny FILE* / hodnoty. Bez toho zustane stdin=NULL -> fileno(NULL) crash. */
+static int do_copy_reloc(elf_object_t *obj, Elf64_Rela *r, void *where) {
+    size_t sym_idx = ELF64_R_SYM(r->r_info);
+    if (sym_idx >= obj->dynsym_count)
+        return 0;
+    const Elf64_Sym *s = &obj->dynsym[sym_idx];
+    const char *name = obj->dynstr + s->st_name;
+    size_t sz = s->st_size ? (size_t)s->st_size : sizeof(uint64_t);
+
+    void *src = NULL;
+    if (obj->scope) {
+        for (size_t i = 0; i < obj->scope->count && !src; i++) {
+            elf_object_t *m = obj->scope->mods[i];
+            if (!m || m == obj)
+                continue;
+            if (!m->dynsym || !m->dynstr)
+                continue;
+            for (size_t j = 0; j < m->dynsym_count; j++) {
+                const Elf64_Sym *ds = &m->dynsym[j];
+                if (ds->st_name == 0 || ds->st_shndx == SHN_UNDEF)
+                    continue;
+                if (ELF64_ST_BIND(ds->st_info) == STB_LOCAL)
+                    continue;
+                if (strcmp(m->dynstr + ds->st_name, name) != 0)
+                    continue;
+                src = (char *)m->base_addr + (ds->st_value - map_base_vaddr(m));
+                break;
+            }
+        }
+    }
+    if (!src)
+        src = override_lookup(name);   /* __stack_chk_guard, __rseq_* apod. */
+    if (src) {
+        memcpy(where, src, sz);
+        if (elf_debug())
+            fprintf(stderr, "[COPY] %s <- %p (%zu B)\n", name, src, sz);
+        return 1;
+    }
+    fprintf(stderr, "[WARN] COPY reloc unresolved: %s in %s\n",
+            name, obj->soname ? obj->soname : "EXE");
+    return 0;
+}
+
 int elf_relocate(elf_object_t *obj) {
     if (!obj)
         return -1;
@@ -2468,6 +2518,9 @@ int elf_relocate(elf_object_t *obj) {
             count++;
             break;
         case R_AARCH64_IRELATIVE:
+            break;
+        case R_AARCH64_COPY:
+            count += do_copy_reloc(obj, r, where);
             break;
         case R_AARCH64_TLS_TPREL:
         case R_AARCH64_TLSDESC:
@@ -2680,10 +2733,6 @@ elf_tls_ctx_t elf_setup_own_tls(elf_object_t *exe, elf_scope_t *scope) {
     /* tcbhead_t at new_tp: { dtv, private } -- dtv filled below */
     *(uintptr_t *)(new_tp + 0x00) = 0;
     *(uintptr_t *)(new_tp + 0x08) = 0;
-    /* rseq area (TP+0x10..0x2f): cpu_id = -1 (RSEQ_CPU_ID_UNINITIALIZED),
-     * takze RSEQ_GETMEM_ONCE(cpu_id) < 0 -> glibc new threads NEnastavi
-     * ATTR_FLAG_DO_RSEQ a NIKDY nezavolaji rseq syscall (293, app KILL). */
-    __builtin_memset((void *)(new_tp + ELF_RSEQ_OFFSET), 0xff, ELF_RSEQ_SIZE);
 
     for (size_t i = 0; i < g_tls_mod_count; i++) {
         elf_object_t *m = g_tls_mods[i];
@@ -2700,11 +2749,20 @@ elf_tls_ctx_t elf_setup_own_tls(elf_object_t *exe, elf_scope_t *scope) {
             memset(dst + m->tdata_filesz, 0, m->tls_memsz - m->tdata_filesz);
     }
 
+    /* rseq area (na konci TLS bloku): cpu_id=-1 (0xFF) =>
+     * RSEQ_GETMEM_ONCE(cpu_id) < 0 -> glibc new threads NEnastavi
+     * ATTR_FLAG_DO_RSEQ a NIKDY nezavolaji rseq syscall (293, app KILL).
+     * POZOR: nesmi byt na TP+0x10 - kolidovala by s TLS blokem hlavniho exe,
+     * ktery non-PIE binarky adresuji pres zapečene TPREL offsety (TP+0x10+). */
+    uintptr_t rseq_off = ALIGN_UP(span, 16);
+    __builtin_memset((void *)(new_tp + rseq_off), 0xff, ELF_RSEQ_SIZE);
+    ldso_rseq_offset = (int64_t)rseq_off;
+
     /* Build a glibc-shaped DTV so __tls_get_addr (GD/LD TLS) works.
        dtv_t layout: u[0]=counter | {val,to_free}, 16 bytes per entry.
        A[0]=delka, A[1]=generace, A[2+modid-1]=entry; tcbhead.dtv = &A[1]. */
     typedef struct { uintptr_t u[2]; } ldso_dtv_t;
-    ldso_dtv_t *dtv = (ldso_dtv_t *)(new_tp + ALIGN_UP(span, 16));
+    ldso_dtv_t *dtv = (ldso_dtv_t *)(new_tp + rseq_off + ELF_RSEQ_SIZE);
     memset(dtv, 0, (2 + g_tls_mod_count) * sizeof(ldso_dtv_t));
     dtv[0].u[0] = g_tls_mod_count + 1;   /* dtv length (dtv[-1].counter) */
     dtv[1].u[0] = 1;                     /* TLS generation counter */

@@ -5,12 +5,24 @@
 #include <stddef.h>
 #include <elf.h>
 
-/* Dedikovana rseq area v nasem TLS bloku (hned za tcbhead_t, ktere je 16 B
- * na TP). Naplnime ji 0xFF, takze cpu_id = -1 < 0 -> glibc new-thread
- * do_rseq=false -> NIKDY nezavola rseq syscall (293), ktery Android app
- * seccomp KILLuje (KILL obchazi SIGSYS handler). */
-#define ELF_RSEQ_OFFSET 0x10u
-#define ELF_RSEQ_SIZE   0x20u
+/* NDK <elf.h> R_AARCH64_COPY nedefinuje (jen P32 variantu). */
+#ifndef R_AARCH64_COPY
+#define R_AARCH64_COPY 1024
+#endif
+
+/* TLS layout (aarch64, TLS_DTV_AT_TP):
+ *   struct pthread  [TP-0x720, TP)
+ *   tcbhead_t       { dtv, private }  na TP (16 B)
+ *   TLS bloky       [TP + ELF_TLS_TCB_SIZE, ...)  <- hlavni exe MUSI byt na 0x10!
+ *   rseq area       na konci vsech bloku (0xFF => cpu_id=-1)
+ *
+ * KRITICKE: non-PIE binarky (python/perl/...) maji local-exec TPREL offsety
+ * zapečene linkerem jako TP + sym_off + TLS_TCB_SIZE (0x10). Kdyby exe blok
+ * nezacinal na 0x10, binarka cte cizi data (napr. rseq area) -> fatal error.
+ * Proto rseq NESMI byt na TP+0x10, ale az za vsemi TLS bloky (jako glibc
+ * "extra TLS block" v _dl_determine_tlsoffset). */
+#define ELF_TLS_TCB_SIZE 0x10u
+#define ELF_RSEQ_SIZE    0x20u
 
 typedef struct {
     void *base_addr;
@@ -110,6 +122,7 @@ size_t elf_tls_module_count(void);
 elf_object_t *elf_tls_module_at(size_t i);
 uintptr_t elf_tls_span(void);
 uintptr_t elf_tls_static_size(void);
+uintptr_t elf_tls_rseq_offset(void);
 
 extern int elf_init_argc;
 extern char **elf_init_argv;
