@@ -1438,7 +1438,23 @@ static void hl_emit(const char *buf, size_t len) {
 
 /* ─────────────────────────── prompt ─────────────────────────── */
 
-static void print_prompt_text(const char *ps1) {
+/* Prompt se generuje do tohoto bufferu a ed_render ho vykresli PRAVE JEDNOU.
+ * (Driv se tisknul v main smycce i v ed_render -> uzivatel videl dva prompty.) */
+static char g_prompt_buf[8192];
+
+static size_t rp_puts(char *o, size_t cap, size_t n, const char *s) {
+    size_t l = strlen(s);
+    if (n + l < cap) { memcpy(o + n, s, l); n += l; }
+    return n;
+}
+static size_t rp_putc(char *o, size_t cap, size_t n, char c) {
+    if (n + 1 < cap) o[n++] = c;
+    return n;
+}
+
+/* Vykresli PS1 (s %u/%h/%~/%$ a \e sekvencemi) do bufferu; vraci delku. */
+static size_t render_prompt_text(const char *ps1, char *o, size_t cap) {
+    size_t n = 0;
     char vp[1024];
     get_vpwd(vp, sizeof vp);
     const char *show = vp;
@@ -1451,17 +1467,17 @@ static void print_prompt_text(const char *ps1) {
 
     /* dual mode: host svět označíme žlutým [host] prefixem */
     if (g_dual_world && g_world == WORLD_HOST)
-        fputs("\x1b[33m[host]\x1b[0m ", stdout);
+        n = rp_puts(o, cap, n, "\x1b[33m[host]\x1b[0m ");
 
     for (const char *p = ps1; *p; p++) {
         /* interpretace escape sekvencí z gbshrc (\e \n \t \x1b ...) */
         if (p[0] == '\\' && p[1]) {
             p++;
             switch (*p) {
-            case 'e': putchar('\033'); break;
-            case 'n': putchar('\n'); break;
-            case 't': putchar('\t'); break;
-            case '\\': putchar('\\'); break;
+            case 'e': n = rp_putc(o, cap, n, '\033'); break;
+            case 'n': n = rp_putc(o, cap, n, '\n'); break;
+            case 't': n = rp_putc(o, cap, n, '\t'); break;
+            case '\\': n = rp_putc(o, cap, n, '\\'); break;
             case 'x': {
                 int hv = 0; int nd = 0;
                 while (nd < 2 && isxdigit((unsigned char)p[1])) {
@@ -1470,27 +1486,27 @@ static void print_prompt_text(const char *ps1) {
                             : (c | 32) - 'a' + 10;
                     hv = hv * 16 + dv; nd++;
                 }
-                putchar(hv ? hv : '\033');
+                n = rp_putc(o, cap, n, hv ? hv : '\033');
                 break;
             }
-            default: putchar(*p); break;
+            default: n = rp_putc(o, cap, n, *p); break;
             }
             continue;
         }
         if (p[0] == '%' && p[1]) {
             p++;
             switch (*p) {
-            case 'u': fputs(env_or("USER", env_or("LOGNAME", "?")), stdout); break;
-            case 'h': fputs(env_or("HOSTNAME", "android"), stdout); break;
-            case '~': fputs(shortcwd, stdout); break;
-            case '$': fputs(getuid() == 0 ? "#" : "$", stdout); break;
-            default:  putchar(*p);
+            case 'u': n = rp_puts(o, cap, n, env_or("USER", env_or("LOGNAME", "?"))); break;
+            case 'h': n = rp_puts(o, cap, n, env_or("HOSTNAME", "android")); break;
+            case '~': n = rp_puts(o, cap, n, shortcwd); break;
+            case '$': n = rp_puts(o, cap, n, getuid() == 0 ? "#" : "$"); break;
+            default:  n = rp_putc(o, cap, n, *p);
             }
         } else {
-            putchar(*p);
+            n = rp_putc(o, cap, n, *p);
         }
     }
-    fflush(stdout);
+    return n;
 }
 
 
@@ -1648,19 +1664,22 @@ static void print_fancy_prompt(void) {
     char branch[128];
     get_git_branch(branch, sizeof branch);
 
-    fputs("\x1b[1;34m", stdout);
-    fputs(shortc, stdout);
-    fputs("\x1b[0m", stdout);
+    size_t n = 0;
+    n = rp_puts(g_prompt_buf, sizeof g_prompt_buf, n, "\x1b[1;34m");
+    n = rp_puts(g_prompt_buf, sizeof g_prompt_buf, n, shortc);
+    n = rp_puts(g_prompt_buf, sizeof g_prompt_buf, n, "\x1b[0m");
     if (branch[0]) {
-        fputs(" \x1b[1;32m\xe2\x8e\x87 ", stdout);   /* ⎇ */
-        fputs(branch, stdout);
-        fputs("\x1b[0m", stdout);
+        n = rp_puts(g_prompt_buf, sizeof g_prompt_buf, n, " \x1b[1;32m\xe2\x8e\x87 ");
+        n = rp_puts(g_prompt_buf, sizeof g_prompt_buf, n, branch);
+        n = rp_puts(g_prompt_buf, sizeof g_prompt_buf, n, "\x1b[0m");
     }
     if (g_last_status != 0) {
-        printf(" \x1b[1;91m\xe2\x9c\x97%d\x1b[0m", g_last_status);  /* ✗N */
+        char st[32];
+        snprintf(st, sizeof st, " \x1b[1;91m\xe2\x9c\x97%d\x1b[0m", g_last_status);
+        n = rp_puts(g_prompt_buf, sizeof g_prompt_buf, n, st);
     }
-    fputs("\n\x1b[1;36m\xe2\x9d\xaf\x1b[0m ", stdout);          /* ❯ */
-    fflush(stdout);
+    n = rp_puts(g_prompt_buf, sizeof g_prompt_buf, n, "\n\x1b[1;36m\xe2\x9d\xaf\x1b[0m ");
+    if (n < sizeof g_prompt_buf) g_prompt_buf[n] = 0;
 }
 
 /* starship přes elf_loader (pokud funguje) — výstup do bufferu */
@@ -1692,14 +1711,30 @@ static int try_starship_prompt(void) {
     int st; waitpid(pid, &st, 0);
     if (n <= 0 || !WIFEXITED(st) || WEXITSTATUS(st) != 0) return -1;
     tmp[n] = 0;
-    fputs(tmp, stdout);
+    snprintf(g_prompt_buf, sizeof g_prompt_buf, "%s", tmp);
     return 0;
+}
+
+/* Vyber a vygeneruj prompt do g_prompt_buf (starship -> fancy -> raw). */
+static void print_prompt_raw(void);
+static size_t render_prompt_text(const char *ps1, char *o, size_t cap);
+static void print_fancy_prompt(void);
+
+static void build_prompt(void) {
+    const char *pmode = env_or("GBSH_PROMPT_MODE", "");
+    if (strcmp(pmode, "starship") == 0) {
+        if (try_starship_prompt() == 0) return;
+        print_fancy_prompt();
+        return;
+    }
+    if (strcmp(pmode, "fancy") == 0) { print_fancy_prompt(); return; }
+    print_prompt_raw();
 }
 
 /* ─────────────────────────── line editor (raw mode) ─────────────────── */
 
 static void print_prompt_raw(void);
-static void print_prompt_text(const char *ps1);
+static size_t render_prompt_text(const char *ps1, char *o, size_t cap);
 
 /* šířka terminálu (sloupce) — přes ioctl, jinak $COLUMNS, jinak 80 */
 static int get_term_cols(void) {
@@ -1712,42 +1747,27 @@ static int get_term_cols(void) {
 }
 
 /* viditelná šířka promptu (bez ANSI) — pro výpočet pozice kurzoru při zalomení */
+/* Viditelná šířka AKTUÁLNÍHO promptu (g_prompt_buf): bez ANSI escape,
+ * bere jen poslední řádek (multi-line starship prompt). UTF-8: počítá
+ * lead bajty (ne continuation 10xxxxxx). */
 static int prompt_display_width(void) {
-    const char *ps1 = env_or("GBSH_PROMPT",
-        "\x1b[1;32m%u@%h\x1b[0m:\x1b[36m%~\x1b[0m$ ");
+    const unsigned char *p = (const unsigned char *)g_prompt_buf;
     int w = 0;
-    for (const char *p = ps1; *p; p++) {
-        if (p[0] == '\\' && p[1]) {
+    while (*p) {
+        if (p[0] == 0x1b) {                 /* ESC sekvence */
             p++;
-            switch (*p) {
-            case 'n': w = 0; break;
-            case 't': w += 8; break;
-            case 'x': while (p[1] && isxdigit((unsigned char)p[1])) p++; break;
-            default: break;
+            if (*p == '[') {                /* CSI: ESC [ ... fin */
+                p++;
+                while (*p && !(*p >= '@' && *p <= '~')) p++;
+                if (*p) p++;
+            } else if (*p) {
+                p++;
             }
             continue;
         }
-        if (p[0] == '%' && p[1]) {
-            p++;
-            switch (*p) {
-            case 'u': w += (int)strlen(env_or("USER", env_or("LOGNAME", "?"))); break;
-            case 'h': w += (int)strlen(env_or("HOSTNAME", "android")); break;
-            case '~': {
-                char cwd[1024]; const char *show = getcwd(cwd, sizeof cwd) ? cwd : "?";
-                const char *home = env_or("HOME", "");
-                char sc[1100];
-                if (home[0] && starts_with(show, home))
-                    snprintf(sc, sizeof sc, "~%s", show + strlen(home));
-                else snprintf(sc, sizeof sc, "%s", show);
-                w += (int)strlen(sc);
-                break;
-            }
-            case '$': w += 1; break;
-            default: w += 1; break;
-            }
-            continue;
-        }
-        w += 1;
+        if (*p == '\n' || *p == '\r') { w = 0; p++; continue; }
+        if ((*p & 0xC0) != 0x80) w++;
+        p++;
     }
     return w;
 }
@@ -1764,7 +1784,7 @@ static void ed_render(const char *prompt, const char *buf, size_t len, size_t cu
     fputs("\x1b[s", stdout);                  /* ulož start promptu pro příště */
     fputs("\x1b[J", stdout);                  /* smaž od startu promptu dolů */
 
-    print_prompt_raw();
+    fputs(g_prompt_buf, stdout);
     hl_emit(buf, len);
     fputs("\x1b[0m", stdout);
     fputs("\x1b[K", stdout);                  /* umazat zbytek posledního řádku */
@@ -1914,7 +1934,8 @@ static char *read_line_interactive(void) {
 static void print_prompt_raw(void) {
     /* barevný default; GBSH_PROMPT může obsahovat vlastní ANSI */
     const char *ps1 = env_or("GBSH_PROMPT", "\x1b[1;32m%u@%h\x1b[0m:\x1b[36m%~\x1b[0m$ ");
-    print_prompt_text(ps1);
+    size_t n = render_prompt_text(ps1, g_prompt_buf, sizeof g_prompt_buf);
+    if (n < sizeof g_prompt_buf) g_prompt_buf[n] = 0;
 }
 
 static void print_prompt(void) {
@@ -2110,16 +2131,12 @@ int main(int argc, char **argv) {
         return g_last_status;
     }
 
-    const char *pmode = env_or("GBSH_PROMPT_MODE", "");
-    int use_starship = strcmp(pmode, "starship") == 0;
-    int use_fancy    = strcmp(pmode, "fancy") == 0;
-
     if (isatty(STDIN_FILENO)) {
-        /* interaktivní režim: live syntax highlighting + historie */
+        /* interaktivní režim: live syntax highlighting + historie.
+         * Prompt se generuje JEDNOU (build_prompt) a ed_render ho vykresli;
+         * zadne druhe tisteni v teto smycce (to delalo dva prompty). */
         while (g_running) {
-            if (use_starship)      { if (try_starship_prompt() != 0) print_fancy_prompt(); }
-            else if (use_fancy)    print_fancy_prompt();
-            else                   print_prompt_raw();
+            build_prompt();
             char *line = read_line_interactive();
             if (!line) { printf("exit\n"); break; }
             hist_add(line);
