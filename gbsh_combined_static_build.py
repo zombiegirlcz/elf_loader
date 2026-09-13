@@ -45,6 +45,7 @@ def build():
     # 1) Create dispatcher main that routes to loader or gbsh
     with open("/tmp/dispatcher.c", "w") as f:
         f.write('''
+#include <stdlib.h>
 #include <string.h>
 extern int elf_loader_main(int argc, char **argv, char **envp);
 extern int gbsh_main(int argc, char **argv);
@@ -61,6 +62,11 @@ int main(int argc, char **argv, char **envp) {
         if (loader_flag)
             return elf_loader_main(argc, argv, envp);
     }
+    /* Combined binary: the loader is embedded in this same executable.
+     * Point gbsh at ourselves so its fork+execve(loader) loop re-enters
+     * this dispatcher (argv[1] = --ownall/--shim/... => loader path). */
+    if (!getenv("ELF_LOADER"))
+        setenv("ELF_LOADER", "/proc/self/exe", 0);
     return gbsh_main(argc, argv);
 }
 ''')
@@ -68,6 +74,7 @@ int main(int argc, char **argv, char **envp) {
     # 2) Compile elf_loader sources with main renamed
     cc("-fPIE", "-c", "/src/src/main.c", "-o", "/tmp/main.o", "-Dmain=elf_loader_main")
     cc("-fPIE", "-c", "/src/src/elf_loader.c", "-o", "/tmp/elf_loader.o")
+    cc("-fPIE", "-c", "/src/src/ldso_tls.c", "-o", "/tmp/ldso_tls.o")
     cc("-c", "/src/src/entry.S", "-o", "/tmp/entry.o")
     cc("-c", "/src/src/dlfcn_stubs.c", "-o", "/tmp/dlfcn_stubs.o")
 
@@ -79,8 +86,8 @@ int main(int argc, char **argv, char **envp) {
 
     # 5) Link everything as static (non-PIE)
     cc("-static",
-       "/tmp/dispatcher.o", "/tmp/main.o", "/tmp/elf_loader.o", "/tmp/entry.o",
-       "/tmp/dlfcn_stubs.o", "/tmp/gbsh.o",
+       "/tmp/dispatcher.o", "/tmp/main.o", "/tmp/elf_loader.o", "/tmp/ldso_tls.o",
+       "/tmp/entry.o", "/tmp/dlfcn_stubs.o", "/tmp/gbsh.o",
        "-o", "/tmp/gbsh_combined_static")
 
     # 6) Read back artifact
