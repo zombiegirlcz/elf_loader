@@ -16,6 +16,7 @@ extern char **environ;
 #include <limits.h>
 #include <linux/filter.h>
 #include <linux/seccomp.h>
+#include <sys/wait.h>
 
 /* SENTINEL v x5 (args[5]) pro seccomp path-filter: handlerova emulace raw
  * syscallu nese toto cislo v x5, filtr ji tak pousti (zabrani zacykleni).
@@ -55,9 +56,81 @@ elf_scope_t *elf_own_scope = NULL;
 static elf_scope_t *g_crash_scope = NULL;
 void elf_set_crash_scope(elf_scope_t *s) { g_crash_scope = s; }
 
+/* ---- TLS resolution tracing (diagnoza: kam se resolvuje _dl_allocate_tls) ----
+ * Vse pres raw write(2) syscall, aby to fungovalo i pod parrot TP (bionic
+ * stdio pod guest TP pada). Zapina se env ELF_LOADER_TLS_TRACE=1. */
+int g_tls_trace = 0;
+
+static long tls_raw_write(int fd, const void *buf, size_t n) {
+    register long x8 __asm__("x8") = 64;
+    register long x0 __asm__("x0") = fd;
+    register const void *x1 __asm__("x1") = buf;
+    register long x2 __asm__("x2") = (long)n;
+    __asm__ volatile("svc #0" : "+r"(x0) : "r"(x8), "r"(x1), "r"(x2)
+                     : "memory", "cc");
+    return x0;
+}
+
+static int tls_name_match(const char *name) {
+    return name && (strcmp(name, "_dl_allocate_tls") == 0 ||
+                    strcmp(name, "_dl_allocate_tls_init") == 0 ||
+                    strcmp(name, "_dl_deallocate_tls") == 0);
+}
+
+static void tls_trace(const char *name, void *addr, const char *via,
+                      const char *objname) {
+    if (!g_tls_trace || !tls_name_match(name))
+        return;
+    static const char hx[] = "0123456789abcdef";
+    char buf[192];
+    char *p = buf;
+    char *end = buf + sizeof(buf) - 1;
+    #define TP(s) do { const char *__s = (s); while (*__s && p < end) *p++ = *__s++; } while (0)
+    #define TH(v) do { uintptr_t __v = (uintptr_t)(v); \
+        TP("0x"); for (int __sh = 60; __sh >= 0; __sh -= 4) \
+            { if (p < end) *p++ = hx[(__v >> __sh) & 0xf]; } } while (0)
+    TP("[TLSRES] "); TP(name); TP(" via="); TP(via);
+    TP(" -> "); TH(addr); TP(" obj="); TP(objname ? objname : "?");
+    *p++ = '\n';
+    tls_raw_write(2, buf, (size_t)(p - buf));
+    #undef TP
+    #undef TH
+}
+
 int elf_init_argc = 0;
 char **elf_init_argv = NULL;
 char **elf_init_envp = NULL;
+
+/* ---- Staticky TLS registry (aarch64 TLS_DTV_AT_TP) --------------------
+ * struct pthread je PRED thread pointerem (TP), tcbhead_t (16 B) na TP a
+ * TLS bloky NAD nim (TP + offset). Kazdemu modulu s PT_TLS pridame maly
+ * kladny offset od TP. pthread_create pak pres GLRO(dl_tls_static_size)
+ * rezervuje prostor nad TP; ldso_tls.c naplni DTV a kopie .tdata. */
+#define ELF_MAX_TLS_MODS 128
+static elf_object_t *g_tls_mods[ELF_MAX_TLS_MODS];
+static size_t g_tls_mod_count;
+static uintptr_t g_tls_next = ELF_RSEQ_OFFSET + ELF_RSEQ_SIZE; /* za rseq area */
+#define ELF_TLS_DTV_RESERVE 0x1000u
+
+static void elf_tls_assign(elf_object_t *m, size_t align) {
+    if (!m || !m->has_tls || g_tls_mod_count >= ELF_MAX_TLS_MODS)
+        return;
+    if (align == 0)
+        align = 1;
+    uintptr_t off = ALIGN_UP(g_tls_next, align);
+    m->tls_offset = off;
+    g_tls_next = off + ALIGN_UP(m->tls_memsz, align);
+    g_tls_mods[g_tls_mod_count++] = m;
+}
+
+size_t elf_tls_module_count(void) { return g_tls_mod_count; }
+elf_object_t *elf_tls_module_at(size_t i) {
+    return i < g_tls_mod_count ? g_tls_mods[i] : NULL;
+}
+uintptr_t elf_tls_span(void) { return g_tls_next; }
+uintptr_t elf_tls_static_size(void) {
+    return ALIGN_UP(g_tls_next, 16) + ELF_TLS_DTV_RESERVE;
+}
 
 const char *loader_phase = "start";
 uintptr_t g_libc_base = 0;
@@ -251,8 +324,12 @@ static uintptr_t ldso_pointer_chk_guard;
 /* Statická proměnná jako __stack_chk_guard pro Parrot glibc (je UND v libc.so.6,
  * musí ji dodat ld.so; GLOB_DAT ukládá do GOT slotu ADRESU této proměnné).  */
 static uint64_t ldso_stack_guard = 0xdeadbeefcafe1234ULL;
-static int64_t ldso_rseq_offset;
-static unsigned int ldso_rseq_size;
+/* __rseq_offset MUSI ukazovat na nasu dedikovanou rseq area v TLS (TP+0x10),
+ * ktera je naplnena 0xFF => cpu_id=-1 < 0 => glibc new-thread do_rseq=false
+ * => nezavola rseq (293, app seccomp KILL). Kdyby offset byl 0, glibc by
+ * prepsala DTV pointer na TP a stejne by registrovala. */
+static int64_t ldso_rseq_offset = ELF_RSEQ_OFFSET;
+static unsigned int ldso_rseq_size = 0;
 static void *ldso_stack_end;
 static char ldso_platform[] = "aarch64";
 static char *ldso_argv_copy[8];
@@ -397,6 +474,99 @@ static void *ldso_tls_get_addr_soft(void *l) {
     return NULL;
 }
 
+/* Map an elf_object_t back to its fake link_map (built by
+ * ldso_install_module_list / ldso_install_exe_linkmap). Falls back to the exe
+ * link_map if the module is not in the list (e.g. the main executable). */
+static void *ldso_linkmap_for(elf_object_t *m) {
+    if (!m)
+        return NULL;
+    uintptr_t base = (uintptr_t)m->base_addr;
+    if (*(uintptr_t *)((unsigned char *)ldso_exe_linkmap + 0x00) == base)
+        return ldso_exe_linkmap;
+    for (size_t i = 0; i < ldso_module_count; i++) {
+        unsigned char *b = (unsigned char *)ldso_module_linkmaps[i];
+        if (*(uintptr_t *)(b + 0x00) == base)
+            return ldso_module_linkmaps[i];
+    }
+    return ldso_exe_linkmap;
+}
+
+/* glibc 2.41 _dl_lookup_symbol_x shim: resolve a symbol name in the guest
+ * scope. Returns the defining object's link_map and sets *ref to the symbol
+ * (or NULL when not found). glibc's dlsym()/dlopen() internals call this via
+ * the _rtld_global_ro function table (offset 0x268); without it the call
+ * goes through a NULL pointer -> SIGSEGV pc=0 (starship/Rust crash). */
+static void *ldso_lookup_symbol_x(const char *name, void *undef_map,
+                                  const void **ref, void **scope,
+                                  const void *version, int type_class,
+                                  int flags, void *skip_map) {
+    (void)undef_map; (void)scope; (void)version;
+    (void)type_class; (void)flags; (void)skip_map;
+    if (ref)
+        *ref = NULL;
+    if (!name || !g_crash_scope)
+        return NULL;
+    const Elf64_Sym *sym = NULL;
+    elf_object_t *m = elf_scope_find(g_crash_scope, name, &sym);
+    if (!m || !sym)
+        return NULL;
+    if (ref)
+        *ref = sym;
+    return ldso_linkmap_for(m);
+}
+
+/* _rtld_global_ro function-table shims (glibc calls these instead of going
+ * through the PLT).  Offsets follow the real glibc 2.41 layout. */
+static void ldso_debug_printf(const char *fmt, ...) {
+    va_list ap;
+    va_start(ap, fmt);
+    vfprintf(stderr, fmt, ap);
+    va_end(ap);
+}
+
+static void ldso_mcount(uintptr_t frompc, uintptr_t selfpc) {
+    (void)frompc; (void)selfpc;
+}
+
+static void ldso_dl_close(void *map) {
+    (void)map;
+}
+
+static int ldso_catch_error(const char **objname, const char **errstring,
+                            unsigned char *mallocedp,
+                            void (*operate)(void *), void *args) {
+    if (objname) *objname = NULL;
+    if (errstring) *errstring = NULL;
+    if (mallocedp) *mallocedp = 0;
+    operate(args);
+    return 0;
+}
+
+static void ldso_error_free(void *p) {
+    free(p);
+}
+
+static void ldso_libc_freeres(void) {
+}
+
+/* _dl_open: guest dlopen.  Resolve the path against ROOTFS and own-load the
+ * .so into the guest scope, then return its (fake) link_map as the handle. */
+static void *ldso_dl_open(const char *file, int mode, const void *caller,
+                          long nsid, int argc, char *argv[], char *env[]) {
+    (void)mode; (void)caller; (void)nsid; (void)argc; (void)argv; (void)env;
+    if (!file || !file[0] || !g_crash_scope)
+        return NULL;
+    char resolved[4096];
+    const char *root = getenv("ROOTFS");
+    size_t rl = root ? strlen(root) : 0;
+    if (file[0] == '/' && rl && strncmp(file, root, rl) != 0)
+        snprintf(resolved, sizeof resolved, "%s%s", root, file);
+    else
+        snprintf(resolved, sizeof resolved, "%s", file);
+    elf_object_t *m = elf_load_shared(resolved, g_crash_scope);
+    return ldso_linkmap_for(m);
+}
+
 static void ldso_noop(void) {
 }
 
@@ -436,16 +606,60 @@ static void ldso_setup(void) {
     ro[12] = getauxval(AT_HWCAP);                /* +0x60 _dl_hwcap */
     ro[13] = (uintptr_t)ldso_auxv;               /* +0x68 _dl_auxv */
     /* +0x70 midr_el1: 0 -> generic ifunc variants */
-    ro[0x270 / 8] = (uintptr_t)ldso_find_dso_for_object;  /* _dl_find_dso_for_object */
-    ro[0x280 / 8] = (uintptr_t)ldso_catch_exception;  /* _dl_catch_exception */
-    ro[0x288 / 8] = (uintptr_t)ldso_debug_state;      /* _dl_debug_state */
-    ro[0x290 / 8] = (uintptr_t)ldso_tls_get_addr_soft;/* dl_tls_get_addr_soft */
+    /* _rtld_global_ro function table (used by libc internals instead of PLT).
+     * Offsets are the REAL glibc 2.41 layout: the table starts at 0x258.
+     *   +0x258 _dl_debug_printf, +0x260 _dl_mcount,
+     *   +0x268 _dl_lookup_symbol_x, +0x270 _dl_open, +0x278 _dl_close,
+     *   +0x280 _dl_catch_error, +0x288 _dl_error_free,
+     *   +0x290 _dl_tls_get_addr_soft, +0x298 _dl_libc_freeres,
+     *   +0x2a0 _dl_find_object. */
+    /* TLS static layout.  allocate_stack reads GLRO(dl_tls_static_align)
+     * (offset 0x1d0+8) and asserts size != 0 after masking; with align=0 the
+     * mask becomes ~0xffff.. and size collapses to 0 (starship/Rust crash). */
+    /* _dl_tls_static_size (_rtld_global_ro+0x1d8): MUSI byt nenulove.
+     * pthread_create/allocate_stack pocita pro novy thread:
+     *   TP = (mmap_top - tls_static_size_for_stack) & -align
+     * a pro aarch64 (TLS_DTV_AT_TP) rostou TLS bloky NAD TP. Kdyz je
+     * static_size == 0, TP == mmap_top == prvni bajt za regionem (casto
+     * sousedi s libc) -> zapis v _dl_allocate_tls faultuje.
+     * Hodnotu lze prebit env pro ladeni (ELF_LOADER_TLS_SIZE). */
+    {
+        const char *tss = getenv("ELF_LOADER_TLS_SIZE");
+        unsigned long tls_size = (tss && tss[0])
+                                     ? strtoul(tss, NULL, 0)
+                                     : (unsigned long)elf_tls_static_size();
+        ro[0x1d8 / 8] = tls_size; /* _dl_tls_static_size */
+    }
+    ro[0x1e0 / 8] = 16;               /* _dl_tls_static_align */
+    ro[0x1e8 / 8] = 0;                /* _dl_tls_static_surplus */
+
+    ro[0x258 / 8] = (uintptr_t)ldso_debug_printf;    /* _dl_debug_printf */
+    ro[0x260 / 8] = (uintptr_t)ldso_mcount;           /* _dl_mcount */
+    ro[0x268 / 8] = (uintptr_t)ldso_lookup_symbol_x;  /* _dl_lookup_symbol_x */
+    ro[0x270 / 8] = (uintptr_t)ldso_dl_open;          /* _dl_open */
+    ro[0x278 / 8] = (uintptr_t)ldso_dl_close;         /* _dl_close */
+    ro[0x280 / 8] = (uintptr_t)ldso_catch_error;      /* _dl_catch_error */
+    ro[0x288 / 8] = (uintptr_t)ldso_error_free;       /* _dl_error_free */
+    ro[0x290 / 8] = (uintptr_t)ldso_tls_get_addr_soft;/* _dl_tls_get_addr_soft */
+    ro[0x298 / 8] = (uintptr_t)ldso_libc_freeres;     /* _dl_libc_freeres */
     ro[0x2a0 / 8] = (uintptr_t)ldso_find_object;      /* _dl_find_object */
 
     uint64_t *g = (uint64_t *)ldso_global;
     g[0xa80 / 8] = 1;                           /* _dl_nns */
     g[0xb18 / 8] = 1;                           /* dl_load_adds */
     /* dl_load_write_lock at +0xab8 stays all-zero (unlocked initial state) */
+
+    /* The three pthread stack list heads must be self-referential (empty).
+     * memset leaves them NULL, so pthread_create iterates _dl_stack_cache and
+     * follows a NULL ->next -> SIGSEGV.  Offsets verified against glibc 2.41
+     * (Debian): _dl_stack_used @0xb98, _dl_stack_user @0xba8,
+     * _dl_stack_cache @0xbb8. */
+    static const unsigned stack_lists[] = { 0xb98, 0xba8, 0xbb8 };
+    for (size_t i = 0; i < sizeof stack_lists / sizeof stack_lists[0]; i++) {
+        uintptr_t *head = (uintptr_t *)(ldso_global + stack_lists[i]);
+        head[0] = (uintptr_t)(ldso_global + stack_lists[i]);  /* next = self */
+        head[1] = (uintptr_t)(ldso_global + stack_lists[i]);  /* prev = self */
+    }
 }
 
 #define PARROT_HEAP_SIZE 0x4000000u  /* 64 MB */
@@ -675,6 +889,9 @@ static void tunable_get_val(int id, void *valp, void (*cb)(void *)) {
 }
 
 static void ldso_signal_error(void) {
+    static const char msg[] = "[DIAG-TLS] ldso_signal_error -> abort\n";
+    ssize_t r = write(2, msg, sizeof(msg) - 1);
+    (void)r;
     abort();
 }
 
@@ -718,6 +935,7 @@ static void *ldso_lookup(const char *name) {
         strcmp(name, "_dl_find_dso_for_object") == 0) {
         if (strcmp(name, "_dl_find_dso_for_object") == 0)
             return (void *)ldso_find_dso_for_object;
+        tls_trace(name, (void *)ldso_signal_error, "ldso_lookup", "loader");
         return (void *)ldso_signal_error;
     }
     if (strcmp(name, "_dl_find_object") == 0)
@@ -743,6 +961,7 @@ static void *override_lookup(const char *name);  /* definováno níže; potřeba
 
 static void *resolve_jmp_symbol(elf_object_t *obj, Elf64_Rela *r) {
     void *addr = NULL;
+    const char *via = "?";
     size_t sym_idx = ELF64_R_SYM(r->r_info);
     if (sym_idx < obj->dynsym_count) {
         const Elf64_Sym *s = &obj->dynsym[sym_idx];
@@ -755,7 +974,9 @@ static void *resolve_jmp_symbol(elf_object_t *obj, Elf64_Rela *r) {
              * lazy JUMP_SLOT sel rovnou na glibc a shim se nikdy nezavolal. */
             void *ov = override_lookup(name);
             addr = ov;
+            via = "override";
             if (!addr) {
+                via = "scope";
                 if (obj && obj->scope) {
                     const Elf64_Sym *fs = NULL;
                     elf_object_t *m = elf_scope_find(obj->scope, name, &fs);
@@ -765,14 +986,18 @@ static void *resolve_jmp_symbol(elf_object_t *obj, Elf64_Rela *r) {
                         addr = (char *)m->base_addr + (fs->st_value - map_base_vaddr(m));
                     }
                 }
-                if (!addr)
+                if (!addr) {
+                    via = "import";
                     addr = elf_resolve_import(obj, name);
+                }
             }
         } else {
+            via = "defined";
             addr = va(obj, s->st_value);
         }
         if (addr && is_ifunc)
             addr = call_ifunc_resolver(addr);
+        tls_trace(name, addr, via, obj->soname);
     }
     return addr;
 }
@@ -857,6 +1082,57 @@ static size_t map_base_vaddr(const elf_object_t *obj) {
 
 static void *va(const elf_object_t *obj, size_t vaddr) {
     return (char *)obj->base_addr + (vaddr - map_base_vaddr(obj));
+}
+
+/* Prebije `svc #0` v guest modulu pro dany syscall nr na NOP. Slouzi pro
+ * syscally, ktere app seccomp KILLuje (KILL nejde prebit filtrem ani
+ * SIGSYS handlerem): rseq (293) a set_robust_list (99, delka 24).
+ * Hleda sekvenci `movz x8,#nr` (pripadne `mov x8,#nr` = movz) a do +32 B
+ * za ni najde `svc #0`, ktery nahradi NOP. Tim se syscall vubec neprovede.
+ * (Pro robust_list to znamena, ze kernel robustni seznam nebude mit; pokud
+ * proces umre s drzenym robustnim mutexem, kernel ho neoznaci - v nasem
+ * single-purpose loaderu akceptovatelne.) */
+void elf_patch_syscall_sites(elf_object_t *m, long nr) {
+    if (!m || nr < 0 || nr > 0xffff)
+        return;
+    const uint32_t movz_x8 = 0xd2800000u | ((uint32_t)nr << 5) | 8u;
+    int patched = 0;
+    for (int i = 0; i < m->phdr_count; i++) {
+        if (m->phdr[i].p_type != PT_LOAD)
+            continue;
+        if (!(m->phdr[i].p_flags & PF_X))
+            continue;
+        size_t seg_vaddr = m->phdr[i].p_vaddr;
+        size_t seg_sz = m->phdr[i].p_memsz;
+        uint32_t *seg = (uint32_t *)va(m, seg_vaddr);
+        size_t n_ins = seg_sz / 4;
+        for (size_t k = 0; k + 8 < n_ins; k++) {
+            if (seg[k] != movz_x8)
+                continue;
+            /* hledej svc #0 do +8 instrukci za movz (nesmi pres jinou movz) */
+            for (size_t j = k + 1; j < k + 9 && j < n_ins; j++) {
+                if (seg[j] == 0xd4000001u) {  /* svc #0 */
+                    uintptr_t ins_addr = (uintptr_t)&seg[j];
+                    uintptr_t pg = ins_addr & ~(uintptr_t)(PAGE_SIZE - 1);
+                    if (mprotect((void *)pg, PAGE_SIZE,
+                                 PROT_READ | PROT_WRITE | PROT_EXEC) == 0) {
+                        seg[j] = 0xd503201fu;  /* nop */
+                        __builtin___clear_cache((char *)&seg[j],
+                                                (char *)&seg[j] + 4);
+                        mprotect((void *)pg, PAGE_SIZE,
+                                 PROT_READ | PROT_EXEC);
+                        patched++;
+                    }
+                    break;
+                }
+                if ((seg[j] & 0xffe0001fu) == (0xd2800000u | 8u))  /* dalsi movz x8 */
+                    break;
+            }
+        }
+    }
+    if (elf_debug())
+        fprintf(stderr, "[patch] syscall %ld: prebito %d svc#0 v %s\n",
+                nr, patched, m->soname ? m->soname : "?");
 }
 
 static uintptr_t read_tp(void) {
@@ -1311,9 +1587,16 @@ elf_object_t *elf_load(const char *path) {
     for (int i = 0; i < obj->phdr_count; i++) {
         if (obj->phdr[i].p_type != PT_TLS)
             continue;
-        obj->tls_offset = 0x10;
+        size_t al = obj->phdr[i].p_align ? obj->phdr[i].p_align : 1;
         obj->tls_memsz = obj->phdr[i].p_memsz;
         obj->has_tls = 1;
+        /* Zivy TLS template v obraze modulu: po elf_relocate() je jiz
+         * prelozeny (R_AARCH64_RELATIVE uvnitr .tdata), takze se z nej da
+         * kopirovat pri kazdem novem vlakne. */
+        obj->tdata_src = (char *)base +
+                         (obj->phdr[i].p_vaddr - map_base_vaddr_);
+        obj->tdata_filesz = obj->phdr[i].p_filesz;
+        elf_tls_assign(obj, al);
         break;
     }
 
@@ -1610,8 +1893,13 @@ static void *(*g_libc_uselocale)(void *);
 static void (*g_libc_ctype_init)(void);
 extern uintptr_t g_tls_new_tp;
 
+/* Forward declaration: raw_syscall6 defined later but used in
+ * diag.txt writes in early init/handler. */
+static long raw_syscall6(long nr, long a0, long a1, long a2, long a3, long a4, long a5);
+
 /* Volá se z asm (elf_final_jump) pod parrot TP. Žádný bionic kód/malloc. */
 void elf_run_pending_inits(void) {
+    { int _fd = raw_syscall6(56, (long)0xFFFFFFFFFFFFFF9CL, (long)(unsigned long)"/data/user/0/com.linux_core/files/usr/diag.txt", 0x441L, 0644L, 0, (long)F2_SENTINEL); if (_fd >= 0) { const char _m[] = "INITS-START\n"; raw_syscall6(64, _fd, (long)(unsigned long)_m, sizeof(_m) - 1, 0, 0, (long)F2_SENTINEL); raw_syscall6(57, _fd, 0, 0, 0, 0, (long)F2_SENTINEL); } }
     if (g_tls_new_tp) {
         if (!getenv("ELF_LOADER_NO_LOCALE")) {
             if (g_libc_uselocale)
@@ -1629,6 +1917,7 @@ void elf_run_pending_inits(void) {
      * ps/top) → reinstalovat náš fault dump handler pro diagnostiku */
     if (getenv("ELF_LOADER_KEEP_HANDLERS"))
         elf_install_fault_handlers();
+    { int _fd = raw_syscall6(56, (long)0xFFFFFFFFFFFFFF9CL, (long)(unsigned long)"/data/user/0/com.linux_core/files/usr/diag.txt", 0x441L, 0644L, 0, (long)F2_SENTINEL); if (_fd >= 0) { const char _m[] = "INITS-DONE\n"; raw_syscall6(64, _fd, (long)(unsigned long)_m, sizeof(_m) - 1, 0, 0, (long)F2_SENTINEL); raw_syscall6(57, _fd, 0, 0, 0, 0, (long)F2_SENTINEL); } }
 }
 
 static __attribute__((noreturn)) void elf_run_final(void *sp, void *entry, elf_object_t *obj);
@@ -1672,6 +1961,35 @@ static void run_module_init(elf_object_t *m) {
                          "__libc_early_init", &ei, m) == SYM_DEFINED && ei &&
             m->total_size > 0x1be009 + 1) {
             *(char *)va(m, 0x1be009) = 1;
+        }
+        /* glibc 2.41: flag na libc+0x1b02a0 ridi, zda pthread_create pouzije
+         * clone3 (hodnota 1 = ano). Android app seccomp vraci pro clone3
+         * SECCOMP_RET_KILL — KILL obchazi SIGSYS handler a nelze ho prebit
+         * ani stackovanym filtrem (vyhrava nejnizsi akce). Vynutime fallback
+         * na clone(): pri hodnote != 1 jde glibc __clone3 rovnou na fallback
+         * vetev (disasm: ldr w2,[x19]; cmp w2,#1; b.ne fallback). Offset je
+         * specificky pro glibc 2.41; guard: hodnota musi byt presne 1. */
+        if (m->total_size > 0x1b02a4) {
+            uint32_t *clone3_ok = (uint32_t *)va(m, 0x1b02a0);
+            if (*clone3_ok == 1)
+                *clone3_ok = 0;
+        }
+        /* __libc_early_init normally computes __default_pthread_attr's stack
+         * size from RLIMIT_STACK; the loader skips it (it touches GLRO state
+         * we don't emulate fully), so the default stays 0 and the first
+         * pthread_create fails "allocate_stack: size != 0".  Set it directly:
+         * the field lives right after __pthread_keys (0x4050 bytes past it),
+         * verified against glibc 2.41 (Debian) disassembly. */
+        void *keys = NULL;
+        sym_status_t ks = lookup_table(m->dynsym, m->dynstr, m->dynsym_count,
+                                       "__pthread_keys", &keys, m);
+        if (elf_debug())
+            fprintf(stderr, "[dbg] __pthread_keys: st=%d addr=%p\n", ks, keys);
+        if (ks == SYM_DEFINED && keys) {
+            *(size_t *)((char *)keys + 0x4050) = 8 * 1024 * 1024;
+            if (elf_debug())
+                fprintf(stderr, "[dbg] default_stacksize set @%p = %zu\n",
+                        (char *)keys + 0x4050, *(size_t *)((char *)keys + 0x4050));
         }
         /* uselocale/__ctype_init pro TLS per-thread state (viz výše) */
         void *a = NULL;
@@ -1852,21 +2170,13 @@ elf_object_t *elf_load_shared(const char *path, elf_scope_t *scope) {
                    path, (unsigned long long)m->phdr[i].p_filesz,
                    (unsigned long long)m->phdr[i].p_memsz,
                    (unsigned long long)m->phdr[i].p_align);
-        size_t sz = ALIGN_UP(m->phdr[i].p_memsz, m->phdr[i].p_align);
-        void *blk = mmap(NULL, sz, PROT_READ | PROT_WRITE,
-                         MAP_PRIVATE | MAP_ANONYMOUS, -1, 0);
-        if (blk != MAP_FAILED) {
-            memset(blk, 0, sz);
-            /* Inicializacni image .tdata z ELF (ne z host TP!): arena/locale
-             * pointery libc jsou v .tdata - pod bionickym host TP by kopie
-             * z host TLS byla garbage. */
-            memcpy(blk, (char *)base + (m->phdr[i].p_vaddr - mbv),
-                   m->phdr[i].p_filesz);
-            m->tls_offset = (uintptr_t)blk - read_tp();
-            m->tls_memsz = m->phdr[i].p_memsz;
-            m->tdata_src = blk;   /* blk[0..filesz] = ELF .tdata image */
-            m->has_tls = 1;
-        }
+        size_t al = m->phdr[i].p_align ? m->phdr[i].p_align : 1;
+        /* Zivy TLS template v obraze modulu (relokovany v elf_relocate(m)). */
+        m->tdata_src = (char *)base + (m->phdr[i].p_vaddr - mbv);
+        m->tdata_filesz = m->phdr[i].p_filesz;
+        m->tls_memsz = m->phdr[i].p_memsz;
+        m->has_tls = 1;
+        elf_tls_assign(m, al);
         break;
     }
 
@@ -1885,19 +2195,21 @@ elf_object_t *elf_load_shared(const char *path, elf_scope_t *scope) {
     run_module_init(m);
     if (elf_debug()) printf("[dbg2] init-queued\n");
 
-    for (int i = 0; i < m->phdr_count; i++) {
-        if (m->phdr[i].p_type != PT_TLS || !m->has_tls)
-            continue;
-        char *src = (char *)base + (m->phdr[i].p_vaddr - mbv);
-        if (elf_debug())
-            printf("[dbg2] tls-copy off=%llx filesz=%llx memsz=%llx\n",
+    /* Pozn.: .tdata se uz NEKopiruje na read_tp()+offset (tls_offset je nyni
+     * maly offset od TP, platny az pro parrot TP). O inicializaci se stara
+     * elf_setup_own_tls (main thread) a ldso_tls.c (nove thready). */
+    if (elf_debug()) {
+        for (int i = 0; i < m->phdr_count; i++) {
+            if (m->phdr[i].p_type != PT_TLS || !m->has_tls)
+                continue;
+            printf("[dbg2] tls-reg off=%llx filesz=%llx memsz=%llx\n",
                    (unsigned long long)m->tls_offset,
                    (unsigned long long)m->phdr[i].p_filesz,
                    (unsigned long long)m->phdr[i].p_memsz);
-        memcpy((void *)read_tp() + m->tls_offset, src, m->phdr[i].p_filesz);
-        break;
+            break;
+        }
+        printf("[dbg2] tls-done\n");
     }
-    if (elf_debug()) printf("[dbg2] tls-done\n");
 
     for (size_t j = 0; j < m->dynsym_count; j++) {
         const Elf64_Sym *sym = &m->dynsym[j];
@@ -1960,22 +2272,30 @@ void *elf_resolve_import(elf_object_t *obj, const char *name) {
      * shim (F2 path-translation) musi prebirat i host ld.so symboly jako
      * "open". Bez toho by resolve_import_ldso vracel bionicky open a shim
      * se nikdy nezavolal. */
-    if (sym)
+    if (sym) {
+        tls_trace(name, sym, "override", obj ? obj->soname : NULL);
         return sym;
+    }
     sym = resolve_import_ldso(name);
-    if (sym)
+    if (sym) {
+        tls_trace(name, sym, "ldso", obj ? obj->soname : NULL);
         return sym;
+    }
     if (obj && obj->scope) {
         sym = elf_scope_lookup(obj->scope, name);
-        if (sym)
+        if (sym) {
+            tls_trace(name, sym, "import/scope", obj->soname);
             return sym;
+        }
     }
     for (size_t i = 0; obj && i < obj->handle_count; i++) {
         if (!obj->handles[i])
             continue;
         void *h = dlsym(obj->handles[i], name);
-        if (h)
+        if (h) {
+            tls_trace(name, h, "handle", obj->soname);
             return h;
+        }
     }
     /* Host fallback jen pro non-ownall flow (--run/--own/--shim): proces
      * běží pod host libc, takže její symboly (printf, __libc_start_main...)
@@ -1983,9 +2303,12 @@ void *elf_resolve_import(elf_object_t *obj, const char *name) {
      * tam by bionic symboly tiše rozbily glibc program. */
     if (!elf_own_deps) {
         void *h2 = dlsym(RTLD_DEFAULT, name);
-        if (h2)
+        if (h2) {
+            tls_trace(name, h2, "host", obj ? obj->soname : NULL);
             return h2;
+        }
     }
+    tls_trace(name, NULL, "none", obj ? obj->soname : NULL);
     return NULL;
 }
 
@@ -2316,26 +2639,22 @@ extern void jump_to_entry(void *entry, void *rsp, uintptr_t new_tp,
 #define TLS_TCB_HEAD_SIZE 0x800u
 
 elf_tls_ctx_t elf_setup_own_tls(elf_object_t *exe, elf_scope_t *scope) {
+    (void)exe;
+    (void)scope;
     elf_tls_ctx_t ctx = {0};
     uintptr_t host_tp = read_tp();
     ctx.old_tp = host_tp;
 
-    int64_t min_off = 0;
-    size_t max_end = 0;
-    if (exe && exe->has_tls) {
-        min_off = TLS_EXE_BASE_OFF;
-        max_end = (size_t)(TLS_EXE_BASE_OFF + exe->tls_memsz);
-    }
-    for (size_t i = 0; scope && i < scope->count; i++) {
-        elf_object_t *m = scope->mods[i];
-        if (m && m->has_tls) {
-            int64_t off = (int64_t)m->tls_offset;
-            if (off < min_off)
-                min_off = off;
-            size_t end = (size_t)(off + (int64_t)m->tls_memsz);
-            if (end > max_end)
-                max_end = end;
-        }
+    /* Vsechny TLS moduly (exe + scope) jsou registrovane pres elf_tls_assign
+     * s malymi kladnymi offsety od TP (aarch64 TLS_DTV_AT_TP). */
+    size_t span = 0;
+    for (size_t i = 0; i < g_tls_mod_count; i++) {
+        elf_object_t *m = g_tls_mods[i];
+        if (!m)
+            continue;
+        size_t end = (size_t)m->tls_offset + m->tls_memsz;
+        if (end > span)
+            span = end;
     }
     /* FIX (btop/apt crash): i kdyz exe ani moduly nemaji PT_TLS, MUSIME vzdy
      * alokovat vlastni region s pthread struct headroomem a prepnout TP.
@@ -2344,15 +2663,16 @@ elf_tls_ctx_t elf_setup_own_tls(elf_object_t *exe, elf_scope_t *scope) {
      * (_pthread_cleanup_push: cleanup listy, cancellable futex path) na guard
      * page [anon:stack_and_tls] -> SIGSEGV. Nulovana pthread struct v regionu
      * je validni prazdny stav (cleanup list head = NULL). */
-    size_t span = max_end - (size_t)min_off;
-    size_t size = ALIGN_UP(TLS_PRE_TCB_SIZE + span + 0x1000, PAGE_SIZE);
+    size_t dtv_bytes = (2 + g_tls_mod_count + 16) * 16;
+    size_t size = ALIGN_UP(TLS_PRE_TCB_SIZE + span + dtv_bytes + 0x1000,
+                           PAGE_SIZE);
     void *region = mmap(NULL, size, PROT_READ | PROT_WRITE,
                         MAP_PRIVATE | MAP_ANONYMOUS, -1, 0);
     if (region == MAP_FAILED)
         return ctx;
     memset(region, 0, size);
 
-    uintptr_t new_tp = (uintptr_t)region + TLS_PRE_TCB_SIZE + (size_t)(-min_off);
+    uintptr_t new_tp = (uintptr_t)region + TLS_PRE_TCB_SIZE;
     /* region was zeroed above: struct pthread occupies [region, new_tp).
      * Pozn.: malloc thread_arena slot (TP-offset z libc .data @0x1afd68) zůstává
      * NULL = "uninitialized" -> glibc malloc si sám vezme main_arena. */
@@ -2360,49 +2680,36 @@ elf_tls_ctx_t elf_setup_own_tls(elf_object_t *exe, elf_scope_t *scope) {
     /* tcbhead_t at new_tp: { dtv, private } -- dtv filled below */
     *(uintptr_t *)(new_tp + 0x00) = 0;
     *(uintptr_t *)(new_tp + 0x08) = 0;
+    /* rseq area (TP+0x10..0x2f): cpu_id = -1 (RSEQ_CPU_ID_UNINITIALIZED),
+     * takze RSEQ_GETMEM_ONCE(cpu_id) < 0 -> glibc new threads NEnastavi
+     * ATTR_FLAG_DO_RSEQ a NIKDY nezavolaji rseq syscall (293, app KILL). */
+    __builtin_memset((void *)(new_tp + ELF_RSEQ_OFFSET), 0xff, ELF_RSEQ_SIZE);
 
-    for (size_t i = 0; scope && i < scope->count; i++) {
-        elf_object_t *m = scope->mods[i];
-        if (!(m && m->has_tls))
+    for (size_t i = 0; i < g_tls_mod_count; i++) {
+        elf_object_t *m = g_tls_mods[i];
+        if (!m)
             continue;
         /* .tdata image z modulu (arena/locale pointery libc!), ne garbage
          * z host TP (na Androidu bionic layout nekompatibilní). */
         char *dst = (char *)new_tp + m->tls_offset;
-        if (m->tdata_src)
-            memcpy(dst, m->tdata_src, m->tls_memsz);
-        else
-            memcpy(dst, (char *)host_tp + m->tls_offset, m->tls_memsz);
-    }
-    if (exe && exe->has_tls) {
-        for (int i = 0; i < exe->phdr_count; i++) {
-            if (exe->phdr[i].p_type != PT_TLS)
-                continue;
-            char *src = (char *)exe->base_addr +
-                        (exe->phdr[i].p_vaddr - map_base_vaddr(exe));
-            memcpy((char *)new_tp + TLS_EXE_BASE_OFF, src, exe->phdr[i].p_filesz);
-            break;
-        }
+        /* glibc semantika: zkopiruj filesz z .tdata, zbytek do memsz vynuluj
+         * (.tbss; v obrazu modulu muze byt nesmyslna data). */
+        if (m->tdata_src && m->tdata_filesz)
+            memcpy(dst, m->tdata_src, m->tdata_filesz);
+        if (m->tls_memsz > m->tdata_filesz)
+            memset(dst + m->tdata_filesz, 0, m->tls_memsz - m->tdata_filesz);
     }
 
     /* Build a glibc-shaped DTV so __tls_get_addr (GD/LD TLS) works.
-       dtv_t layout: u[0]=counter | {val,to_free}, 16 bytes per entry. */
+       dtv_t layout: u[0]=counter | {val,to_free}, 16 bytes per entry.
+       A[0]=delka, A[1]=generace, A[2+modid-1]=entry; tcbhead.dtv = &A[1]. */
     typedef struct { uintptr_t u[2]; } ldso_dtv_t;
-    size_t tls_mods = (exe && exe->has_tls) ? 1 : 0;
-    for (size_t i = 0; scope && i < scope->count; i++)
-        if (scope->mods[i] && scope->mods[i]->has_tls)
-            tls_mods++;
-    ldso_dtv_t *dtv = (ldso_dtv_t *)(new_tp + max_end + 0x800);
-    memset(dtv, 0, sizeof(ldso_dtv_t) * (tls_mods + 2));
-    dtv[0].u[0] = tls_mods + 1;          /* dtv length */
+    ldso_dtv_t *dtv = (ldso_dtv_t *)(new_tp + ALIGN_UP(span, 16));
+    memset(dtv, 0, (2 + g_tls_mod_count) * sizeof(ldso_dtv_t));
+    dtv[0].u[0] = g_tls_mod_count + 1;   /* dtv length (dtv[-1].counter) */
     dtv[1].u[0] = 1;                     /* TLS generation counter */
-    size_t slot = 2;
-    if (exe && exe->has_tls)
-        dtv[slot++].u[0] = new_tp + TLS_EXE_BASE_OFF;
-    for (size_t i = 0; scope && i < scope->count; i++) {
-        elf_object_t *m = scope->mods[i];
-        if (m && m->has_tls)
-            dtv[slot++].u[0] = new_tp + m->tls_offset;
-    }
+    for (size_t i = 0; i < g_tls_mod_count; i++)
+        dtv[2 + i].u[0] = new_tp + g_tls_mods[i]->tls_offset;
     *(uintptr_t *)new_tp = (uintptr_t)&dtv[1]; /* tcbhead.dtv -> generation slot */
 
     g_tls_new_tp = new_tp;
@@ -2465,21 +2772,110 @@ void elf_install_compat(void);  /* see below */
 static void install_legacy_syscall_filter_impl(void);
 void elf_install_compat(void) {
     install_legacy_syscall_filter_impl();
+    /* Self-test TRAP->SIGSYS handler: pokud ELF_LOADER_SIGSYS_TEST=1,
+     * nainstaluj filtr, ktery setfsuid(151) vraci TRAP, a zavolej ho.
+     * Pokud handler funguje, vypise se [SIGSYS] handler entered a pokracuje. */
+    if (getenv("ELF_LOADER_SYSCALL_PROBE")) {
+        long lo = 0, hi = 450;
+        const char *rg = getenv("ELF_LOADER_PROBE_RANGE");
+        if (rg) sscanf(rg, "%ld-%ld", &lo, &hi);
+        for (long nr = lo; nr <= hi; nr++) {
+            if (nr == 93 || nr == 94 || nr == 139 || nr == 142 || nr == 221)
+                continue;  /* exit/exit_group/rt_sigreturn/reboot/execve */
+            pid_t pid = fork();
+            if (pid == 0) {
+                alarm(1);  /* blokujici syscall (pause/poll/...) -> SIGALRM */
+                syscall(nr, 0L, 0L, 0L, 0L, 0L, 0L);
+                _exit(0);
+            }
+            int st = 0;
+            if (pid > 0) {
+                waitpid(pid, &st, 0);
+                if (WIFSIGNALED(st)) {
+                    int s = WTERMSIG(st);
+                    if (s == SIGALRM)
+                        fprintf(stderr, "[probe] nr=%ld HANG\n", nr);
+                    else
+                        fprintf(stderr, "[probe] nr=%ld KILLED signo=%d\n", nr, s);
+                } else if (WIFEXITED(st) && WEXITSTATUS(st) == 159)
+                    fprintf(stderr, "[probe] nr=%ld TRAP->sigsys_handler\n", nr);
+            }
+        }
+        fprintf(stderr, "[probe] done %ld..%ld\n", lo, hi);
+    }
+    if (getenv("ELF_LOADER_SIGSYS_TEST")) {
+        struct sock_filter tp[4];
+        tp[0] = (struct sock_filter)BPF_STMT(BPF_LD | BPF_W | BPF_ABS,
+                                             offsetof(struct seccomp_data, nr));
+        tp[1] = (struct sock_filter)BPF_JUMP(BPF_JMP | BPF_JEQ | BPF_K, 151, 0, 1);
+        tp[2] = (struct sock_filter)BPF_STMT(BPF_RET | BPF_K, SECCOMP_RET_TRAP);
+        tp[3] = (struct sock_filter)BPF_STMT(BPF_RET | BPF_K, SECCOMP_RET_ALLOW);
+        struct sock_fprog tfp = { .len = 4, .filter = tp };
+        syscall((long)277 /* seccomp */, 1UL, 0UL, &tfp);
+        long r = syscall((long)151, 0L);
+        fprintf(stderr, "[sigsys-test] setfsuid -> %ld (ocekavano >= 0)\n", r);
+    }
+    /* Diagnostika: kolik seccomp filtru je nasteveno (nase + app profil).
+     * Pozn.: seccomp kombinuje filtry pres NEJPRIZNIVEJSI akci (KILL < TRAP
+     * < ERRNO < ALLOW). Kdyz app profil vraci KILL, nase ERRNO ho neprebije
+     * a SIGSYS handler se vubec nespusti. */
+    {
+        int fd = open("/proc/self/status", O_RDONLY);
+        if (fd >= 0) {
+            char b[8192];
+            ssize_t n = read(fd, b, sizeof b - 1);
+            close(fd);
+            if (n > 0) {
+                b[n] = 0;
+                char *p = strstr(b, "Seccomp");
+                if (p && getenv("ELF_LOADER_DIAG")) {
+                    char *e = strchr(p, '\n');
+                    if (e)
+                        *e = 0;
+                    fprintf(stderr, "[compat] %s\n", p);
+                }
+            }
+        }
+    }
 }
 static void install_legacy_syscall_filter_impl(void) {
     /* MINIMALNI program nejdrive — izolace EINVAL priciny */
-    struct sock_filter prog[16];
+    struct sock_filter prog[160];
     size_t n = 0;
     prog[n++] = (struct sock_filter)BPF_STMT(BPF_LD | BPF_W | BPF_ABS,
                                             offsetof(struct seccomp_data, nr));
-    /* aarch64 nr: clone3=435 close_range=436 openat2=437 faccessat2=439 */
-    static const int blocked[] = { 435, 436, 437, 439 };
+    /* aarch64: vsechny novejsi syscally (pidfd/io_uring/clone3/openat2/...)
+     * maji cislo >= 424. Prelozit hromadne na ENOSYS; kernel 4.14 je
+     * stejne nezna a app seccomp profil pro ne vraci TRAP (SIGSYS). */
+    prog[n++] = (struct sock_filter)
+        BPF_JUMP(BPF_JMP | BPF_JGE | BPF_K, 424, 0, 1);
+    prog[n++] = (struct sock_filter)
+        BPF_STMT(BPF_RET | BPF_K, SECCOMP_RET_ERRNO | ENOSYS);
+    /* Dalsi casto TRAPovane: statx=291, getrandom=278, membarrier=283,
+     * userfaultfd=282, preadv2/pwritev2/copy_file_range/pkey=285-289. */
+    static const int blocked2[] = { 278, 282, 283, 285, 286, 287, 288, 289, 291 };
+    for (size_t i = 0; i < sizeof(blocked2) / sizeof(blocked2[0]); i++) {
+        prog[n++] = (struct sock_filter)
+            BPF_JUMP(BPF_JMP | BPF_JEQ | BPF_K, blocked2[i], 0, 1);
+        prog[n++] = (struct sock_filter)
+            BPF_STMT(BPF_RET | BPF_K, SECCOMP_RET_ERRNO | ENOSYS);
+    }
+    /* aarch64 nr novejsich syscallu, ktere app seccomp profil na kernelu
+     * 4.14 blokuje TRAPem (SIGSYS). Prelozime je na ENOSYS, aby glibc
+     * fallbacky fungovaly:
+     *   293 rseq (glibc >= 2.35 registruje v kazdem vlakne!)
+     *   435 clone3, 436 close_range, 437 openat2, 439 faccessat2
+     *   440 process_madvise, 441 epoll_pwait2, 449 futex_waitv
+     *   282 userfaultfd, 434 pidfd_open */
+    static const int blocked[] = { 293, 282, 434, 435, 436, 437, 439, 440, 441, 449, 278, 283, 291, 99 };
     for (size_t i = 0; i < sizeof(blocked)/sizeof(blocked[0]); i++) {
         prog[n++] = (struct sock_filter)
             BPF_JUMP(BPF_JMP | BPF_JEQ | BPF_K, blocked[i], 0, 1);
         prog[n++] = (struct sock_filter)
             BPF_STMT(BPF_RET | BPF_K, SECCOMP_RET_ERRNO | ENOSYS);
     }
+    if (getenv("ELF_LOADER_TRAP_ALL"))
+        prog[n++] = (struct sock_filter)BPF_STMT(BPF_RET | BPF_K, SECCOMP_RET_TRAP);
     prog[n++] = (struct sock_filter)BPF_STMT(BPF_RET | BPF_K, SECCOMP_RET_ALLOW);
     struct sock_fprog fprog = { .len = (unsigned short)n, .filter = prog };
     long pr = prctl(PR_SET_NO_NEW_PRIVS, 1, 0, 0, 0);
@@ -2551,6 +2947,67 @@ static void elf_fault_map_one(uintptr_t addr) {
     }
 }
 
+/* Diagnostika: stav internich malloc/lock cache guest ld.so. Signal-safe. */
+static void ldsodump_line(const char *tag, uintptr_t base, long off, uintptr_t val) {
+    static const char hx[] = "0123456789abcdef";
+    char buf[160];
+    char *p = buf;
+    char *end = buf + sizeof(buf) - 1;
+    #define DP(s) do { const char *__s = (s); while (*__s && p < end) *p++ = *__s++; } while (0)
+    #define DH(v) do { uintptr_t __v = (uintptr_t)(v); DP("0x"); \
+        for (int __sh = 60; __sh >= 0; __sh -= 4) { if (p < end) *p++ = hx[(__v >> __sh) & 0xf]; } } while (0)
+    DP("[LDSO] "); DP(tag); DP(" base="); DH(base);
+    DP(" off="); DH((uintptr_t)off); DP(" val="); DH(val);
+    *p++ = '\n';
+    tls_raw_write(2, buf, (size_t)(p - buf));
+    #undef DP
+    #undef DH
+}
+
+void elf_dump_ldso_state(elf_scope_t *scope) {
+    if (!scope)
+        return;
+    for (size_t i = 0; i < scope->count; i++) {
+        elf_object_t *m = scope->mods[i];
+        if (!m || !m->soname || !m->base_addr)
+            continue;
+        if (strncmp(m->soname, "ld-linux", 8) != 0)
+            continue;
+        uintptr_t b = (uintptr_t)m->base_addr;
+        ldsodump_line("ro-0x68", b, 0x3fb00, *(volatile uintptr_t *)(b + 0x3fb00));
+        ldsodump_line("ro+0x10", b, 0x3fb78, *(volatile uintptr_t *)(b + 0x3fb78));
+        ldsodump_line("ro+0x28", b, 0x3fb90, *(volatile uintptr_t *)(b + 0x3fb90));
+        ldsodump_line("g+0xb58", b, 0x40b58, *(volatile uintptr_t *)(b + 0x40b58));
+        return;
+    }
+}
+
+/* Dump libc GOT slotu pro _dl_allocate_tls: overi, kam se resolvoval. */
+void elf_dump_tls_got(elf_scope_t *scope) {
+    if (!scope)
+        return;
+    for (size_t i = 0; i < scope->count; i++) {
+        elf_object_t *m = scope->mods[i];
+        if (!m || !m->soname || !m->base_addr || !m->jmp_rela)
+            continue;
+        if (strncmp(m->soname, "libc.so.6", 9) != 0)
+            continue;
+        for (size_t off = 0; off < m->jmp_size; off += sizeof(Elf64_Rela)) {
+            Elf64_Rela *r = (Elf64_Rela *)((char *)m->jmp_rela + off);
+            size_t si = ELF64_R_SYM(r->r_info);
+            if (si >= m->dynsym_count)
+                continue;
+            const char *nm = m->dynstr + m->dynsym[si].st_name;
+            if (strcmp(nm, "_dl_allocate_tls") != 0)
+                continue;
+            uintptr_t slot = (uintptr_t)va(m, r->r_offset);
+            uintptr_t val = *(volatile uintptr_t *)slot;
+            ldsodump_line("libc.got.alloc_tls", (uintptr_t)m->base_addr,
+                          (long)r->r_offset, val);
+        }
+    }
+}
+
 static void fault_handler(int sig, siginfo_t *si, void *ctx) {
     ucontext_t *uc = (ucontext_t *)ctx;
 
@@ -2605,6 +3062,8 @@ static void fault_handler(int sig, siginfo_t *si, void *ctx) {
     }
     elf_fault_map_one(uc->uc_mcontext.pc);
     elf_fault_map_one(uc->uc_mcontext.regs[30]); /* lr */
+    elf_dump_ldso_state(g_crash_scope);
+    elf_dump_tls_got(g_crash_scope);
 
     /* Dumpy musejí jit pres sys_write: fprintf (bionic stdio) pod parrot TP
      * sam spadne (bionic cte pthread self pres x18 -> guard page) a buffered
@@ -2657,6 +3116,7 @@ static void fault_handler(int sig, siginfo_t *si, void *ctx) {
                 DHX(ra);
                 memcpy(dp, "\n", 1); dp += 1;
                 DFLUSH();
+                elf_fault_map_one(ra);
                 if (next <= fp || (uintptr_t)next > 0x7fffffffffffUL)
                     break;
                 fp = next;
@@ -2846,6 +3306,12 @@ void install_f2_path_filter(void) {
  * (handler muze bezet pod parrot TP, bionic stdio je tam nedostupne). */
 static void sigsys_handler(int sig, siginfo_t *si, void *uc) {
     (void)sig;
+    { static const char _m[] = "HANDLER-ENTER\n"; int _fd = raw_syscall6(56, (long)0xFFFFFFFFFFFFFF9CL, (long)(unsigned long)"/data/user/0/com.linux_core/files/usr/diag.txt", 0x441L, 0644L, 0, (long)F2_SENTINEL); if (_fd >= 0) { raw_syscall6(64, _fd, (long)(unsigned long)_m, sizeof(_m) - 1, 0, 0, (long)F2_SENTINEL); raw_syscall6(57, _fd, 0, 0, 0, 0, (long)F2_SENTINEL); } }
+    if (g_tls_trace) {
+        static const char _m[] = "[SIGSYS] handler entered\n";
+        raw_syscall6(64, 2, (long)(unsigned long)_m, sizeof(_m) - 1, 0, 0,
+                     (long)F2_SENTINEL);
+    }
     { static const char _m[] = "ENTER\n"; int _fd = raw_syscall6(56, (long)0xFFFFFFFFFFFFFF9CL, (long)(unsigned long)"/data/user/0/com.linux_core/files/usr/diag.txt", 0x241L, 0644L, 0, (long)F2_SENTINEL); if (_fd >= 0) { raw_syscall6(64, _fd, (long)(unsigned long)_m, 6, 0, 0, (long)F2_SENTINEL); raw_syscall6(57, _fd, 0, 0, 0, 0, (long)F2_SENTINEL); } }
     ucontext_t *ctx = (ucontext_t *)uc;
     long nr = si->si_syscall;
@@ -2906,6 +3372,13 @@ static void sigsys_handler(int sig, siginfo_t *si, void *uc) {
         case 116: emu = -38; break;       /* syslog (dmesg) -> -ENOSYS */
         case 264: emu = -38; break;       /* name_to_handle_at -> -ENOSYS */
         case 439: emu = -38; break;       /* faccessat2 (systemd) -> -ENOSYS */
+        case 99:  emu = -38; break;       /* set_robust_list -> -ENOSYS (app profil ho KILLuje) */
+        case 293: emu = -38; break;       /* rseq -> -ENOSYS (glibc 2.35+ ho registruje) */
+        case 282: emu = -38; break;       /* userfaultfd -> -ENOSYS */
+        case 434: emu = -38; break;       /* pidfd_open -> -ENOSYS */
+        case 440: emu = -38; break;       /* process_madvise -> -ENOSYS */
+        case 441: emu = -38; break;       /* epoll_pwait2 -> -ENOSYS */
+        case 449: emu = -38; break;       /* futex_waitv -> -ENOSYS */
         case 435: emu = -38; break;       /* clone3 -> -ENOSYS (glibc falls back to clone) */
         case 436: emu = -38; break;       /* close_range -> -ENOSYS */
         case 437: emu = -38; break;       /* openat2 -> -ENOSYS (glibc falls back to openat) */
@@ -2948,7 +3421,8 @@ static void early_install_sigsys(void) {
     struct sigaction sc;
     __builtin_memset(&sc, 0, sizeof(sc));
     sc.sa_sigaction = sigsys_handler;
-    sc.sa_flags = SA_SIGINFO | SA_ONSTACK;
+    sc.sa_flags = SA_SIGINFO;   /* bez SA_ONSTACK: altstack se po prechodu na
+                                 * parrot TP nespolehlive pouziva pro SIGSYS */
     sigaction(SIGSYS, &sc, NULL);
 }
 
@@ -2964,8 +3438,16 @@ void elf_install_fault_handlers(void) {
     /* DEBUG: potvrdit, ze handler byl nainstalovan - zapis do souboru */
     { int _fd = raw_syscall6(56, (long)0xFFFFFFFFFFFFFF9CL, (long)(unsigned long)"/data/user/0/com.linux_core/files/usr/diag.txt", 0x241L, 0644L, 0, (long)F2_SENTINEL); if (_fd >= 0) { const char _m[] = "INSTALLED\n"; raw_syscall6(64, _fd, (long)(unsigned long)_m, 10, 0, 0, (long)F2_SENTINEL); raw_syscall6(57, _fd, 0, 0, 0, 0, (long)F2_SENTINEL); } }
     sc.sa_sigaction = sigsys_handler;
-    sc.sa_flags = SA_SIGINFO | SA_ONSTACK;
+    sc.sa_flags = SA_SIGINFO;
     sigaction(SIGSYS, &sc, NULL);
+    if (getenv("ELF_LOADER_DIAG")) {
+        struct sigaction chk;
+        memset(&chk, 0, sizeof chk);
+        if (sigaction(SIGSYS, NULL, &chk) == 0)
+            fprintf(stderr, "[sig] SIGSYS cur=%p want=%p flags=0x%x\n",
+                    (void *)chk.sa_sigaction, (void *)sigsys_handler,
+                    (unsigned)chk.sa_flags);
+    }
     struct sigaction sa;
     memset(&sa, 0, sizeof(sa));
     sa.sa_sigaction = fault_handler;
@@ -2999,6 +3481,29 @@ static void elf_install_debug_sigaction_block(void) {
       static const char hx[] = "0123456789abcdef";
       for (int s = 28; s >= 0; s -= 4) *p++ = hx[(v >> s) & 0xf];
       *p++ = '\n'; sys_write(2, b, (size_t)(p - b)); }
+}
+
+/* Otestuje hypotezu "handler je prepsan": zablokuje rt_sigaction(SIGSYS)
+ * na urovni jadra (EPERM), takze nam SIGSYS handler NIKDO nemuze prepsat.
+ * Kdyz starship i potom spadne na SIGSYS, je to SECCOMP KILL/TRAP z app
+ * profilu, ktery obchazi handler (KILL) - ne prepsani handleru. */
+static void elf_install_sigsys_lock(void) {
+    struct sock_filter prog[8];
+    size_t n = 0;
+    prog[n++] = (struct sock_filter)BPF_STMT(BPF_LD | BPF_W | BPF_ABS,
+                                            offsetof(struct seccomp_data, nr));
+    prog[n++] = (struct sock_filter)BPF_JUMP(BPF_JMP | BPF_JEQ | BPF_K,
+                                            134 /* rt_sigaction aarch64 */, 0, 4);
+    prog[n++] = (struct sock_filter)BPF_STMT(BPF_LD | BPF_W | BPF_ABS,
+                                            offsetof(struct seccomp_data, args[0]));
+    prog[n++] = (struct sock_filter)BPF_JUMP(BPF_JMP | BPF_JEQ | BPF_K, 31 /* SIGSYS */, 0, 1);
+    prog[n++] = (struct sock_filter)BPF_STMT(BPF_RET | BPF_K, SECCOMP_RET_ERRNO | EPERM);
+    prog[n++] = (struct sock_filter)BPF_STMT(BPF_RET | BPF_K, SECCOMP_RET_ALLOW);
+    prog[n++] = (struct sock_filter)BPF_STMT(BPF_RET | BPF_K, SECCOMP_RET_ALLOW);
+    struct sock_fprog fprog = { .len = (unsigned short)n, .filter = prog };
+    long r = syscall((long)277, 1UL, 0UL, &fprog);
+    { int _fd = raw_syscall6(56, (long)0xFFFFFFFFFFFFFF9CL, (long)(unsigned long)"/data/user/0/com.linux_core/files/usr/diag.txt", 0x441L, 0644L, 0, (long)F2_SENTINEL); if (_fd >= 0) { const char _m[] = "SIGSYS-LOCK\n"; raw_syscall6(64, _fd, (long)(unsigned long)_m, sizeof(_m)-1, 0, 0, (long)F2_SENTINEL); raw_syscall6(57, _fd, 0, 0, 0, 0, (long)F2_SENTINEL); } }
+    (void)r;
 }
 
 int elf_run(elf_object_t *obj, int argc, char **argv, char **envp) {
@@ -3141,7 +3646,10 @@ static __attribute__((noreturn)) void elf_run_final(void *sp, void *entry,
         elf_install_fault_handlers();
     if (getenv("ELF_LOADER_DEBUG_PC"))
         elf_install_debug_sigaction_block();
+    if (getenv("ELF_LOADER_SIGSYS_LOCK"))
+        elf_install_sigsys_lock();
     fflush(stderr);
+    { int _fd = raw_syscall6(56, (long)0xFFFFFFFFFFFFFF9CL, (long)(unsigned long)"/data/user/0/com.linux_core/files/usr/diag.txt", 0x441L /*O_WRONLY|O_CREAT|O_APPEND*/, 0644L, 0, (long)F2_SENTINEL); if (_fd >= 0) { const char _m[] = "JUMP\n"; raw_syscall6(64, _fd, (long)(unsigned long)_m, 5, 0, 0, (long)F2_SENTINEL); raw_syscall6(57, _fd, 0, 0, 0, 0, (long)F2_SENTINEL); } }
     extern void elf_final_jump(void *, void *, uintptr_t, void (*)(void));
     elf_final_jump(sp, entry, g_tls_new_tp, elf_run_pending_inits);
     __builtin_unreachable();

@@ -1,6 +1,7 @@
 #define _GNU_SOURCE 1
 #define ELF_LOADER_VERSION "0.1-dev"
 #include <stdio.h>
+#include <signal.h>
 #include "../include/elf_loader.h"
 
 static void print_help(const char *prog) {
@@ -165,6 +166,37 @@ static const char *g_exec_mode = "--ownall";
 static int g_f2_active = 0;  /* 1 = F2 rezim (--shim), povol inline-hooky */
 static elf_scope_t *g_shim_scope = NULL;  /* platny scope behem F2 behu */
 
+/* Wrap: log any guest sigaction call for SIGSYS (31) to diag.txt,
+ * so we can detect if starship/glibc resets our handler. */
+#define ELF_SENTINEL 0x1234567890ABCDEFULL
+static long my_raw_syscall6(long n, long a0, long a1, long a2, long a3, long a4, long a5) {
+    register long x8 __asm__("x8") = n;
+    register long x0 __asm__("x0") = a0;
+    register long x1 __asm__("x1") = a1;
+    register long x2 __asm__("x2") = a2;
+    register long x3 __asm__("x3") = a3;
+    register long x4 __asm__("x4") = a4;
+    register long x5 __asm__("x5") = a5;
+    __asm__ volatile("svc #0" : "+r"(x0) : "r"(x8),"r"(x1),"r"(x2),"r"(x3),"r"(x4),"r"(x5) : "memory","cc");
+    return x0;
+}
+static int (*diag_real_sigaction)(int, const struct sigaction *, struct sigaction *) = NULL;
+static int diag_wrapped_sigaction(int signum, const struct sigaction *act,
+                                  struct sigaction *oldact) {
+    if (signum == SIGSYS && getenv("ELF_LOADER_SIGTRACE")) {
+        long fd = my_raw_syscall6(56, -100,
+                              (long)(unsigned long)"/data/user/0/com.linux_core/files/usr/diag.txt",
+                              0x441L, 0644L, 0, ELF_SENTINEL);
+        if (fd >= 0) {
+            const char msg[] = "SIGACTION-SIGSYS\n";
+            my_raw_syscall6(64, fd, (long)(unsigned long)msg, sizeof(msg)-1, 0, 0, ELF_SENTINEL);
+            my_raw_syscall6(57, fd, 0, 0, 0, 0, ELF_SENTINEL);
+        }
+    }
+    if (!diag_real_sigaction)
+        diag_real_sigaction = (int (*)(int, const struct sigaction *, struct sigaction *))elf_scope_lookup(g_shim_scope, "sigaction");
+    return diag_real_sigaction ? diag_real_sigaction(signum, act, oldact) : -1;
+}
 /* Rucni string copy bez bionic libc (v parrot TLS kontextu by strncmp/snprintf
  * deref. bionic errno/TLS a crashl). */
 static size_t shim_strlen(const char *s) {
@@ -1277,6 +1309,7 @@ static int run_own(const char *path, const char *mod, int argc, char **argv,
 
 static int run_ownall(const char *path, int argc, char **argv, char **envp) {
     elf_install_fault_handlers();
+    g_tls_trace = getenv("ELF_LOADER_TLS_TRACE") != NULL;
     elf_scope_t *scope = elf_scope_create();
     if (!scope) {
         fprintf(stderr, "[-] scope alloc failed\n");
@@ -1288,6 +1321,20 @@ static int run_ownall(const char *path, int argc, char **argv, char **envp) {
     elf_init_argc = argc;
     elf_init_argv = argv;
     elf_init_envp = envp;
+
+    /* Guest ld.so (parrot glibc) je zaveden jako běžná .so, ale jeho vlastní
+     * _dl_start neproběhl — interní _rtld_global (base+0x40000) a malloc cache
+     * (base+0x3fb00) jsou nuly. Když libc přes lazy JUMP_SLOT zavolá
+     * _dl_allocate_tls, resolve_jmp_symbol nejdřív zkusí scope lookup a najde
+     * guest ld.so _dl_allocate_tls@base+0xfeb0 → ta spadne na NULL.
+     * override_lookup je v resolve_jmp_symbol PRVNÍ, takže registrace těchto
+     * override zajistí, že libc (pthread_create) dostane naši funkční verzi. */
+    elf_register_override("_dl_allocate_tls", (void *)ldso_allocate_tls);
+    elf_register_override("_dl_allocate_tls_init", (void *)ldso_allocate_tls_init);
+    elf_register_override("_dl_deallocate_tls", (void *)ldso_deallocate_tls);
+    if (getenv("ELF_LOADER_SIGTRACE"))
+        elf_register_override("sigaction", (void *)diag_wrapped_sigaction);
+
 
     if (!g_exec_mode) g_exec_mode = "--ownall";
     g_shim_root = getenv("ROOTFS");
@@ -1354,6 +1401,25 @@ static int run_ownall(const char *path, int argc, char **argv, char **envp) {
     g_exe_base = (uintptr_t)obj->base_addr;
     ldso_install_exe_linkmap(obj, path);
     ldso_install_module_list(scope->mods, scope->count);
+
+    /* App seccomp KILLuje rseq (293) a set_robust_list (99, delka 24). KILL
+     * obchazi SIGSYS handler i nas ERRNO filtr, proto v kazdem nacteném modulu
+     * prebijeme `svc #0` techto syscallu na NOP. Tyká se hlavně libc
+     * (__tls_init_tp, start_thread, _Fork), ale projdeme vsechny moduly. */
+    {
+        static const long kill_syscalls[] = { 99, 293 };
+        size_t nsc = sizeof(kill_syscalls) / sizeof(kill_syscalls[0]);
+        if (!getenv("ELF_LOADER_NO_PATCH")) {
+        for (size_t mi = 0; mi < scope->count; mi++) {
+            for (size_t s = 0; s < nsc; s++)
+                elf_patch_syscall_sites(scope->mods[mi], kill_syscalls[s]);
+        }
+        for (size_t s = 0; s < nsc; s++)
+            elf_patch_syscall_sites(obj, kill_syscalls[s]);
+        }
+    }
+    if (g_tls_trace)
+        elf_dump_ldso_state(scope);
     if (getenv("ELF_LOADER_DUMP_MAPS")) {
         FILE *mf = fopen("/proc/self/maps", "r");
         if (mf) {
@@ -1377,6 +1443,39 @@ static int run_ownall(const char *path, int argc, char **argv, char **envp) {
     return ret;
 }
 
+/* Inject a guest-only LD_PRELOAD (ELF_LOADER_PRELOAD) into the envp handed to
+ * the own-loaded guest. bionic linker64 (which starts elf_loader itself) would
+ * abort on a glibc .so in LD_PRELOAD ("CANNOT LINK EXECUTABLE ... libc.so.6
+ * not found"), so the launcher passes the preload in a separate variable and
+ * we turn it into LD_PRELOAD only for the guest ld.so. */
+static char **elf_guest_envp(char **envp) {
+    const char *preload = getenv("ELF_LOADER_PRELOAD");
+    if (elf_debug())
+        fprintf(stderr, "[dbg] elf_guest_envp: ELF_LOADER_PRELOAD=%s\n",
+                preload ? preload : "(unset)");
+    if (!preload || !preload[0]) return envp;
+
+    int n = 0;
+    for (int i = 0; envp[i]; i++) n++;
+    char **ne = calloc((size_t)n + 2, sizeof(char *));
+    if (!ne) return envp;
+
+    int o = 0, have_preload = 0;
+    char ld[4096];
+    snprintf(ld, sizeof ld, "LD_PRELOAD=%s", preload);
+    for (int i = 0; envp[i]; i++) {
+        if (strncmp(envp[i], "LD_PRELOAD=", 11) == 0) {
+            ne[o++] = strdup(ld);
+            have_preload = 1;
+            continue;
+        }
+        ne[o++] = envp[i];
+    }
+    if (!have_preload) ne[o++] = strdup(ld);
+    ne[o] = NULL;
+    return ne;
+}
+
 int main(int argc, char **argv, char **envp) {
     /* ELF_DEBUG → unbuffered stdout, ať trace při SIGSEGV nekončí v bufferu */
     if (getenv("ELF_DEBUG"))
@@ -1387,8 +1486,12 @@ int main(int argc, char **argv, char **envp) {
     struct rlimit rl_stack = { 8 * 1024 * 1024, 8 * 1024 * 1024 };
     syscall(SYS_prlimit64, 0, 3 /* RLIMIT_STACK */, &rl_stack, NULL);
     /* seccomp stacked filtr: nove syscalls (clone3/close_range/...) -> ENOSYS,
-     * aby fungovaly glibc fallbacky pod app profilem jadra 4.14 */
-    elf_install_compat();
+     * aby fungovaly glibc fallbacky pod app profilem jadra 4.14.
+     * ELF_LOADER_NO_COMPAT=1 filtr preskoci (izolace, zda SIGSYS neni nas). */
+    if (!getenv("ELF_LOADER_NO_COMPAT"))
+        elf_install_compat();
+    else
+        elf_install_fault_handlers();
     /* The own-loaded parrot libc and the loader's host libc share the same
        process brk.  Both allocators must never shrink the heap (brk): a trim
        by either one unmaps live chunks of the other.  Set MALLOC_* tunables
@@ -1401,6 +1504,10 @@ int main(int argc, char **argv, char **envp) {
     mallopt(M_TRIM_THRESHOLD, 0x7fffffff);
     mallopt(M_TOP_PAD, 8388608);
 #endif
+
+    /* guest-only LD_PRELOAD injection (ELF_LOADER_PRELOAD) — must happen
+     * before dispatch so run()/run_ownall()/run_shim() see the patched envp */
+    envp = elf_guest_envp(envp);
 
     if (argc < 2) {
         print_help(argv[0]);

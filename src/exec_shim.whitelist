@@ -1,0 +1,5 @@
+# exec_shim whitelist — one binary name (or full path) per line.
+# Empty lines and lines starting with '#' are ignored.
+#
+# For now only starship is redirected through elf_loader.
+starship
