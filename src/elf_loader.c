@@ -2030,16 +2030,36 @@ static int load_module_needed(elf_object_t *m, elf_scope_t *scope) {
 
     char *search = build_search(m->origin_dir ? m->origin_dir : ".");
     if (elf_own_deps) {
-        char *dl = derive_distro_libdirs(m->origin_dir ? m->origin_dir : "");
-        char *osearch;
-        if (dl) {
-            osearch = malloc(strlen(dl) + strlen(search) +
-                             strlen(sys_libdirs()) + 4);
-            sprintf(osearch, "%s:%s:%s", dl, search, sys_libdirs());
-        } else {
-            osearch = malloc(strlen(search) + strlen(sys_libdirs()) + 8);
-            sprintf(osearch, "%s:%s", search, sys_libdirs());
+        /* DT_RUNPATH / DT_RPATH modulu (s $ORIGIN). Python balicky (numpy)
+         * maji RPATH=$ORIGIN/../../numpy.libs a sve .so (libscipy_openblas)
+         * drzi mimo standardni libdirs - bez tohoto by je loader nenasel a
+         * symboly zustaly NULL -> SIGSEGV. Poradi: RUNPATH prvni (nejuzsi). */
+        char *rpath_exp = NULL;
+        {
+            char *runpath = NULL, *rpath = NULL;
+            for (Elf64_Dyn *d = dyn; d->d_tag != DT_NULL; d++) {
+                if (d->d_tag == DT_RUNPATH)
+                    runpath = dynstr + d->d_un.d_val;
+                else if (d->d_tag == DT_RPATH)
+                    rpath = dynstr + d->d_un.d_val;
+            }
+            const char *rp = runpath ? runpath : rpath;
+            if (rp && rp[0])
+                rpath_exp = expand_dirs(rp, m->origin_dir ? m->origin_dir : ".");
         }
+        char *dl = derive_distro_libdirs(m->origin_dir ? m->origin_dir : "");
+        size_t need = strlen(search) + strlen(sys_libdirs()) + 16
+                    + (dl ? strlen(dl) : 0)
+                    + (rpath_exp ? strlen(rpath_exp) : 0);
+        char *osearch = malloc(need);
+        if (rpath_exp && rpath_exp[0])
+            sprintf(osearch, "%s:%s:%s:%s", rpath_exp, dl ? dl : "",
+                    search, sys_libdirs());
+        else if (dl)
+            sprintf(osearch, "%s:%s:%s", dl, search, sys_libdirs());
+        else
+            sprintf(osearch, "%s:%s", search, sys_libdirs());
+        free(rpath_exp);
         preload_distro_ldso(osearch, scope);
         for (Elf64_Dyn *d = dyn; d->d_tag != DT_NULL; d++) {
             if (d->d_tag != DT_NEEDED)
