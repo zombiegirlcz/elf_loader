@@ -892,11 +892,130 @@ static void tunable_get_val(int id, void *valp, void (*cb)(void *)) {
     tunable_recursion_guard = 0;
 }
 
+static void *resolve_import_ldso(const char *name);
+static void *ldso_lookup(const char *name);
+
 static void ldso_signal_error(void) {
     static const char msg[] = "[DIAG-TLS] ldso_signal_error -> abort\n";
     ssize_t r = write(2, msg, sizeof(msg) - 1);
     (void)r;
     abort();
+}
+
+/* ───────────── dl* (dlopen/dlsym/dlerror/dlclose/dladdr) pro --ownall ─────
+ * Guest glibc ma vlastni dlopen/dlsym implementovane nad _rtld_global, ktere
+ * ale spoustime bez jejiho _dl_start -> _rtld_global je nulovy a kazde volani
+ * guest dlopen/dlsym (napr. Rust uv hleda gnu_get_libc_version pres dlsym)
+ * spadne na NULL dereference. Nahradime je nasi implementaci nad scopes:
+ *   - symboly hledame v jiz nactenem scope (elf_scope_lookup) nebo v ldso
+ *     override tabulce (resolve_import_ldso)
+ *   - handle = elf_object_t* pro konkretni modul, nebo scope pro RTLD_DEFAULT
+ */
+static int  g_dl_err_valid;
+static char g_dl_err[256];
+
+static elf_object_t *ldso_load_new(const char *file);
+
+static void dl_set_err(const char *msg) {
+    snprintf(g_dl_err, sizeof g_dl_err, "%s", msg ? msg : "unknown dl error");
+    g_dl_err_valid = 1;
+}
+
+static const char *dl_base_name(const char *p) {
+    if (!p) return "";
+    const char *s = strrchr(p, '/');
+    return s ? s + 1 : p;
+}
+
+/* Najdi uz nacteny modul podle soname / basename / plne cesty. */
+static elf_object_t *dl_find_loaded(const char *file) {
+    if (!file || !g_crash_scope) return NULL;
+    const char *want = dl_base_name(file);
+    for (size_t i = 0; i < g_crash_scope->count; i++) {
+        elf_object_t *m = g_crash_scope->mods[i];
+        if (!m || !m->soname) continue;
+        if (strcmp(m->soname, file) == 0) return m;
+        if (strcmp(dl_base_name(m->soname), want) == 0) return m;
+    }
+    return NULL;
+}
+
+void *ldso_dlopen(const char *file, int mode) {
+    (void)mode;
+    if (!file) {                 /* dlopen(NULL) = handle hlavniho programu */
+        g_dl_err_valid = 0;
+        return (void *)g_crash_scope;
+    }
+    elf_object_t *m = dl_find_loaded(file);
+    if (m) { g_dl_err_valid = 0; return (void *)m; }
+    /* zkus jeste registr overrides (pro jmena bez modulu) */
+    if (resolve_import_ldso(file)) { g_dl_err_valid = 0; return (void *)g_crash_scope; }
+    /* Není načtený -> zkus ho own-loadnout z search paths (Python
+     * import _ctypes potřebuje libffi.so.8 atd.). */
+    m = ldso_load_new(file);
+    if (m) { g_dl_err_valid = 0; return (void *)m; }
+    char buf[256];
+    snprintf(buf, sizeof buf, "%s: cannot open shared object file", file);
+    dl_set_err(buf);
+    return NULL;
+}
+
+void *ldso_dlsym(void *handle, const char *name) {
+    if (!name) { dl_set_err("invalid symbol name"); return NULL; }
+    if (!handle || handle == (void *)-1) {          /* RTLD_DEFAULT / RTLD_NEXT */
+        if (g_crash_scope) {
+            void *p = elf_scope_lookup(g_crash_scope, name);
+            if (p) { g_dl_err_valid = 0; return p; }
+        }
+        void *p = resolve_import_ldso(name);
+        if (p) { g_dl_err_valid = 0; return p; }
+        dl_set_err(name);
+        return NULL;
+    }
+    if (handle == (void *)g_crash_scope) {
+        void *p = g_crash_scope ? elf_scope_lookup(g_crash_scope, name) : NULL;
+        if (p) { g_dl_err_valid = 0; return p; }
+        dl_set_err(name);
+        return NULL;
+    }
+    /* handle je elf_object_t* vraceny nasim dlopen */
+    void *addr = NULL;
+    if (elf_resolve_symbol((elf_object_t *)handle, name, &addr) != SYM_NOT_FOUND
+        && addr) {
+        g_dl_err_valid = 0;
+        return addr;
+    }
+    dl_set_err(name);
+    return NULL;
+}
+
+const char *ldso_dlerror(void) {
+    if (!g_dl_err_valid) return NULL;
+    g_dl_err_valid = 0;
+    return g_dl_err;
+}
+
+int ldso_dlclose(void *h) { (void)h; return 0; }
+
+/* Dl_info { const char *dli_fname; void *dli_fbase;
+ *           const char *dli_sname; void *dli_saddr; } */
+int ldso_dladdr(const void *addr, void *info_out) {
+    const char **out = (const char **)info_out;
+    if (!out) return 0;
+    out[0] = NULL; out[1] = NULL; out[2] = NULL; out[3] = NULL;
+    if (!g_crash_scope) return 0;
+    uintptr_t a = (uintptr_t)addr;
+    for (size_t i = 0; i < g_crash_scope->count; i++) {
+        elf_object_t *m = g_crash_scope->mods[i];
+        if (!m || !m->base_addr) continue;
+        uintptr_t b = (uintptr_t)m->base_addr;
+        if (a >= b && a < b + m->total_size) {
+            out[0] = m->soname;
+            out[1] = (const char *)b;
+            return 1;
+        }
+    }
+    return 0;
 }
 
 static void *ldso_lookup(const char *name) {
@@ -949,6 +1068,17 @@ static void *ldso_lookup(const char *name) {
     if (strcmp(name, "_dl_audit_preinit") == 0 ||
         strcmp(name, "_dl_audit_symbind_alt") == 0)
         return (void *)ldso_noop;
+    if (strcmp(name, "dlopen") == 0 || strcmp(name, "dlopen64") == 0 ||
+        strcmp(name, "__dlopen") == 0)
+        return (void *)ldso_dlopen;
+    if (strcmp(name, "dlsym") == 0 || strcmp(name, "__dlsym") == 0)
+        return (void *)ldso_dlsym;
+    if (strcmp(name, "dlerror") == 0)
+        return (void *)ldso_dlerror;
+    if (strcmp(name, "dlclose") == 0)
+        return (void *)ldso_dlclose;
+    if (strcmp(name, "dladdr") == 0)
+        return (void *)ldso_dladdr;
     if (strcmp(name, "brk") == 0 || strcmp(name, "__brk") == 0)
         return (void *)ldso_brk;
     if (strcmp(name, "sbrk") == 0 || strcmp(name, "__sbrk") == 0)
@@ -1088,18 +1218,26 @@ static void *va(const elf_object_t *obj, size_t vaddr) {
     return (char *)obj->base_addr + (vaddr - map_base_vaddr(obj));
 }
 
-/* Prebije `svc #0` v guest modulu pro dany syscall nr na NOP. Slouzi pro
- * syscally, ktere app seccomp KILLuje (KILL nejde prebit filtrem ani
- * SIGSYS handlerem): rseq (293) a set_robust_list (99, delka 24).
- * Hleda sekvenci `movz x8,#nr` (pripadne `mov x8,#nr` = movz) a do +32 B
- * za ni najde `svc #0`, ktery nahradi NOP. Tim se syscall vubec neprovede.
- * (Pro robust_list to znamena, ze kernel robustni seznam nebude mit; pokud
- * proces umre s drzenym robustnim mutexem, kernel ho neoznaci - v nasem
- * single-purpose loaderu akceptovatelne.) */
-void elf_patch_syscall_sites(elf_object_t *m, long nr) {
+/* Prebije `svc #0` v guest modulu pro dany syscall nr. Slouzi pro syscally,
+ * ktere app seccomp KILLuje (KILL nejde prebit filtrem ani SIGSYS handlerem):
+ * rseq (293), set_robust_list (99, delka 24) a clone3 (435).
+ *
+ * err == 0  -> `svc #0` se prebije na NOP  (syscall se vubec neprovede)
+ * err  > 0  -> `svc #0` se prebije na `movn x0,#(err-1)` -> x0 = -err,
+ *              takze se volajicimu vraci -errno (napr. -ENOSYS). To je
+ *              potreba u clone3: Rust/glibc si pri ENOSYS fallbackne na clone().
+ *
+ * Hleda sekvenci `movz x8,#nr` (pripadne `mov x8,#nr` = movz) a do +8
+ * instrukci za ni najde `svc #0`. */
+void elf_patch_syscall_sites(elf_object_t *m, long nr, long err) {
     if (!m || nr < 0 || nr > 0xffff)
         return;
     const uint32_t movz_x8 = 0xd2800000u | ((uint32_t)nr << 5) | 8u;
+    uint32_t repl;
+    if (err > 0)
+        repl = 0x92800000u | (((uint32_t)(err - 1) & 0xffffu) << 5); /* movn x0,#err-1 */
+    else
+        repl = 0xd503201fu;                                          /* nop */
     int patched = 0;
     for (int i = 0; i < m->phdr_count; i++) {
         if (m->phdr[i].p_type != PT_LOAD)
@@ -1120,7 +1258,7 @@ void elf_patch_syscall_sites(elf_object_t *m, long nr) {
                     uintptr_t pg = ins_addr & ~(uintptr_t)(PAGE_SIZE - 1);
                     if (mprotect((void *)pg, PAGE_SIZE,
                                  PROT_READ | PROT_WRITE | PROT_EXEC) == 0) {
-                        seg[j] = 0xd503201fu;  /* nop */
+                        seg[j] = repl;
                         __builtin___clear_cache((char *)&seg[j],
                                                 (char *)&seg[j] + 4);
                         mprotect((void *)pg, PAGE_SIZE,
@@ -1135,8 +1273,8 @@ void elf_patch_syscall_sites(elf_object_t *m, long nr) {
         }
     }
     if (elf_debug())
-        fprintf(stderr, "[patch] syscall %ld: prebito %d svc#0 v %s\n",
-                nr, patched, m->soname ? m->soname : "?");
+        fprintf(stderr, "[patch] syscall %ld (err=%ld): prebito %d svc#0 v %s\n",
+                nr, err, patched, m->soname ? m->soname : "?");
 }
 
 static uintptr_t read_tp(void) {
@@ -1896,6 +2034,7 @@ static size_t g_pending_count, g_pending_cap;
 static void *(*g_libc_uselocale)(void *);
 static void (*g_libc_ctype_init)(void);
 extern uintptr_t g_tls_new_tp;
+extern uintptr_t g_tls_old_tp;
 
 /* Forward declaration: raw_syscall6 defined later but used in
  * diag.txt writes in early init/handler. */
@@ -2242,6 +2381,71 @@ elf_object_t *elf_load_shared(const char *path, elf_scope_t *scope) {
         printf("[+] own-loaded module: %s (base %p, %zu dynsym)\n", path,
            (void *)base, m->dynsym_count);
     fflush(stdout);
+    return m;
+}
+
+/* Runtime dlopen: guest požádal o modul, který ještě není načtený
+ * (typicky Python import _ctypes -> libffi.so.8). Sestavíme search path
+ * z distro libdirs a own-loadneme ho do crash scope. Loaderuv kod (bionic
+ * libc/malloc) běží pod host TP, guest inity pod parrot TP. */
+static elf_object_t *ldso_load_new(const char *file) {
+    if (!g_crash_scope || !file || !file[0])
+        return NULL;
+
+    uintptr_t saved_tp = 0;
+    int switched = 0;
+    if (g_tls_old_tp) {
+        __asm__ volatile("mrs %0, tpidr_el0" : "=r"(saved_tp));
+        __asm__ volatile("msr tpidr_el0, %0" : : "r"(g_tls_old_tp));
+        switched = 1;
+    }
+
+    char *search = NULL;
+    const char *root = getenv("ROOTFS");
+    char pbuf[4096];
+    /* absolutni cesta -> zkus ji přímo (s ROOTFS prefixem) */
+    if (file[0] == '/') {
+        snprintf(pbuf, sizeof pbuf, "%s%s", (root && root[0]) ? root : "", file);
+        if (access(pbuf, R_OK) == 0)
+            search = strdup(pbuf);
+    } else if (strchr(file, '/')) {
+        snprintf(pbuf, sizeof pbuf, "%s%s", (root && root[0]) ? root : "", file);
+        if (access(pbuf, R_OK) == 0)
+            search = strdup(pbuf);
+    }
+    if (!search) {
+        char *dl = derive_distro_libdirs("");
+        char osearch[4096];
+        if (dl)
+            snprintf(osearch, sizeof osearch, "%s:%s", dl, sys_libdirs());
+        else
+            snprintf(osearch, sizeof osearch, "%s", sys_libdirs());
+        search = find_in_paths(file, osearch);
+    }
+    if (!search) {
+        if (switched)
+            __asm__ volatile("msr tpidr_el0, %0" : : "r"(saved_tp));
+        return NULL;
+    }
+
+    size_t prev_count = g_pending_count;
+    elf_object_t *m = elf_load_shared(search, g_crash_scope);
+    free(search);
+
+    if (switched)
+        __asm__ volatile("msr tpidr_el0, %0" : : "r"(saved_tp));
+
+    if (!m)
+        return NULL;
+
+    /* Spusť inity nově přidané do fronty (guest kód pod parrot TP). */
+    if (!getenv("ELF_LOADER_NO_INITS")) {
+        for (size_t i = prev_count; i < g_pending_count; i++) {
+            init_fn_t fn = g_pending_inits[i];
+            if (fn)
+                fn(elf_init_argc, elf_init_argv, elf_init_envp);
+        }
+    }
     return m;
 }
 

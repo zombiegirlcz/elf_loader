@@ -1049,6 +1049,10 @@ typedef ssize_t (*fp_readlink)(const char *, char *, size_t);
 typedef ssize_t (*fp_readlinkat)(int, const char *, char *, size_t);
 typedef char *(*fp_realpath)(const char *, char *);
 typedef void *(*fp_dlopen)(const char *, int);
+static void *g_orig_dlsym;
+static void *g_orig_dlclose;
+static void *g_orig_dlerror;
+static void *g_orig_dladdr;
 typedef int (*fp_chdir)(const char *);
 static void *shim_opendir(const char *p) {
     char b[8192]; const char *path = p; if (shim_translate(p, b, sizeof b)) path = b;
@@ -1093,8 +1097,36 @@ static void *shim_dlopen(const char *p, int f) {
             }
         }
     }
+    /* --ownall: guest glibc dlopen padá na nulovém _rtld_global -> naše
+     * náhrada nad scopes. Non-ownall (host bionic): reálný dlopen. */
+    if (elf_own_deps)
+        return ldso_dlopen(path, f);
     fp_dlopen ff = (fp_dlopen)g_orig_dlopen;
     return ff ? ff(path, f) : NULL;
+}
+static void *shim_dlsym(void *h, const char *name) {
+    if (elf_own_deps)
+        return ldso_dlsym(h, name);
+    void *(*ff)(void *, const char *) = (void *(*)(void *, const char *))g_orig_dlsym;
+    return ff ? ff(h, name) : NULL;
+}
+static int shim_dlclose(void *h) {
+    if (elf_own_deps)
+        return ldso_dlclose(h);
+    int (*ff)(void *) = (int (*)(void *))g_orig_dlclose;
+    return ff ? ff(h) : 0;
+}
+static const char *shim_dlerror(void) {
+    if (elf_own_deps)
+        return ldso_dlerror();
+    const char *(*ff)(void) = (const char *(*)(void))g_orig_dlerror;
+    return ff ? ff() : NULL;
+}
+static int shim_dladdr(const void *addr, void *info) {
+    if (elf_own_deps)
+        return ldso_dladdr(addr, info);
+    int (*ff)(const void *, void *) = (int (*)(const void *, void *))g_orig_dladdr;
+    return ff ? ff(addr, info) : 0;
 }
 static int shim_chdir(const char *p) {
     char b[8192]; const char *path = p; if (shim_translate(p, b, sizeof b)) path = b;
@@ -1402,20 +1434,30 @@ static int run_ownall(const char *path, int argc, char **argv, char **envp) {
     ldso_install_exe_linkmap(obj, path);
     ldso_install_module_list(scope->mods, scope->count);
 
-    /* App seccomp KILLuje rseq (293) a set_robust_list (99, delka 24). KILL
-     * obchazi SIGSYS handler i nas ERRNO filtr, proto v kazdem nacteném modulu
-     * prebijeme `svc #0` techto syscallu na NOP. Tyká se hlavně libc
-     * (__tls_init_tp, start_thread, _Fork), ale projdeme vsechny moduly. */
+    /* App seccomp KILLuje rseq (293), set_robust_list (99, delka 24) a
+     * clone3 (435). KILL obchazi SIGSYS handler i nas ERRNO filtr, proto v
+     * kazdem nactenem modulu prebijeme `svc #0` techto syscallu. Pro 99/293
+     * staci NOP (syscall se neprovede). U clone3 potrebujeme vratit -ENOSYS,
+     * aby Rust/glibc fallbacknul na clone() - jinak by NOP znamenal, ze se
+     * navratova hodnota x0 nikdy nenastavi a vlakno by se nespravne vytvorilo.
+     * Tyká se hlavne libc (__tls_init_tp, start_thread, _Fork), ale projdeme
+     * vsechny moduly. */
     {
-        static const long kill_syscalls[] = { 99, 293 };
+        static const struct { long nr; long err; } kill_syscalls[] = {
+            { 99,  0 },      /* set_robust_list -> NOP */
+            { 293, 0 },      /* rseq            -> NOP */
+            { 435, 38 },     /* clone3          -> -ENOSYS */
+        };
         size_t nsc = sizeof(kill_syscalls) / sizeof(kill_syscalls[0]);
         if (!getenv("ELF_LOADER_NO_PATCH")) {
         for (size_t mi = 0; mi < scope->count; mi++) {
             for (size_t s = 0; s < nsc; s++)
-                elf_patch_syscall_sites(scope->mods[mi], kill_syscalls[s]);
+                elf_patch_syscall_sites(scope->mods[mi], kill_syscalls[s].nr,
+                                        kill_syscalls[s].err);
         }
         for (size_t s = 0; s < nsc; s++)
-            elf_patch_syscall_sites(obj, kill_syscalls[s]);
+            elf_patch_syscall_sites(obj, kill_syscalls[s].nr,
+                                    kill_syscalls[s].err);
         }
     }
     if (g_tls_trace)

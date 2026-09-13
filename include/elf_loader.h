@@ -94,16 +94,27 @@ void ldso_install_module_list(elf_object_t *const *mods, size_t count);
 void elf_register_override(const char *name, void *fn);
 
 /* Aplikacni Android seccomp vraci SECCOMP_RET_KILL pro nektere syscally
- * (rseq=293, set_robust_list=99 s velikosti 24). KILL ma nejvyssi precedenci
- * a obchazi SIGSYS handler, takze nas filtr/handler ho neprebiji. Obrana:
- * v guest libc najdi `mov x8,#nr ; ... ; svc #0` a svc prebij na NOP. */
-void elf_patch_syscall_sites(elf_object_t *m, long nr);
+ * (rseq=293, set_robust_list=99 s velikosti 24, clone3=435). KILL ma nejvyssi
+ * precedenci a obchazi SIGSYS handler, takze nas filtr/handler ho neprebiji.
+ * Obrana: v guest modulu najdi `mov x8,#nr ; ... ; svc #0` a svc prebij:
+ *   err == 0 -> NOP (syscall se neprovede)
+ *   err  > 0 -> `movn x0,#err-1` (volajici dostane -errno, napr. -ENOSYS)
+ * U clone3 potrebujeme -ENOSYS, aby Rust/glibc fallbacknul na clone(). */
+void elf_patch_syscall_sites(elf_object_t *m, long nr, long err);
 
 /* ldso_tls.c: vlastní implementace glibc ld.so TLS funkcí (guest ld.so je
  * neinicializovaný, takže jeho _dl_allocate_tls padá na NULL _rtld_global). */
 void *ldso_allocate_tls(void *mem);
 void *ldso_allocate_tls_init(void *result, int main_thread);
 void ldso_deallocate_tls(void *tcb, int dealloc_tcb);
+
+/* Náhrady guest dl* nad scopes (guest glibc dlopen/dlsym padá, protože
+ * nespouštíme její _dl_start -> _rtld_global je nulový). */
+void *ldso_dlopen(const char *file, int mode);
+void *ldso_dlsym(void *handle, const char *name);
+int ldso_dlclose(void *h);
+int ldso_dladdr(const void *addr, void *info_out);
+const char *ldso_dlerror(void);
 void elf_set_lazy(int on);
 void *elf_lazy_resolve(uintptr_t got_slot);
 
