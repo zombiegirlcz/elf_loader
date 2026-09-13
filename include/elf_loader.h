@@ -67,6 +67,11 @@ typedef struct elf_scope {
     elf_object_t **mods;
     size_t count;
     size_t cap;
+    /* Hlavní exe. Není v mods (aby ho elf_scope_destroy neuvolnil dvakrát),
+     * ale při hledání symbolů slouží jako fallback: Pythoní extension moduly
+     * (_ctypes.so) importují PyExc_*, PyTuple_Type, _PyRuntime z hlavního
+     * executable, který v mods chybí. */
+    elf_object_t *exe;
 } elf_scope_t;
 
 typedef enum {

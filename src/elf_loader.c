@@ -914,7 +914,23 @@ static void ldso_signal_error(void) {
 static int  g_dl_err_valid;
 static char g_dl_err[256];
 
+/* TLS thread-pointery: bionic (host) a parrot (guest). Definovane nize. */
+extern uintptr_t g_tls_new_tp;
+extern uintptr_t g_tls_old_tp;
+
 static elf_object_t *ldso_load_new(const char *file);
+static void *override_lookup(const char *name);
+
+/* Loaderuv kod je bionicky (scudo malloc, bionic libc) a MUSI bezet pod
+ * bionickym TP. Kdyz nas zavola guest (parrot TP) pres override dlopen/dlsym,
+ * musime TP na dobu behu loaderu prepnout, jinak bionic malloc/errno cte
+ * parrot TLS jako sve struktury -> SIGSEGV v bionic libc. */
+static inline uintptr_t dl_tp_get(void) {
+    uintptr_t t; __asm__ volatile("mrs %0, tpidr_el0" : "=r"(t)); return t;
+}
+static inline void dl_tp_set(uintptr_t t) {
+    __asm__ volatile("msr tpidr_el0, %0" : : "r"(t));
+}
 
 static void dl_set_err(const char *msg) {
     snprintf(g_dl_err, sizeof g_dl_err, "%s", msg ? msg : "unknown dl error");
@@ -942,51 +958,71 @@ static elf_object_t *dl_find_loaded(const char *file) {
 
 void *ldso_dlopen(const char *file, int mode) {
     (void)mode;
+    uintptr_t saved = dl_tp_get();
+    int sw = (g_tls_old_tp && saved != g_tls_old_tp);
+    if (sw) dl_tp_set(g_tls_old_tp);
+    void *ret = NULL;
     if (!file) {                 /* dlopen(NULL) = handle hlavniho programu */
         g_dl_err_valid = 0;
-        return (void *)g_crash_scope;
+        ret = (void *)g_crash_scope;
+    } else {
+        elf_object_t *m = dl_find_loaded(file);
+        if (m) { g_dl_err_valid = 0; ret = (void *)m; }
+        else if (resolve_import_ldso(file)) { g_dl_err_valid = 0; ret = (void *)g_crash_scope; }
+        else {
+            /* Není načtený -> zkus ho own-loadnout z search paths (Python
+             * import _ctypes potřebuje libffi.so.8 atd.). */
+            m = ldso_load_new(file);
+            if (m) { g_dl_err_valid = 0; ret = (void *)m; }
+            else {
+                char buf[256];
+                snprintf(buf, sizeof buf, "%s: cannot open shared object file", file);
+                dl_set_err(buf);
+            }
+        }
     }
-    elf_object_t *m = dl_find_loaded(file);
-    if (m) { g_dl_err_valid = 0; return (void *)m; }
-    /* zkus jeste registr overrides (pro jmena bez modulu) */
-    if (resolve_import_ldso(file)) { g_dl_err_valid = 0; return (void *)g_crash_scope; }
-    /* Není načtený -> zkus ho own-loadnout z search paths (Python
-     * import _ctypes potřebuje libffi.so.8 atd.). */
-    m = ldso_load_new(file);
-    if (m) { g_dl_err_valid = 0; return (void *)m; }
-    char buf[256];
-    snprintf(buf, sizeof buf, "%s: cannot open shared object file", file);
-    dl_set_err(buf);
-    return NULL;
+    if (sw) dl_tp_set(saved);
+    return ret;
 }
 
 void *ldso_dlsym(void *handle, const char *name) {
     if (!name) { dl_set_err("invalid symbol name"); return NULL; }
+    uintptr_t saved = dl_tp_get();
+    int sw = (g_tls_old_tp && saved != g_tls_old_tp);
+    if (sw) dl_tp_set(g_tls_old_tp);
+    void *ret = NULL;
     if (!handle || handle == (void *)-1) {          /* RTLD_DEFAULT / RTLD_NEXT */
-        if (g_crash_scope) {
-            void *p = elf_scope_lookup(g_crash_scope, name);
-            if (p) { g_dl_err_valid = 0; return p; }
+        /* OVERRIDE prvni! Jinak by elf_scope_lookup nasel guest glibc
+         * dlopen/dlsym (pracuji nad nulovym _rtld_global) a Python by si
+         * pres dlsym(RTLD_DEFAULT,"dlopen") vytahl rozbitou verzi. */
+        void *p = override_lookup(name);
+        if (p) { g_dl_err_valid = 0; ret = p; }
+        if (!ret && g_crash_scope) {
+            p = elf_scope_lookup(g_crash_scope, name);
+            if (p) { g_dl_err_valid = 0; ret = p; }
         }
-        void *p = resolve_import_ldso(name);
-        if (p) { g_dl_err_valid = 0; return p; }
-        dl_set_err(name);
-        return NULL;
-    }
-    if (handle == (void *)g_crash_scope) {
+        if (!ret) {
+            p = resolve_import_ldso(name);
+            if (p) { g_dl_err_valid = 0; ret = p; }
+            else dl_set_err(name);
+        }
+    } else if (handle == (void *)g_crash_scope) {
         void *p = g_crash_scope ? elf_scope_lookup(g_crash_scope, name) : NULL;
-        if (p) { g_dl_err_valid = 0; return p; }
-        dl_set_err(name);
-        return NULL;
+        if (p) { g_dl_err_valid = 0; ret = p; }
+        else dl_set_err(name);
+    } else {
+        /* handle je elf_object_t* vraceny nasim dlopen */
+        void *addr = NULL;
+        if (elf_resolve_symbol((elf_object_t *)handle, name, &addr) != SYM_NOT_FOUND
+            && addr) {
+            g_dl_err_valid = 0;
+            ret = addr;
+        } else {
+            dl_set_err(name);
+        }
     }
-    /* handle je elf_object_t* vraceny nasim dlopen */
-    void *addr = NULL;
-    if (elf_resolve_symbol((elf_object_t *)handle, name, &addr) != SYM_NOT_FOUND
-        && addr) {
-        g_dl_err_valid = 0;
-        return addr;
-    }
-    dl_set_err(name);
-    return NULL;
+    if (sw) dl_tp_set(saved);
+    return ret;
 }
 
 const char *ldso_dlerror(void) {
@@ -1092,7 +1128,6 @@ static void *resolve_import_ldso(const char *name) {
 }
 
 static void *override_lookup(const char *name);  /* definováno níže; potřeba pro F2 lazy override */
-
 static void *resolve_jmp_symbol(elf_object_t *obj, Elf64_Rela *r) {
     void *addr = NULL;
     const char *via = "?";
@@ -1832,6 +1867,23 @@ elf_object_t *elf_scope_find(const elf_scope_t *s, const char *name,
             return m;
         }
     }
+    /* Fallback: hlavni exe (Python extension moduly potrebuji PyExc_*,
+     * PyTuple_Type, _PyRuntime z python3.13, ktery neni v mods). */
+    elf_object_t *e = s->exe;
+    if (e && e->dynsym && e->dynstr) {
+        for (size_t j = 0; j < e->dynsym_count; j++) {
+            const Elf64_Sym *sym = &e->dynsym[j];
+            if (sym->st_name == 0 || sym->st_shndx == SHN_UNDEF)
+                continue;
+            if (ELF64_ST_BIND(sym->st_info) == STB_LOCAL)
+                continue;
+            if (strcmp(e->dynstr + sym->st_name, name) != 0)
+                continue;
+            if (out_sym)
+                *out_sym = sym;
+            return e;
+        }
+    }
     if (out_sym)
         *out_sym = NULL;
     return NULL;
@@ -2386,30 +2438,33 @@ elf_object_t *elf_load_shared(const char *path, elf_scope_t *scope) {
 
 /* Runtime dlopen: guest požádal o modul, který ještě není načtený
  * (typicky Python import _ctypes -> libffi.so.8). Sestavíme search path
- * z distro libdirs a own-loadneme ho do crash scope. Loaderuv kod (bionic
- * libc/malloc) běží pod host TP, guest inity pod parrot TP. */
+ * z distro libdirs a own-loadneme ho do crash scope.
+ * VOLÁNO s bionickým TP (ldso_dlopen už přepnul) — elf_load_shared je
+ * loaderuv bionický kód. Inity guest modulu ale musí běžet pod parrot TP,
+ * takže je spustíme s dočasným přepnutím na g_tls_new_tp a zpět. */
 static elf_object_t *ldso_load_new(const char *file) {
     if (!g_crash_scope || !file || !file[0])
         return NULL;
 
-    uintptr_t saved_tp = 0;
-    int switched = 0;
-    if (g_tls_old_tp) {
-        __asm__ volatile("mrs %0, tpidr_el0" : "=r"(saved_tp));
-        __asm__ volatile("msr tpidr_el0, %0" : : "r"(g_tls_old_tp));
-        switched = 1;
-    }
-
     char *search = NULL;
     const char *root = getenv("ROOTFS");
+    size_t rl = (root && root[0]) ? strlen(root) : 0;
     char pbuf[4096];
-    /* absolutni cesta -> zkus ji přímo (s ROOTFS prefixem) */
-    if (file[0] == '/') {
-        snprintf(pbuf, sizeof pbuf, "%s%s", (root && root[0]) ? root : "", file);
+    /* Případy:
+     *  a) file je už device-absolutní cesta (Python sys.path) -> zkusit přímo
+     *  b) file je guest-absolutní (/usr/lib/...) -> ROOTFS + file
+     *  c) relativní / se '/' -> ROOTFS + file
+     *  d) holé soname -> hledat v libdirs */
+    if (access(file, R_OK) == 0) {
+        search = strdup(file);
+    } else if (file[0] == '/') {
+        snprintf(pbuf, sizeof pbuf, "%s%s", root ? root : "", file);
         if (access(pbuf, R_OK) == 0)
             search = strdup(pbuf);
+        else if (rl && strncmp(file, root, rl) == 0)
+            search = strdup(file);
     } else if (strchr(file, '/')) {
-        snprintf(pbuf, sizeof pbuf, "%s%s", (root && root[0]) ? root : "", file);
+        snprintf(pbuf, sizeof pbuf, "%s%s", root ? root : "", file);
         if (access(pbuf, R_OK) == 0)
             search = strdup(pbuf);
     }
@@ -2422,29 +2477,26 @@ static elf_object_t *ldso_load_new(const char *file) {
             snprintf(osearch, sizeof osearch, "%s", sys_libdirs());
         search = find_in_paths(file, osearch);
     }
-    if (!search) {
-        if (switched)
-            __asm__ volatile("msr tpidr_el0, %0" : : "r"(saved_tp));
+    if (!search)
         return NULL;
-    }
 
     size_t prev_count = g_pending_count;
     elf_object_t *m = elf_load_shared(search, g_crash_scope);
     free(search);
-
-    if (switched)
-        __asm__ volatile("msr tpidr_el0, %0" : : "r"(saved_tp));
-
     if (!m)
         return NULL;
 
-    /* Spusť inity nově přidané do fronty (guest kód pod parrot TP). */
-    if (!getenv("ELF_LOADER_NO_INITS")) {
+    /* Spusť inity nově přidané do fronty pod parrot TP (guest kód). */
+    if (!getenv("ELF_LOADER_NO_INITS") && g_pending_count > prev_count) {
+        uintptr_t save2 = dl_tp_get();
+        if (g_tls_new_tp)
+            dl_tp_set(g_tls_new_tp);
         for (size_t i = prev_count; i < g_pending_count; i++) {
             init_fn_t fn = g_pending_inits[i];
             if (fn)
                 fn(elf_init_argc, elf_init_argv, elf_init_envp);
         }
+        dl_tp_set(save2);
     }
     return m;
 }

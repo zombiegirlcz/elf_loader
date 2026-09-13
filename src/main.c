@@ -1364,6 +1364,19 @@ static int run_ownall(const char *path, int argc, char **argv, char **envp) {
     elf_register_override("_dl_allocate_tls", (void *)ldso_allocate_tls);
     elf_register_override("_dl_allocate_tls_init", (void *)ldso_allocate_tls_init);
     elf_register_override("_dl_deallocate_tls", (void *)ldso_deallocate_tls);
+    /* Guest glibc dlopen/dlsym/dlerror/dlclose/dladdr pracuji nad _rtld_global,
+     * ktery pri nasem own-loadu zustava nulovy -> kazde volani (Rust uv hleda
+     * gnu_get_libc_version, Python _ctypes volá dlsym) spadne. Registrujeme
+     * nase nahrady jako OVERRIDE (jdou v overide_lookup prvni, v lazy i eager
+     * ceste), aby se nikdy neresolvovaly na rozbite guest glibc symboly. */
+    elf_register_override("dlopen", (void *)ldso_dlopen);
+    elf_register_override("dlopen64", (void *)ldso_dlopen);
+    elf_register_override("__dlopen", (void *)ldso_dlopen);
+    elf_register_override("dlsym", (void *)ldso_dlsym);
+    elf_register_override("__dlsym", (void *)ldso_dlsym);
+    elf_register_override("dlclose", (void *)ldso_dlclose);
+    elf_register_override("dlerror", (void *)ldso_dlerror);
+    elf_register_override("dladdr", (void *)ldso_dladdr);
     if (getenv("ELF_LOADER_SIGTRACE"))
         elf_register_override("sigaction", (void *)diag_wrapped_sigaction);
 
@@ -1431,6 +1444,7 @@ static int run_ownall(const char *path, int argc, char **argv, char **envp) {
     }
 
     g_exe_base = (uintptr_t)obj->base_addr;
+    scope->exe = obj;   /* fallback pro symboly z hlavniho exe (PyExc_*, _PyRuntime) */
     ldso_install_exe_linkmap(obj, path);
     ldso_install_module_list(scope->mods, scope->count);
 
