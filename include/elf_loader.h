@@ -23,6 +23,11 @@
  * "extra TLS block" v _dl_determine_tlsoffset). */
 #define ELF_TLS_TCB_SIZE 0x10u
 #define ELF_RSEQ_SIZE    0x20u
+/* Fixni rezerva pro TLS bloky vsech modulu (od TP+0x10 do TP+ELF_TLS_RESERVE).
+ * rseq area + DTV jdou na PEVNY offset za ni, aby dynamicky nacitane moduly
+ * (Python extension moduly jako _cffi_backend) nikdy nekolidovaly s rseq/DTV
+ * a nemuseli realokovat region za behu. */
+#define ELF_TLS_RESERVE  0x100000u  /* 1 MB pro TLS vsech modulu */
 
 typedef struct {
     void *base_addr;
@@ -120,6 +125,9 @@ void *ldso_dlsym(void *handle, const char *name);
 int ldso_dlclose(void *h);
 int ldso_dladdr(const void *addr, void *info_out);
 const char *ldso_dlerror(void);
+/* Zaregistruj novy dynamicky nacteny TLS modul do TLS aktualniho vlakna
+ * (zkopiruje .tdata do TP + tls_offset a nastavi DTV entry). */
+void elf_tls_add_module_to_thread(elf_object_t *m);
 void elf_set_lazy(int on);
 void *elf_lazy_resolve(uintptr_t got_slot);
 

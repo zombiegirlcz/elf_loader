@@ -118,6 +118,15 @@ static void elf_tls_assign(elf_object_t *m, size_t align) {
     if (align == 0)
         align = 1;
     uintptr_t off = ALIGN_UP(g_tls_next, align);
+    if (off + ALIGN_UP(m->tls_memsz, align) > ELF_TLS_RESERVE) {
+        /* Rezerva pretelka. NESMIME nechat tls_offset=0 (has_tls=1) - pak by
+         * elf_tls_add_module_to_thread zapsal .tdata na TP+0 a prepsal
+         * tcbhead.dtv -> rozbil cely TLS. Modul bez TLS je mene zle. */
+        fprintf(stderr, "[WARN] TLS reserve exhausted for %s\n",
+                m->soname ? m->soname : "?");
+        m->has_tls = 0;
+        return;
+    }
     m->tls_offset = off;
     g_tls_next = off + ALIGN_UP(m->tls_memsz, align);
     g_tls_mods[g_tls_mod_count++] = m;
@@ -128,11 +137,14 @@ elf_object_t *elf_tls_module_at(size_t i) {
     return i < g_tls_mod_count ? g_tls_mods[i] : NULL;
 }
 uintptr_t elf_tls_span(void) { return g_tls_next; }
-/* rseq area jde AZ za vsechny TLS bloky (jako glibc "extra TLS block"),
- * aby hlavni exe (non-PIE, zapečene TPREL offsety) sedel na TP+0x10. */
-uintptr_t elf_tls_rseq_offset(void) { return ALIGN_UP(g_tls_next, 16); }
+/* rseq area je na PEVNEM offsetu ELF_TLS_RESERVE (za rezervou pro TLS bloky
+ * vsech modulu). Diky tomu dynamicky nacitane moduly (Python extension .so)
+ * nikdy nekoliduji s rseq/DTV a region se nemusi realokovat za behu.
+ * Hlavni exe (non-PIE, zapečene TPREL offsety) sedi na TP+0x10 = OK. */
+uintptr_t elf_tls_rseq_offset(void) { return ELF_TLS_RESERVE; }
 uintptr_t elf_tls_static_size(void) {
     return ALIGN_UP(elf_tls_rseq_offset() + ELF_RSEQ_SIZE, 16)
+           + (2 + ELF_MAX_TLS_MODS + 16) * 16   /* DTV pro max modulu */
            + ELF_TLS_DTV_RESERVE;
 }
 
@@ -1302,7 +1314,15 @@ void elf_patch_syscall_sites(elf_object_t *m, long nr, long err) {
                     }
                     break;
                 }
-                if ((seg[j] & 0xffe0001fu) == (0xd2800000u | 8u))  /* dalsi movz x8 */
+                /* Mezi movz x8,#nr a svc povolime instrukce, ktere NEZAPISUJI
+                 * do x8 (Rd != x8) - typicky nastaveni argumentu x0-x7.
+                 * Pokud nekdo x8 prepsal (Rd == x8), svc patri jinemu syscallu
+                 * a jeho prepsanim bychom rozbili volani (napr. _cffi_backend
+                 * mel konstantu blizko svc). nop/bti preskocime vzdy. */
+                if (seg[j] == 0xd503201fu /* nop */ ||
+                    (seg[j] & 0xffffff1fu) == 0xd503241fu /* bti c/j */)
+                    continue;
+                if ((seg[j] & 0x1fu) == 8u)   /* Rd == x8/w8 -> x8 prepsan */
                     break;
             }
         }
@@ -2390,6 +2410,15 @@ elf_object_t *elf_load_shared(const char *path, elf_scope_t *scope) {
     run_module_init(m);
     if (elf_debug()) printf("[dbg2] init-queued\n");
 
+    /* Dynamicky nacteny modul s PT_TLS (i jeho zavislosti) potrebuje mit
+     * .tdata zkopirovanou do AKTUALNIHO threadu. Pri startu to dela
+     * elf_setup_own_tls pro vsechny moduly; pri runtime loadu (Python
+     * extension .so jako numpy/_multiarray_umath + libscipy_openblas) uz
+     * hlavni TLS region existuje, takze kopirujeme rovnou. Bez toho zustane
+     * TLS zavislosti smeti -> pthread_key_create/delete padá. */
+    if (g_tls_new_tp && m->has_tls && m->tls_offset)
+        elf_tls_add_module_to_thread(m);
+
     /* Pozn.: .tdata se uz NEKopiruje na read_tp()+offset (tls_offset je nyni
      * maly offset od TP, platny az pro parrot TP). O inicializaci se stara
      * elf_setup_own_tls (main thread) a ldso_tls.c (nove thready). */
@@ -2485,6 +2514,10 @@ static elf_object_t *ldso_load_new(const char *file) {
     free(search);
     if (!m)
         return NULL;
+    /* Novy modul muze mit PT_TLS -> zkopiruj jeho .tdata do aktualniho
+     * threadu (region ma fixni rezervu, takze se vejde). */
+    if (m->has_tls)
+        elf_tls_add_module_to_thread(m);
 
     /* Spusť inity nově přidané do fronty pod parrot TP (guest kód). */
     if (!getenv("ELF_LOADER_NO_INITS") && g_pending_count > prev_count) {
@@ -2972,9 +3005,11 @@ elf_tls_ctx_t elf_setup_own_tls(elf_object_t *exe, elf_scope_t *scope) {
      * (_pthread_cleanup_push: cleanup listy, cancellable futex path) na guard
      * page [anon:stack_and_tls] -> SIGSEGV. Nulovana pthread struct v regionu
      * je validni prazdny stav (cleanup list head = NULL). */
-    size_t dtv_bytes = (2 + g_tls_mod_count + 16) * 16;
-    size_t size = ALIGN_UP(TLS_PRE_TCB_SIZE + span + dtv_bytes + 0x1000,
-                           PAGE_SIZE);
+    /* DTV dimenzujeme na MAX modulu (dynamicky load muze pridat dalsi). */
+    size_t dtv_bytes = (2 + ELF_MAX_TLS_MODS + 16) * 16;
+    size_t need_end = (size_t)ELF_TLS_RESERVE + ELF_RSEQ_SIZE + dtv_bytes;
+    if (need_end < span) need_end = span;
+    size_t size = ALIGN_UP(TLS_PRE_TCB_SIZE + need_end + 0x1000, PAGE_SIZE);
     void *region = mmap(NULL, size, PROT_READ | PROT_WRITE,
                         MAP_PRIVATE | MAP_ANONYMOUS, -1, 0);
     if (region == MAP_FAILED)
@@ -3010,7 +3045,7 @@ elf_tls_ctx_t elf_setup_own_tls(elf_object_t *exe, elf_scope_t *scope) {
      * ATTR_FLAG_DO_RSEQ a NIKDY nezavolaji rseq syscall (293, app KILL).
      * POZOR: nesmi byt na TP+0x10 - kolidovala by s TLS blokem hlavniho exe,
      * ktery non-PIE binarky adresuji pres zapečene TPREL offsety (TP+0x10+). */
-    uintptr_t rseq_off = ALIGN_UP(span, 16);
+    uintptr_t rseq_off = ELF_TLS_RESERVE;
     __builtin_memset((void *)(new_tp + rseq_off), 0xff, ELF_RSEQ_SIZE);
     ldso_rseq_offset = (int64_t)rseq_off;
 
@@ -3019,7 +3054,7 @@ elf_tls_ctx_t elf_setup_own_tls(elf_object_t *exe, elf_scope_t *scope) {
        A[0]=delka, A[1]=generace, A[2+modid-1]=entry; tcbhead.dtv = &A[1]. */
     typedef struct { uintptr_t u[2]; } ldso_dtv_t;
     ldso_dtv_t *dtv = (ldso_dtv_t *)(new_tp + rseq_off + ELF_RSEQ_SIZE);
-    memset(dtv, 0, (2 + g_tls_mod_count) * sizeof(ldso_dtv_t));
+    memset(dtv, 0, (2 + ELF_MAX_TLS_MODS + 16) * sizeof(ldso_dtv_t));
     dtv[0].u[0] = g_tls_mod_count + 1;   /* dtv length (dtv[-1].counter) */
     dtv[1].u[0] = 1;                     /* TLS generation counter */
     for (size_t i = 0; i < g_tls_mod_count; i++)
@@ -3035,6 +3070,35 @@ elf_tls_ctx_t elf_setup_own_tls(elf_object_t *exe, elf_scope_t *scope) {
      * malloc/free dereferencoval nulovy cache v parrot regionu -> SIGSEGV.
      * Switch dela az elf_run_final() tesne pred entry. */
     return ctx;
+}
+
+/* Dynamicky nacteny modul s PT_TLS: zkopiruj jeho .tdata do aktualniho
+ * threadu (TP + tls_offset) a nastav DTV entry. Diky fixni ELF_TLS_RESERVE
+ * je tls_offset vzdy uvnitr alokovaneho regionu a DTV je dimenzovane na
+ * ELF_MAX_TLS_MODS, takze se nic neprekryva ani nepretece. */
+void elf_tls_add_module_to_thread(elf_object_t *m) {
+    if (!m || !m->has_tls || !m->tls_offset || !g_tls_new_tp)
+        return;
+    uintptr_t tp = g_tls_new_tp;
+    char *dst = (char *)tp + m->tls_offset;
+    if (m->tdata_src && m->tdata_filesz)
+        memcpy(dst, m->tdata_src, m->tdata_filesz);
+    if (m->tls_memsz > m->tdata_filesz)
+        memset(dst + m->tdata_filesz, 0, m->tls_memsz - m->tdata_filesz);
+
+    /* DTV: tcbhead.dtv -> &A[1]; A[0]=delka, A[1]=generace, A[2+modid-1]=val */
+    typedef struct { uintptr_t u[2]; } ldso_dtv_t;
+    uintptr_t rseq_off = elf_tls_rseq_offset();
+    ldso_dtv_t *A = (ldso_dtv_t *)(tp + rseq_off + ELF_RSEQ_SIZE);
+    size_t modid = 0;
+    for (size_t i = 0; i < g_tls_mod_count; i++)
+        if (g_tls_mods[i] == m) { modid = i + 1; break; }
+    if (modid == 0 || modid > ELF_MAX_TLS_MODS)
+        return;
+    if (modid + 1 > A[0].u[0])
+        A[0].u[0] = modid + 1;
+    A[1 + modid].u[0] = (uintptr_t)dst;
+    A[1 + modid].u[1] = 0;
 }
 
 void elf_teardown_own_tls(elf_tls_ctx_t *ctx) {
