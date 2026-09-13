@@ -63,7 +63,9 @@ static int g_alias_count = 0;
 #define WORLD_HOST  0
 #define WORLD_ROOTFS 1
 static int  g_world = WORLD_ROOTFS;
-static int  g_dual_world = 0;
+static int  g_dual_world = 1;
+   /* default ZAPNUTO: cd .. z rootfs / preklopi na fyzicky Android (a cd
+    * $ROOTFS zpet). Bez toho je / strop a uzivatel se nedostane ven. */
    /* --double-world / -dw */
 static char g_vpath[1024];            /* virtuální cesta uvnitř rootfs ("/") */
 static char g_host_entry[600];        /* kam ses dostane cd .. z "/" */
@@ -1927,8 +1929,29 @@ static void detect_env(void) {
          export ROOTFS=/cesta/k/distro   (např. parrot rootfs) */
     const char *rf = getenv("ROOTFS");
     if (!rf || !rf[0]) {
-        fprintf(stderr, "gbsh: ROOTFS není nastaven — export ROOTFS=/cesta/k/distro "
-                        "(např. parrot rootfs) a spusť znovu\n");
+        /* Auto-detekce: hledej distro rootfs pod $HOME (typicky
+         * $HOME/nh/distro/{parrot,kali,docker/archlinux}). Poradi = priorita.
+         * Diky tomu gbsh nabehne i bez `export ROOTFS=...`. */
+        static const char *cands[] = {
+            "nh/distro/parrot", "nh/distro/kali", "nh/distro/docker/archlinux",
+            "nh/distro/docker/debian", "nh/distro/docker/ubuntu",
+            "ROOTFS-for-proot", NULL
+        };
+        const char *home = env_or("HOME", "/");
+        static char found[1200];
+        for (int i = 0; cands[i]; i++) {
+            char c[1200];
+            snprintf(c, sizeof c, "%s/%s", home, cands[i]);
+            if (access(c, R_OK) == 0) { snprintf(found, sizeof found, "%s", c); break; }
+        }
+        if (found[0]) {
+            rf = found;
+            setenv("ROOTFS", rf, 0);
+        }
+    }
+    if (!rf || !rf[0]) {
+        fprintf(stderr, "gbsh: ROOTFS není nastaven a auto-detekce selhala — "
+                        "export ROOTFS=/cesta/k/distro (např. parrot rootfs) a spusť znovu\n");
         exit(1);
     }
     snprintf(g_rootfs, sizeof g_rootfs, "%s", rf);
