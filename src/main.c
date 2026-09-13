@@ -1122,6 +1122,71 @@ static const char *shim_dlerror(void) {
     const char *(*ff)(void) = (const char *(*)(void))g_orig_dlerror;
     return ff ? ff() : NULL;
 }
+typedef int (*fp_posix_spawnp)(pid_t *, const char *,
+                               const void *, const void *,
+                               char *const[], char *const[]);
+static void *g_orig_posix_spawnp;
+static void *g_orig_posix_spawn;
+
+/* uv používá posix_spawnp (Rust std) pro zjištění libc: spouští
+ * /lib/ld-linux-aarch64.so.1 --version. Guest cesta se musí přeložit na
+ * device a re-exec přes elf_loader (jinak kernel hledá /lib/ld-linux na
+ * hostu -> ENOENT -> "Could not detect libc"). Delegujeme na reálný guest
+ * glibc posix_spawnp s argv = [elf_loader, --ownall, resolved, ...]. */
+static int shim_posix_spawnp(pid_t *pid, const char *p, const void *fa,
+                             const void *at, char *const argv[],
+                             char *const envp[]) {
+    if (!p || !p[0]) return -1;
+    char resolved[8192];
+    resolved[0] = 0;
+    size_t rl = g_shim_root ? shim_strlen(g_shim_root) : 0;
+    if (p[0] == '/') {
+        if (!shim_translate(p, resolved, sizeof resolved)) {
+            if (rl && shim_strncmp(p, g_shim_root, rl) == 0)
+                shim_strcpy(resolved, sizeof resolved, p);
+            else if (rl) {
+                shim_strcpy(resolved, sizeof resolved, g_shim_root);
+                shim_strcat(resolved, sizeof resolved, p);
+            } else {
+                shim_strcpy(resolved, sizeof resolved, p);
+            }
+        }
+    } else if (shim_strchr(p, '/')) {
+        if (rl) {
+            shim_strcpy(resolved, sizeof resolved, g_shim_root);
+            shim_strcat(resolved, sizeof resolved, "/");
+            shim_strcat(resolved, sizeof resolved, p);
+        } else {
+            shim_strcpy(resolved, sizeof resolved, p);
+        }
+    } else {
+        if (!search_guest_path(p, envp, resolved, sizeof resolved)) {
+            if (rl) {
+                shim_strcpy(resolved, sizeof resolved, g_shim_root);
+                shim_strcat(resolved, sizeof resolved, "/usr/bin/");
+                shim_strcat(resolved, sizeof resolved, p);
+            } else {
+                shim_strcpy(resolved, sizeof resolved, p);
+            }
+        }
+    }
+    if (!resolved[0]) return -1;
+
+    const char *loader_bin = g_shim_loader && g_shim_loader[0]
+                                 ? g_shim_loader : "/proc/self/exe";
+    char *na[512];
+    int narg = 0;
+    na[narg++] = (char *)loader_bin;
+    na[narg++] = (char *)(g_exec_mode ? g_exec_mode : "--ownall");
+    na[narg++] = resolved;
+    for (int i = 1; argv && argv[i] && narg < 510; i++)
+        na[narg++] = argv[i];
+    na[narg] = NULL;
+
+    fp_posix_spawnp f = (fp_posix_spawnp)g_orig_posix_spawnp;
+    return f ? f(pid, loader_bin, fa, at, na, envp) : -1;
+}
+
 static int shim_dladdr(const void *addr, void *info) {
     if (elf_own_deps)
         return ldso_dladdr(addr, info);
@@ -1225,6 +1290,8 @@ static f2_hook_t g_f2_hooks[] = {
     {"execve",(void*)shim_execve,&g_orig_execve},{"execv",(void*)shim_execv,&g_orig_execv},
     {"execvp",(void*)shim_execvp,&g_orig_execvp},{"execvpe",(void*)shim_execvpe,&g_orig_execvpe},
     {"execveat",(void*)shim_execveat,&g_orig_execveat},
+    {"posix_spawnp",(void*)shim_posix_spawnp,&g_orig_posix_spawnp},
+    {"posix_spawn",(void*)shim_posix_spawnp,&g_orig_posix_spawn},
     {"opendir",(void*)shim_opendir,&g_orig_opendir},
     {"readlink",(void*)shim_readlink,&g_orig_readlink},{"readlinkat",(void*)shim_readlinkat,&g_orig_readlinkat},
     {"realpath",(void*)shim_realpath,&g_orig_realpath},{"dlopen",(void*)shim_dlopen,&g_orig_dlopen},
