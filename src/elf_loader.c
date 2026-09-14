@@ -2133,6 +2133,9 @@ extern uintptr_t g_tls_old_tp;
 static long raw_syscall6(long nr, long a0, long a1, long a2, long a3, long a4, long a5);
 
 /* Volá se z asm (elf_final_jump) pod parrot TP. Žádný bionic kód/malloc. */
+static void install_sigsys_handler_now(void);
+static int g_f2_filter_active = 0;
+
 void elf_run_pending_inits(void) {
     { int _fd = raw_syscall6(56, (long)0xFFFFFFFFFFFFFF9CL, (long)(unsigned long)"/data/user/0/com.linux_core/files/usr/diag.txt", 0x441L, 0644L, 0, (long)F2_SENTINEL); if (_fd >= 0) { const char _m[] = "INITS-START\n"; raw_syscall6(64, _fd, (long)(unsigned long)_m, sizeof(_m) - 1, 0, 0, (long)F2_SENTINEL); raw_syscall6(57, _fd, 0, 0, 0, 0, (long)F2_SENTINEL); } }
     if (g_tls_new_tp) {
@@ -2152,6 +2155,20 @@ void elf_run_pending_inits(void) {
      * ps/top) → reinstalovat náš fault dump handler pro diagnostiku */
     if (getenv("ELF_LOADER_KEEP_HANDLERS"))
         elf_install_fault_handlers();
+    /* Guest glibc při inicializaci přepíše SIGSYS handler na default ->
+     * F2 path-translation (seccomp TRAP na openat) by zabila proces.
+     * Reinstalujeme náš handler. sigaction je bionický (čte bionic TLS),
+     * takže na dobu volání přepneme TP na bionic. */
+    if (g_f2_filter_active && g_tls_old_tp) {
+        uintptr_t _s; __asm__ volatile("mrs %0, tpidr_el0" : "=r"(_s));
+        if (_s != g_tls_old_tp) {
+            __asm__ volatile("msr tpidr_el0, %0" : : "r"(g_tls_old_tp));
+            install_sigsys_handler_now();
+            __asm__ volatile("msr tpidr_el0, %0" : : "r"(_s));
+        } else {
+            install_sigsys_handler_now();
+        }
+    }
     { int _fd = raw_syscall6(56, (long)0xFFFFFFFFFFFFFF9CL, (long)(unsigned long)"/data/user/0/com.linux_core/files/usr/diag.txt", 0x441L, 0644L, 0, (long)F2_SENTINEL); if (_fd >= 0) { const char _m[] = "INITS-DONE\n"; raw_syscall6(64, _fd, (long)(unsigned long)_m, sizeof(_m) - 1, 0, 0, (long)F2_SENTINEL); raw_syscall6(57, _fd, 0, 0, 0, 0, (long)F2_SENTINEL); } }
 }
 
@@ -3693,8 +3710,35 @@ static void install_f2_path_filter_impl(void) {
     }
     prog[n++] = (struct sock_filter)BPF_STMT(BPF_RET | BPF_K, SECCOMP_RET_ALLOW);
     struct sock_fprog fprog = { .len = (unsigned short)n, .filter = prog };
-    (void)prctl(PR_SET_NO_NEW_PRIVS, 1, 0, 0, 0);
-    (void)syscall((long)277, 1UL, 0UL, &fprog);
+    long rp = prctl(PR_SET_NO_NEW_PRIVS, 1, 0, 0, 0);
+    long rs = syscall((long)277, 1UL, 0UL, &fprog);
+    if (rs == 0) g_f2_filter_active = 1;
+    /* diag: zapsat navratove kody (raw, TP-independent) */
+    {
+        int fd = (int)raw_syscall6(56, -100L,
+            (long)(unsigned long)"/data/user/0/com.linux_core/files/usr/diag.txt",
+            0x441L, 0644L, 0, (long)F2_SENTINEL);
+        if (fd >= 0) {
+            char b[96]; int i = 0;
+            const char *p = "FILTER prctl=";
+            while (*p) b[i++] = *p++;
+            if (rp < 0) { b[i++]='-'; rp = -rp; }
+            char t[20]; int ti = 0;
+            if (rp == 0) t[ti++]='0';
+            while (rp > 0) { t[ti++] = '0' + (rp % 10); rp /= 10; }
+            while (ti > 0) b[i++] = t[--ti];
+            p = " seccomp=";
+            while (*p) b[i++] = *p++;
+            if (rs < 0) { b[i++]='-'; rs = -rs; }
+            ti = 0;
+            if (rs == 0) t[ti++]='0';
+            while (rs > 0) { t[ti++] = '0' + (rs % 10); rs /= 10; }
+            while (ti > 0) b[i++] = t[--ti];
+            b[i++] = '\n';
+            raw_syscall6(64, fd, (long)(unsigned long)b, i, 0, 0, (long)F2_SENTINEL);
+            raw_syscall6(57, fd, 0, 0, 0, 0, (long)F2_SENTINEL);
+        }
+    }
 }
 void install_f2_path_filter(void) {
     if (g_f2_root) install_f2_path_filter_impl();
@@ -3809,6 +3853,14 @@ static void sigsys_handler(int sig, siginfo_t *si, void *uc) {
  * main(), closing the window where bionic ld.so or early init could hit a
  * TRAP'd syscall and die. Only installs SIGSYS (not SIGSEGV/SIGILL/SIGBUS)
  * to avoid interfering with linker fault handling. */
+static void install_sigsys_handler_now(void) {
+    struct sigaction sc;
+    __builtin_memset(&sc, 0, sizeof(sc));
+    sc.sa_sigaction = sigsys_handler;
+    sc.sa_flags = SA_SIGINFO;
+    sigaction(SIGSYS, &sc, NULL);
+}
+
 __attribute__((constructor(101)))
 static void early_install_sigsys(void) {
     static char early_altstack[262144];
@@ -3816,12 +3868,7 @@ static void early_install_sigsys(void) {
     ess.ss_sp = early_altstack;
     ess.ss_size = sizeof(early_altstack);
     sigaltstack(&ess, NULL);
-    struct sigaction sc;
-    __builtin_memset(&sc, 0, sizeof(sc));
-    sc.sa_sigaction = sigsys_handler;
-    sc.sa_flags = SA_SIGINFO;   /* bez SA_ONSTACK: altstack se po prechodu na
-                                 * parrot TP nespolehlive pouziva pro SIGSYS */
-    sigaction(SIGSYS, &sc, NULL);
+    install_sigsys_handler_now();
 }
 
 void elf_install_fault_handlers(void) {

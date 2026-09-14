@@ -142,7 +142,8 @@ static int run_ownall(const char *path, int argc, char **argv, char **envp);
  * explicitni reseni symlinku v elf_load. F2_FILTER=1 filtr zapne (bez re-execu). */
 static int f2_should_filter(void) {
     const char *v = getenv("F2_FILTER");
-    return v && v[0] && v[0] != '0';
+    if (v && v[0] == '0') return 0;   /* F2_FILTER=0 -> vypnout */
+    return 1;                          /* default: zapnout (DNS/path translation) */
 }
 
 /* F2: path-translatni seccomp (non-root) je implementovan v elf_loader.c
@@ -1477,6 +1478,10 @@ static int run_ownall(const char *path, int argc, char **argv, char **envp) {
      * explicitni reseni symlinku v elf_load (resolve_symlinks_under_root). */
     if (g_f2_active) {
         f2_set_root(g_shim_root);
+        /* --ownall potrebuje path translation i pro glibc-interni volani
+         * (__open64_nocancel -> /etc/resolv.conf pro DNS), ktera obchazeji
+         * PLT override. Proto filtr zapiname DEFAULTNE (lze vypnout
+         * F2_FILTER=0). */
         if (f2_should_filter()) {
             install_f2_path_filter();
         }
