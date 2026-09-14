@@ -405,7 +405,10 @@ enum { SRC_HOST, SRC_ROOTFS };
 static int resolve_source(const char *cmd, char *rootfs_path, size_t rp_cap) {
     if (g_world == WORLD_ROOTFS) {
         if (!strchr(cmd, '/')) {
-            static const char *rdirs[] = { "/usr/bin", "/bin", "/usr/sbin", "/sbin" };
+            static const char *rdirs[] = { "/usr/local/bin", "/usr/local/sbin",
+                "/usr/bin", "/bin", "/usr/sbin", "/sbin",
+                "/root/.local/bin", "/root/.npm-global/bin",
+                "/root/.nvm/versions/node/v26.8.1/bin" };
             for (size_t i = 0; i < sizeof rdirs / sizeof rdirs[0]; i++) {
                 snprintf(rootfs_path, rp_cap, "%s%s/%s", g_rootfs, rdirs[i], cmd);
                 if (access(rootfs_path, X_OK) == 0) return SRC_ROOTFS;
@@ -448,7 +451,10 @@ static int resolve_source(const char *cmd, char *rootfs_path, size_t rp_cap) {
 
     /* 3) rootfs fallback jen v ROOTFS světě (host svět = čistý host) */
     if (g_world == WORLD_ROOTFS) {
-        static const char *rdirs[] = { "/usr/bin", "/bin", "/usr/sbin", "/sbin" };
+        static const char *rdirs[] = { "/usr/local/bin", "/usr/local/sbin",
+                "/usr/bin", "/bin", "/usr/sbin", "/sbin",
+                "/root/.local/bin", "/root/.npm-global/bin",
+                "/root/.nvm/versions/node/v26.8.1/bin" };
         for (size_t i = 0; i < sizeof rdirs / sizeof rdirs[0]; i++) {
             snprintf(rootfs_path, rp_cap, "%s%s/%s", g_rootfs, rdirs[i], cmd);
             if (access(rootfs_path, X_OK) == 0) return SRC_ROOTFS;
@@ -1002,7 +1008,23 @@ static pid_t launch_external(char **argv, int src, const char *rootfs_path,
         signal(SIGQUIT, SIG_DFL);
         /* PATH podle světa: rootfs děti vidí distro PATH, host děti systémovou */
         if (g_world == WORLD_ROOTFS) {
-            setenv("PATH", "/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin", 1);
+            {
+                char pbuf[2048];
+                /* gbsh běží na hostu (bionic), ale v rootfs světě je
+                 * uživatelský home fyzicky $ROOTFS/root. Pro ~ bin a nvm
+                 * cesty proto použijeme $ROOTFS/root, ne host HOME. */
+                char rhome[1200];
+                if (g_rootfs[0])
+                    snprintf(rhome, sizeof rhome, "%s/root", g_rootfs);
+                else
+                    snprintf(rhome, sizeof rhome, "/root");
+                snprintf(pbuf, sizeof pbuf,
+                    "/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin"
+                    ":%s/.local/bin:%s/.npm-global/bin"
+                    ":%s/.nvm/versions/node/v26.8.1/bin",
+                    rhome, rhome, rhome);
+                setenv("PATH", pbuf, 1);
+            }
             /* elf_loader vlastní libc.so musí brát z /system (jinak GNU ld
                script z parrotu = bad ELF magic), parrot glibc libs až za tím
                pro INNER loader (libc.so.6 apod.) */
