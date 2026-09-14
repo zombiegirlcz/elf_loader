@@ -1772,25 +1772,42 @@ static int prompt_display_width(void) {
     return w;
 }
 
+/* Počet fyzických řádků, které zabral poslední render (pro relativní posun
+ * kurzoru při příštím překreslení). Terminál appky nepodporuje DECSC/DECRC
+ * (\x1b[s/\x1b[u), takže místo save/restore počítáme řádky a posouváme se
+ * nahoru relativně (\x1b[<n>A). */
+/* Prompt se tiskne POUZE JEDNOU (terminál appky nepodporuje DECSC/DECRC
+ * \x1b[s/\x1b[u). Při dalším překreslení se posuneme nahoru jen o počet
+ * řádků, které zabral VSTUP (wrap podle šířky terminálu) — ne o řádky
+ * promptu. Tím zmizí duplikace promptu při každém stisku klávesy. */
+static int g_prompt_printed = 0;
+static int g_input_rows = 0;
+
+static int input_wrap_rows(size_t len, int tw) {
+    if (tw <= 0 || len == 0) return 0;
+    return (int)(len / (size_t)tw);
+}
+
 static void ed_render(const char *prompt, const char *buf, size_t len, size_t cur) {
     (void)prompt;
     int tw = get_term_cols();
 
-    /* Vrátit kurzor na začátek promptu (uložená pozice) a smazat CELU
-       oblast vstupu včetně zalomených řádků. To odstraňuje duplicity,
-       které vznikaly, když \r\x1b[K smazalo jen jeden fyzický řádek. */
-    if (g_saved) fputs("\x1b[u", stdout);   /* obnov start promptu */
-    else         fputs("\r", stdout);         /* první překreslení: začátek řádku */
-    fputs("\x1b[s", stdout);                  /* ulož start promptu pro příště */
-    fputs("\x1b[J", stdout);                  /* smaž od startu promptu dolů */
+    if (!g_prompt_printed) {
+        fputs(g_prompt_buf, stdout);
+        g_prompt_printed = 1;
+        g_input_rows = 0;
+    } else {
+        if (g_input_rows > 0) printf("\x1b[%dA", g_input_rows);
+        fputs("\r\x1b[J", stdout);
+    }
 
-    fputs(g_prompt_buf, stdout);
     hl_emit(buf, len);
     fputs("\x1b[0m", stdout);
-    fputs("\x1b[K", stdout);                  /* umazat zbytek posledního řádku */
+    fputs("\x1b[K", stdout);
+
+    g_input_rows = input_wrap_rows(len, tw);
 
     if (cur < len) {
-        /* přesuň kurzor zpět na cur s ohledem na zalomení řádku */
         int pw = prompt_display_width();
         int disp_cur = pw + (int)cur;
         int disp_end = pw + (int)len;
@@ -1800,7 +1817,6 @@ static void ed_render(const char *prompt, const char *buf, size_t len, size_t cu
         if (back_rows > 0) printf("\x1b[%dA", back_rows);
         if (back_cols > 0) printf("\x1b[%dD", back_cols);
     }
-    g_saved = 1;
     fflush(stdout);
 }
 
@@ -1812,7 +1828,8 @@ static char *read_line_interactive(void) {
     int paste = 0;
 
     raw_enable();
-    g_saved = 0;
+    g_prompt_printed = 0;
+    g_input_rows = 0;
     while (1) {
         ed_render("", buf, len, cur);
         char c;
