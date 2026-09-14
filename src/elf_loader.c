@@ -392,30 +392,12 @@ static size_t ldso_module_count;
 static int ldso_modules_built;
 
 void ldso_install_module_list(elf_object_t *const *mods, size_t count) {
+    /* ldso_register_linkmap je definovan nize; deklarace vpred. */
+    extern size_t ldso_register_linkmap(elf_object_t *m);
     if (count > LDSO_MAX_MODULES)
         count = LDSO_MAX_MODULES;
-    for (size_t i = 0; i < count; i++) {
-        elf_object_t *m = mods[i];
-        if (!m)
-            continue;
-        uint64_t *lm = ldso_module_linkmaps[ldso_module_count];
-        memset(lm, 0, sizeof ldso_module_linkmaps[0]);
-        unsigned char *b = (unsigned char *)lm;
-        uintptr_t base = (uintptr_t)m->base_addr;
-        const char *name = m->soname ? m->soname : "";
-        strncpy(ldso_module_names[ldso_module_count], name,
-                sizeof ldso_module_names[0] - 1);
-        ldso_module_names[ldso_module_count][sizeof ldso_module_names[0] - 1] = 0;
-        *(uintptr_t *)(b + 0x00) = base;                          /* l_addr */
-        *(uintptr_t *)(b + 0x08) = (uintptr_t)ldso_module_names[ldso_module_count];
-        *(uintptr_t *)(b + 0x28) = (uintptr_t)lm;                 /* l_real */
-        *(uintptr_t *)(b + 0x2f0) = (uintptr_t)m->phdr;           /* l_phdr */
-        *(uint16_t *)(b + 0x300) = (uint16_t)m->phdr_count;       /* l_phnum */
-        b[0x366] = 0x8;                                           /* l_contiguous */
-        *(uintptr_t *)(b + 0x398) = base;                         /* l_map_start */
-        *(uintptr_t *)(b + 0x3a0) = base + m->total_size;         /* l_map_end */
-        ldso_module_count++;
-    }
+    for (size_t i = 0; i < count; i++)
+        (void)ldso_register_linkmap(mods[i]);
     ldso_modules_built = 1;
 }
 
@@ -493,6 +475,39 @@ static void *ldso_tls_get_addr_soft(void *l) {
 /* Map an elf_object_t back to its fake link_map (built by
  * ldso_install_module_list / ldso_install_exe_linkmap). Falls back to the exe
  * link_map if the module is not in the list (e.g. the main executable). */
+/* Zaregistruje linkmap pro modul (i dynamicky nacteny za behu pres dlopen).
+ * Bez tohoto zaznamu v ldso_module_linkmaps vraci ldso_linkmap_for fallback
+ * ldso_exe_linkmap, takze glibc pocita adresy symbolu proti spatnemu base ->
+ * flaky SIGSEGV zavisly na ASLR layoutu. Dedup podle l_addr. */
+size_t ldso_register_linkmap(elf_object_t *m) {
+    if (!m)
+        return (size_t)-1;
+    uintptr_t base = (uintptr_t)m->base_addr;
+    for (size_t i = 0; i < ldso_module_count; i++) {
+        unsigned char *b = (unsigned char *)ldso_module_linkmaps[i];
+        if (*(uintptr_t *)(b + 0x00) == base)
+            return i;
+    }
+    if (ldso_module_count >= LDSO_MAX_MODULES)
+        return (size_t)-1;
+    uint64_t *lm = ldso_module_linkmaps[ldso_module_count];
+    memset(lm, 0, sizeof ldso_module_linkmaps[0]);
+    unsigned char *b = (unsigned char *)lm;
+    const char *name = m->soname ? m->soname : "";
+    strncpy(ldso_module_names[ldso_module_count], name,
+            sizeof ldso_module_names[0] - 1);
+    ldso_module_names[ldso_module_count][sizeof ldso_module_names[0] - 1] = 0;
+    *(uintptr_t *)(b + 0x00) = base;                          /* l_addr */
+    *(uintptr_t *)(b + 0x08) = (uintptr_t)ldso_module_names[ldso_module_count];
+    *(uintptr_t *)(b + 0x28) = (uintptr_t)lm;                 /* l_real */
+    *(uintptr_t *)(b + 0x2f0) = (uintptr_t)m->phdr;           /* l_phdr */
+    *(uint16_t *)(b + 0x300) = (uint16_t)m->phdr_count;       /* l_phnum */
+    b[0x366] = 0x8;                                           /* l_contiguous */
+    *(uintptr_t *)(b + 0x398) = base;                         /* l_map_start */
+    *(uintptr_t *)(b + 0x3a0) = base + m->total_size;         /* l_map_end */
+    return ldso_module_count++;
+}
+
 static void *ldso_linkmap_for(elf_object_t *m) {
     if (!m)
         return NULL;
@@ -503,6 +518,14 @@ static void *ldso_linkmap_for(elf_object_t *m) {
         unsigned char *b = (unsigned char *)ldso_module_linkmaps[i];
         if (*(uintptr_t *)(b + 0x00) == base)
             return ldso_module_linkmaps[i];
+    }
+    /* Modul nacteny za behu (dlopen/NSS/ctypes/Go) - zaregistruj linkmap,
+     * aby glibc dostal spravny l_addr. Jinak by vratil exe linkmap a pocital
+     * adresy proti spatnemu base -> flaky crash dle ASLR layoutu. */
+    {
+        size_t idx = ldso_register_linkmap(m);
+        if (idx != (size_t)-1)
+            return ldso_module_linkmaps[idx];
     }
     return ldso_exe_linkmap;
 }
@@ -3691,7 +3714,10 @@ static void install_f2_path_filter_impl(void) {
                                             offsetof(struct seccomp_data, nr));
     /* aarch64 cisla: openat=56 statx=291 newfstatat=79 readlinkat=78 faccessat=48
      * (POZOR: 63=read, 65=readv -> nesmi byt v seznamu!) */
-    static const int pathnrs[] = { 56, 291, 79, 78, 48 };
+    /* Jen openat: staci pro DNS (/etc/resolv.conf) i vetsinu path prekladu.
+     * statx/newfstatat/faccessat ZAMERNE vynechany - TRAP na ne rozbiji
+     * glibc interni cesty (NSS/dl_iterate_phdr) -> segfault v id/whoami. */
+    static const int pathnrs[] = { 56 };
     for (size_t i = 0; i < sizeof(pathnrs)/sizeof(pathnrs[0]); i++) {
         prog[n++] = (struct sock_filter)BPF_JUMP(BPF_JMP | BPF_JEQ | BPF_K,
                                                  pathnrs[i], 0, 6);
@@ -3761,35 +3787,32 @@ static void sigsys_handler(int sig, siginfo_t *si, void *uc) {
      * raw svc s SENTINEL v x5 (filtr ho pusti). Chyti i glibc-interni open. */
     /* stejna sada jako install_f2_path_filter_impl: openat=56 statx=291
      * newfstatat=79 readlinkat=78 faccessat=48 */
-    if (g_f2_root && (nr == 56 || nr == 291 || nr == 79 || nr == 78 || nr == 48)) {
-        char *orig = (char *)(unsigned long)ctx->uc_mcontext.regs[1];
+    if (nr == 56 && g_f2_root) {
+        const char *orig = (const char *)(unsigned long)ctx->uc_mcontext.regs[1];
         long dirfd = (long)ctx->uc_mcontext.regs[0];
         long a2 = (long)ctx->uc_mcontext.regs[2];
         long a3 = (long)ctx->uc_mcontext.regs[3];
         long a4 = (long)ctx->uc_mcontext.regs[4];
-        if (nr == 78) {  /* readlinkat: preloz CESTU, vrat ORIGINALNI link text
-                         * (guest ho znovu otevre pres openat -> my vyresime) */
-            char tr[8192];
-            f2_translate(orig, tr, sizeof tr);
-            long r = raw_syscall6(78, dirfd, (long)tr, a2, a3, 0, (long)F2_SENTINEL);
-            ctx->uc_mcontext.regs[0] = r;
-            return;
+        /* Preklad jen pro /etc/resolv.conf (DNS). Ostatni cesty posli na
+         * kernel BEZE ZMENY - TRAP+emulace vsech openatu rozbiji glibc
+         * interni cesty (NSS/dlopen/dl_iterate_phdr) -> segfault v id/zsh. */
+        static const char rc[] = "/etc/resolv.conf";
+        int is_rc = 0;
+        if (orig) {
+            is_rc = 1;
+            for (int i = 0; rc[i]; i++) {
+                if (orig[i] != rc[i]) { is_rc = 0; break; }
+            }
         }
-        /* openat/statx/newfstatat/faccessat: vyres symlinky (absolutni cile
-         * v ROOTFS by kernel resil proti realnemu rootu -> ENOENT). */
-        /* AT_SYMLINK_NOFOLLOW flag: openat(56)/statx(291) maji flagy v x2 (a2),
-         * newfstatat(79)/faccessat(48) v x3 (a3). statx je tedy ve skupine a2. */
-        long flags = (nr == 79 || nr == 48) ? a3 : a2;
-        char *out = g_f2_sc;
-        if (orig && orig[0] && !(flags & F2_AT_SYMLINK_NOFOLLOW))
-            f2_realpath(orig, out, sizeof g_f2_sc);
-        else
-            f2_translate(orig, out, sizeof g_f2_sc);
-        long res = raw_syscall6(nr, dirfd, (long)(unsigned long)out, a2, a3, a4,
-                                (long)F2_SENTINEL);
-        /* arm64: signal-frame pc uz je svc+4 (hardware posune pri vyjimce),
-         * proto NEMENIME pc; jen vratovou hodnotu x0. */
-        ctx->uc_mcontext.regs[0] = res;
+        char tr[4096];
+        const char *use = orig;
+        if (is_rc && orig && orig[0] == '/') {
+            f2_translate(orig, tr, sizeof tr);
+            use = tr;
+        }
+        long r = raw_syscall6(56, dirfd, (long)(unsigned long)use, a2, a3, a4,
+                              (long)F2_SENTINEL);
+        ctx->uc_mcontext.regs[0] = r;
         return;
     }
     /* Emulovatelné syscally zakazané Androidím seccompem.
