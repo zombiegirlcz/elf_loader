@@ -965,3 +965,38 @@ s libtinfo.so.6.5 (SONAME match splní DT_NEEDED). Rozbité symlinky EPERM trvaj
   `$GBSHRC`, `$HOME/.gbshrc`, `$ROOTFS/root/.gbshrc`, `$ROOTFS/etc/gbshrc`.
 - Testovací artefakty: `test_static_pie/` (minimal.c, exit_code.c, write.c,
   malloc.c, string.c, env.c, fork.c, build_tests.py, compare.py, combined_test.py).
+
+## 2026-09-15: gbsh -dw rekurzivní cd + dvojitý starship prompt
+
+### Symptom
+- `-dw` režim: každé `cd` (i bez argumentu) lepilo host `HOME` jako další
+  segment virtuální cesty → `/…/parrot/$/data/user/0/…/files/…` a smyčka
+  se opakovala (viz výpis: 6+ úrovní `$`).
+- Starship prompt se vykresloval dvakrát přes sebe (default i s configem),
+  `$` a `ls` lítaly na začátek řádku.
+
+### Příčina
+1. `bi_cd()` bez argumentu bral `env_or("HOME","/")`. V **rootfs světě** je
+   `HOME` = host app dir (`/data/user/0/com.linux_core/files`), který se ale
+   předal do `rootfs_relcd()` jako *virtuální* cesta → `$ROOTFS/data/user/0/…`.
+   V rootfs existoval reálný adresář `$` (88 položek), takže `stat()` prošel
+   a cesta se lepila místo aby `cd` selhal.
+2. `try_starship_prompt()` četl pipe **jedním `read()` do 2048 B**. Starship
+   prompt s configem je víceřádkový a delší → zbytek se ztratil.
+3. `ed_render()` počítal jen s `input_wrap_rows` (řádky vstupu), ne s řádky
+   promptu. Multi-line prompt s `\n` → kurzorová matematika míchala řádky.
+
+### Oprava (commit 389104b)
+- `bi_cd()` bez argumentu: `g_world == WORLD_ROOTFS` → `/root` (virtuální
+  cesta v distru), jinak `HOME`. `~` expanze stejně.
+- `try_starship_prompt()`: čte pipe ve smyčce dokud nedá EOF (buffer 8192 B).
+- `ed_render()`: `prompt_rows()` spočítá `\n` v promptu; při překreslení se
+  posun o `prompt_rows() + g_input_rows` nahoru a prompt znovu vytiskne.
+- Smazán stray adresář `$` v `$ROOTFS/` i `$HOME` (88 položek celkem).
+
+### Ověřeno
+- `gbsh -dw -c 'pwd; cd; pwd; cd; pwd; cd ..; pwd; cd /; pwd; cd ..; pwd'`
+  → `/`, `/root`, `/root`, `/`, `/`, `/data/…/nh/distro` — bez smyčky, bez `$`.
+- `gbsh -dw -c 'cd; pwd; cd ..; pwd; cd; pwd'` → `/root`, `/`, `/root`.
+- Prompt oprava je v kódu; interaktivní TTY test nutný v terminálu appky
+  (nelze přes `-c`).
