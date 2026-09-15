@@ -1046,13 +1046,49 @@ void *ldso_dlopen(const char *file, int mode) {
     return ret;
 }
 
+/* RTLD_NEXT podpora: najdi modul ve scope, do ktereho patri adresa `a`. */
+static elf_object_t *scope_mod_for_addr(elf_scope_t *s, uintptr_t a) {
+    if (!s)
+        return NULL;
+    for (size_t i = 0; i < s->count; i++) {
+        elf_object_t *m = s->mods[i];
+        if (!m || !m->base_addr)
+            continue;
+        uintptr_t lo = (uintptr_t)m->base_addr;
+        uintptr_t hi = lo + (m->total_size ? m->total_size : 0x400000);
+        if (a >= lo && a < hi)
+            return m;
+    }
+    return NULL;
+}
+
+/* Hledej `name` jen v jednom modulu (definovane globalni symboly). */
+static void *mod_lookup_name(elf_object_t *m, const char *name) {
+    if (!m || !m->dynsym || !m->dynstr)
+        return NULL;
+    for (size_t j = 0; j < m->dynsym_count; j++) {
+        const Elf64_Sym *sym = &m->dynsym[j];
+        if (sym->st_name == 0 || sym->st_shndx == SHN_UNDEF)
+            continue;
+        if (ELF64_ST_BIND(sym->st_info) == STB_LOCAL)
+            continue;
+        if (strcmp(m->dynstr + sym->st_name, name) != 0)
+            continue;
+        void *addr = (char *)m->base_addr + (sym->st_value - map_base_vaddr(m));
+        if (ELF64_ST_TYPE(sym->st_info) == STT_GNU_IFUNC)
+            addr = call_ifunc_resolver(addr);
+        return addr;
+    }
+    return NULL;
+}
+
 void *ldso_dlsym(void *handle, const char *name) {
     if (!name) { dl_set_err("invalid symbol name"); return NULL; }
     uintptr_t saved = dl_tp_get();
     int sw = (g_tls_old_tp && saved != g_tls_old_tp);
     if (sw) dl_tp_set(g_tls_old_tp);
     void *ret = NULL;
-    if (!handle || handle == (void *)-1) {          /* RTLD_DEFAULT / RTLD_NEXT */
+    if (!handle) {                                  /* RTLD_DEFAULT */
         /* OVERRIDE prvni! Jinak by elf_scope_lookup nasel guest glibc
          * dlopen/dlsym (pracuji nad nulovym _rtld_global) a Python by si
          * pres dlsym(RTLD_DEFAULT,"dlopen") vytahl rozbitou verzi. */
@@ -1065,6 +1101,28 @@ void *ldso_dlsym(void *handle, const char *name) {
         if (!ret) {
             p = resolve_import_ldso(name);
             if (p) { g_dl_err_valid = 0; ret = p; }
+            else dl_set_err(name);
+        }
+    } else if (handle == (void *)-1) {              /* RTLD_NEXT */
+        /* Sem chodi fakeroot (libfakeroot-tcp.so): next_<fn> = dlsym(RTLD_NEXT,
+         * "<fn>"). Nesmime vratit symbol z modulu, ktery jej vola (jinak
+         * nekonecna rekurze), ani nase override (ty patri "pred" nim).
+         * Najdeme volajici modul a hledame az ZA nim. */
+        uintptr_t caller = (uintptr_t)__builtin_return_address(0);
+        elf_object_t *cm = g_crash_scope
+                               ? scope_mod_for_addr(g_crash_scope, caller) : NULL;
+        size_t start = 0;
+        if (cm && g_crash_scope) {
+            for (size_t i = 0; i < g_crash_scope->count; i++)
+                if (g_crash_scope->mods[i] == cm) { start = i + 1; break; }
+        }
+        for (size_t i = start; g_crash_scope && i < g_crash_scope->count; i++) {
+            void *rp = mod_lookup_name(g_crash_scope->mods[i], name);
+            if (rp) { g_dl_err_valid = 0; ret = rp; break; }
+        }
+        if (!ret) {
+            void *rp = resolve_import_ldso(name);
+            if (rp) { g_dl_err_valid = 0; ret = rp; }
             else dl_set_err(name);
         }
     } else if (handle == (void *)g_crash_scope) {
@@ -1225,6 +1283,9 @@ static void *resolve_jmp_symbol(elf_object_t *obj, Elf64_Rela *r) {
             via = "defined";
             addr = va(obj, s->st_value);
         }
+        if (is_ifunc && getenv("ELF_LOADER_RELOC_TRACE"))
+            fprintf(stderr, "[ifunc] %s in %s -> resolver %p\n",
+                    name, obj->soname ? obj->soname : "?", addr);
         if (addr && is_ifunc)
             addr = call_ifunc_resolver(addr);
         tls_trace(name, addr, via, obj->soname);
@@ -3898,6 +3959,19 @@ static void sigsys_handler(int sig, siginfo_t *si, void *uc) {
         if (_old)
             raw_syscall6(134, 31L, 0L, _old, 8L, 0L, (long)F2_SENTINEL);
         ctx->uc_mcontext.regs[0] = 0;
+        return;
+    }
+    /* accept(202) je app seccompem TRAPnuta (overeno: DENIED nr=202 pri
+     * faked-tcp connectu) -> faked-tcp umira. Prelozime na accept4(242)
+     * (aarch64 glibc accept == accept4 s flags=0). Kdyby i 242 byla TRAP,
+     * handler se re-enters s nr=242 a vrati -ENOSYS (zadna nekonecna smycka). */
+    if (nr == 202) {
+        long fd  = (long)ctx->uc_mcontext.regs[0];
+        long sa  = (long)ctx->uc_mcontext.regs[1];
+        long len = (long)ctx->uc_mcontext.regs[2];
+        long r = raw_syscall6(242, fd, sa, len, 0, 0, (long)F2_SENTINEL);
+        ctx->uc_mcontext.regs[0] = r;
+        f2_reinstall_sigsys();
         return;
     }
     long emu = -999;  /* -999 = nemáme emulaci pro tento nr */
