@@ -163,6 +163,10 @@ void *elf_scope_lookup(const elf_scope_t *s, const char *name);
 elf_object_t *elf_scope_find(const elf_scope_t *s, const char *name,
                              const Elf64_Sym **out_sym);
 elf_object_t *elf_load_shared(const char *path, elf_scope_t *scope);
+/* Zaradi DT_INIT + init_array modulu (vcetne hlavniho exe) do fronty,
+ * kterou spusti elf_run_final() pod parrot TP. Pro hlavni exe se musi
+ * zavolat po elf_relocate(obj) - elf_load() sam inity nequeueuje. */
+void elf_queue_module_inits(elf_object_t *m);
 
 /* Debug levels */
 #define ELF_DEBUG_LEVEL_NONE    0

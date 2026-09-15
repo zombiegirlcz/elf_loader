@@ -426,11 +426,40 @@ static void *ldso_find_dso_for_object(uintptr_t addr, long a1, long a2,
     return NULL;
 }
 
+/* --- Bionic <-> parrot TLS prepinani pro shimy volane z guest glibc ---
+ * Loaderuv kod je bionicky (scudo malloc, bionic libc) a MUSI bezet pod
+ * bionickym TP. Guest glibc ale vola nase _rtld_global_ro shimy pod parrot
+ * TP; kdyz shim zavola bionickou funkci (malloc/free/getenv/stat/snprintf),
+ * bionic si pres tpidr_el0 precte parrot TLS jako sve struktury -> SIGSEGV.
+ * (Presne to padalo u node/V8 __backtrace -> _dl_find_object / _dl_open
+ * a u zsh/bash pri getpwuid -> dl_iterate_phdr.) */
+extern uintptr_t g_tls_old_tp;
+
+static inline uintptr_t dl_tp_get(void) {
+    uintptr_t t; __asm__ volatile("mrs %0, tpidr_el0" : "=r"(t)); return t;
+}
+static inline void dl_tp_set(uintptr_t t) {
+    __asm__ volatile("msr tpidr_el0, %0" : : "r"(t));
+}
+/* Vstoupí do loader (bionic) scope. Vrací 1 = na konci obnovit TP. */
+static inline int dl_enter_host(uintptr_t *saved) {
+    uintptr_t cur = dl_tp_get();
+    *saved = cur;
+    if (g_tls_old_tp && cur != g_tls_old_tp) {
+        dl_tp_set(g_tls_old_tp);
+        return 1;
+    }
+    return 0;
+}
+static inline void dl_leave_host(int sw, uintptr_t saved) {
+    if (sw) dl_tp_set(saved);
+}
+
 /* glibc 2.41+ _dl_find_object: (const void *pc, struct dl_find_object *result).
    Fills result for the object containing PC, returns 0 on success / -1 on
    not-found.  Result layout: +0 dlfo_addr, +8 dlfo_name, +16 dlfo_phdr,
    +24 dlfo_phnum, +32 dlfo_map_start, +40 dlfo_map_end, +48 dlfo_link_map.  */
-static int ldso_find_object(uintptr_t pc, void *result) {
+static int ldso_find_object_impl(uintptr_t pc, void *result) {
     uintptr_t *dlfo = (uintptr_t *)result;
     void *lm = ldso_find_dso_for_object(pc, 0, 0, 0, 0, 0, 0);
     if (!dlfo || !lm) {
@@ -447,6 +476,15 @@ static int ldso_find_object(uintptr_t pc, void *result) {
     dlfo[5] = *(uintptr_t *)(b + 0x3a0);  /* dlfo_map_end */
     dlfo[6] = (uintptr_t)lm;              /* dlfo_link_map */
     return 0;
+}
+
+/* Wrapper: guest glibc vola _dl_find_object pod parrot TP, ale telo shimu
+ * pouziva loaderuv bionicky kod -> prepni na bionic TP. */
+static int ldso_find_object(uintptr_t pc, void *result) {
+    uintptr_t _s; int _sw = dl_enter_host(&_s);
+    int _r = ldso_find_object_impl(pc, result);
+    dl_leave_host(_sw, _s);
+    return _r;
 }
 
 /* glibc 2.41+ _dl_catch_exception: runs operate(args) under exception
@@ -535,10 +573,10 @@ static void *ldso_linkmap_for(elf_object_t *m) {
  * (or NULL when not found). glibc's dlsym()/dlopen() internals call this via
  * the _rtld_global_ro function table (offset 0x268); without it the call
  * goes through a NULL pointer -> SIGSEGV pc=0 (starship/Rust crash). */
-static void *ldso_lookup_symbol_x(const char *name, void *undef_map,
-                                  const void **ref, void **scope,
-                                  const void *version, int type_class,
-                                  int flags, void *skip_map) {
+static void *ldso_lookup_symbol_x_impl(const char *name, void *undef_map,
+                                       const void **ref, void **scope,
+                                       const void *version, int type_class,
+                                       int flags, void *skip_map) {
     (void)undef_map; (void)scope; (void)version;
     (void)type_class; (void)flags; (void)skip_map;
     if (ref)
@@ -554,13 +592,27 @@ static void *ldso_lookup_symbol_x(const char *name, void *undef_map,
     return ldso_linkmap_for(m);
 }
 
+/* Wrapper: bionicky loader kod (memset/strncpy v ldso_register_linkmap). */
+static void *ldso_lookup_symbol_x(const char *name, void *undef_map,
+                                  const void **ref, void **scope,
+                                  const void *version, int type_class,
+                                  int flags, void *skip_map) {
+    uintptr_t _s; int _sw = dl_enter_host(&_s);
+    void *_r = ldso_lookup_symbol_x_impl(name, undef_map, ref, scope,
+                                         version, type_class, flags, skip_map);
+    dl_leave_host(_sw, _s);
+    return _r;
+}
+
 /* _rtld_global_ro function-table shims (glibc calls these instead of going
  * through the PLT).  Offsets follow the real glibc 2.41 layout. */
 static void ldso_debug_printf(const char *fmt, ...) {
+    uintptr_t _s; int _sw = dl_enter_host(&_s);
     va_list ap;
     va_start(ap, fmt);
     vfprintf(stderr, fmt, ap);
     va_end(ap);
+    dl_leave_host(_sw, _s);
 }
 
 static void ldso_mcount(uintptr_t frompc, uintptr_t selfpc) {
@@ -582,7 +634,9 @@ static int ldso_catch_error(const char **objname, const char **errstring,
 }
 
 static void ldso_error_free(void *p) {
+    uintptr_t _s; int _sw = dl_enter_host(&_s);
     free(p);
+    dl_leave_host(_sw, _s);
 }
 
 static void ldso_libc_freeres(void) {
@@ -590,8 +644,18 @@ static void ldso_libc_freeres(void) {
 
 /* _dl_open: guest dlopen.  Resolve the path against ROOTFS and own-load the
  * .so into the guest scope, then return its (fake) link_map as the handle. */
-static void *ldso_dl_open(const char *file, int mode, const void *caller,
-                          long nsid, int argc, char *argv[], char *env[]) {
+/* Fronta init funkci je definovana nize (elf_queue_init / elf_run_pending_inits).
+ * Runtime _dl_open ji ale take potrebuje spustit - jinak zustanou konstruktory
+ * noveho modulu nezavolane (OpenSSL libcrypto: bez sveho OSSL ctoru nemá
+ * registry provideru -> OSSL_PROVIDER_available("default")==0 -> node
+ * CHECK(ncrypto::CSPRNG(nullptr,0)) assert). */
+typedef void (*init_fn_t)(int, char **, char **);
+static init_fn_t *g_pending_inits;
+static size_t g_pending_count;
+extern uintptr_t g_tls_new_tp;
+
+static void *ldso_dl_open_impl(const char *file, int mode, const void *caller,
+                               long nsid, int argc, char *argv[], char *env[]) {
     (void)mode; (void)caller; (void)nsid; (void)argc; (void)argv; (void)env;
     if (!file || !file[0] || !g_crash_scope)
         return NULL;
@@ -628,8 +692,33 @@ static void *ldso_dl_open(const char *file, int mode, const void *caller,
         if (!resolved[0])
             snprintf(resolved, sizeof resolved, "%s", file);
     }
+    size_t prev_count = g_pending_count;
     elf_object_t *m = elf_load_shared(resolved, g_crash_scope);
+    /* Nove zarazene inity spust pod parrot TP - jsou to konstruktory guest
+     * modulu (libcrypto OSSL ctor, libstdc++ atd.), ktere sahaji do guest TLS.
+     * loader sam (a ldso_linkmap_for nize) musi zustat pod bionickym TP. */
+    if (m && !getenv("ELF_LOADER_NO_INITS") && g_pending_count > prev_count) {
+        uintptr_t save2 = dl_tp_get();
+        if (g_tls_new_tp)
+            dl_tp_set(g_tls_new_tp);
+        for (size_t i = prev_count; i < g_pending_count; i++) {
+            init_fn_t fn = g_pending_inits[i];
+            if (fn)
+                fn(elf_init_argc, elf_init_argv, elf_init_envp);
+        }
+        dl_tp_set(save2);
+    }
     return ldso_linkmap_for(m);
+}
+
+/* Wrapper: elf_load_shared + ldso_linkmap_for jsou bionicky loader kod
+ * (malloc/memset/stat/getenv). Guest glibc sem vstupuje pod parrot TP. */
+static void *ldso_dl_open(const char *file, int mode, const void *caller,
+                          long nsid, int argc, char *argv[], char *env[]) {
+    uintptr_t _s; int _sw = dl_enter_host(&_s);
+    void *_r = ldso_dl_open_impl(file, mode, caller, nsid, argc, argv, env);
+    dl_leave_host(_sw, _s);
+    return _r;
 }
 
 static void ldso_noop(void) {
@@ -975,23 +1064,11 @@ static void ldso_signal_error(void) {
 static int  g_dl_err_valid;
 static char g_dl_err[256];
 
-/* TLS thread-pointery: bionic (host) a parrot (guest). Definovane nize. */
+/* TLS thread-pointery: bionic (host) a parrot (guest). Definovane vyse. */
 extern uintptr_t g_tls_new_tp;
-extern uintptr_t g_tls_old_tp;
 
 static elf_object_t *ldso_load_new(const char *file);
 static void *override_lookup(const char *name);
-
-/* Loaderuv kod je bionicky (scudo malloc, bionic libc) a MUSI bezet pod
- * bionickym TP. Kdyz nas zavola guest (parrot TP) pres override dlopen/dlsym,
- * musime TP na dobu behu loaderu prepnout, jinak bionic malloc/errno cte
- * parrot TLS jako sve struktury -> SIGSEGV v bionic libc. */
-static inline uintptr_t dl_tp_get(void) {
-    uintptr_t t; __asm__ volatile("mrs %0, tpidr_el0" : "=r"(t)); return t;
-}
-static inline void dl_tp_set(uintptr_t t) {
-    __asm__ volatile("msr tpidr_el0, %0" : : "r"(t));
-}
 
 static void dl_set_err(const char *msg) {
     snprintf(g_dl_err, sizeof g_dl_err, "%s", msg ? msg : "unknown dl error");
@@ -2224,9 +2301,9 @@ static int load_module_needed(elf_object_t *m, elf_scope_t *scope) {
  * (btop, apt) v ctorusech sahají pod TP-0x720 (_pthread_cleanup_push /
  * cancellable futex) -> guard page bionického main-TLS -> SIGSEGV.
  * Spouští je elf_run_final() až POD parrot TP těsně před entry. */
-typedef void (*init_fn_t)(int, char **, char **);
-static init_fn_t *g_pending_inits;
-static size_t g_pending_count, g_pending_cap;
+/* init_fn_t, g_pending_inits a g_pending_count jsou deklarovane vyse
+ * (u ldso_dl_open_impl) - runtime _dl_open je take musi spoustet. */
+static size_t g_pending_cap;
 
 /* libc TLS per-thread state: locale pointer + ctype tables leží v
  * [TP + slot_off] slotech (offsety v libc .data na 0x1aff40 / 0x1afd58).
@@ -2246,24 +2323,41 @@ static long raw_syscall6(long nr, long a0, long a1, long a2, long a3, long a4, l
 static void install_sigsys_handler_now(void);
 static int g_f2_filter_active = 0;
 
+/* Skip flagy cachovane pod bionickym TP - elf_run_pending_inits bezi pod
+ * parrot TP a bionicke getenv() by tam cetlo parrot TLS (undefined result). */
+static int g_skip_inits = 0;
+static int g_skip_locale = 0;
+static int g_keep_handlers = 0;
+
 void elf_run_pending_inits(void) {
     { int _fd = raw_syscall6(56, (long)0xFFFFFFFFFFFFFF9CL, (long)(unsigned long)"/data/user/0/com.linux_core/files/usr/diag.txt", 0x441L, 0644L, 0, (long)F2_SENTINEL); if (_fd >= 0) { const char _m[] = "INITS-START\n"; raw_syscall6(64, _fd, (long)(unsigned long)_m, sizeof(_m) - 1, 0, 0, (long)F2_SENTINEL); raw_syscall6(57, _fd, 0, 0, 0, 0, (long)F2_SENTINEL); } }
     if (g_tls_new_tp) {
-        if (!getenv("ELF_LOADER_NO_LOCALE")) {
+        if (!g_skip_locale) {
             if (g_libc_uselocale)
                 g_libc_uselocale(NULL);      /* thread locale = _nl_global_locale */
             if (g_libc_ctype_init)
                 g_libc_ctype_init();         /* ctype_b/tolower sloty pro tento TP */
         }
     }
-    if (!getenv("ELF_LOADER_NO_INITS"))
+    {
+        char _b[48]; int _i = 0; const char *_p = "INITS-RUN n=";
+        while (*_p) _b[_i++] = *_p++;
+        unsigned long _n = (unsigned long)g_pending_count; char _t[24]; int _ti = 0;
+        if (_n == 0) _t[_ti++] = '0';
+        while (_n > 0) { _t[_ti++] = (char)('0' + (_n % 10)); _n /= 10; }
+        while (_ti > 0) _b[_i++] = _t[--_ti];
+        _b[_i++] = '\n';
+        int _fd = (int)raw_syscall6(56, (long)0xFFFFFFFFFFFFFF9CL, (long)(unsigned long)"/data/user/0/com.linux_core/files/usr/diag.txt", 0x441L, 0644L, 0, (long)F2_SENTINEL);
+        if (_fd >= 0) { raw_syscall6(64, _fd, (long)(unsigned long)_b, _i, 0, 0, (long)F2_SENTINEL); raw_syscall6(57, _fd, 0, 0, 0, 0, (long)F2_SENTINEL); }
+    }
+    if (!g_skip_inits)
     for (size_t i = 0; i < g_pending_count; i++) {
         init_fn_t fn = g_pending_inits[i];
         fn(elf_init_argc, elf_init_argv, elf_init_envp);
     }
     /* po initech: libc/program může mít přepsán SIGSEGV handler (procps
      * ps/top) → reinstalovat náš fault dump handler pro diagnostiku */
-    if (getenv("ELF_LOADER_KEEP_HANDLERS"))
+    if (g_keep_handlers)
         elf_install_fault_handlers();
     /* Guest glibc při inicializaci přepíše SIGSYS handler na default ->
      * F2 path-translation (seccomp TRAP na openat) by zabila proces.
@@ -2375,12 +2469,43 @@ static void run_module_init(elf_object_t *m) {
     typedef void (*init_fn_t)(int, char **, char **);
     if (init)
         elf_queue_init((init_fn_t)va(m, init));
+    /* DIAG: pro kazdy modul soname + DT_INIT + DT_INIT_ARRAYSZ */
+    {
+        char _b[256]; int _i = 0; const char *_p = "MOD ";
+        while (*_p) _b[_i++] = *_p++;
+        const char *sn = m->soname ? m->soname : "?";
+        for (const char *q = sn; *q && _i < 100; q++) _b[_i++] = *q;
+        const char *k1 = " init=0x"; while (*k1) _b[_i++] = *k1++;
+        static const char hx[] = "0123456789abcdef";
+        char _h[17]; int _hi; unsigned long _v;
+        _v = (unsigned long)init; _hi = 0;
+        if (!_v) _h[_hi++] = '0';
+        while (_v) { _h[_hi++] = hx[_v & 15]; _v >>= 4; }
+        while (_hi) _b[_i++] = _h[--_hi];
+        const char *k2 = " iasz=0x"; while (*k2) _b[_i++] = *k2++;
+        _v = (unsigned long)init_arraysz; _hi = 0;
+        if (!_v) _h[_hi++] = '0';
+        while (_v) { _h[_hi++] = hx[_v & 15]; _v >>= 4; }
+        while (_hi) _b[_i++] = _h[--_hi];
+        _b[_i++] = '\n';
+        int _fd = (int)raw_syscall6(56, (long)0xFFFFFFFFFFFFFF9CL, (long)(unsigned long)"/data/user/0/com.linux_core/files/usr/diag.txt", 0x441L, 0644L, 0, (long)F2_SENTINEL);
+        if (_fd >= 0) { raw_syscall6(64, _fd, (long)(unsigned long)_b, _i, 0, 0, (long)F2_SENTINEL); raw_syscall6(57, _fd, 0, 0, 0, 0, (long)F2_SENTINEL); }
+    }
     if (init_array && init_arraysz) {
         uint64_t *arr = (uint64_t *)va(m, init_array);
         size_t n = init_arraysz / sizeof(uint64_t);
         for (size_t i = 0; i < n; i++)
             elf_queue_init((init_fn_t)arr[i]);
     }
+}
+
+/* Verejny wrapper: zaradi DT_INIT + init_array hlavniho exe do fronty.
+ * elf_load() sam inity nequeueuje (exe se relokuje az v main.c), takze
+ * run_ownall musi tuhle funkci zavolat PO elf_relocate(obj). Bez toho
+ * konstruktory hlavniho programu nebezi vubec (node ma OpenSSL staticky ->
+ * bez OSSL ctoru zadny provider -> CSPRNG assert). */
+void elf_queue_module_inits(elf_object_t *m) {
+    run_module_init(m);
 }
 
 /* Android stub detection: a dependency symlinked to /bin/true (or
@@ -2626,7 +2751,6 @@ elf_object_t *elf_load_shared(const char *path, elf_scope_t *scope) {
     fflush(stdout);
     return m;
 }
-
 /* Runtime dlopen: guest požádal o modul, který ještě není načtený
  * (typicky Python import _ctypes -> libffi.so.8). Sestavíme search path
  * z distro libdirs a own-loadneme ho do crash scope.
@@ -3149,6 +3273,29 @@ elf_tls_ctx_t elf_setup_own_tls(elf_object_t *exe, elf_scope_t *scope) {
     uintptr_t host_tp = read_tp();
     ctx.old_tp = host_tp;
 
+    /* Cachuj skip-flagy TED - jsme pod bionickym TP, getenv() funguje.
+     * elf_run_pending_inits() bezi pod parrot TP, kde by bionicke getenv()
+     * cetlo parrot TLS a vracelo nesmysl (inity by se preskocily). */
+    {
+        const char *v;
+        v = getenv("ELF_LOADER_NO_INITS");
+        g_skip_inits = (v && v[0] && v[0] != '0') ? 1 : 0;
+        v = getenv("ELF_LOADER_NO_LOCALE");
+        g_skip_locale = (v && v[0] && v[0] != '0') ? 1 : 0;
+        v = getenv("ELF_LOADER_KEEP_HANDLERS");
+        g_keep_handlers = (v && v[0] && v[0] != '0') ? 1 : 0;
+        /* Diagnostika do diag.txt (raw, TP-independent) */
+        char _b[64]; int _i = 0; const char *_p = "ENV-CACHE skip_inits=";
+        while (*_p) _b[_i++] = *_p++;
+        _b[_i++] = (char)('0' + g_skip_inits);
+        const char *_p2 = " skip_locale=";
+        while (*_p2) _b[_i++] = *_p2++;
+        _b[_i++] = (char)('0' + g_skip_locale);
+        _b[_i++] = '\n';
+        int _fd = (int)raw_syscall6(56, (long)0xFFFFFFFFFFFFFF9CL, (long)(unsigned long)"/data/user/0/com.linux_core/files/usr/diag.txt", 0x441L, 0644L, 0, (long)F2_SENTINEL);
+        if (_fd >= 0) { raw_syscall6(64, _fd, (long)(unsigned long)_b, _i, 0, 0, (long)F2_SENTINEL); raw_syscall6(57, _fd, 0, 0, 0, 0, (long)F2_SENTINEL); }
+    }
+
     /* Vsechny TLS moduly (exe + scope) jsou registrovane pres elf_tls_assign
      * s malymi kladnymi offsety od TP (aarch64 TLS_DTV_AT_TP). */
     size_t span = 0;
@@ -3391,9 +3538,12 @@ static void install_legacy_syscall_filter_impl(void) {
         BPF_JUMP(BPF_JMP | BPF_JGE | BPF_K, 424, 0, 1);
     prog[n++] = (struct sock_filter)
         BPF_STMT(BPF_RET | BPF_K, SECCOMP_RET_ERRNO | ENOSYS);
-    /* Dalsi casto TRAPovane: statx=291, getrandom=278, membarrier=283,
-     * userfaultfd=282, preadv2/pwritev2/copy_file_range/pkey=285-289. */
-    static const int blocked2[] = { 278, 282, 283, 285, 286, 287, 288, 289, 291 };
+    /* Dalsi casto TRAPovane: statx=291, membarrier=283,
+     * userfaultfd=282, preadv2/pwritev2/copy_file_range/pkey=285-289.
+     * POZOR: getrandom(278) ZAMERNE NEblokujeme - node/OpenSSL CSPRNG
+     * pres nej ziskava entropii; s ENOSYS selze ncrypto::CSPRNG assert.
+     * (Rootfs nema /dev/urandom, takze fallback nefunguje.) */
+    static const int blocked2[] = { 282, 283, 285, 286, 287, 288, 289, 291 };
     for (size_t i = 0; i < sizeof(blocked2) / sizeof(blocked2[0]); i++) {
         prog[n++] = (struct sock_filter)
             BPF_JUMP(BPF_JMP | BPF_JEQ | BPF_K, blocked2[i], 0, 1);
@@ -3407,7 +3557,7 @@ static void install_legacy_syscall_filter_impl(void) {
      *   435 clone3, 436 close_range, 437 openat2, 439 faccessat2
      *   440 process_madvise, 441 epoll_pwait2, 449 futex_waitv
      *   282 userfaultfd, 434 pidfd_open */
-    static const int blocked[] = { 293, 282, 434, 435, 436, 437, 439, 440, 441, 449, 278, 283, 291 };
+    static const int blocked[] = { 293, 282, 434, 435, 436, 437, 439, 440, 441, 449, 283, 291 };
     for (size_t i = 0; i < sizeof(blocked)/sizeof(blocked[0]); i++) {
         prog[n++] = (struct sock_filter)
             BPF_JUMP(BPF_JMP | BPF_JEQ | BPF_K, blocked[i], 0, 1);
