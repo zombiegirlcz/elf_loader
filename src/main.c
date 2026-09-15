@@ -141,9 +141,14 @@ static int run_ownall(const char *path, int argc, char **argv, char **envp);
  * v --shim rezimu; preklad cest zajistuji PLT override + inline hooky +
  * explicitni reseni symlinku v elf_load. F2_FILTER=1 filtr zapne (bez re-execu). */
 static int f2_should_filter(void) {
+    /* F2 seccomp filtr je DEFAULTNE VYPNUTY. Filtr se dedi pres execve do
+     * fork+exec deti (subprocess, zsh -i compinit/fzf), kde mezi execve a
+     * instalaci SIGSYS handleru bezici bionicky ld.so udela openat -> TRAP
+     * bez handleru -> dite umre ("Bad system call").
+     * DNS a interni cesty resi inline-hook __open64_nocancel (viz vyse).
+     * Zapnout lze F2_FILTER=1 (experimenty). */
     const char *v = getenv("F2_FILTER");
-    if (v && v[0] == '0') return 0;   /* F2_FILTER=0 -> vypnout */
-    return 1;                          /* default: zapnout (DNS/path translation) */
+    return (v && v[0] && v[0] != '0');
 }
 
 /* F2: path-translatni seccomp (non-root) je implementovan v elf_loader.c
@@ -290,6 +295,7 @@ static int shim_translate(const char *p, char *out, size_t n) {
  * RWX pro patch kodu na Androidu projde (zadny file-backed W^X). */
 static void *g_orig_open = NULL, *g_orig_open64 = NULL, *g_orig_openat = NULL,
             *g_orig_openat64 = NULL;
+static void *g_orig_open64_nocancel = NULL;  /* interni glibc open pro DNS/NSS */
 static void *g_orig_stat = NULL, *g_orig_stat64 = NULL, *g_orig___xstat = NULL,
             *g_orig_lstat = NULL, *g_orig___lxstat = NULL;
 static void *g_orig_access = NULL, *g_orig_euidaccess = NULL, *g_orig_faccessat = NULL;
@@ -382,6 +388,11 @@ static int patch_branch(void *target, void *dst) {
         *(uint32_t *)((char *)b + 4) = 0xD61F0200;     /* BR x16 */
         *(uint64_t *)((char *)b + 8) = (uint64_t)dst;
         __builtin___clear_cache(b, (char *)b + 16);
+        /* KRITICKE: alloc_near vraci RW (ne X) stranku. Bez tohoto mprotect
+         * skoci B na bridge a spadne na "exec neexecutabilni stranky"
+         * (fault: pc == ad == adresa bridge). make_bridge() to dela, tady
+         * to chybelo. */
+        mprotect(b, 4096, PROT_READ | PROT_EXEC);
         uint32_t b2 = branch_insn(target, b);
         if (!b2) { mprotect((void *)pg, 4096, PROT_READ | PROT_EXEC); return -1; }
         *(uint32_t *)target = b2;
@@ -1323,6 +1334,90 @@ static int f2_only_match(const char *name) {
 /* F2 setup: (1) zaregistrujeme symbol-override pro PLT binarky (binary vidi
  * shim primo pres vlastni PLT), (2) patchneme glibc leaf funkce inline-hookem,
  * aby se zachytily i glibc-interni volani (opendir->openat64 raw syscall). */
+/* Raw syscall (aarch64) - TP-independent. Shim funkce jsou volany z guest
+ * libc (aktivni parrot TP), kde bionicky syscall() potrebuje bionicky TP kvuli
+ * errno -> pouzijeme primy svc #0. */
+static long main_raw_syscall4(long nr, long a0, long a1, long a2, long a3) {
+    register long x8 __asm__("x8") = nr;
+    register long x0 __asm__("x0") = a0;
+    register long x1 __asm__("x1") = a1;
+    register long x2 __asm__("x2") = a2;
+    register long x3 __asm__("x3") = a3;
+    __asm__ volatile("svc #0"
+                     : "+r"(x0)
+                     : "r"(x8), "r"(x1), "r"(x2), "r"(x3)
+                     : "memory", "cc");
+    return x0;
+}
+
+/* Interni glibc volani __open64_nocancel (GLIBC_PRIVATE) obchazi PLT override
+ * i inline hooky na open/open64 - proto guest glibc cetl host /etc/resolv.conf
+ * (neexistuje) a DNS nefungovalo. Tato funkce je volana i s cestami jako
+ * /etc/nsswitch.conf, /etc/hosts apod. Prelozime cestu pod ROOTFS.
+ * Diky tomu NEMUSIME mit seccomp F2 filtr (ktery otravoval fork+exec deti). */
+static int shim_open64_nocancel(const char *p, int flags, ...) {
+    /* Preloz cestu a zavolej ORIGINAL pres trampolinu (g_orig_open64_nocancel).
+     * Original nastavi errno spravne (glibc __open64_nocancel semantika) - proto
+     * to nerobime raw syscallem, ktery errno neaktualizuje a rozbil
+     * dl_iterate_phdr/NSS v id/whoami/zsh. */
+    /* CILENY preklad: __open64_nocancel je volan z glibc internich cest
+     * (dlopen NSS modulu, _dl_map_object). Preklad VSECH cest rozbil
+     * dl_iterate_phdr (NULL linkmap) -> pad id/whoami/zsh. Proto prekladame
+     * JEN DNS soubory, ktere NSS/DNS resolver cte internim nocancel volanim
+     * (a ktere PLT override nechyti). Ostatni cesty -> passthrough. */
+    static const char *dns_files[] = {
+        "/etc/resolv.conf", NULL
+    };
+    const char *path = p;
+    char buf[8192];
+    if (p && p[0] == '/') {
+        for (int i = 0; dns_files[i]; i++) {
+            size_t dl = shim_strlen(dns_files[i]);
+            if (shim_strncmp(p, dns_files[i], dl) == 0 &&
+                (p[dl] == 0 || p[dl] == '/')) {
+                if (shim_translate(p, buf, sizeof buf)) path = buf;
+                break;
+            }
+        }
+    }
+    va_list ap; va_start(ap, flags); mode_t mode = va_arg(ap, mode_t); va_end(ap);
+    fp_open f = (fp_open)g_orig_open64_nocancel;
+    return f ? f(path, flags, mode) : -1;
+}
+
+/* Inline hook pro funkce s PAC prologem (paciasp) - hook_install je odmita,
+ * protoze prvni instrukce neni B-thunk. Zkopirujeme prvni instrukci do
+ * trampoliny, za ni B na target+4, a target prejdeme na B->shim. PAC zustava
+ * konzistentni (trampolina dela paciasp/autiasp se stejnym SP). */
+static int hook_inline_prologue(void *target, void *shim, void **orig) {
+    if (!target || !shim) return 0;
+    uint32_t ins0 = *(const uint32_t *)target;
+    /* Odmitni B/BL/ADRP/LDR-lit prolog (thunk pattern) - PAC (d503233f) je OK. */
+    uint32_t cls = ins0 & 0xFC000000;
+    if (cls == 0x14000000 || cls == 0x94000000) return 0;
+    if ((ins0 & 0x9F000000) == 0x90000000) return 0;
+    if ((ins0 & 0xBF000000) == 0x18000000) return 0;
+    /* Trampolina: zkopiruj prvni instrukci, za ni B na target+4. Shim pak
+     * muze zavolat g_orig (= trampolina) a zachovat glibc errno semantiku.
+     * (Raw syscall v shimu obchazel errno -> rozbity dl_iterate_phdr/NSS.) */
+    void *tramp = alloc_near(target);
+    if (tramp == MAP_FAILED) return 0;
+    *(uint32_t *)tramp = ins0;
+    uint32_t bi = branch_insn((char *)tramp + 4, (char *)target + 4);
+    if (!bi) {
+        void *b = make_bridge((char *)target + 4);
+        if (!b) return 0;
+        bi = branch_insn((char *)tramp + 4, b);
+        if (!bi) return 0;
+    }
+    *(uint32_t *)((char *)tramp + 4) = bi;
+    __builtin___clear_cache(tramp, (char *)tramp + 8);
+    mprotect(tramp, 4096, PROT_READ | PROT_WRITE | PROT_EXEC);
+    if (patch_branch(target, shim) != 0) return 0;
+    *orig = tramp;
+    return 1;
+}
+
 static void shim_register_overrides(void) {
     if (getenv("F2_DISABLE")) return;  /* debug: zadne override */
     g_shim_root = getenv("ROOTFS");
@@ -1337,6 +1432,27 @@ static void shim_install_hooks(void) {
     int ok = 0;
     for (size_t i = 0; i < sizeof g_f2_hooks / sizeof g_f2_hooks[0]; i++)
         if (f2_only_match(g_f2_hooks[i].n) && hook_install(&g_f2_hooks[i])) ok++;
+    /* Interni glibc open (__open64_nocancel) obchazi PLT override i inline
+     * hooky na open/open64 - proto guest glibc cetl host /etc/resolv.conf
+     * (neexistuje) a DNS nefungovalo. Inline-hook (PAC prolog) ho prelozi pod
+     * ROOTFS. Nahrazuje seccomp F2 filtr, ktery zabijel fork+exec deti
+     * (subprocess/zsh -i). Vypnout lze F2_NO_INTERNAL_HOOK=1.
+     * POZOR: musi bezet az po elf_load (scope ma moduly), proto zde a ne
+     * v shim_register_overrides. */
+    if (g_shim_scope && !getenv("F2_NO_INTERNAL_HOOK")) {
+        void *t = elf_scope_lookup(g_shim_scope, "__open64_nocancel");
+        if (!t) t = elf_scope_lookup(g_shim_scope, "__open_nocancel");
+        if (elf_debug())
+            fprintf(stderr, "[hook] __open64_nocancel lookup=%p\n", t);
+        if (t && hook_inline_prologue(t, (void *)shim_open64_nocancel,
+                                      &g_orig_open64_nocancel)) {
+            ok++;
+            if (elf_debug())
+                fprintf(stderr, "[hook] __open64_nocancel inline OK\n");
+        } else if (t && elf_debug()) {
+            fprintf(stderr, "[hook] __open64_nocancel inline FAIL\n");
+        }
+    }
     if (elf_debug())
         fprintf(stderr, "[F2-hooks] inline-patchnuto %d glibc funkci\n", ok);
 }

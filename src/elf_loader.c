@@ -3305,7 +3305,7 @@ static void install_legacy_syscall_filter_impl(void) {
      *   435 clone3, 436 close_range, 437 openat2, 439 faccessat2
      *   440 process_madvise, 441 epoll_pwait2, 449 futex_waitv
      *   282 userfaultfd, 434 pidfd_open */
-    static const int blocked[] = { 293, 282, 434, 435, 436, 437, 439, 440, 441, 449, 278, 283, 291, 99 };
+    static const int blocked[] = { 293, 282, 434, 435, 436, 437, 439, 440, 441, 449, 278, 283, 291 };
     for (size_t i = 0; i < sizeof(blocked)/sizeof(blocked[0]); i++) {
         prog[n++] = (struct sock_filter)
             BPF_JUMP(BPF_JMP | BPF_JEQ | BPF_K, blocked[i], 0, 1);
@@ -3772,6 +3772,26 @@ void install_f2_path_filter(void) {
 
 /* SIGSYS = seccomp odmitl syscall. Vypise cislo syscallu cistym sys_write
  * (handler muze bezet pod parrot TP, bionic stdio je tam nedostupne). */
+static void sigsys_handler(int, siginfo_t *, void *);
+
+/* Reinstalace SIGSYS handleru KERNEL layoutem (bionic struct sigaction ma
+ * jiny layout nez kernel!). Volej z handleru, aby nas handler "drzel" i kdyz
+ * ho guest runtime (glibc/zsh) prebije. raw syscall = TP-independent. */
+static void f2_reinstall_sigsys(void) {
+    struct {
+        void (*h)(int, void *, void *);
+        unsigned long flags;
+        void (*r)(void);
+        unsigned long mask;
+    } ka;
+    ka.h = (void (*)(int, void *, void *))sigsys_handler;
+    ka.flags = 4UL;   /* SA_SIGINFO */
+    ka.r = 0;
+    ka.mask = 0;
+    raw_syscall6(134, 31L /* SIGSYS */, (long)(unsigned long)&ka, 0L, 8L, 0L,
+                 (long)F2_SENTINEL);
+}
+
 static void sigsys_handler(int sig, siginfo_t *si, void *uc) {
     (void)sig;
     { static const char _m[] = "HANDLER-ENTER\n"; int _fd = raw_syscall6(56, (long)0xFFFFFFFFFFFFFF9CL, (long)(unsigned long)"/data/user/0/com.linux_core/files/usr/diag.txt", 0x441L, 0644L, 0, (long)F2_SENTINEL); if (_fd >= 0) { raw_syscall6(64, _fd, (long)(unsigned long)_m, sizeof(_m) - 1, 0, 0, (long)F2_SENTINEL); raw_syscall6(57, _fd, 0, 0, 0, 0, (long)F2_SENTINEL); } }
@@ -3783,6 +3803,15 @@ static void sigsys_handler(int sig, siginfo_t *si, void *uc) {
     { static const char _m[] = "ENTER\n"; int _fd = raw_syscall6(56, (long)0xFFFFFFFFFFFFFF9CL, (long)(unsigned long)"/data/user/0/com.linux_core/files/usr/diag.txt", 0x241L, 0644L, 0, (long)F2_SENTINEL); if (_fd >= 0) { raw_syscall6(64, _fd, (long)(unsigned long)_m, 6, 0, 0, (long)F2_SENTINEL); raw_syscall6(57, _fd, 0, 0, 0, 0, (long)F2_SENTINEL); } }
     ucontext_t *ctx = (ucontext_t *)uc;
     long nr = si->si_syscall;
+    { char _b[32]; int _i = 0; const char *_p = "SIGSYS nr=";
+      while (*_p) _b[_i++] = *_p++;
+      unsigned long _n = (unsigned long)nr; char _t[24]; int _ti = 0;
+      if (_n == 0) _t[_ti++] = '0';
+      while (_n > 0) { _t[_ti++] = (char)('0' + (_n % 10)); _n /= 10; }
+      while (_ti > 0) _b[_i++] = _t[--_ti];
+      _b[_i++] = '\n';
+      int _fd = (int)raw_syscall6(56, (long)0xFFFFFFFFFFFFFF9CL, (long)(unsigned long)"/data/user/0/com.linux_core/files/usr/diag.txt", 0x441L, 0644L, 0, (long)F2_SENTINEL);
+      if (_fd >= 0) { raw_syscall6(64, _fd, (long)(unsigned long)_b, _i, 0, 0, (long)F2_SENTINEL); raw_syscall6(57, _fd, 0, 0, 0, 0, (long)F2_SENTINEL); } }
     /* F2 seccomp path-translation: prelozime cestu (x1) a zemulujeme syscall
      * raw svc s SENTINEL v x5 (filtr ho pusti). Chyti i glibc-interni open. */
     /* stejna sada jako install_f2_path_filter_impl: openat=56 statx=291
@@ -3820,6 +3849,15 @@ static void sigsys_handler(int sig, siginfo_t *si, void *uc) {
      * povolené syscally jdou na reálné jádro a sem vubec nedojdou.
      * Vracíme benigní hodnotu a preskocíme svc #0 -> binárka pokracuje.
      * (futex_waitv 444 apod. vyžadují reálné jádro -> neemulovatelné.) */
+    /* rt_sigaction(134) se SIGSYS: cizi pokus prepsat nas handler ->
+     * predstirej uspech, NAS handler zustava aktivni. */
+    if (nr == 134) {
+        long _old = (long)ctx->uc_mcontext.regs[2];
+        if (_old)
+            raw_syscall6(134, 31L, 0L, _old, 8L, 0L, (long)F2_SENTINEL);
+        ctx->uc_mcontext.regs[0] = 0;
+        return;
+    }
     long emu = -999;  /* -999 = nemáme emulaci pro tento nr */
     switch (nr) {
         case 151: emu = getuid(); break;  /* setfsuid  (best-effort, navrat ignorovan) */
@@ -3854,21 +3892,38 @@ static void sigsys_handler(int sig, siginfo_t *si, void *uc) {
         default: break;
     }
     if (emu != -999) {
-        ctx->uc_mcontext.pc += 4;             /* preskoc svc #0 */
+        /* POZOR: na tomto arm64 jiz ucontext.pc ukazuje na svc+4
+         * (viz F2 vetev vyse), takze pc NEMENIME - jinak bychom
+         * preskocili dalsi instrukci a spadli. */
         ctx->uc_mcontext.regs[0] = emu;       /* emulovaná navratová hodnota */
+        f2_reinstall_sigsys();                /* drz nas handler */
         return;                               /* sigreturn -> pokracovani */
     }
-    char buf[64];
-    const char *pre = "[SIGSYS] denied syscall nr=";
-    char *p = buf;
-    for (const char *q = pre; *q; q++) *p++ = *q;
-    char tmp[24]; int ti = 0;
-    if (nr == 0) tmp[ti++] = '0';
-    while (nr > 0) { tmp[ti++] = (char)('0' + (nr % 10)); nr /= 10; }
-    while (ti > 0) *p++ = tmp[--ti];
-    *p++ = '\n';
-    sys_write(2, buf, (size_t)(p - buf));
-    _exit(159);
+    /* DIAG: zaloguj cislo neemulovaneho syscallu a vrat -ENOSYS misto
+     * _exit(159) - proces tak pokracuje a my zjistime, co zsh -i potrebuje. */
+    {
+        char buf[48];
+        const char *pre = "DENIED nr=";
+        char *p = buf;
+        for (const char *q = pre; *q; q++) *p++ = *q;
+        char tmp[24]; int ti = 0;
+        unsigned long _n = nr;
+        if (_n == 0) tmp[ti++] = '0';
+        while (_n > 0) { tmp[ti++] = (char)('0' + (_n % 10)); _n /= 10; }
+        while (ti > 0) *p++ = tmp[--ti];
+        *p++ = '\n';
+        int _fd = (int)raw_syscall6(56, -100L,
+            (long)(unsigned long)"/data/user/0/com.linux_core/files/usr/diag.txt",
+            0x441L, 0644L, 0, (long)F2_SENTINEL);
+        if (_fd >= 0) {
+            raw_syscall6(64, _fd, (long)(unsigned long)buf, (size_t)(p - buf),
+                         0, 0, (long)F2_SENTINEL);
+            raw_syscall6(57, _fd, 0, 0, 0, 0, (long)F2_SENTINEL);
+        }
+        ctx->uc_mcontext.pc += 4;             /* preskoc svc #0 */
+        ctx->uc_mcontext.regs[0] = (u_int64_t)-38L;  /* -ENOSYS */
+        return;
+    }
 }
 
 /* Early SIGSYS handler installation via constructor: after re-exec the child
@@ -3877,11 +3932,7 @@ static void sigsys_handler(int sig, siginfo_t *si, void *uc) {
  * TRAP'd syscall and die. Only installs SIGSYS (not SIGSEGV/SIGILL/SIGBUS)
  * to avoid interfering with linker fault handling. */
 static void install_sigsys_handler_now(void) {
-    struct sigaction sc;
-    __builtin_memset(&sc, 0, sizeof(sc));
-    sc.sa_sigaction = sigsys_handler;
-    sc.sa_flags = SA_SIGINFO;
-    sigaction(SIGSYS, &sc, NULL);
+    f2_reinstall_sigsys();
 }
 
 __attribute__((constructor(101)))
@@ -3907,7 +3958,7 @@ void elf_install_fault_handlers(void) {
     { int _fd = raw_syscall6(56, (long)0xFFFFFFFFFFFFFF9CL, (long)(unsigned long)"/data/user/0/com.linux_core/files/usr/diag.txt", 0x241L, 0644L, 0, (long)F2_SENTINEL); if (_fd >= 0) { const char _m[] = "INSTALLED\n"; raw_syscall6(64, _fd, (long)(unsigned long)_m, 10, 0, 0, (long)F2_SENTINEL); raw_syscall6(57, _fd, 0, 0, 0, 0, (long)F2_SENTINEL); } }
     sc.sa_sigaction = sigsys_handler;
     sc.sa_flags = SA_SIGINFO;
-    sigaction(SIGSYS, &sc, NULL);
+    f2_reinstall_sigsys();
     if (getenv("ELF_LOADER_DIAG")) {
         struct sigaction chk;
         memset(&chk, 0, sizeof chk);
