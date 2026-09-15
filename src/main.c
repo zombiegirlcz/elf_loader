@@ -312,6 +312,7 @@ static void *g_orig_fopen = NULL, *g_orig_fopen64 = NULL,
 static void *g_orig_fileno_unlocked = NULL;
 static void *g_orig_fileno = NULL;
 static void *g_orig_flockfile = NULL;
+static void *g_orig_setfsuid = NULL, *g_orig_setfsgid = NULL;
 static void *g_orig_opendir = NULL, *g_orig_readlink = NULL, *g_orig_readlinkat = NULL,
             *g_orig_realpath = NULL, *g_orig_dlopen = NULL, *g_orig_chdir = NULL;
 
@@ -1284,6 +1285,13 @@ static void shim_flockfile(FILE *fp) {
     if (f) f(fp);
 }
 
+/* App seccomp KILLuje setfsuid(151)/setfsgid(152) (KILL obchazi SIGSYS
+ * handler). glibc/libtinfo je volaji (napr. _nc_safe_fopen pred fopen, aby
+ * docasne zmenily fsuid). Na Androidu nejsou potreba (app uid je fsuid) ->
+ * predstirejme uspech a vrat uid/gid bez zmeny. */
+static int shim_setfsuid(unsigned int uid) { (void)uid; return (int)getuid(); }
+static int shim_setfsgid(unsigned int gid) { (void)gid; return (int)getgid(); }
+
 static f2_hook_t g_f2_hooks[] = {
     {"open",(void*)shim_open,&g_orig_open},{"open64",(void*)shim_open64,&g_orig_open64},
     {"__open",(void*)shim_open,&g_orig_open},{"__open64",(void*)shim_open64,&g_orig_open64},
@@ -1315,6 +1323,8 @@ static f2_hook_t g_f2_hooks[] = {
     {"prlimit64",(void*)shim_getrlimit,&g_orig_prlimit64},
     {"fileno_unlocked",(void*)shim_fileno_unlocked,&g_orig_fileno_unlocked},{"fileno",(void*)shim_fileno,&g_orig_fileno},
     {"flockfile",(void*)shim_flockfile,&g_orig_flockfile},
+    {"setfsuid",(void*)shim_setfsuid,&g_orig_setfsuid},
+    {"setfsgid",(void*)shim_setfsgid,&g_orig_setfsgid},
 };
 
 static int f2_only_match(const char *name) {
@@ -1365,16 +1375,23 @@ static int shim_open64_nocancel(const char *p, int flags, ...) {
      * dl_iterate_phdr (NULL linkmap) -> pad id/whoami/zsh. Proto prekladame
      * JEN DNS soubory, ktere NSS/DNS resolver cte internim nocancel volanim
      * (a ktere PLT override nechyti). Ostatni cesty -> passthrough. */
-    static const char *dns_files[] = {
-        "/etc/resolv.conf", NULL
+    /* Prekladame JEN konkretni /etc/ konfiguraky, ktere glibc cte internim
+     * nocancel volanim (obchazi PLT override): DNS resolver (resolv.conf),
+     * NSS files backend (passwd/group/nsswitch/hosts).
+     * Ostatni /etc/ (ld.so.cache, ld.so.preload) a /usr/lib (dlopen NSS
+     * modulu) NEprekladame - jejich preklad rozbil knihovny/linkmapy
+     * (DNS prestal fungovat, dl_iterate_phdr NULL deref). */
+    static const char *etc_files[] = {
+        "/etc/resolv.conf", "/etc/passwd", "/etc/group",
+        "/etc/nsswitch.conf", "/etc/hosts", NULL
     };
     const char *path = p;
     char buf[8192];
     if (p && p[0] == '/') {
-        for (int i = 0; dns_files[i]; i++) {
-            size_t dl = shim_strlen(dns_files[i]);
-            if (shim_strncmp(p, dns_files[i], dl) == 0 &&
-                (p[dl] == 0 || p[dl] == '/')) {
+        for (int i = 0; etc_files[i]; i++) {
+            size_t fl = shim_strlen(etc_files[i]);
+            if (shim_strncmp(p, etc_files[i], fl) == 0 &&
+                (p[fl] == 0 || p[fl] == '/')) {
                 if (shim_translate(p, buf, sizeof buf)) path = buf;
                 break;
             }
@@ -1649,6 +1666,8 @@ static int run_ownall(const char *path, int argc, char **argv, char **envp) {
             { 99,  0 },      /* set_robust_list -> NOP */
             { 293, 0 },      /* rseq            -> NOP */
             { 435, 38 },     /* clone3          -> -ENOSYS */
+            { 151, 0 },      /* setfsuid        -> NOP (app profil TRAPuje) */
+            { 152, 0 },      /* setfsgid        -> NOP */
         };
         size_t nsc = sizeof(kill_syscalls) / sizeof(kill_syscalls[0]);
         if (!getenv("ELF_LOADER_NO_PATCH")) {

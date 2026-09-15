@@ -598,10 +598,36 @@ static void *ldso_dl_open(const char *file, int mode, const void *caller,
     char resolved[4096];
     const char *root = getenv("ROOTFS");
     size_t rl = root ? strlen(root) : 0;
-    if (file[0] == '/' && rl && strncmp(file, root, rl) != 0)
-        snprintf(resolved, sizeof resolved, "%s%s", root, file);
-    else
-        snprintf(resolved, sizeof resolved, "%s", file);
+    if (file[0] == '/') {
+        if (rl && strncmp(file, root, rl) != 0)
+            snprintf(resolved, sizeof resolved, "%s%s", root, file);
+        else
+            snprintf(resolved, sizeof resolved, "%s", file);
+    } else {
+        /* Soname bez cesty (libtinfo.so.6 z NEEDED zsh modulu). Hledej v
+         * standardnich distro libdirs pod ROOTFS - jinak zsh zmodload
+         * terminfo/termcap nenajde libtinfo a spadne. */
+        resolved[0] = 0;
+        if (rl) {
+            static const char *sub[] = {
+                "/usr/lib/aarch64-linux-gnu", "/lib/aarch64-linux-gnu",
+                "/usr/lib", "/lib",
+                "/usr/local/lib/aarch64-linux-gnu", "/usr/local/lib",
+                NULL
+            };
+            for (int i = 0; sub[i]; i++) {
+                char cand[4096];
+                snprintf(cand, sizeof cand, "%s%s/%s", root, sub[i], file);
+                struct stat _st;
+                if (stat(cand, &_st) == 0) {
+                    snprintf(resolved, sizeof resolved, "%s", cand);
+                    break;
+                }
+            }
+        }
+        if (!resolved[0])
+            snprintf(resolved, sizeof resolved, "%s", file);
+    }
     elf_object_t *m = elf_load_shared(resolved, g_crash_scope);
     return ldso_linkmap_for(m);
 }
@@ -2518,6 +2544,21 @@ elf_object_t *elf_load_shared(const char *path, elf_scope_t *scope) {
             break;
         }
     }
+    /* App seccomp KILLuje rseq(293), set_robust_list(99) a clone3(435).
+     * Staticke moduly se patchi pri startu (main.c), ale dynamicky loadovane
+     * (zsh zmodload, NSS, Python extension) se musi patchovat TADY - jinak
+     * jejich konstruktor/inicializace syscall KILLne -> "Bad system call". */
+    if (!getenv("ELF_LOADER_NO_PATCH") && m->phdr && m->phdr_count > 0) {
+        elf_patch_syscall_sites(m, 99, 0);    /* set_robust_list -> NOP */
+        elf_patch_syscall_sites(m, 293, 0);   /* rseq            -> NOP */
+        elf_patch_syscall_sites(m, 435, 38);  /* clone3          -> -ENOSYS */
+        /* setfsuid(151)/setfsgid(152): libtinfo (_nc_safe_fopen), glibc
+         * login_tty apod. je volaji PRIMO (ne pres nas override v PLT).
+         * App profil na ne vraci TRAP/KILL -> "Bad system call". Prebitim
+         * na NOP je zcela vyradime (navratova hodnota se ignoruje). */
+        elf_patch_syscall_sites(m, 151, 0);
+        elf_patch_syscall_sites(m, 152, 0);
+    }
     if (elf_debug())
         printf("[+] own-loaded module: %s (base %p, %zu dynsym)\n", path,
            (void *)base, m->dynsym_count);
@@ -3802,6 +3843,7 @@ static void sigsys_handler(int sig, siginfo_t *si, void *uc) {
     }
     { static const char _m[] = "ENTER\n"; int _fd = raw_syscall6(56, (long)0xFFFFFFFFFFFFFF9CL, (long)(unsigned long)"/data/user/0/com.linux_core/files/usr/diag.txt", 0x241L, 0644L, 0, (long)F2_SENTINEL); if (_fd >= 0) { raw_syscall6(64, _fd, (long)(unsigned long)_m, 6, 0, 0, (long)F2_SENTINEL); raw_syscall6(57, _fd, 0, 0, 0, 0, (long)F2_SENTINEL); } }
     ucontext_t *ctx = (ucontext_t *)uc;
+    f2_reinstall_sigsys();   /* drz nas handler i kdyz ho guest resetuje */
     long nr = si->si_syscall;
     { char _b[32]; int _i = 0; const char *_p = "SIGSYS nr=";
       while (*_p) _b[_i++] = *_p++;
@@ -3860,8 +3902,11 @@ static void sigsys_handler(int sig, siginfo_t *si, void *uc) {
     }
     long emu = -999;  /* -999 = nemáme emulaci pro tento nr */
     switch (nr) {
-        case 151: emu = getuid(); break;  /* setfsuid  (best-effort, navrat ignorovan) */
-        case 152: emu = getuid(); break;  /* setfsgid  (best-effort, navrat ignorovan) */
+        /* POZOR: getuid()/getgid() jsou BIONICKE funkce - pod parrot TP
+         * (kde handler bezi) ctou spatny TLS/errno slot -> crash. Proto RAW
+         * syscall (aarch64: getuid=174, getgid=176) se SENTINELem. */
+        case 151: emu = raw_syscall6(174, 0,0,0,0,0, (long)F2_SENTINEL); break; /* setfsuid -> getuid */
+        case 152: emu = raw_syscall6(176, 0,0,0,0,0, (long)F2_SENTINEL); break; /* setfsgid -> getgid */
         case 140: emu = 0; break;         /* setpriority (best-effort) */
         case 141: emu = 0; break;         /* getpriority (best-effort) */
         case 235: emu = 0; break;         /* mbind */
