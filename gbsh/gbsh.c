@@ -505,13 +505,20 @@ static int rootfs_relcd(const char *target, char *newvpath, size_t cap) {
 static int bi_cd(char **argv, int argc) {
     char targetbuf[MAX_LINE];
     const char *target;
-    if (argc < 2) target = env_or("HOME", "/");
-    else target = argv[1];
+    if (argc < 2) {
+        /* Bez argumentu: v rootfs svete jdi do /root distra. Host HOME je
+         * app dir (/data/user/0/...), ktery v rootfs svete neexistuje jako
+         * vpath -> rootfs_relcd by hledal $ROOTFS/data/user/0/... a cesta by
+         * se lepila (rekurzivni cd smycka). V host svete teprve HOME. */
+        target = (g_world == WORLD_ROOTFS) ? "/root" : env_or("HOME", "/");
+    } else {
+        target = argv[1];
+    }
 
-    /* ~ expanze */
+    /* ~ expanze: v rootfs svete ~ = /root (virtualni), v host svete HOME */
     if (starts_with(target, "~")) {
-        snprintf(targetbuf, sizeof targetbuf, "%s%s",
-                 env_or("HOME", "/"), target + 1);
+        const char *h = (g_world == WORLD_ROOTFS) ? "/root" : env_or("HOME", "/");
+        snprintf(targetbuf, sizeof targetbuf, "%s%s", h, target + 1);
         target = targetbuf;
     }
 
@@ -1727,12 +1734,21 @@ static int try_starship_prompt(void) {
         _exit(127);
     }
     close(fds[1]);
-    char tmp[2048];
-    ssize_t n = read(fds[0], tmp, sizeof tmp - 1);
+    /* Cteme v smycce dokud pipe neda EOF - starship prompt byva vice-radkovy
+     * a vetsi nez jeden read() buffer; drive se zbytek ztratil (oriznuty
+     * prompt = spatne vykreslovani / dva prompty pres sebe). */
+    static char tmp[8192];
+    size_t got = 0;
+    for (;;) {
+        ssize_t r = read(fds[0], tmp + got, sizeof tmp - 1 - got);
+        if (r <= 0) break;
+        got += (size_t)r;
+        if (got >= sizeof tmp - 1) break;
+    }
     close(fds[0]);
     int st; waitpid(pid, &st, 0);
-    if (n <= 0 || !WIFEXITED(st) || WEXITSTATUS(st) != 0) return -1;
-    tmp[n] = 0;
+    if (got == 0 || !WIFEXITED(st) || WEXITSTATUS(st) != 0) return -1;
+    tmp[got] = 0;
     snprintf(g_prompt_buf, sizeof g_prompt_buf, "%s", tmp);
     return 0;
 }
@@ -1805,6 +1821,16 @@ static int prompt_display_width(void) {
 static int g_prompt_printed = 0;
 static int g_input_rows = 0;
 
+/* Pocet radku, ktere zabira prompt (multi-line starship). Pri překresleni se
+ * o ne musime posunout nahoru a prompt znovu vytisknout (app terminal
+ * nepodporuje DECSC/DECRC a \x1b[J maze od kurzoru dolu). */
+static int prompt_rows(void) {
+    int n = 0;
+    for (const char *p = g_prompt_buf; *p; p++)
+        if (*p == '\n') n++;
+    return n;
+}
+
 static int input_wrap_rows(size_t len, int tw) {
     if (tw <= 0 || len == 0) return 0;
     return (int)(len / (size_t)tw);
@@ -1819,8 +1845,10 @@ static void ed_render(const char *prompt, const char *buf, size_t len, size_t cu
         g_prompt_printed = 1;
         g_input_rows = 0;
     } else {
-        if (g_input_rows > 0) printf("\x1b[%dA", g_input_rows);
+        int up = prompt_rows() + g_input_rows;
+        if (up > 0) printf("\x1b[%dA", up);
         fputs("\r\x1b[J", stdout);
+        fputs(g_prompt_buf, stdout);   /* multi-line prompt znovu */
     }
 
     hl_emit(buf, len);
