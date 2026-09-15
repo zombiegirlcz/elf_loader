@@ -81,7 +81,11 @@ while IFS= read -r C; do
 done < /tmp/.push.lines
 # dekódovat do .new a atomicky rename (mv -f funguje i když je $DST prave
 # spusteny / busy -> vyhne se ETXTBSY pri > $DST truncate)
-ashell -c "/system/bin/base64 -d $DST.b64 | /system/bin/gunzip > $DST.new && /system/bin/mv -f $DST.new $DST && /system/bin/chmod $PERMS $DST" >/dev/null 2>&1
+# POZOR: chmod MUSI byt PRED mv! Kdyby se delal az po rename, existuje okno,
+# kdy je $DST neexecutabilni (0644 z redirectu). U `loader` to znamena, ze
+# v tom okne NEFUNGUJE ZADNY prikaz v guestu -> hlasi "not found" vsude a
+# vypada to jako smazany rootfs. chmod na .new + atomicky rename = bez okna.
+ashell -c "/system/bin/base64 -d $DST.b64 | /system/bin/gunzip > $DST.new && /system/bin/chmod $PERMS $DST.new && /system/bin/mv -f $DST.new $DST" >/dev/null 2>&1
 GOT2=$(ashell -c "/system/bin/wc -c $DST" 2>/dev/null | awk '{print $1}')
 ORIG=$(stat -c%s "$SRC")
 if [ "$GOT2" = "$ORIG" ]; then

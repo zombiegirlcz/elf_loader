@@ -1629,6 +1629,35 @@ static int run_ownall(const char *path, int argc, char **argv, char **envp) {
     shim_install_hooks();    /* patch glibc leaf funkci (F2 / re-exec) */
     shim_resolve_fallback(); /* fallback real funkci (W^X) */
 
+    /* FAKEROOT mod (volitelne): kdyz ELF_LOADER_FAKEROOT urcuje cestu k
+     * libfakeroot-tcp.so, own-loadneme ji jako PRVNI modul ve scope (pred
+     * libc), aby fakeroot chown/stat/getuid wrappery vyhraly v elf_scope_find
+     * pro PLT volani z guest binarky (dpkg/apt). Fakeroot si realne libc
+     * funkce najde sam pres dlopen("libc.so.6")+dlsym(libc_handle, name) -
+     * nas ldso_dlopen ho prelozi a vrati handle na skutecny libc objekt.
+     * Nase override (open/openat, ...) ma vzdy prioritu, takze path-translation
+     * zustane nase. Vypnuti: ELF_LOADER_NO_FAKEROOT=1. */
+    const char *fr_path = getenv("ELF_LOADER_FAKEROOT");
+    if (fr_path && fr_path[0] && !getenv("ELF_LOADER_NO_FAKEROOT")) {
+        elf_object_t *fm = elf_load_shared(fr_path, scope);
+        if (fm) {
+            /* posun na index 0 (pred libc, ktery elf_load_shared pridal prvni) */
+            if (scope->count > 1 && scope->mods[0] != fm) {
+                size_t fi = 0;
+                for (size_t k = 0; k < scope->count; k++)
+                    if (scope->mods[k] == fm) { fi = k; break; }
+                for (size_t k = fi; k > 0; k--)
+                    scope->mods[k] = scope->mods[k-1];
+                scope->mods[0] = fm;
+            }
+            if (elf_debug())
+                fprintf(stderr, "[fakeroot] load OK: %s (idx 0, count=%zu)\n",
+                        fr_path, scope->count);
+        } else if (elf_debug()) {
+            fprintf(stderr, "[fakeroot] load FAILED: %s\n", fr_path);
+        }
+    }
+
     void *libc_obj = NULL;
     for (size_t mi = 0; mi < scope->count; mi++)
         if (scope->mods[mi]->soname && strstr(scope->mods[mi]->soname, "libc.so.6"))
