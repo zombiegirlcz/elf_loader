@@ -39,6 +39,8 @@
 #include <limits.h>
 #include <unistd.h>
 #include <errno.h>
+#include <sys/stat.h>
+#include <sys/types.h>
 
 extern char **environ;
 
@@ -71,6 +73,33 @@ static int  g_inited = 0;
 static const char *g_loader = "/system/bin/elf_loader";
 static const char *g_mode   = "--ownall";
 static const char *g_rootfs = NULL;
+
+/* Zpetna vazba pro whitelist: append do $ROOTFS/root/elf_loader/white.log.
+ * Loguje se kazdy redirect i kazde selhani (errno) -> je videt "co a proc". */
+static void white_log(const char *fmt, ...)
+    __attribute__((format(printf, 1, 2)));
+
+static void white_log(const char *fmt, ...) {
+    const char *root = g_rootfs;
+    char path[PATH_MAX];
+    if (root && root[0]) {
+        char dir[PATH_MAX];
+        snprintf(dir, sizeof dir, "%s/root", root);
+        mkdir(dir, 0755);
+        snprintf(dir, sizeof dir, "%s/root/elf_loader", root);
+        mkdir(dir, 0755);
+        snprintf(path, sizeof path, "%s/root/elf_loader/white.log", root);
+    } else {
+        snprintf(path, sizeof path, "white.log");
+    }
+    FILE *f = fopen(path, "a");
+    if (!f) return;
+    va_list ap;
+    va_start(ap, fmt);
+    vfprintf(f, fmt, ap);
+    va_end(ap);
+    fclose(f);
+}
 
 static void shim_debug(const char *fmt, ...)
     __attribute__((format(printf, 1, 2)));
@@ -140,6 +169,7 @@ static void load_whitelist(void) {
     }
     fclose(f);
     shim_debug("[exec_shim] whitelist loaded (%d name(s)) from %s\n", g_nnames, wf);
+    white_log("[whitelist] loaded %d name(s) from %s\n", g_nnames, wf);
 }
 
 __attribute__((constructor)) static void shim_ctor(void) {
@@ -260,15 +290,23 @@ static int redirect_exec(const char *path, char *const argv[], char *const envp[
         return 0;   /* 0 = not redirected */
 
     char **na = build_loader_argv(resolved, argv);
-    if (!na) return -1;
+    if (!na) {
+        white_log("[FAIL] path=%s resolved=%s reason=build_loader_argv OOM\n",
+                  path, resolved);
+        return -1;
+    }
     char **ne = env_without_preload(envp);
 
     shim_debug("[exec_shim] redirect %s -> %s %s %s\n",
                path, g_loader, g_mode, resolved);
+    white_log("[exec] path=%s resolved=%s mode=%s loader=%s search_path=%d\n",
+              path, resolved, g_mode, g_loader, search_path);
 
     /* execve replaces the image on success; on failure return errno semantics. */
     real_execve(g_loader, na, ne);
     int saved = errno;
+    white_log("[FAIL] path=%s resolved=%s execve(%s) errno=%d (%s)\n",
+              path, resolved, g_loader, saved, strerror(saved));
     free(na);
     free(ne);
     errno = saved;

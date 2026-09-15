@@ -863,6 +863,132 @@ static int search_guest_path(const char *p, char *const envp[], char *out, size_
     return 0;
 }
 
+/* ===== whitelist + white.log (zpetna vazba pro re-exec) =====
+ * Whitelist a logovaci cesta se inicializuji v shim_register_overrides()
+ * (bionicky kontext, bezpecne getenv/strlen). Vlastni zapis do logu jde pres
+ * raw syscally s WL_SENTINEL v x5, aby ho F2 path-filtr nechal projit (a
+ * neprekladal uz hotovou device cestu). */
+#define WL_SENTINEL 0x1234567890ABCDEFULL
+#define WL_MAX 256
+#define WL_NAME_LEN 128
+static char g_wl_names[WL_MAX][WL_NAME_LEN];
+static int  g_wl_count = -1;      /* -1 = nenacteno, 0 = prazdny/nenalezeno */
+static char g_wl_logpath[8192];   /* $ROOTFS/root/elf_loader/white.log */
+static int  g_wl_ready = 0;
+
+static void wl_fd_puts(int fd, const char *s) {
+    if (!s) s = "(null)";
+    shim_raw_syscall6(64 /*write*/, fd, (long)s, (long)shim_strlen(s), 0, 0, 0);
+}
+static void wl_fd_putl(int fd, long v) {
+    char b[24];
+    int i = 0;
+    if (v < 0) { wl_fd_puts(fd, "-"); v = -v; }
+    if (!v) b[i++] = '0';
+    while (v) { b[i++] = (char)('0' + (v % 10)); v /= 10; }
+    while (i > 0) { char c = b[--i]; shim_raw_syscall6(64, fd, (long)&c, 1, 0, 0, 0); }
+}
+static const char *wl_base(const char *p) {
+    const char *b = p ? p : "";
+    for (const char *q = b; *q; q++)
+        if (*q == '/') b = q + 1;
+    return b;
+}
+
+/* Nacti whitelist + priprav log cestu. Volano z bionickeho kontextu. */
+static void wl_init(void) {
+    if (g_wl_ready) return;
+    g_wl_ready = 1;
+    if (!g_shim_root || !g_shim_root[0]) { g_wl_count = 0; return; }
+
+    char dir[8192];
+    shim_strcpy(dir, sizeof dir, g_shim_root);
+    shim_strcat(dir, sizeof dir, "/root/elf_loader");
+    shim_raw_syscall6(34 /*mkdirat*/, -100, (long)dir, 0755, 0, 0, 0);
+    shim_strcpy(g_wl_logpath, sizeof g_wl_logpath, dir);
+    shim_strcat(g_wl_logpath, sizeof g_wl_logpath, "/white.log");
+
+    const char *env = getenv("ELF_LOADER_WHITELIST");
+    char path[8192];
+    if (env && env[0]) {
+        shim_strcpy(path, sizeof path, env);
+    } else {
+        shim_strcpy(path, sizeof path, dir);
+        shim_strcat(path, sizeof path, "/whitelist.txt");
+    }
+
+    int fd = (int)shim_raw_syscall6(56 /*openat*/, -100, (long)path, 0 /*O_RDONLY*/,
+                                    0, 0, (long)WL_SENTINEL);
+    if (fd < 0) { g_wl_count = 0; return; }
+    char buf[16384];
+    long n = shim_raw_syscall6(63 /*read*/, fd, (long)buf, (long)sizeof(buf) - 1,
+                               0, 0, 0);
+    shim_raw_syscall6(57 /*close*/, fd, 0, 0, 0, 0, 0);
+    if (n <= 0) { g_wl_count = 0; return; }
+    buf[n] = 0;
+    g_wl_count = 0;
+    char *s = buf;
+    while (*s && g_wl_count < WL_MAX) {
+        char *e = s;
+        while (*e && *e != '\n' && *e != '\r') e++;
+        char save = *e;
+        *e = 0;
+        char *a = s;
+        while (*a == ' ' || *a == '\t') a++;
+        if (*a && *a != '#') {
+            char *z = a + shim_strlen(a);
+            while (z > a && (z[-1] == ' ' || z[-1] == '\t')) *--z = 0;
+            if (*a) shim_strcpy(g_wl_names[g_wl_count++], WL_NAME_LEN, a);
+        }
+        if (!save) break;
+        s = e + 1;
+    }
+}
+
+/* 1 = smi se redirectovat, 0 = ne. Bez whitelistu (0 polozek) -> vse. */
+static int wl_match(const char *p) {
+    if (g_wl_count <= 0) return 1;
+    const char *b = wl_base(p);
+    for (int i = 0; i < g_wl_count; i++)
+        if (shim_strcmp(g_wl_names[i], b) == 0) return 1;
+    return 0;
+}
+
+static int wl_log_open(void) {
+    if (!g_wl_logpath[0]) return -1;
+    long fd = shim_raw_syscall6(56, -100, (long)g_wl_logpath,
+                                0x441 /*O_WRONLY|O_CREAT|O_APPEND*/, 0644, 0,
+                                (long)WL_SENTINEL);
+    return fd >= 0 ? (int)fd : -1;
+}
+static void wl_log_exec(const char *p, const char *resolved, int is_script,
+                        const char *interp) {
+    int fd = wl_log_open();
+    if (fd < 0) return;
+    wl_fd_puts(fd, "[exec] path="); wl_fd_puts(fd, p);
+    wl_fd_puts(fd, " resolved="); wl_fd_puts(fd, resolved);
+    if (is_script) { wl_fd_puts(fd, " script=1 interp="); wl_fd_puts(fd, interp); }
+    wl_fd_puts(fd, "\n");
+    shim_raw_syscall6(57, fd, 0, 0, 0, 0, 0);
+}
+static void wl_log_skip(const char *p, const char *why) {
+    int fd = wl_log_open();
+    if (fd < 0) return;
+    wl_fd_puts(fd, "[skip] path="); wl_fd_puts(fd, p);
+    wl_fd_puts(fd, " reason="); wl_fd_puts(fd, why);
+    wl_fd_puts(fd, "\n");
+    shim_raw_syscall6(57, fd, 0, 0, 0, 0, 0);
+}
+static void wl_log_fail(const char *p, const char *resolved, long rc) {
+    int fd = wl_log_open();
+    if (fd < 0) return;
+    wl_fd_puts(fd, "[fail] path="); wl_fd_puts(fd, p);
+    wl_fd_puts(fd, " resolved="); wl_fd_puts(fd, resolved);
+    wl_fd_puts(fd, " rc="); wl_fd_putl(fd, rc);
+    wl_fd_puts(fd, "\n");
+    shim_raw_syscall6(57, fd, 0, 0, 0, 0, 0);
+}
+
 static int shim_execve(const char *p, char *const argv[], char *const envp[]) {
     if (!p || !p[0]) return -1;
 
@@ -977,6 +1103,15 @@ static int shim_execve(const char *p, char *const argv[], char *const envp[]) {
         }
     }
 
+    /* Whitelist gate: binarky mimo whitelist se NEredirectuji (real execve),
+     * ale zaloguji se do white.log, aby bylo videt co chybi. */
+    if (!wl_match(p)) {
+        wl_log_skip(p, "not-in-whitelist");
+        fp_execve rf = (fp_execve)g_orig_execve;
+        return rf ? rf(p, argv, envp) : -1;
+    }
+    wl_log_exec(p, chkpath, is_script, interp);
+
     char *na[512];
     int narg = 0;
     const char *loader_bin = g_shim_loader && g_shim_loader[0] ? g_shim_loader : "/proc/self/exe";
@@ -999,7 +1134,9 @@ static int shim_execve(const char *p, char *const argv[], char *const envp[]) {
     na[narg] = NULL;
 
     fp_execve f = (fp_execve)g_orig_execve;
-    return f ? f(loader_bin, na, envp) : -1;
+    int rr = f ? f(loader_bin, na, envp) : -1;
+    wl_log_fail(p, chkpath, rr);   /* sem se dostaneme jen kdyz execve selhal */
+    return rr;
 }
 
 static int shim_execv(const char *p, char *const argv[]) {
@@ -1440,6 +1577,7 @@ static void shim_register_overrides(void) {
     g_shim_root = getenv("ROOTFS");
     g_shim_loader = getenv("ELF_LOADER");
     if (!g_shim_loader || !g_shim_loader[0]) g_shim_loader = "/proc/self/exe";
+    wl_init();   /* nacti whitelist + priprav white.log (bionicky kontext) */
     for (size_t i = 0; i < sizeof g_f2_hooks / sizeof g_f2_hooks[0]; i++)
         if (f2_only_match(g_f2_hooks[i].n))
             elf_register_override(g_f2_hooks[i].n, g_f2_hooks[i].shim);

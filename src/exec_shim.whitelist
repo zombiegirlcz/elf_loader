@@ -1,5 +1,141 @@
 # exec_shim whitelist — one binary name (or full path) per line.
 # Empty lines and lines starting with '#' are ignored.
 #
-# For now only starship is redirected through elf_loader.
-starship
+# Binarky, ktere se pri exec re-routuji pres elf_loader (--ownall), aby bezely
+# s parrot glibc misto primeho exec (PT_INTERP /lib/ld-linux-aarch64.so.1 na
+# Androidu neexistuje). Pozn.: kazdy redirect i selhani se loguje do
+# $ROOTFS/root/elf_loader/white.log (viz exec_shim.c white_log).
+#
+# POZN: starship je odstranen — funguje naprimo, nema smysl ho redirectovat.
+
+# --- shell / zakladni ---
+sh
+bash
+zsh
+dash
+env
+which
+command
+id
+whoami
+groups
+users
+logname
+tty
+
+# --- dpkg / apt (fakeroot cesta) ---
+dpkg
+dpkg-deb
+dpkg-query
+dpkg-split
+dpkg-trigger
+dpkg-divert
+dpkg-statoverride
+apt
+apt-get
+apt-cache
+apt-config
+apt-key
+apt-mark
+start-stop-daemon
+update-alternatives
+update-rc.d
+invoke-rc.d
+debconf
+
+# --- coreutils / file operace ---
+ls
+cat
+cp
+mv
+rm
+mkdir
+rmdir
+ln
+touch
+chmod
+chown
+chgrp
+chroot
+install
+mknod
+readlink
+realpath
+dirname
+basename
+stat
+du
+df
+sync
+truncate
+mkfifo
+tar
+gzip
+gunzip
+zcat
+bzip2
+bunzip2
+xz
+unxz
+zip
+unzip
+
+# --- text processing ---
+sed
+grep
+egrep
+fgrep
+rgrep
+awk
+mawk
+gawk
+cut
+tr
+sort
+uniq
+head
+tail
+wc
+nl
+paste
+join
+comm
+diff
+patch
+xargs
+find
+tee
+less
+more
+
+# --- ostatni bezne ---
+file
+strings
+ldd
+ldconfig
+locale
+localedef
+getent
+hostname
+uname
+date
+sleep
+printf
+echo
+true
+false
+test
+expr
+seq
+yes
+kill
+ps
+top
+free
+
+# --- interpretry ---
+python3
+python
+perl
+ruby
+node
