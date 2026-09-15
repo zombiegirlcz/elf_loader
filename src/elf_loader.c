@@ -2488,8 +2488,7 @@ static void run_module_init(elf_object_t *m) {
         while (_v) { _h[_hi++] = hx[_v & 15]; _v >>= 4; }
         while (_hi) _b[_i++] = _h[--_hi];
         _b[_i++] = '\n';
-        int _fd = (int)raw_syscall6(56, (long)0xFFFFFFFFFFFFFF9CL, (long)(unsigned long)"/data/user/0/com.linux_core/files/usr/diag.txt", 0x441L, 0644L, 0, (long)F2_SENTINEL);
-        if (_fd >= 0) { raw_syscall6(64, _fd, (long)(unsigned long)_b, _i, 0, 0, (long)F2_SENTINEL); raw_syscall6(57, _fd, 0, 0, 0, 0, (long)F2_SENTINEL); }
+        raw_syscall6(64, 2, (long)(unsigned long)_b, _i, 0, 0, (long)F2_SENTINEL);
     }
     if (init_array && init_arraysz) {
         uint64_t *arr = (uint64_t *)va(m, init_array);
@@ -2505,7 +2504,21 @@ static void run_module_init(elf_object_t *m) {
  * konstruktory hlavniho programu nebezi vubec (node ma OpenSSL staticky ->
  * bez OSSL ctoru zadny provider -> CSPRNG assert). */
 void elf_queue_module_inits(elf_object_t *m) {
+    size_t _before = g_pending_count;
     run_module_init(m);
+    {
+        char _b[200]; int _i = 0;
+        const char *_p = "QINIT "; while (*_p) _b[_i++] = *_p++;
+        const char *sn = (m && m->soname) ? m->soname : "?";
+        for (const char *q = sn; *q && _i < 120; q++) _b[_i++] = *q;
+        const char *_p2 = " add="; while (*_p2) _b[_i++] = *_p2++;
+        char _t[24]; int _ti = 0; unsigned long _n = (unsigned long)(g_pending_count - _before);
+        if (!_n) _t[_ti++] = '0';
+        while (_n) { _t[_ti++] = (char)('0' + (_n % 10)); _n /= 10; }
+        while (_ti) _b[_i++] = _t[--_ti];
+        _b[_i++] = 10;
+        raw_syscall6(64, 2, (long)(unsigned long)_b, _i, 0, 0, (long)F2_SENTINEL);
+    }
 }
 
 /* Android stub detection: a dependency symlinked to /bin/true (or
@@ -3329,6 +3342,22 @@ elf_tls_ctx_t elf_setup_own_tls(elf_object_t *exe, elf_scope_t *scope) {
     /* region was zeroed above: struct pthread occupies [region, new_tp).
      * Pozn.: malloc thread_arena slot (TP-offset z libc .data @0x1afd68) zůstává
      * NULL = "uninitialized" -> glibc malloc si sám vezme main_arena. */
+
+    /* glibc drzi v struct pthread (TP-0x720) `tid` na offsetu 0xD0.
+     * Realny ld.so/exec ho naplni pres set_tid_address; nas loader ho
+     * nechal nulovy, a pak pthread_rwlock_rdlock/wrlock porovnava
+     * __writer s THREAD_SELF->tid -> pri odemcenem zamku (__writer==0)
+     * vyjde 0==0 a glibc vraci falesny EDEADLK (35). To rozbiji OpenSSL
+     * zamky (store se neinicializuje -> zadny provider -> node CSPRNG
+     * assert) i pthread_mutex (__owner==0). Napevno sem zapiseme kernel
+     * tid (aarch64 gettid=178) - nikdy neni 0. */
+    {
+        int *tid_slot = (int *)(new_tp - 0x650);   /* TP-0x720+0xD0 */
+        *tid_slot = 0;
+        long t = raw_syscall6(178, 0,0,0,0,0, (long)F2_SENTINEL);
+        if (t > 0)
+            *tid_slot = (int)t;
+    }
 
     /* tcbhead_t at new_tp: { dtv, private } -- dtv filled below */
     *(uintptr_t *)(new_tp + 0x00) = 0;

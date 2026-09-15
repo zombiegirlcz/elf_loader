@@ -44,6 +44,18 @@ typedef struct { uintptr_t u[2]; } dtv2_t;   /* {counter | val,to_free} */
 static void tls_setup_thread(uintptr_t tp) {
     size_t n = elf_tls_module_count();
     uintptr_t span = elf_tls_span();
+    /* glibc cte THREAD_SELF->tid (TP-0x720+0xD0) v pthread_rwlock_rdlock
+     * (porovnava __writer s tid) a v pthread_mutex (__owner). Kdyz je tid
+     * nula a zamek odemceny (__writer/__owner == 0), glibc vraci falesny
+     * EDEADLK (35) a OpenSSL zamky se neinicializuji. Napevno zapiseme
+     * kernel tid pres raw svc (gettid=178) - inline asm, TP-independent. */
+    {
+        register long x8 __asm__("x8") = 178;
+        register long x0 __asm__("x0") = 0;
+        __asm__ volatile("svc #0" : "+r"(x0) : "r"(x8) : "memory", "cc");
+        int *tid_slot = (int *)(tp - 0x650);   /* TP-0x720+0xD0 */
+        *tid_slot = (x0 > 0) ? (int)x0 : 1;
+    }
     /* rseq area je AZ za vsemi TLS bloky (TP+0x10 patri hlavnimu exe kvuli
      * zapečenym local-exec TPREL offsetum non-PIE binarek). */
     uintptr_t rseq_off = elf_tls_rseq_offset();

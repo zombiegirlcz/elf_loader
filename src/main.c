@@ -1680,6 +1680,18 @@ static int run_own(const char *path, const char *mod, int argc, char **argv,
 
 static int run_ownall(const char *path, int argc, char **argv, char **envp) {
     elf_install_fault_handlers();
+    /* Zajisti fd 0/1/2. V Android app sandboxu (ashell -c) byva fd 0 zavreny;
+     * prvni loaderuv open() pak dostane fd 0 a jeho close() zavre "stdin".
+     * Node/libuv na to pada: uv__close Assertion `fd > STDERR_FILENO`.
+     * Python3 -c padal na fileno(stdin=NULL). Otevreme /dev/null pro chybejici
+     * standardni fd (fcntl F_GETFD vrati -1/EBADF). */
+    for (int _fd = 0; _fd <= 2; _fd++) {
+        if (fcntl(_fd, F_GETFD) == -1) {
+            int _n = open("/dev/null", O_RDWR);
+            if (_n < 0) { _n = open("/dev/null", O_RDONLY); }
+            if (_n >= 0 && _n != _fd) { dup2(_n, _fd); close(_n); }
+        }
+    }
     g_tls_trace = getenv("ELF_LOADER_TLS_TRACE") != NULL;
     elf_scope_t *scope = elf_scope_create();
     if (!scope) {
@@ -1814,6 +1826,12 @@ static int run_ownall(const char *path, int argc, char **argv, char **envp) {
         elf_unload(obj);
         return 1;
     }
+
+    /* Hlavni exe: elf_load() inity nequeueuje (relokuje se az tady), takze
+     * konstruktory hlavniho programu musime zaradit rucne. Bez toho nebezi
+     * napr. OpenSSL ctor v node (staticky linkovany) -> zadny provider ->
+     * CHECK(ncrypto::CSPRNG(nullptr,0)) assert. */
+    elf_queue_module_inits(obj);
 
     g_exe_base = (uintptr_t)obj->base_addr;
     scope->exe = obj;   /* fallback pro symboly z hlavniho exe (PyExc_*, _PyRuntime) */
