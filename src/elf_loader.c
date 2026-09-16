@@ -3576,12 +3576,12 @@ static void install_legacy_syscall_filter_impl(void) {
         BPF_JUMP(BPF_JMP | BPF_JGE | BPF_K, 424, 0, 1);
     prog[n++] = (struct sock_filter)
         BPF_STMT(BPF_RET | BPF_K, SECCOMP_RET_ERRNO | ENOSYS);
-    /* Dalsi casto TRAPovane: statx=291, membarrier=283,
-     * userfaultfd=282, preadv2/pwritev2/copy_file_range/pkey=285-289.
-     * POZOR: getrandom(278) ZAMERNE NEblokujeme - node/OpenSSL CSPRNG
-     * pres nej ziskava entropii; s ENOSYS selze ncrypto::CSPRNG assert.
-     * (Rootfs nema /dev/urandom, takze fallback nefunguje.) */
-    static const int blocked2[] = { 282, 283, 285, 286, 287, 288, 289, 291 };
+    /* Dalsi casto TRAPovane: statx=291, membarrier=283, userfaultfd=282.
+     * POZOR 1: getrandom(278) ZAMERNE NEblokujeme - node/OpenSSL CSPRNG.
+     * POZOR 2: pkey_* (285-289) NEblokujeme - V8 je pouziva pro write-protect
+     * code memory / cage page mprotect (pkey_mprotect=288). S ENOSYS zustanou
+     * cage stranky r--p a V8 do nich zapise -> SIGSEGV v InterpreterEntry. */
+    static const int blocked2[] = { 282, 283, 291 };
     for (size_t i = 0; i < sizeof(blocked2) / sizeof(blocked2[0]); i++) {
         prog[n++] = (struct sock_filter)
             BPF_JUMP(BPF_JMP | BPF_JEQ | BPF_K, blocked2[i], 0, 1);
@@ -3596,6 +3596,7 @@ static void install_legacy_syscall_filter_impl(void) {
      *   440 process_madvise, 441 epoll_pwait2, 449 futex_waitv
      *   282 userfaultfd, 434 pidfd_open */
     static const int blocked[] = { 293, 282, 434, 435, 436, 437, 439, 440, 441, 449, 283, 291 };
+    /* pkey_* (285-289) zamerne vynechany - viz blocked2 vyse. */
     for (size_t i = 0; i < sizeof(blocked)/sizeof(blocked[0]); i++) {
         prog[n++] = (struct sock_filter)
             BPF_JUMP(BPF_JMP | BPF_JEQ | BPF_K, blocked[i], 0, 1);

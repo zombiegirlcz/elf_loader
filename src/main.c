@@ -1903,11 +1903,11 @@ static int run_ownall(const char *path, int argc, char **argv, char **envp) {
     /* pthread_create fix: vzdy - glibc EINVAL kvuli velkemu TLS static size. */
     elf_register_override("pthread_create", (void *)shim_pthread_create);
     elf_register_override("pthread_getattr_np", (void *)shim_pthread_getattr_np);
-    /* sigaction override VZDY: zachyti instalaci fatal-signal handleru
-     * (V8/node si instaluje vlastni SIGSEGV handler) a ulozi ho do
-     * g_guest_fatal; nas fault_handler zustava aktivni a pri crashi
-     * chainuje na guest handler. */
-    elf_register_override("sigaction", (void *)diag_wrapped_sigaction);
+    /* sigaction override: zachyti instalaci fatal-signal handleru a ulozi
+     * ho do g_guest_fatal. Lze vypnout ELF_LOADER_NO_SA_OVERRIDE=1 (pak si
+     * V8/node instaluje sve handlery a nas fault dump se nezobrazi). */
+    if (!getenv("ELF_LOADER_NO_SA_OVERRIDE"))
+        elf_register_override("sigaction", (void *)diag_wrapped_sigaction);
 
 
     if (!g_exec_mode) g_exec_mode = "--ownall";
