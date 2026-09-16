@@ -175,6 +175,7 @@ static elf_scope_t *g_shim_scope = NULL;  /* platny scope behem F2 behu */
 /* Wrap: log any guest sigaction call for SIGSYS (31) to diag.txt,
  * so we can detect if starship/glibc resets our handler. */
 #define ELF_SENTINEL 0x1234567890ABCDEFULL
+static void raw_wr2(const char *b, int n);
 static long my_raw_syscall6(long n, long a0, long a1, long a2, long a3, long a4, long a5) {
     register long x8 __asm__("x8") = n;
     register long x0 __asm__("x0") = a0;
@@ -189,6 +190,26 @@ static long my_raw_syscall6(long n, long a0, long a1, long a2, long a3, long a4,
 static int (*diag_real_sigaction)(int, const struct sigaction *, struct sigaction *) = NULL;
 static int diag_wrapped_sigaction(int signum, const struct sigaction *act,
                                   struct sigaction *oldact) {
+    /* TRACE vsech instalaci fatalnich handleru: kdo je instaluje (addr) */
+    if (getenv("ELF_LOADER_SIGTRACE") && act &&
+        (signum == 11 || signum == 7 || signum == 4 || signum == 6 ||
+         signum == 8 || signum == 5 || signum == 31)) {
+        char b[96]; int i = 0;
+        const char *q = "SA sig=";
+        while (*q) b[i++] = *q++;
+        int v = signum;
+        if (v >= 10) b[i++] = (char)('0' + v / 10);
+        b[i++] = (char)('0' + v % 10);
+        q = " h="; while (*q) b[i++] = *q++;
+        unsigned long u = (unsigned long)(act->sa_sigaction);
+        static const char hxd[] = "0123456789abcdef";
+        for (int sh = 60; sh >= 0; sh -= 4) b[i++] = hxd[(u >> sh) & 0xf];
+        q = " f=0x"; while (*q) b[i++] = *q++;
+        u = (unsigned long)(act->sa_flags);
+        for (int sh = 28; sh >= 0; sh -= 4) b[i++] = hxd[(u >> sh) & 0xf];
+        b[i++] = 10;
+        raw_wr2(b, i);
+    }
     if (signum == SIGSYS && getenv("ELF_LOADER_SIGTRACE")) {
         long fd = my_raw_syscall6(56, -100,
                               (long)(unsigned long)"/data/user/0/com.linux_core/files/usr/diag.txt",
@@ -201,6 +222,13 @@ static int diag_wrapped_sigaction(int signum, const struct sigaction *act,
     }
     if (!diag_real_sigaction)
         diag_real_sigaction = (int (*)(int, const struct sigaction *, struct sigaction *))elf_scope_lookup(g_shim_scope, "sigaction");
+    /* Fatalni signaly: uloz guest handler a NENECH nas fault_handler
+     * prepsat. Guest handler pak chainujeme z fault_handleru. */
+    if (act && (signum == 11 || signum == 7 || signum == 4 ||
+                signum == 6 || signum == 8 || signum == 5)) {
+        elf_set_guest_fatal(signum, act);
+        return 0;
+    }
     return diag_real_sigaction ? diag_real_sigaction(signum, act, oldact) : -1;
 }
 /* Rucni string copy bez bionic libc (v parrot TLS kontextu by strncmp/snprintf
@@ -1875,8 +1903,11 @@ static int run_ownall(const char *path, int argc, char **argv, char **envp) {
     /* pthread_create fix: vzdy - glibc EINVAL kvuli velkemu TLS static size. */
     elf_register_override("pthread_create", (void *)shim_pthread_create);
     elf_register_override("pthread_getattr_np", (void *)shim_pthread_getattr_np);
-    if (getenv("ELF_LOADER_SIGTRACE"))
-        elf_register_override("sigaction", (void *)diag_wrapped_sigaction);
+    /* sigaction override VZDY: zachyti instalaci fatal-signal handleru
+     * (V8/node si instaluje vlastni SIGSEGV handler) a ulozi ho do
+     * g_guest_fatal; nas fault_handler zustava aktivni a pri crashi
+     * chainuje na guest handler. */
+    elf_register_override("sigaction", (void *)diag_wrapped_sigaction);
 
 
     if (!g_exec_mode) g_exec_mode = "--ownall";

@@ -822,7 +822,7 @@ static void ldso_setup(void) {
     }
 }
 
-#define PARROT_HEAP_SIZE 0x4000000u  /* 64 MB */
+#define PARROT_HEAP_SIZE 0x40000000u /* 1 GB - node/V8 spotrebuje stovky MB */
 static void *parrot_heap_base;
 static char *parrot_brk_cur;
 
@@ -852,8 +852,11 @@ void *ldso_sbrk(long inc) {
     char *nxt = old + inc;
     if (nxt < lo)
         nxt = lo;
+    /* Pri prekroceni MUSIME vratit (void*)-1, NE clamp na hi: glibc malloc
+     * by jinak videl platny pointer a zapsal za konec -> SIGSEGV. S -1
+     * malloc fallbackne na mmap (node/V8 velke alokace). */
     if (nxt > hi)
-        nxt = hi;
+        return (void *)-1;
     parrot_brk_cur = nxt;
     return old;
 }
@@ -3733,6 +3736,24 @@ void elf_dump_tls_got(elf_scope_t *scope) {
     }
 }
 
+/* Ulozene guest fatal-signal handlery pro chainovani. Kdyz V8/node
+ * instaluje vlastni SIGSEGV handler pres sigaction, nas shim ho ulozi sem
+ * a necha nas fault_handler aktivni. Ten pri crashi vypise fault dump
+ * a PAK chainuje na puvodni (guest) handler. */
+static struct sigaction g_guest_fatal[64];
+static int g_guest_fatal_set[64];
+void elf_set_guest_fatal(int sig, const struct sigaction *sa) {
+    if (sig >= 0 && sig < 64 && sa) {
+        g_guest_fatal[sig] = *sa;
+        g_guest_fatal_set[sig] = 1;
+    }
+}
+const struct sigaction *elf_get_guest_fatal(int sig) {
+    if (sig >= 0 && sig < 64 && g_guest_fatal_set[sig])
+        return &g_guest_fatal[sig];
+    return NULL;
+}
+
 static void fault_handler(int sig, siginfo_t *si, void *ctx) {
     ucontext_t *uc = (ucontext_t *)ctx;
 
@@ -3858,6 +3879,20 @@ static void fault_handler(int sig, siginfo_t *si, void *ctx) {
                 (unsigned long)((char *)uc->uc_mcontext.pc -
                                 (char *)di.dli_fbase));
     fflush(stderr);
+    /* Chain na puvodni (guest) handler, pokud ho nekdo (V8/node) instaloval.
+     * Musime nejdriv obnovit jeho sigaction a znovu vyvolat signal, aby se
+     * spustil s plnym kontextem (my uz jsme v handleru). Jednoduseji:
+     * pokud guest handler existuje, zavolame ho pres SA_SIGINFO prototyp. */
+    {
+        const struct sigaction *ga = elf_get_guest_fatal(sig);
+        if (ga && (ga->sa_flags & SA_SIGINFO) && ga->sa_sigaction &&
+            ga->sa_sigaction != (void *)fault_handler) {
+            ga->sa_sigaction(sig, si, ctx);
+        } else if (ga && ga->sa_handler && ga->sa_handler != SIG_DFL &&
+                   ga->sa_handler != SIG_IGN) {
+            ga->sa_handler(sig);
+        }
+    }
     _exit(128 + sig);
 }
 
@@ -4289,18 +4324,41 @@ void elf_install_fault_handlers(void) {
  * aby target nemohl prepsat loaderuv fault handler a my videli skutecny
  * PC jeho crashi (napr. procps instaluje vlastni SIGSEGV handler). */
 static void elf_install_debug_sigaction_block(void) {
-    struct sock_filter prog[8];
+    /* Blokuj rt_sigaction pro VSECHNY fatalni signaly, ktere by V8/node mohly
+     * prepsat (SIGSEGV=11, SIGBUS=7, SIGILL=4, SIGABRT=6, SIGFPE=8, SIGTRAP=5).
+     * Bez toho nas fault_handler zmizi a crash je tichy. */
+    /* Blokuj POUZE nastaveni handleru (args[1] != NULL), NE cteni
+     * (args[1] == NULL, napr. node ResetSignalHandlers). Jinak node assertuje
+     * `(0) == (sigaction(nr, nullptr, &old))` -> abort. */
+    static const int fatal[] = { 11, 7, 4, 6, 8, 5 };
+    struct sock_filter prog[64];
     size_t n = 0;
     prog[n++] = (struct sock_filter)BPF_STMT(BPF_LD | BPF_W | BPF_ABS,
                                             offsetof(struct seccomp_data, nr));
+    /* nr != rt_sigaction -> ALLOW (skok na konec) */
     prog[n++] = (struct sock_filter)BPF_JUMP(BPF_JMP | BPF_JEQ | BPF_K,
-                                            134 /* rt_sigaction aarch64 */, 0, 4);
+                                            134, 0, 0);
+    size_t jump_nr_fix = n - 1;
+    /* args[1] (act) == NULL -> cteni -> ALLOW */
+    prog[n++] = (struct sock_filter)BPF_STMT(BPF_LD | BPF_W | BPF_ABS,
+                                            offsetof(struct seccomp_data, args[1]));
+    prog[n++] = (struct sock_filter)BPF_JUMP(BPF_JMP | BPF_JEQ | BPF_K, 0, 0, 0);
+    size_t jump_act_fix = n - 1;
+    /* args[0] = signum */
     prog[n++] = (struct sock_filter)BPF_STMT(BPF_LD | BPF_W | BPF_ABS,
                                             offsetof(struct seccomp_data, args[0]));
-    prog[n++] = (struct sock_filter)BPF_JUMP(BPF_JMP | BPF_JEQ | BPF_K, 11 /* SIGSEGV */, 0, 1);
-    prog[n++] = (struct sock_filter)BPF_STMT(BPF_RET | BPF_K, SECCOMP_RET_ERRNO | EPERM);
+    for (size_t i = 0; i < sizeof fatal / sizeof fatal[0]; i++) {
+        prog[n++] = (struct sock_filter)BPF_JUMP(BPF_JMP | BPF_JEQ | BPF_K,
+                                                 (unsigned int)fatal[i], 0, 1);
+        prog[n++] = (struct sock_filter)BPF_STMT(BPF_RET | BPF_K, SECCOMP_RET_ERRNO | EPERM);
+    }
+    /* ALLOW */
+    size_t idx_allow = n;
     prog[n++] = (struct sock_filter)BPF_STMT(BPF_RET | BPF_K, SECCOMP_RET_ALLOW);
-    prog[n++] = (struct sock_filter)BPF_STMT(BPF_RET | BPF_K, SECCOMP_RET_ALLOW);
+    /* opravit skoky na ALLOW */
+    prog[jump_nr_fix].jf = (unsigned char)(idx_allow - jump_nr_fix - 1);
+    /* JEQ args[1]==0 -> jt (equal), ne jf! */
+    prog[jump_act_fix].jt = (unsigned char)(idx_allow - jump_act_fix - 1);
     struct sock_fprog fprog = { .len = (unsigned short)n, .filter = prog };
     long r = syscall((long)277, 1UL, 0UL, &fprog);
     { char b[48]; char *p = b; const char *q = "[dbg-sa-block] ret=";
@@ -4344,15 +4402,25 @@ int elf_run(elf_object_t *obj, int argc, char **argv, char **envp) {
     while (envp[env_count])
         env_count++;
 
-    size_t stack_size = 8 * 1024 * 1024;
-    char *stack = mmap(NULL, stack_size, PROT_READ | PROT_WRITE,
-                       MAP_PRIVATE | MAP_ANONYMOUS, -1, 0);
-    if (stack == MAP_FAILED) {
+    /* Guest stack: 64 MB + guard page. V8/node ma "central stack" koncept
+     * a pri preteceni potrebuje guard page, aby dostal SIGSEGV (ne tiche
+     * prepsani sousedniho mapovani). Stack roste dolu, takze guard patri na
+     * NEJNIZSI adresu. */
+    size_t stack_size = 64 * 1024 * 1024;
+    size_t stack_guard = 0x1000;   /* 1 page PROT_NONE na spodku */
+    size_t stack_map = stack_size + stack_guard;
+    char *stack_map_base = mmap(NULL, stack_map, PROT_READ | PROT_WRITE,
+                                MAP_PRIVATE | MAP_ANONYMOUS, -1, 0);
+    if (stack_map_base == MAP_FAILED) {
         perror("mmap stack");
         return -1;
     }
-    g_guest_stack_base = (uintptr_t)stack;
-    g_guest_stack_size = stack_size;
+    if (mprotect(stack_map_base, stack_guard, PROT_NONE) != 0) {
+        perror("mprotect stack guard");
+    }
+    char *stack = stack_map_base + stack_guard;
+    g_guest_stack_base = (uintptr_t)stack_map_base;   /* vcetne guardu */
+    g_guest_stack_size = stack_map;
 
     char *stack_top = stack + stack_size;
 
