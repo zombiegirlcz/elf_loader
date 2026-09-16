@@ -151,6 +151,12 @@ uintptr_t elf_tls_static_size(void) {
 const char *loader_phase = "start";
 uintptr_t g_libc_base = 0;
 uintptr_t g_exe_base = 0;
+/* Guest (mmap) stack: pthread_getattr_np ho nenajde jako [stack] v
+ * /proc/self/maps (neni to kernel stack), takze vrací ENOENT a V8 pak
+ * failuje na IsOnCentralStack(). Override pthread_getattr_np attr naplni
+ * temito hodnotami. */
+uintptr_t g_guest_stack_base = 0;
+uintptr_t g_guest_stack_size = 0;
 
 static int is_ld_linux(const char *name) {
     return strncmp(name, "ld-linux", 8) == 0 || strcmp(name, "ld.so.1") == 0;
@@ -4218,7 +4224,12 @@ static void sigsys_handler(int sig, siginfo_t *si, void *uc) {
                          0, 0, (long)F2_SENTINEL);
             raw_syscall6(57, _fd, 0, 0, 0, 0, (long)F2_SENTINEL);
         }
-        ctx->uc_mcontext.pc += 4;             /* preskoc svc #0 */
+        /* POZOR: pc uz ukazuje na svc+4 (stejne jako v emu ceste vyse).
+         * Dřívější `pc += 4` preskocilo glibc error-check za svc
+         * (cmn x0,#-4095; b.hi) -> glibc nezkonvertovalo -ENOSYS na
+         * errno=38; return -1 a volajici dostal raw -38. Node/libuv pak
+         * v uv__iou_init videl fd=-38 (!= -1) a sel do uv__close(-38)
+         * -> Assertion `fd > STDERR_FILENO`. */
         ctx->uc_mcontext.regs[0] = (u_int64_t)-38L;  /* -ENOSYS */
         return;
     }
@@ -4340,6 +4351,8 @@ int elf_run(elf_object_t *obj, int argc, char **argv, char **envp) {
         perror("mmap stack");
         return -1;
     }
+    g_guest_stack_base = (uintptr_t)stack;
+    g_guest_stack_size = stack_size;
 
     char *stack_top = stack + stack_size;
 

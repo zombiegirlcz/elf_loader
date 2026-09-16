@@ -312,6 +312,7 @@ static void *g_orig_fopen = NULL, *g_orig_fopen64 = NULL,
 static void *g_orig_fileno_unlocked = NULL;
 static void *g_orig_fileno = NULL;
 static void *g_orig_flockfile = NULL;
+static void *g_orig_close = NULL;
 static void *g_orig_setfsuid = NULL, *g_orig_setfsgid = NULL;
 static void *g_orig_opendir = NULL, *g_orig_readlink = NULL, *g_orig_readlinkat = NULL,
             *g_orig_realpath = NULL, *g_orig_dlopen = NULL, *g_orig_chdir = NULL;
@@ -1422,6 +1423,146 @@ static void shim_flockfile(FILE *fp) {
     if (f) f(fp);
 }
 
+/* DIAG: __assert_fail override - zachyti assertion a vypise retezec volajicich
+ * pres __builtin_return_address. Node/libuv v uv__close assertuje pri fd<=2;
+ * potřebujeme zjistit, KDO uv__close vola. Zapisy raw write(2) - bez TLS. */
+static void raw_wr2(const char *b, int n) {
+    register long x8 __asm__("x8") = 64;
+    register long x0 __asm__("x0") = 2;
+    register long x1 __asm__("x1") = (long)b;
+    register long x2 __asm__("x2") = n;
+    __asm__ volatile("svc #0" : "+r"(x0) : "r"(x8), "r"(x1), "r"(x2)
+                     : "memory", "cc");
+}
+static void hexcat(char *b, int *i, unsigned long v) {
+    static const char hx[] = "0123456789abcdef";
+    b[(*i)++] = '0'; b[(*i)++] = 'x';
+    int started = 0;
+    for (int sh = 60; sh >= 0; sh -= 4) {
+        int d = (int)((v >> sh) & 0xf);
+        if (d || started || sh == 0) { b[(*i)++] = hx[d]; started = 1; }
+    }
+}
+static void (*g_orig_assert_fail)(const char*, const char*, unsigned int, const char*);
+static void shim_assert_fail(const char *assertion, const char *file,
+                             unsigned int line, const char *function) {
+    char b[512]; int i = 0;
+    const char *p = "ASSERT ra0=";
+    while (*p) b[i++] = *p++;
+    hexcat(b, &i, (unsigned long)__builtin_return_address(0));
+    p = " ra1="; while (*p) b[i++] = *p++;
+    hexcat(b, &i, (unsigned long)__builtin_return_address(1));
+    p = " ra2="; while (*p) b[i++] = *p++;
+    hexcat(b, &i, (unsigned long)__builtin_return_address(2));
+    p = " ra3="; while (*p) b[i++] = *p++;
+    hexcat(b, &i, (unsigned long)__builtin_return_address(3));
+    p = " line="; while (*p) b[i++] = *p++;
+    { unsigned int v = line; char t[12]; int ti = 0;
+      if (!v) t[ti++] = '0';
+      while (v) { t[ti++] = (char)('0' + (v % 10)); v /= 10; }
+      while (ti) b[i++] = t[--ti]; }
+    b[i++] = '\n';
+    raw_wr2(b, i);
+    if (file) { char fb[256]; int j = 0; const char *q = file;
+                while (*q && j < 250) fb[j++] = *q++;
+                fb[j++] = '\n'; raw_wr2(fb, j); }
+    if (!g_orig_assert_fail && g_shim_scope)
+        g_orig_assert_fail = (void *)elf_scope_lookup(g_shim_scope, "__assert_fail");
+    if (g_orig_assert_fail)
+        g_orig_assert_fail(assertion, file, line, function);
+    _exit(134);
+}
+
+/* V8/node volá pthread_getattr_np(main) a testuje, ze SP lezi ve vracenem
+ * rozsahu (IsOnCentralStack). Náš guest bezi na mmap stacku (8 MB), ktery
+ * ale v /proc/self/maps NENI oznaceny jako [stack] - glibc proto vrati
+ * ENOENT. Override: zavolej orig, pri chybe napln attr nasim stackem.
+ * attr layout (glibc aarch64): +0x10 guardsize, +0x18 stack TOP, +0x20 size. */
+#define ATTR_STACKADDR 0x18
+#define ATTR_STACKSIZE 0x20
+typedef int (*fp_pthread_getattr_np)(void *th, void *attr);
+static int shim_pthread_getattr_np(void *th, void *attr) {
+    fp_pthread_getattr_np f = (fp_pthread_getattr_np)elf_scope_lookup(g_shim_scope, "pthread_getattr_np");
+    int r = f ? f(th, attr) : -1;
+    if (r != 0 && attr) {
+        extern uintptr_t g_guest_stack_base, g_guest_stack_size;
+        if (g_guest_stack_size) {
+            unsigned char *a = (unsigned char *)attr;
+            *(unsigned long *)(a + ATTR_STACKADDR) =
+                g_guest_stack_base + g_guest_stack_size;
+            *(unsigned long *)(a + ATTR_STACKSIZE) = g_guest_stack_size;
+            r = 0;
+        }
+    }
+    return r;
+}
+
+
+/* DIAG: pthread_create override - pri EINVAL vypise pole attr (stacksize,
+ * guardsize, flags). V8/node vytvari vlakna s vlastnimi atributy; EINVAL
+ * znamena, ze nejaka hodnota neprosla glibc validaci. */
+typedef int (*fp_pthread_create)(void*, const void*, void *(*)(void*), void*);
+static int shim_pthread_create(void *th, const void *attr, void *(*fn)(void*), void *arg) {
+    fp_pthread_create f = (fp_pthread_create)elf_scope_lookup(g_shim_scope, "pthread_create");
+    if (!f) return 22;
+    int r = f(th, attr, fn, arg);
+    /* Nase dl_tls_static_size (~1 MB) zvetsuje __pthread_get_minstack, takze
+     * glibc odmitne maly stacksize (node/V8 zadá 0x20000) -> EINVAL.
+     * V realnem glibc je TLS static size maly a 128 KB staci. Retry s 8 MB.
+     * attr layout (aarch64 glibc): flags+0, guardsize+0x10, stacksize+0x20. */
+    if (r == 22 && attr) {
+        unsigned char copy[64];
+        for (int k = 0; k < 64; k++) copy[k] = ((const unsigned char *)attr)[k];
+        *(unsigned long *)(copy + 0x20) = 8UL * 1024 * 1024;
+        r = f(th, copy, fn, arg);
+    }
+    if (r != 0 && attr) {
+        const unsigned char *a = (const unsigned char *)attr;
+        static const char hxd[] = "0123456789abcdef";
+        char b[512]; int i = 0;
+        const char *p = "PTHCREATE rc=";
+        while (*p) b[i++] = *p++;
+        char t[12]; int ti = 0; int v = r;
+        if (!v) t[ti++] = '0';
+        while (v) { t[ti++] = (char)('0' + (v % 10)); v /= 10; }
+        while (ti) b[i++] = t[--ti];
+        for (int off = 0; off < 64; off += 8) {
+            b[i++] = ' ';
+            b[i++] = hxd[(off >> 4) & 0xf];
+            b[i++] = hxd[off & 0xf];
+            b[i++] = '=';
+            unsigned long u = 0;
+            for (int k = 7; k >= 0; k--) u = (u << 8) | a[off + k];
+            for (int sh = 60; sh >= 0; sh -= 4) b[i++] = hxd[(u >> sh) & 0xf];
+        }
+        b[i++] = 10;
+        raw_wr2(b, i);
+    }
+    return r;
+}
+
+
+
+typedef int (*fp_close)(int);
+static int shim_close(int fd) {
+    if (fd <= 2) {
+        char b[80]; int i = 0;
+        const char *p = "[CLOSE] fd=";
+        while (*p) b[i++] = *p++;
+        int v = fd; if (v < 0) { b[i++] = '-'; v = -v; }
+        if (v >= 10) b[i++] = (char)('0' + (v / 10));
+        b[i++] = (char)('0' + (v % 10));
+        b[i++] = 10;
+        register long x8 __asm__("x8") = 64;
+        register long x0 __asm__("x0") = 2;
+        register long x1 __asm__("x1") = (long)b;
+        register long x2 __asm__("x2") = i;
+        __asm__ volatile("svc #0" : "+r"(x0) : "r"(x8), "r"(x1), "r"(x2) : "memory", "cc");
+    }
+    fp_close f = (fp_close)g_orig_close;
+    return f ? f(fd) : -1;
+}
+
 /* App seccomp KILLuje setfsuid(151)/setfsgid(152) (KILL obchazi SIGSYS
  * handler). glibc/libtinfo je volaji (napr. _nc_safe_fopen pred fopen, aby
  * docasne zmenily fsuid). Na Androidu nejsou potreba (app uid je fsuid) ->
@@ -1460,6 +1601,7 @@ static f2_hook_t g_f2_hooks[] = {
     {"prlimit64",(void*)shim_getrlimit,&g_orig_prlimit64},
     {"fileno_unlocked",(void*)shim_fileno_unlocked,&g_orig_fileno_unlocked},{"fileno",(void*)shim_fileno,&g_orig_fileno},
     {"flockfile",(void*)shim_flockfile,&g_orig_flockfile},
+    {"close",(void*)shim_close,&g_orig_close},
     {"setfsuid",(void*)shim_setfsuid,&g_orig_setfsuid},
     {"setfsgid",(void*)shim_setfsgid,&g_orig_setfsgid},
 };
@@ -1728,6 +1870,11 @@ static int run_ownall(const char *path, int argc, char **argv, char **envp) {
     elf_register_override("dlclose", (void *)ldso_dlclose);
     elf_register_override("dlerror", (void *)ldso_dlerror);
     elf_register_override("dladdr", (void *)ldso_dladdr);
+    if (getenv("ELF_LOADER_ASSERT_TRACE"))
+        elf_register_override("__assert_fail", (void *)shim_assert_fail);
+    /* pthread_create fix: vzdy - glibc EINVAL kvuli velkemu TLS static size. */
+    elf_register_override("pthread_create", (void *)shim_pthread_create);
+    elf_register_override("pthread_getattr_np", (void *)shim_pthread_getattr_np);
     if (getenv("ELF_LOADER_SIGTRACE"))
         elf_register_override("sigaction", (void *)diag_wrapped_sigaction);
 
