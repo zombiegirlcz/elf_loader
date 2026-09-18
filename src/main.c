@@ -1018,6 +1018,82 @@ static void wl_log_fail(const char *p, const char *resolved, long rc) {
     shim_raw_syscall6(57, fd, 0, 0, 0, 0, 0);
 }
 
+/* ───────── child env propagation (rootfs for fork+exec children) ─────────
+ * When the caller launches the loader without exporting ROOTFS (e.g. ashell -c
+ * with just an absolute guest path), g_shim_root is NULL and the re-exec'd
+ * child loader cannot locate the distro libdirs -> "dep libc.so not found".
+ * We derive the distro root from the child binary path and guarantee ROOTFS,
+ * ELF_ROOTFS and LD_LIBRARY_PATH are present in the envp handed to the child.
+ * Only guest binaries go through this path (host/excluded execs return early
+ * with the original envp). Static storage only: this runs under parrot TP. */
+#define SHIM_CE_MAX 4096
+static char *g_ce_ptrs[SHIM_CE_MAX];
+static char  g_ce_str[32768];
+static char  g_ce_root[2048];
+
+/* Walk up from the file's directory looking for usr/lib/aarch64-linux-gnu. */
+static const char *shim_derive_root_from_path(const char *file) {
+    if (!file || !file[0]) return NULL;
+    char dir[2048];
+    shim_strcpy(dir, sizeof(dir), file);
+    char *slash = dir;
+    for (char *q = dir; *q; q++) if (*q == '/') slash = q;
+    if (slash > dir) *slash = 0; else if (slash == dir) dir[1] = 0;
+    for (int depth = 0; depth < 64; depth++) {
+        char probe[2304];
+        shim_strcpy(probe, sizeof(probe), dir);
+        shim_strcat(probe, sizeof(probe), "/usr/lib/aarch64-linux-gnu");
+        if (raw_path_exists(probe)) {
+            shim_strcpy(g_ce_root, sizeof(g_ce_root), dir);
+            return g_ce_root;
+        }
+        char *s2 = NULL;
+        for (char *q = dir; *q; q++) if (*q == '/') s2 = q;
+        if (!s2) break;
+        if (s2 == dir) { dir[1] = 0; }
+        else *s2 = 0;
+    }
+    return NULL;
+}
+
+static char **shim_child_envp(char *const envp[], const char *child_file) {
+    const char *root = (g_shim_root && g_shim_root[0])
+                           ? g_shim_root : shim_derive_root_from_path(child_file);
+    if (!root || !root[0]) return envp;
+
+    /* NEPRIDAVAT LD_LIBRARY_PATH: ditetem je znovu spusteny elf_loader
+     * (bionicky dynamicky), jehoz vnejsi bionicky linker by pres
+     * LD_LIBRARY_PATH natahl parrot libc.so (GNU ld skript, text) ->
+     * "bad ELF magic". Vnitrni glibc loader si distro libdirs odvodi sam
+     * z cesty exe (derive_distro_libdirs) a z ELF_ROOTFS. Staci tedy
+     * propagovat ROOTFS + ELF_ROOTFS. */
+
+    /* Build new envp: drop ROOTFS/ELF_ROOTFS, keep the rest. */
+    int o = 0;
+    for (int i = 0; envp && envp[i] && o < SHIM_CE_MAX - 8; i++) {
+        if (shim_strncmp(envp[i], "ROOTFS=", 7) == 0) continue;
+        if (shim_strncmp(envp[i], "ELF_ROOTFS=", 11) == 0) continue;
+        g_ce_ptrs[o++] = envp[i];
+    }
+    char *sp = g_ce_str;
+    char *send = g_ce_str + sizeof(g_ce_str);
+    #define CE_PUSH(name, val) do { \
+        const char *_n = (name), *_v = (val); \
+        char *_d = sp; \
+        while (*_n && _d < send - 2) *_d++ = *_n++; \
+        if (_d < send - 1) *_d++ = '='; \
+        while (*_v && _d < send - 2) *_d++ = *_v++; \
+        if (_d < send - 1) *_d++ = 0; \
+        if (o < SHIM_CE_MAX - 4) g_ce_ptrs[o++] = sp; \
+        sp = _d; \
+    } while (0)
+    CE_PUSH("ROOTFS", root);
+    CE_PUSH("ELF_ROOTFS", root);
+    #undef CE_PUSH
+    g_ce_ptrs[o] = NULL;
+    return g_ce_ptrs;
+}
+
 static int shim_execve(const char *p, char *const argv[], char *const envp[]) {
     if (!p || !p[0]) return -1;
 
@@ -1163,7 +1239,8 @@ static int shim_execve(const char *p, char *const argv[], char *const envp[]) {
     na[narg] = NULL;
 
     fp_execve f = (fp_execve)g_orig_execve;
-    int rr = f ? f(loader_bin, na, envp) : -1;
+    char **cenv = shim_child_envp(envp, chkpath);
+    int rr = f ? f(loader_bin, na, cenv) : -1;
     wl_log_fail(p, chkpath, rr);   /* sem se dostaneme jen kdyz execve selhal */
     return rr;
 }
@@ -1363,7 +1440,8 @@ static int shim_posix_spawnp(pid_t *pid, const char *p, const void *fa,
     na[narg] = NULL;
 
     fp_posix_spawnp f = (fp_posix_spawnp)g_orig_posix_spawnp;
-    return f ? f(pid, loader_bin, fa, at, na, envp) : -1;
+    char **cenv = shim_child_envp(envp, resolved);
+    return f ? f(pid, loader_bin, fa, at, na, cenv) : -1;
 }
 
 static int shim_dladdr(const void *addr, void *info) {
@@ -1913,6 +1991,18 @@ static int run_ownall(const char *path, int argc, char **argv, char **envp) {
     if (!g_exec_mode) g_exec_mode = "--ownall";
     g_shim_root = getenv("ROOTFS");
     g_shim_loader = getenv("ELF_LOADER");
+    /* ROOTFS neni v env (ad-hoc spusteni: loader --ownall /abs/guest/bin/x):
+     * odvodime distro root z cesty spustene binarky. Bez toho zustane
+     * g_shim_root NULL, search_guest_path nehleda v rootfs a fork+exec deti
+     * (tar -> gzip) dostanou loader bez rootfs -> "dep libc.so not found". */
+    if (!g_shim_root || !g_shim_root[0]) {
+        const char *derived = shim_derive_root_from_path(path);
+        if (derived && derived[0]) {
+            g_shim_root = derived;
+            if (elf_debug())
+                fprintf(stderr, "[+] derived ROOTFS from exe path: %s\n", derived);
+        }
+    }
     if (g_shim_root && g_shim_root[0]) {
         g_f2_active = 1;
         setenv("ROOTFS", g_shim_root, 1);

@@ -2478,8 +2478,8 @@ static void run_module_init(elf_object_t *m) {
     typedef void (*init_fn_t)(int, char **, char **);
     if (init)
         elf_queue_init((init_fn_t)va(m, init));
-    /* DIAG: pro kazdy modul soname + DT_INIT + DT_INIT_ARRAYSZ */
-    {
+    /* DIAG: pro kazdy modul soname + DT_INIT + DT_INIT_ARRAYSZ (jen ELF_DEBUG) */
+    if (elf_debug()) {
         char _b[256]; int _i = 0; const char *_p = "MOD ";
         while (*_p) _b[_i++] = *_p++;
         const char *sn = m->soname ? m->soname : "?";
@@ -2515,7 +2515,7 @@ static void run_module_init(elf_object_t *m) {
 void elf_queue_module_inits(elf_object_t *m) {
     size_t _before = g_pending_count;
     run_module_init(m);
-    {
+    if (elf_debug()) {
         char _b[200]; int _i = 0;
         const char *_p = "QINIT "; while (*_p) _b[_i++] = *_p++;
         const char *sn = (m && m->soname) ? m->soname : "?";
