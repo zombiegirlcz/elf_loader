@@ -3813,6 +3813,16 @@ static void fault_handler(int sig, siginfo_t *si, void *ctx) {
         p = " x5p67="; while (*p) b[i++] = *p++;
         unsigned long x5v = (unsigned long)uc->uc_mcontext.regs[5] + 67;
         for (int sh = 60; sh >= 0; sh -= 4) b[i++] = hxd[(x5v >> sh) & 0xf];
+        p = " x5="; while (*p) b[i++] = *p++;
+        unsigned long x5r = (unsigned long)uc->uc_mcontext.regs[5];
+        for (int sh = 60; sh >= 0; sh -= 4) b[i++] = hxd[(x5r >> sh) & 0xf];
+        p = " tid="; while (*p) b[i++] = *p++;
+        long tid = (long)raw_syscall6(178, 0,0,0,0,0,(long)F2_SENTINEL);
+        unsigned long tv = (unsigned long)tid;
+        for (int sh = 28; sh >= 0; sh -= 4) b[i++] = hxd[(tv >> sh) & 0xf];
+        p = " sp="; while (*p) b[i++] = *p++;
+        unsigned long spv = (unsigned long)uc->uc_mcontext.sp;
+        for (int sh = 60; sh >= 0; sh -= 4) b[i++] = hxd[(spv >> sh) & 0xf];
         b[i++] = '\n';
         sys_write(2, b, (size_t)i);
     }
