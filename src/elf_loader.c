@@ -3768,6 +3768,29 @@ const void *elf_get_guest_fatal(int sig) {
 static void fault_handler(int sig, siginfo_t *si, void *ctx) {
     ucontext_t *uc = (ucontext_t *)ctx;
 
+    /* NEJDRIV chain na guest handler. Guest (glibc/V8) si instaluje vlastni
+     * SIGSEGV handler pro read-only heap COW. Musime ho zavolat DRIV, nez
+     * sahneme na bionicke funkce (dladdr/fprintf) - ty pod guest TP spadnou
+     * (bionic cte sve TLS = guest TLS) a chain by se uz nikdy nespustil.
+     * Kdyz guest handler existuje, po jeho navratu se vratime a instrukce
+     * se zopakuje (mprotect uz proběhl) -> zadny _exit, zadny dump. */
+    {
+        const unsigned char *ga = (const unsigned char *)elf_get_guest_fatal(sig);
+        if (ga) {
+            unsigned long gflags =
+                *(const unsigned long *)(ga + GUEST_SA_FLAGS_OFF);
+            void *gh = *(void *const *)(ga + GUEST_SA_HANDLER_OFF);
+            if (gh && gh != (void *)SIG_DFL && gh != (void *)SIG_IGN &&
+                gh != (void *)fault_handler) {
+                if (gflags & 0x4UL /* SA_SIGINFO */)
+                    ((void (*)(int, siginfo_t *, void *))gh)(sig, si, ctx);
+                else
+                    ((void (*)(int))gh)(sig);
+                return;
+            }
+        }
+    }
+
     static const char hexd[] = "0123456789abcdef";
     static char raw[2048];
     char *rp = raw;
