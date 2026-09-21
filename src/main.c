@@ -347,6 +347,7 @@ static void *g_orig_fileno = NULL;
 static void *g_orig_flockfile = NULL;
 static void *g_orig_close = NULL;
 static void *g_orig_setfsuid = NULL, *g_orig_setfsgid = NULL;
+static void *g_orig_mprotect = NULL;
 static void *g_orig_opendir = NULL, *g_orig_readlink = NULL, *g_orig_readlinkat = NULL,
             *g_orig_realpath = NULL, *g_orig_dlopen = NULL, *g_orig_chdir = NULL;
 
@@ -1549,6 +1550,26 @@ static int shim_getrlimit(int resource, struct rlimit *rl) {
 
 typedef int (*fp_fileno_unlocked)(FILE *);
 typedef int (*fp_fileno)(FILE *);
+typedef int (*fp_mprotect)(void *, unsigned long, int);
+static int shim_mprotect(void *addr, unsigned long len, int prot) {
+    fp_mprotect f = (fp_mprotect)g_orig_mprotect;
+    int r = f ? f(addr, len, prot) : -1;
+    if (r != 0) {
+        char b[128]; char *i = b;
+        const char *p = "[MPROT_FAIL] addr="; while (*p) *i++ = *p++;
+        shim_hex(&i, (unsigned long)addr, 12);
+        p = " len="; while (*p) *i++ = *p++;
+        shim_hex(&i, len, 8);
+        p = " prot="; while (*p) *i++ = *p++;
+        shim_hex(&i, (unsigned long)(unsigned)prot, 2);
+        p = " err="; while (*p) *i++ = *p++;
+        int err = 0; int *e = shim_guest_errno(); if (e) err = *e;
+        shim_hex(&i, (unsigned long)(unsigned)err, 2);
+        *i++ = '\n';
+        shim_raw_syscall6(64, 2, (long)b, (long)(i - b), 0, 0, 0);
+    }
+    return r;
+}
 typedef void (*fp_flockfile)(FILE *);
 
 static int shim_fileno_unlocked(FILE *fp) {
@@ -1903,6 +1924,7 @@ static f2_hook_t g_f2_hooks[] = {
     {"close",(void*)shim_close,&g_orig_close},
     {"setfsuid",(void*)shim_setfsuid,&g_orig_setfsuid},
     {"setfsgid",(void*)shim_setfsgid,&g_orig_setfsgid},
+    {"mprotect",(void*)shim_mprotect,&g_orig_mprotect},
 };
 
 static int f2_only_match(const char *name) {
