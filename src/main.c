@@ -58,6 +58,7 @@ static void print_help(const char *prog) {
 #include <fcntl.h>
 #include <errno.h>
 #include <sys/stat.h>
+#include <sys/statvfs.h>
 #include <sys/mman.h>
 #include <sys/resource.h>
 #include <sys/prctl.h>
@@ -328,6 +329,8 @@ static void *g_orig_open = NULL, *g_orig_open64 = NULL, *g_orig_openat = NULL,
 static void *g_orig_open64_nocancel = NULL;  /* interni glibc open pro DNS/NSS */
 static void *g_orig_stat = NULL, *g_orig_stat64 = NULL, *g_orig___xstat = NULL,
             *g_orig_lstat = NULL, *g_orig___lxstat = NULL;
+static void *g_orig_lstat64 = NULL, *g_orig_fstat64 = NULL, *g_orig_fstatat64 = NULL,
+            *g_orig_statvfs = NULL, *g_orig_statvfs64 = NULL;
 static void *g_orig_access = NULL, *g_orig_euidaccess = NULL, *g_orig_faccessat = NULL;
 static void *g_orig_statx = NULL, *g_orig_fstatat = NULL, *g_orig_newfstatat = NULL;
 static void *g_orig_symlink = NULL, *g_orig_symlinkat = NULL, *g_orig_link = NULL,
@@ -552,6 +555,11 @@ typedef int (*fp_stat64)(const char *, struct stat64 *);
 typedef int (*fp_xstat)(int, const char *, struct stat *);
 typedef int (*fp_lstat)(const char *, struct stat *);
 typedef int (*fp_lxstat)(int, const char *, struct stat *);
+typedef int (*fp_lstat64)(const char *, struct stat64 *);
+typedef int (*fp_fstat64)(int, struct stat64 *);
+typedef int (*fp_fstatat64)(int, const char *, struct stat64 *, int);
+typedef int (*fp_statvfs)(const char *, struct statvfs *);
+typedef int (*fp_statvfs64)(const char *, struct statvfs64 *);
 typedef int (*fp_access)(const char *, int);
 typedef int (*fp_euidaccess)(const char *, int);
 typedef int (*fp_faccessat)(int, const char *, int, int);
@@ -584,6 +592,34 @@ static int shim_lstat(const char *p, struct stat *st) {
 static int shim___lxstat(int v, const char *p, struct stat *st) {
     char b[8192]; const char *path = p; if (shim_translate(p, b, sizeof b)) path = b;
     fp_lxstat f = (fp_lxstat)g_orig___lxstat; return f ? f(v, path, st) : -1;
+}
+/* glibc >= 2.33 na aarch64 exportuje realne LFS symboly lstat64/stat64/fstat64.
+ * lstat64 chybel v g_f2_hooks -> git importoval neprelozeny lstat64 proti
+ * host rootu (cannot stat template '/usr/share/git-core/...'). lstat64
+ * ZAMERNE neresi symlinky (lstat nesmi nasledovat posledni symlink). */
+static int shim_lstat64(const char *p, struct stat64 *st) {
+    char b[8192]; const char *path = p; if (shim_translate(p, b, sizeof b)) path = b;
+    fp_lstat64 f = (fp_lstat64)g_orig_lstat64; return f ? f(path, st) : -1;
+}
+static int shim_fstat64(int fd, struct stat64 *st) {
+    fp_fstat64 f = (fp_fstat64)g_orig_fstat64; return f ? f(fd, st) : -1;
+}
+static int shim_fstatat64(int dfd, const char *p, struct stat64 *st, int flags) {
+    char b[8192]; const char *path = p;
+    if (dfd == -100 && p && p[0] == '/') { if (shim_translate(p, b, sizeof b)) path = b; }
+    fp_fstatat64 f = (fp_fstatat64)g_orig_fstatat64; return f ? f(dfd, path, st, flags) : -1;
+}
+static int shim_statvfs(const char *p, struct statvfs *st) {
+    char b[8192]; const char *path = p; if (shim_translate(p, b, sizeof b)) path = b;
+    char resolved[8192];
+    if (shim_resolve_symlinks(path, resolved, sizeof(resolved))) path = resolved;
+    fp_statvfs f = (fp_statvfs)g_orig_statvfs; return f ? f(path, st) : -1;
+}
+static int shim_statvfs64(const char *p, struct statvfs64 *st) {
+    char b[8192]; const char *path = p; if (shim_translate(p, b, sizeof b)) path = b;
+    char resolved[8192];
+    if (shim_resolve_symlinks(path, resolved, sizeof(resolved))) path = resolved;
+    fp_statvfs64 f = (fp_statvfs64)g_orig_statvfs64; return f ? f(path, st) : -1;
 }
 
 static int shim_access(const char *p, int m) {
@@ -1834,6 +1870,11 @@ static f2_hook_t g_f2_hooks[] = {
     {"stat",(void*)shim_stat,&g_orig_stat},{"stat64",(void*)shim_stat64,&g_orig_stat64},
     {"__xstat",(void*)shim___xstat,&g_orig___xstat},{"lstat",(void*)shim_lstat,&g_orig_lstat},
     {"__lxstat",(void*)shim___lxstat,&g_orig___lxstat},
+    {"lstat64",(void*)shim_lstat64,&g_orig_lstat64},
+    {"fstat64",(void*)shim_fstat64,&g_orig_fstat64},
+    {"fstatat64",(void*)shim_fstatat64,&g_orig_fstatat64},
+    {"statvfs",(void*)shim_statvfs,&g_orig_statvfs},
+    {"statvfs64",(void*)shim_statvfs64,&g_orig_statvfs64},
     {"access",(void*)shim_access,&g_orig_access},{"euidaccess",(void*)shim_euidaccess,&g_orig_euidaccess},{"faccessat",(void*)shim_faccessat,&g_orig_faccessat},
     {"statx",(void*)shim_statx,&g_orig_statx},{"fstatat",(void*)shim_fstatat,&g_orig_fstatat},
     {"newfstatat",(void*)shim_newfstatat,&g_orig_newfstatat},{"__fxstatat",(void*)shim_fstatat,&g_orig_fstatat},
