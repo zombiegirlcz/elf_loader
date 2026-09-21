@@ -1399,7 +1399,15 @@ static int shim_posix_spawnp(pid_t *pid, const char *p, const void *fa,
     resolved[0] = 0;
     size_t rl = g_shim_root ? shim_strlen(g_shim_root) : 0;
     if (p[0] == '/') {
-        if (!shim_translate(p, resolved, sizeof resolved)) {
+        /* Excluded host cesty (/system, /vendor, /apex, /proc, ...) se
+         * NESMI prekladat pod ROOTFS. shim_translate vraci 0 i pro ne, takze
+         * stary kod pak omylem prepsal /system/bin/echo -> $ROOTFS/system/...
+         * a loader hlásil "open(...): No such file". Respektuj exclude. */
+        if (shim_excluded(p) || shim_strncmp(p, "/system", 7) == 0 ||
+            shim_strncmp(p, "/vendor", 7) == 0 || shim_strncmp(p, "/apex", 5) == 0 ||
+            shim_strncmp(p, "/product", 8) == 0 || shim_strncmp(p, "/odm", 4) == 0) {
+            shim_strcpy(resolved, sizeof resolved, p);
+        } else if (!shim_translate(p, resolved, sizeof resolved)) {
             if (rl && shim_strncmp(p, g_shim_root, rl) == 0)
                 shim_strcpy(resolved, sizeof resolved, p);
             else if (rl) {
