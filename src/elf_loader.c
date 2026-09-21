@@ -3831,10 +3831,21 @@ static void fault_handler(int sig, siginfo_t *si, void *ctx) {
             void *gh = *(void *const *)(ga + GUEST_SA_HANDLER_OFF);
             if (gh && gh != (void *)SIG_DFL && gh != (void *)SIG_IGN &&
                 gh != (void *)fault_handler) {
+                /* KRITICKE: prepni na guest (parrot) TP, nez zavolame guest
+                 * handler. V8/glibc handler cte svuj Isolate/errno z guest
+                 * TLS pres tpidr_el0. Nase fault_handler ale bezi pod
+                 * bionickym TP -> V8 by prectl garbage (0x2853_xxxx_xxxx),
+                 * neodemkl by RO heap stranku a instrukce by znovu faultla
+                 * (FAULT#2). Po navratu TP obnovime. */
+                extern uintptr_t g_tls_new_tp;
+                uintptr_t saved_tp = dl_tp_get();
+                int sw = (g_tls_new_tp && saved_tp != g_tls_new_tp);
+                if (sw) dl_tp_set(g_tls_new_tp);
                 if (gflags & 0x4UL /* SA_SIGINFO */)
                     ((void (*)(int, siginfo_t *, void *))gh)(sig, si, ctx);
                 else
                     ((void (*)(int))gh)(sig);
+                if (sw) dl_tp_set(saved_tp);
                 return;
             }
         }
