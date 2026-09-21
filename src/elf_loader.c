@@ -353,6 +353,21 @@ static uint64_t ldso_stack_guard = 0xdeadbeefcafe1234ULL;
 static int64_t ldso_rseq_offset = ELF_TLS_TCB_SIZE;
 static unsigned int ldso_rseq_size = 0;
 static void *ldso_stack_end;
+/* COPY relokace `__libc_stack_end`: exe ma v .bss vlastni slot a hodnota se
+ * do nej kopiruje v case relokace. V tu chvili jeste guest stack neexistuje
+ * (mapuje se az v elf_run), takze by slot zustal NULL. Slot si zapamatujeme
+ * a aktualizujeme ho, jakmile stack_end zname. */
+#define LDSO_STACK_END_SLOTS 4
+static void **ldso_stack_end_slots[LDSO_STACK_END_SLOTS];
+static size_t ldso_stack_end_slot_count;
+
+static void ldso_set_stack_end(void *top) {
+    ldso_stack_end = top;
+    for (size_t i = 0; i < ldso_stack_end_slot_count; i++)
+        if (ldso_stack_end_slots[i])
+            *ldso_stack_end_slots[i] = top;
+}
+
 static char ldso_platform[] = "aarch64";
 static char *ldso_argv_copy[8];
 static Elf64_auxv_t ldso_auxv[64];
@@ -3046,6 +3061,12 @@ static int do_copy_reloc(elf_object_t *obj, Elf64_Rela *r, void *where) {
         src = override_lookup(name);   /* __stack_chk_guard, __rseq_* apod. */
     if (src) {
         memcpy(where, src, sz);
+        /* `__libc_stack_end` se v case relokace jeste nezna (guest stack
+         * mapujeme az v elf_run) -> zapamatuj si cilovy slot a doplnime ho
+         * pozdeji pres ldso_set_stack_end(). */
+        if (strcmp(name, "__libc_stack_end") == 0 &&
+            ldso_stack_end_slot_count < LDSO_STACK_END_SLOTS)
+            ldso_stack_end_slots[ldso_stack_end_slot_count++] = (void **)where;
         if (elf_debug())
             fprintf(stderr, "[COPY] %s <- %p (%zu B)\n", name, src, sz);
         return 1;
@@ -4465,6 +4486,11 @@ int elf_run(elf_object_t *obj, int argc, char **argv, char **envp) {
     g_guest_stack_size = stack_map;
 
     char *stack_top = stack + stack_size;
+    /* Nastav __libc_stack_end na horni mez guest stacku. Exe ho ma v .bss
+     * pres COPY relokaci z libc, ale ta probehla drive, nez stack existoval
+     * -> slot je NULL. Zapiseme spravnou hodnotu (a i nas ldso_stack_end
+     * pro override). Bez toho cte V8/glibc NULL -> SIGSEGV. */
+    ldso_set_stack_end(stack_top);
 
     size_t str_total = 256 + argc * 128 + env_count * 256;
 
