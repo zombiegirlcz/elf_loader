@@ -348,6 +348,9 @@ static void *g_orig_flockfile = NULL;
 static void *g_orig_close = NULL;
 static void *g_orig_setfsuid = NULL, *g_orig_setfsgid = NULL;
 static void *g_orig_mprotect = NULL;
+/* ELF_LOADER_VMTRACE=1 -> loguj kazdy mmap/mprotect/munmap (diagnostika
+ * V8 read-only heapu: kdo udelal stranku r--p pred fatalnim store). */
+static int g_vmtrace = 0;
 static void *g_orig_opendir = NULL, *g_orig_readlink = NULL, *g_orig_readlinkat = NULL,
             *g_orig_realpath = NULL, *g_orig_dlopen = NULL, *g_orig_chdir = NULL;
 
@@ -1559,6 +1562,19 @@ typedef int (*fp_mprotect)(void *, unsigned long, int);
 static int shim_mprotect(void *addr, unsigned long len, int prot) {
     fp_mprotect f = (fp_mprotect)g_orig_mprotect;
     int r = f ? f(addr, len, prot) : -1;
+    if (g_vmtrace) {
+        char b[128]; char *i = b;
+        const char *p = "[MPROT] addr="; while (*p) *i++ = *p++;
+        shim_hex(&i, (unsigned long)addr, 12);
+        p = " len="; while (*p) *i++ = *p++;
+        shim_hex(&i, len, 8);
+        p = " prot="; while (*p) *i++ = *p++;
+        shim_hex(&i, (unsigned long)(unsigned)prot, 2);
+        p = " rc="; while (*p) *i++ = *p++;
+        shim_hex(&i, (unsigned long)(unsigned)r, 2);
+        *i++ = '\n';
+        shim_raw_syscall6(64, 2, (long)b, (long)(i - b), 0, 0, 0);
+    }
     if (r != 0) {
         char b[128]; char *i = b;
         const char *p = "[MPROT_FAIL] addr="; while (*p) *i++ = *p++;
@@ -1813,13 +1829,15 @@ static void shim_hex(char **pp, unsigned long v, int nib) {
 }
 /* Diagnostika velkych mmap (V8 sandbox/cage rezervace): pred i po volani. */
 static void shim_mmap_log(unsigned long len, void *addr, int flags,
-                          void *res, int rerr) {
+                          void *res, int rerr, int prot) {
     char b[200]; char *i = b;
     const char *p = "[MMAP] len=";
     while (*p) *i++ = *p++;
     shim_hex(&i, len, 10);
     p = " addr="; while (*p) *i++ = *p++;
     shim_hex(&i, (unsigned long)addr, 12);
+    p = " prot="; while (*p) *i++ = *p++;
+    shim_hex(&i, (unsigned long)(unsigned)prot, 2);
     p = " fl="; while (*p) *i++ = *p++;
     shim_hex(&i, (unsigned long)(unsigned)flags, 6);
     p = " -> "; while (*p) *i++ = *p++;
@@ -1849,12 +1867,12 @@ static void shim_guest_errno_set(int v) {
 
 static void *shim_mmap_common(void *addr, unsigned long len, int prot,
                               int flags, int fd, long off) {
-    int dbg = (addr != NULL) || (len >= (1UL << 30));
+    int dbg = g_vmtrace || (addr != NULL) || (len >= (1UL << 30));
     if (addr && (flags & (int)SHIM_MAP_FIXED_NOREPLACE)) {
         unsigned long a = (unsigned long)addr;
         if (!shim_addr_range_free(a, a + len)) {
             shim_guest_errno_set(17);         /* EEXIST */
-            if (dbg) shim_mmap_log(len, addr, flags, (void *)-1, 17);
+            if (dbg) shim_mmap_log(len, addr, flags, (void *)-1, 17, prot);
             return (void *)-1;
         }
         flags = (flags & ~(int)SHIM_MAP_FIXED_NOREPLACE) | (int)SHIM_MAP_FIXED;
@@ -1880,7 +1898,7 @@ static void *shim_mmap_common(void *addr, unsigned long len, int prot,
         int *ge = shim_guest_errno();
         e = ge ? *ge : 0;
     }
-    if (dbg) shim_mmap_log(len, addr, flags, r, e);
+    if (dbg) shim_mmap_log(len, addr, flags, r, e, prot);
     return r;
 }
 static void *shim_mmap(void *a, unsigned long l, int p, int fl, int fd, long o) {
@@ -1888,6 +1906,29 @@ static void *shim_mmap(void *a, unsigned long l, int p, int fl, int fd, long o) 
 }
 static void *shim_mmap64(void *a, unsigned long l, int p, int fl, int fd, long o) {
     return shim_mmap_common(a, l, p, fl, fd, o);
+}
+typedef int (*fp_munmap)(void *, unsigned long);
+static int shim_munmap(void *addr, unsigned long len) {
+    fp_munmap f = (fp_munmap)elf_scope_lookup(g_shim_scope, "munmap");
+    int r;
+    if (f) {
+        r = f(addr, len);
+    } else {
+        long raw = shim_raw_syscall6(215, (long)addr, (long)len, 0, 0, 0, 0);
+        r = (raw < 0 && raw > -4096) ? -1 : 0;
+    }
+    if (g_vmtrace) {
+        char b[128]; char *i = b;
+        const char *p = "[MUNMAP] addr="; while (*p) *i++ = *p++;
+        shim_hex(&i, (unsigned long)addr, 12);
+        p = " len="; while (*p) *i++ = *p++;
+        shim_hex(&i, len, 8);
+        p = " rc="; while (*p) *i++ = *p++;
+        shim_hex(&i, (unsigned long)(unsigned)r, 2);
+        *i++ = '\n';
+        shim_raw_syscall6(64, 2, (long)b, (long)(i - b), 0, 0, 0);
+    }
+    return r;
 }
 
 static f2_hook_t g_f2_hooks[] = {
@@ -2161,6 +2202,7 @@ static int run_ownall(const char *path, int argc, char **argv, char **envp) {
         }
     }
     g_tls_trace = getenv("ELF_LOADER_TLS_TRACE") != NULL;
+    g_vmtrace = getenv("ELF_LOADER_VMTRACE") != NULL;
     elf_scope_t *scope = elf_scope_create();
     if (!scope) {
         fprintf(stderr, "[-] scope alloc failed\n");
@@ -2206,6 +2248,7 @@ static int run_ownall(const char *path, int argc, char **argv, char **envp) {
      * bez emulace dostane jinou adresu -> divoke komprimovane pointery. */
     elf_register_override("mmap", (void *)shim_mmap);
     elf_register_override("mmap64", (void *)shim_mmap64);
+    if (g_vmtrace) elf_register_override("munmap", (void *)shim_munmap);
     /* sigaction override: zachyti instalaci fatal-signal handleru a ulozi
      * ho do g_guest_fatal. Lze vypnout ELF_LOADER_NO_SA_OVERRIDE=1 (pak si
      * V8/node instaluje sve handlery a nas fault dump se nezobrazi). */
