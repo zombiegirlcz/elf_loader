@@ -61,17 +61,17 @@ while IFS= read -r C; do
     ok=0
     for try in 1 2 3; do
         if [ $first = 1 ]; then
-            ashell -c "echo '$C' > $DST.b64" >/dev/null 2>&1
+            ashell -c "echo '$C' > $DST.b64" </dev/null >/dev/null 2>&1
             first=0
         else
-            GOT=$(ashell -c "/system/bin/wc -c $DST.b64" 2>/dev/null | awk '{print $1}')
+            GOT=$(ashell -c "/system/bin/wc -c $DST.b64" </dev/null 2>/dev/null | awk '{print $1}')
             if [ "$GOT" = "$WANT" ]; then ok=1; break; fi
             if [ "$GOT" -lt "$WANT" ]; then
-                ERR=$(ashell -c "echo '$C' >> $DST.b64" 2>&1 | head -1)
+                ERR=$(ashell -c "echo '$C' >> $DST.b64" </dev/null 2>&1 | head -1)
                 if [ -n "$ERR" ]; then FAILURES=$((FAILURES+1)); sleep 0.3; fi
             fi
         fi
-        GOT=$(ashell -c "/system/bin/wc -c $DST.b64" 2>/dev/null | awk '{print $1}')
+        GOT=$(ashell -c "/system/bin/wc -c $DST.b64" </dev/null 2>/dev/null | awk '{print $1}')
         [ "$GOT" = "$WANT" ] && { ok=1; break; }
     done
     if [ $ok = 0 ]; then echo "chunk #$idx FAIL ($ERR)"; exit 1; fi

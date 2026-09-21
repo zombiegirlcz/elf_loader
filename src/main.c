@@ -1678,6 +1678,89 @@ static int shim_close(int fd) {
 static int shim_setfsuid(unsigned int uid) { (void)uid; return (int)getuid(); }
 static int shim_setfsgid(unsigned int gid) { (void)gid; return (int)getgid(); }
 
+/* ===== MAP_FIXED_NOREPLACE emulace (kernel 4.14) =====
+ * Android kernel 4.14 flag MAP_FIXED_NOREPLACE (0x100000) NEZNA -> ignoruje
+ * ho a chova se jako hint. V8/Node s nim rezervuje 4GB pointer-compression
+ * cage na PRESNE adrese (napr. 0x2853_0000_0000). Kdyz dostane jinou adresu
+ * s errno=0, vsechny komprimovane pointery jsou divoke -> SIGSEGV v
+ * Builtins_InterpreterEntryTrampoline (sturh wzr,[x5,#67] do r--p stranky).
+ * Emulujeme spravnou semantiku: overime, ze rozsah je volny (parse
+ * /proc/self/maps), a teprve pak pouzijeme MAP_FIXED (presna adresa).
+ * Kdyz je obsazeny -> EEXIST (jako skutecny MAP_FIXED_NOREPLACE). */
+#define SHIM_MAP_FIXED_NOREPLACE 0x100000UL
+#define SHIM_MAP_FIXED           0x10UL
+
+static int shim_addr_range_free(unsigned long start, unsigned long end) {
+    register long x8 __asm__("x8") = 56;   /* openat */
+    register long x0 __asm__("x0") = -100;
+    register long x1 __asm__("x1") = (long)"/proc/self/maps";
+    register long x2 __asm__("x2") = 0;
+    register long x3 __asm__("x3") = 0;
+    __asm__ volatile("svc #0" : "+r"(x0) : "r"(x8),"r"(x1),"r"(x2),"r"(x3)
+                     : "memory","cc");
+    int fd = (int)x0;
+    if (fd < 0) return 1;                    /* optimisticky */
+    static char mbuf[262144];
+    long total = 0, n;
+    while ((n = shim_raw_syscall6(63, fd, (long)(mbuf + total),
+                                  sizeof mbuf - 1 - total, 0, 0, 0)) > 0) {
+        total += n;
+        if (total > (long)sizeof mbuf - 2) break;
+    }
+    shim_raw_syscall6(57, fd, 0, 0, 0, 0, 0);
+    if (total <= 0) return 1;
+    mbuf[total] = 0;
+    char *p = mbuf;
+    while (*p) {
+        unsigned long a = 0, b = 0;
+        int any = 0;
+        while (*p && *p != '-') {
+            char c = *p++;
+            if (c >= '0' && c <= '9') { a = a * 16 + (unsigned)(c - '0'); any = 1; }
+            else if (c >= 'a' && c <= 'f') { a = a * 16 + (unsigned)(c - 'a' + 10); any = 1; }
+        }
+        if (*p == '-') p++;
+        while (*p && *p != ' ') {
+            char c = *p++;
+            if (c >= '0' && c <= '9') b = b * 16 + (unsigned)(c - '0');
+            else if (c >= 'a' && c <= 'f') b = b * 16 + (unsigned)(c - 'a' + 10);
+        }
+        while (*p && *p != '\n') p++;
+        if (*p == '\n') p++;
+        if (!any) continue;
+        if (start < b && end > a) return 0;   /* prekryv -> obsazeno */
+    }
+    return 1;
+}
+
+typedef void *(*fp_mmap)(void *, unsigned long, int, int, int, long);
+static void *shim_mmap_common(void *addr, unsigned long len, int prot,
+                              int flags, int fd, long off) {
+    if (addr && (flags & (int)SHIM_MAP_FIXED_NOREPLACE)) {
+        unsigned long a = (unsigned long)addr;
+        if (!shim_addr_range_free(a, a + len)) {
+            errno = 17;                       /* EEXIST */
+            return (void *)-1;
+        }
+        flags = (flags & ~(int)SHIM_MAP_FIXED_NOREPLACE) | (int)SHIM_MAP_FIXED;
+    } else {
+        flags = flags & ~(int)SHIM_MAP_FIXED_NOREPLACE;
+    }
+    fp_mmap f = (fp_mmap)elf_scope_lookup(g_shim_scope, "mmap");
+    if (!f) {
+        /* fallback: raw mmap syscall (aarch64 222) */
+        return (void *)shim_raw_syscall6(222, (long)addr, (long)len, prot,
+                                         flags, fd, off);
+    }
+    return f(addr, len, prot, flags, fd, off);
+}
+static void *shim_mmap(void *a, unsigned long l, int p, int fl, int fd, long o) {
+    return shim_mmap_common(a, l, p, fl, fd, o);
+}
+static void *shim_mmap64(void *a, unsigned long l, int p, int fl, int fd, long o) {
+    return shim_mmap_common(a, l, p, fl, fd, o);
+}
+
 static f2_hook_t g_f2_hooks[] = {
     {"open",(void*)shim_open,&g_orig_open},{"open64",(void*)shim_open64,&g_orig_open64},
     {"__open",(void*)shim_open,&g_orig_open},{"__open64",(void*)shim_open64,&g_orig_open64},
@@ -1983,6 +2066,11 @@ static int run_ownall(const char *path, int argc, char **argv, char **envp) {
     /* pthread_create fix: vzdy - glibc EINVAL kvuli velkemu TLS static size. */
     elf_register_override("pthread_create", (void *)shim_pthread_create);
     elf_register_override("pthread_getattr_np", (void *)shim_pthread_getattr_np);
+    /* mmap/mmap64: emulace MAP_FIXED_NOREPLACE (kernel 4.14 ho nezna).
+     * V8/Node s nim rezervuje 4GB pointer-compression cage na presne adrese;
+     * bez emulace dostane jinou adresu -> divoke komprimovane pointery. */
+    elf_register_override("mmap", (void *)shim_mmap);
+    elf_register_override("mmap64", (void *)shim_mmap64);
     /* sigaction override: zachyti instalaci fatal-signal handleru a ulozi
      * ho do g_guest_fatal. Lze vypnout ELF_LOADER_NO_SA_OVERRIDE=1 (pak si
      * V8/node instaluje sve handlery a nas fault dump se nezobrazi). */
