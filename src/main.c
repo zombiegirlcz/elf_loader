@@ -205,7 +205,9 @@ static int diag_wrapped_sigaction(int signum, const struct sigaction *act,
         static const char hxd[] = "0123456789abcdef";
         for (int sh = 60; sh >= 0; sh -= 4) b[i++] = hxd[(u >> sh) & 0xf];
         q = " f=0x"; while (*q) b[i++] = *q++;
-        u = (unsigned long)(act->sa_flags);
+        /* guest je glibc (152B struct sigaction, sa_flags @136); nase
+         * (bionic) act->sa_flags by cetlo offset 16 -> nesmysl. */
+        u = *(const unsigned long *)((const unsigned char *)act + 136);
         for (int sh = 28; sh >= 0; sh -= 4) b[i++] = hxd[(u >> sh) & 0xf];
         b[i++] = 10;
         raw_wr2(b, i);

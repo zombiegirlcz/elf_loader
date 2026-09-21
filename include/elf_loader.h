@@ -95,7 +95,7 @@ void elf_unload(elf_object_t *obj);
 
 void elf_install_fault_handlers(void);
 void elf_set_guest_fatal(int sig, const struct sigaction *sa);
-const struct sigaction *elf_get_guest_fatal(int sig);
+const void *elf_get_guest_fatal(int sig);
 void elf_install_compat(void);
 void f2_set_root(const char *r);          /* F2: nastav ROOTFS pro seccomp path-translaci */
 void install_f2_path_filter(void);     /* F2: stackovany RET_TRAP filtr pro openat/statx/... */

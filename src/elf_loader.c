@@ -3741,17 +3741,27 @@ void elf_dump_tls_got(elf_scope_t *scope) {
  * instaluje vlastni SIGSEGV handler pres sigaction, nas shim ho ulozi sem
  * a necha nas fault_handler aktivni. Ten pri crashi vypise fault dump
  * a PAK chainuje na puvodni (guest) handler. */
-static struct sigaction g_guest_fatal[64];
+/* Ulozene guest fatal-signal handlery pro chainovani. Guest je glibc
+ * (parrot) s 152B struct sigaction (sa_flags @136), ale elf_loader.c se
+ * kompiluje bionicem (32B, sa_flags @16). Proto ukladame RAW bajty a vse
+ * cteme pres pevne offsety - jinak (ga->sa_flags & SA_SIGINFO) nikdy
+ * nevyjde a chain guest handleru (V8 read-only heap COW) se nespusti. */
+#define GUEST_SIGACTION_BYTES 152
+#define GUEST_SA_HANDLER_OFF  0
+#define GUEST_SA_FLAGS_OFF    136
+static unsigned char g_guest_fatal[64][GUEST_SIGACTION_BYTES];
 static int g_guest_fatal_set[64];
 void elf_set_guest_fatal(int sig, const struct sigaction *sa) {
     if (sig >= 0 && sig < 64 && sa) {
-        g_guest_fatal[sig] = *sa;
+        const unsigned char *s = (const unsigned char *)sa;
+        for (int i = 0; i < GUEST_SIGACTION_BYTES; i++)
+            g_guest_fatal[sig][i] = s[i];
         g_guest_fatal_set[sig] = 1;
     }
 }
-const struct sigaction *elf_get_guest_fatal(int sig) {
+const void *elf_get_guest_fatal(int sig) {
     if (sig >= 0 && sig < 64 && g_guest_fatal_set[sig])
-        return &g_guest_fatal[sig];
+        return g_guest_fatal[sig];
     return NULL;
 }
 
@@ -3885,13 +3895,21 @@ static void fault_handler(int sig, siginfo_t *si, void *ctx) {
      * spustil s plnym kontextem (my uz jsme v handleru). Jednoduseji:
      * pokud guest handler existuje, zavolame ho pres SA_SIGINFO prototyp. */
     {
-        const struct sigaction *ga = elf_get_guest_fatal(sig);
-        if (ga && (ga->sa_flags & SA_SIGINFO) && ga->sa_sigaction &&
-            ga->sa_sigaction != (void *)fault_handler) {
-            ga->sa_sigaction(sig, si, ctx);
-        } else if (ga && ga->sa_handler && ga->sa_handler != SIG_DFL &&
-                   ga->sa_handler != SIG_IGN) {
-            ga->sa_handler(sig);
+        const unsigned char *ga = (const unsigned char *)elf_get_guest_fatal(sig);
+        if (ga) {
+            unsigned long gflags =
+                *(const unsigned long *)(ga + GUEST_SA_FLAGS_OFF);
+            void *gh = *(void *const *)(ga + GUEST_SA_HANDLER_OFF);
+            if ((gflags & 0x4UL /* SA_SIGINFO (glibc i bionic) */) && gh &&
+                gh != (void *)fault_handler) {
+                ((void (*)(int, siginfo_t *, void *))gh)(sig, si, ctx);
+                return;  /* guest handler opravil pricinu -> retry instrukce */
+            }
+            if (gh && gh != (void *)SIG_DFL && gh != (void *)SIG_IGN &&
+                gh != (void *)fault_handler) {
+                ((void (*)(int))gh)(sig);
+                return;
+            }
         }
     }
     _exit(128 + sig);
