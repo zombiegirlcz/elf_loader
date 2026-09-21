@@ -1436,13 +1436,15 @@ static int shim_posix_spawnp(pid_t *pid, const char *p, const void *fa,
     size_t rl = g_shim_root ? shim_strlen(g_shim_root) : 0;
     if (p[0] == '/') {
         /* Excluded host cesty (/system, /vendor, /apex, /proc, ...) se
-         * NESMI prekladat pod ROOTFS. shim_translate vraci 0 i pro ne, takze
-         * stary kod pak omylem prepsal /system/bin/echo -> $ROOTFS/system/...
-         * a loader hlásil "open(...): No such file". Respektuj exclude. */
+         * NESMI prekladat pod ROOTFS a NESMI se re-execovat pres loader.
+         * Musi se spustit primo (real posix_spawnp), jinak loader pokusi
+         * nacist bionicky binarku jako guest glibc a spadne na libc.so.
+         * (shim_execve to dela spravne, tady chybelo early return). */
         if (shim_excluded(p) || shim_strncmp(p, "/system", 7) == 0 ||
             shim_strncmp(p, "/vendor", 7) == 0 || shim_strncmp(p, "/apex", 5) == 0 ||
             shim_strncmp(p, "/product", 8) == 0 || shim_strncmp(p, "/odm", 4) == 0) {
-            shim_strcpy(resolved, sizeof resolved, p);
+            fp_posix_spawnp f = (fp_posix_spawnp)g_orig_posix_spawnp;
+            return f ? f(pid, p, fa, at, argv, envp) : -1;
         } else if (!shim_translate(p, resolved, sizeof resolved)) {
             if (rl && shim_strncmp(p, g_shim_root, rl) == 0)
                 shim_strcpy(resolved, sizeof resolved, p);
