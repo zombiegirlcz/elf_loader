@@ -1759,13 +1759,29 @@ static void shim_mmap_log(unsigned long len, void *addr, int flags,
     *i++ = '\n';
     shim_raw_syscall6(64, 2, (long)b, (long)(i - b), 0, 0, 0);
 }
+/* Guest (parrot glibc) errno. NESMIME sahat na bionicky `errno` - shim
+ * bezi pod guest TP, kde bionicke __errno() cte TP+offset -> divoky
+ * pointer (si_addr=0x300) a SIGSEGV v loaderu. Guest errno ziskame
+ * z guest libc pres __errno_location. */
+static int *shim_guest_errno(void) {
+    int *(*f)(void) = (int *(*)(void))elf_scope_lookup(g_shim_scope, "__errno_location");
+    if (f)
+        return f();
+    f = (int *(*)(void))elf_scope_lookup(g_shim_scope, "__errno_location64");
+    return f ? f() : NULL;
+}
+static void shim_guest_errno_set(int v) {
+    int *e = shim_guest_errno();
+    if (e) *e = v;
+}
+
 static void *shim_mmap_common(void *addr, unsigned long len, int prot,
                               int flags, int fd, long off) {
     int dbg = (addr != NULL) || (len >= (1UL << 30));
     if (addr && (flags & (int)SHIM_MAP_FIXED_NOREPLACE)) {
         unsigned long a = (unsigned long)addr;
         if (!shim_addr_range_free(a, a + len)) {
-            errno = 17;                       /* EEXIST */
+            shim_guest_errno_set(17);         /* EEXIST */
             if (dbg) shim_mmap_log(len, addr, flags, (void *)-1, 17);
             return (void *)-1;
         }
@@ -1775,16 +1791,22 @@ static void *shim_mmap_common(void *addr, unsigned long len, int prot,
     }
     fp_mmap f = (fp_mmap)elf_scope_lookup(g_shim_scope, "mmap");
     void *r; int e = 0;
+    shim_guest_errno_set(0);
     if (!f) {
         /* fallback: raw mmap syscall (aarch64 222) */
         long raw = shim_raw_syscall6(222, (long)addr, (long)len, prot,
                                      flags, fd, off);
-        r = (void *)raw;
-        if (raw < 0 && raw > -4096) { e = (int)-raw; r = (void *)-1; }
+        if (raw < 0 && raw > -4096) {
+            e = (int)-raw;
+            shim_guest_errno_set(e);
+            r = (void *)-1;
+        } else {
+            r = (void *)raw;
+        }
     } else {
-        errno = 0;
         r = f(addr, len, prot, flags, fd, off);
-        e = errno;
+        int *ge = shim_guest_errno();
+        e = ge ? *ge : 0;
     }
     if (dbg) shim_mmap_log(len, addr, flags, r, e);
     return r;
