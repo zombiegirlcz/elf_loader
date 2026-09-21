@@ -3789,6 +3789,34 @@ const void *elf_get_guest_fatal(int sig) {
 static void fault_handler(int sig, siginfo_t *si, void *ctx) {
     ucontext_t *uc = (ucontext_t *)ctx;
 
+    /* Diagnostika dvojitych faultu: kazde vstoupeni ocislujeme a zalogujeme
+     * si_addr I adresu, kterou by faultovala instrukce na pc (pro
+     * sturh [x5,#67] je to regs[5]+67). Kdyz se lisi, jde o dva faulty
+     * (chain -> guest handler -> re-fault na jine adrese). */
+    {
+        static volatile int fault_seq;
+        int myseq = ++fault_seq;
+        char b[176]; int i = 0;
+        const char *p = "FAULT#";
+        while (*p) b[i++] = *p++;
+        b[i++] = (char)('0' + (myseq % 10));
+        p = " sig="; while (*p) b[i++] = *p++;
+        b[i++] = (char)('0' + (sig / 10));
+        b[i++] = (char)('0' + (sig % 10));
+        static const char hxd[] = "0123456789abcdef";
+        p = " si_addr="; while (*p) b[i++] = *p++;
+        unsigned long a = (unsigned long)si->si_addr;
+        for (int sh = 60; sh >= 0; sh -= 4) b[i++] = hxd[(a >> sh) & 0xf];
+        p = " pc="; while (*p) b[i++] = *p++;
+        unsigned long pcv = (unsigned long)uc->uc_mcontext.pc;
+        for (int sh = 60; sh >= 0; sh -= 4) b[i++] = hxd[(pcv >> sh) & 0xf];
+        p = " x5p67="; while (*p) b[i++] = *p++;
+        unsigned long x5v = (unsigned long)uc->uc_mcontext.regs[5] + 67;
+        for (int sh = 60; sh >= 0; sh -= 4) b[i++] = hxd[(x5v >> sh) & 0xf];
+        b[i++] = '\n';
+        sys_write(2, b, (size_t)i);
+    }
+
     /* NEJDRIV chain na guest handler. Guest (glibc/V8) si instaluje vlastni
      * SIGSEGV handler pro read-only heap COW. Musime ho zavolat DRIV, nez
      * sahneme na bionicke funkce (dladdr/fprintf) - ty pod guest TP spadnou
