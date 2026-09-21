@@ -1,0 +1,72 @@
+name: build-elf-loader
+
+# Cross-compile elf_loader with the Android NDK (bionic aarch64).
+# Same toolchain/flags as finale_loader_build.py (Modal), used because the
+# Modal workspace hit its spend limit.
+#
+# Artifacts:
+#   elf_loader_ndk            dynamic bionic (interpreter /system/bin/linker64)
+#   elf_loader_ndk_staticpie  -static-pie self-contained
+# The dynamic one is what is deployed as files/usr/bin/elf_loader.
+
+on:
+  push:
+    branches: ["**"]
+  pull_request:
+  workflow_dispatch:
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Install Android NDK r28
+        run: |
+          set -eux
+          wget -q https://dl.google.com/android/repository/android-ndk-r28-linux.zip -O /tmp/ndk.zip
+          unzip -q /tmp/ndk.zip -d /opt/
+          TC=/opt/android-ndk-r28/toolchains/llvm/prebuilt/linux-x86_64/bin
+          test -x "$TC/aarch64-linux-android24-clang"
+          echo "TC=$TC" >> "$GITHUB_ENV"
+          "$TC/aarch64-linux-android24-clang" --version
+
+      - name: Cross-compile (dynamic bionic)
+        run: |
+          set -eux
+          FLAGS="-Wall -Wextra -g -O0 -std=c11"
+          SRCS="src/main.c src/elf_loader.c src/ldso_tls.c src/entry.S"
+          "$TC/aarch64-linux-android24-clang" $FLAGS $SRCS -ldl -o /tmp/elf_loader_ndk
+
+      - name: Cross-compile (static-PIE)
+        run: |
+          set -eux
+          FLAGS="-Wall -Wextra -g -O0 -std=c11"
+          SRCS="src/main.c src/elf_loader.c src/ldso_tls.c src/entry.S src/dlfcn_stubs.c"
+          "$TC/aarch64-linux-android24-clang" $FLAGS -fPIE -static-pie $SRCS -o /tmp/elf_loader_ndk_staticpie
+
+      - name: Verify interpreter is bionic
+        run: |
+          set -eux
+          readelf -h /tmp/elf_loader_ndk | grep Machine
+          readelf -l /tmp/elf_loader_ndk | grep -i interpreter
+          readelf -l /tmp/elf_loader_ndk | grep -q '/system/bin/linker64'
+          file /tmp/elf_loader_ndk
+
+      - name: Upload artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: elf_loader_ndk
+          path: |
+            /tmp/elf_loader_ndk
+            /tmp/elf_loader_ndk_staticpie
+          if-no-files-found: error
+
+      - name: Attach to release
+        if: startsWith(github.ref, 'refs/tags/v')
+        uses: softprops/action-gh-release@v2
+        with:
+          files: |
+            /tmp/elf_loader_ndk
+            /tmp/elf_loader_ndk_staticpie

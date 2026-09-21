@@ -404,6 +404,26 @@ void ldso_install_module_list(elf_object_t *const *mods, size_t count) {
         count = LDSO_MAX_MODULES;
     for (size_t i = 0; i < count; i++)
         (void)ldso_register_linkmap(mods[i]);
+    /* Runtime experiment (ELF_FIX=phdr): zapoj exe do retezu l_next/l_prev,
+     * aby realny glibc dl_iterate_phdr (pres _ns_loaded = exe linkmap) uvidel
+     * i guest moduly (libc, ld.so, ...), ne jen main exe. Bez toho je l_next
+     * exe 0 a walk skonci hned. */
+    {
+        const char *fix = getenv("ELF_FIX");
+        if (fix && strstr(fix, "phdr") && ldso_module_count) {
+            uint64_t *exe = (uint64_t *)ldso_exe_linkmap;
+            exe[0x10 / 8] = (uint64_t)(uintptr_t)&ldso_module_linkmaps[ldso_module_count - 1];
+            exe[0x18 / 8] = (uint64_t)(uintptr_t)&ldso_module_linkmaps[0];
+            for (size_t i = 0; i < ldso_module_count; i++) {
+                uint64_t *b = (uint64_t *)ldso_module_linkmaps[i];
+                b[0x10 / 8] = (i == 0) ? (uint64_t)(uintptr_t)ldso_exe_linkmap
+                                       : (uint64_t)(uintptr_t)&ldso_module_linkmaps[i - 1];
+                b[0x18 / 8] = (i + 1 < ldso_module_count)
+                                  ? (uint64_t)(uintptr_t)&ldso_module_linkmaps[i + 1]
+                                  : 0;
+            }
+        }
+    }
     ldso_modules_built = 1;
 }
 
@@ -4424,6 +4444,13 @@ int elf_run(elf_object_t *obj, int argc, char **argv, char **envp) {
     g_guest_stack_size = stack_map;
 
     char *stack_top = stack + stack_size;
+    /* Runtime experiment (ELF_FIX=stack): nastav __libc_stack_end na horni mez
+     * guest stacku. Bez toho je ldso_stack_end NULL a V8/glibc cte NULL. */
+    {
+        const char *fix = getenv("ELF_FIX");
+        if (fix && strstr(fix, "stack"))
+            ldso_stack_end = stack_top;
+    }
 
     size_t str_total = 256 + argc * 128 + env_count * 256;
 
