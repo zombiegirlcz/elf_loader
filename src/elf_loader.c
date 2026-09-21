@@ -3823,6 +3823,17 @@ static void fault_handler(int sig, siginfo_t *si, void *ctx) {
         p = " sp="; while (*p) b[i++] = *p++;
         unsigned long spv = (unsigned long)uc->uc_mcontext.sp;
         for (int sh = 60; sh >= 0; sh -= 4) b[i++] = hxd[(spv >> sh) & 0xf];
+        p = " sc="; while (*p) b[i++] = *p++;
+        long scv = (long)si->si_code;
+        if (scv < 0) { b[i++] = '-'; scv = -scv; }
+        for (int sh = 28; sh >= 0; sh -= 4) b[i++] = hxd[(scv >> sh) & 0xf];
+        p = " fa="; while (*p) b[i++] = *p++;
+        unsigned long fav = (unsigned long)uc->uc_mcontext.fault_address;
+        for (int sh = 60; sh >= 0; sh -= 4) b[i++] = hxd[(fav >> sh) & 0xf];
+        p = " gh="; while (*p) b[i++] = *p++;
+        const unsigned char *gg = (const unsigned char *)elf_get_guest_fatal(sig);
+        unsigned long ghv = gg ? *(const unsigned long *)(gg + GUEST_SA_HANDLER_OFF) : 0;
+        for (int sh = 60; sh >= 0; sh -= 4) b[i++] = hxd[(ghv >> sh) & 0xf];
         b[i++] = '\n';
         sys_write(2, b, (size_t)i);
     }
