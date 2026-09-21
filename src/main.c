@@ -351,6 +351,11 @@ static void *g_orig_mprotect = NULL;
 /* ELF_LOADER_VMTRACE=1 -> loguj kazdy mmap/mprotect/munmap (diagnostika
  * V8 read-only heapu: kdo udelal stranku r--p pred fatalnim store). */
 static int g_vmtrace = 0;
+/* ELF_LOADER_RO_KEEP_WRITE=1 -> mprotect, ktery odebira PROT_WRITE z datove
+ * stranky, necha zapis povoleny. Diagnostika/workaround pro V8 seal
+ * read-only heapu: Builtins_InterpreterEntryTrampoline zapisuje age=0 do
+ * SharedFunctionInfo, ktery po sealu lezi v r--p strance -> SIGSEGV. */
+static int g_ro_keep_write = 0;
 static void *g_orig_opendir = NULL, *g_orig_readlink = NULL, *g_orig_readlinkat = NULL,
             *g_orig_realpath = NULL, *g_orig_dlopen = NULL, *g_orig_chdir = NULL;
 
@@ -1907,6 +1912,37 @@ static void *shim_mmap(void *a, unsigned long l, int p, int fl, int fd, long o) 
 static void *shim_mmap64(void *a, unsigned long l, int p, int fl, int fd, long o) {
     return shim_mmap_common(a, l, p, fl, fd, o);
 }
+/* mprotect override pro --ownall (F2 ma vlastni shim_mprotect v g_f2_hooks). */
+static int shim_mprotect_ov(void *addr, unsigned long len, int prot) {
+    int eff = prot;
+    if (g_ro_keep_write && (prot & PROT_READ)
+        && !(prot & PROT_WRITE) && !(prot & PROT_EXEC))
+        eff = prot | PROT_WRITE;
+    fp_mprotect f = (fp_mprotect)elf_scope_lookup(g_shim_scope, "mprotect");
+    int r;
+    if (f) {
+        r = f(addr, len, eff);
+    } else {
+        long raw = shim_raw_syscall6(226, (long)addr, (long)len, eff, 0, 0, 0);
+        r = (raw < 0 && raw > -4096) ? -1 : 0;
+    }
+    if (g_vmtrace) {
+        char b[160]; char *i = b;
+        const char *p = "[MPROT_OV] addr="; while (*p) *i++ = *p++;
+        shim_hex(&i, (unsigned long)addr, 12);
+        p = " len="; while (*p) *i++ = *p++;
+        shim_hex(&i, len, 8);
+        p = " prot="; while (*p) *i++ = *p++;
+        shim_hex(&i, (unsigned long)(unsigned)prot, 2);
+        p = " eff="; while (*p) *i++ = *p++;
+        shim_hex(&i, (unsigned long)(unsigned)eff, 2);
+        p = " rc="; while (*p) *i++ = *p++;
+        shim_hex(&i, (unsigned long)(unsigned)r, 2);
+        *i++ = '\n';
+        shim_raw_syscall6(64, 2, (long)b, (long)(i - b), 0, 0, 0);
+    }
+    return r;
+}
 typedef int (*fp_munmap)(void *, unsigned long);
 static int shim_munmap(void *addr, unsigned long len) {
     fp_munmap f = (fp_munmap)elf_scope_lookup(g_shim_scope, "munmap");
@@ -2203,6 +2239,7 @@ static int run_ownall(const char *path, int argc, char **argv, char **envp) {
     }
     g_tls_trace = getenv("ELF_LOADER_TLS_TRACE") != NULL;
     g_vmtrace = getenv("ELF_LOADER_VMTRACE") != NULL;
+    g_ro_keep_write = getenv("ELF_LOADER_RO_KEEP_WRITE") != NULL;
     elf_scope_t *scope = elf_scope_create();
     if (!scope) {
         fprintf(stderr, "[-] scope alloc failed\n");
@@ -2249,6 +2286,8 @@ static int run_ownall(const char *path, int argc, char **argv, char **envp) {
     elf_register_override("mmap", (void *)shim_mmap);
     elf_register_override("mmap64", (void *)shim_mmap64);
     if (g_vmtrace) elf_register_override("munmap", (void *)shim_munmap);
+    if (g_vmtrace || g_ro_keep_write)
+        elf_register_override("mprotect", (void *)shim_mprotect_ov);
     /* sigaction override: zachyti instalaci fatal-signal handleru a ulozi
      * ho do g_guest_fatal. Lze vypnout ELF_LOADER_NO_SA_OVERRIDE=1 (pak si
      * V8/node instaluje sve handlery a nas fault dump se nezobrazi). */
