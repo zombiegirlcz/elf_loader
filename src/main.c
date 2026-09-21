@@ -1550,6 +1550,11 @@ static int shim_getrlimit(int resource, struct rlimit *rl) {
 
 typedef int (*fp_fileno_unlocked)(FILE *);
 typedef int (*fp_fileno)(FILE *);
+
+/* Forward declarations for shim_mprotect */
+static void shim_hex(char **pp, unsigned long v, int nib);
+static int *shim_guest_errno(void);
+
 typedef int (*fp_mprotect)(void *, unsigned long, int);
 static int shim_mprotect(void *addr, unsigned long len, int prot) {
     fp_mprotect f = (fp_mprotect)g_orig_mprotect;
