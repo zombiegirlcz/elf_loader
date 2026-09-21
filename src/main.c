@@ -1734,12 +1734,39 @@ static int shim_addr_range_free(unsigned long start, unsigned long end) {
 }
 
 typedef void *(*fp_mmap)(void *, unsigned long, int, int, int, long);
+static void shim_hex(char **pp, unsigned long v, int nib) {
+    static const char hxd[] = "0123456789abcdef";
+    for (int sh = (nib - 1) * 4; sh >= 0; sh -= 4)
+        *(*pp)++ = hxd[(v >> sh) & 0xf];
+}
+/* Diagnostika velkych mmap (V8 sandbox/cage rezervace): pred i po volani. */
+static void shim_mmap_log(unsigned long len, void *addr, int flags,
+                          void *res, int rerr) {
+    char b[200]; char *i = b;
+    const char *p = "[MMAP] len=";
+    while (*p) *i++ = *p++;
+    shim_hex(&i, len, 10);
+    p = " addr="; while (*p) *i++ = *p++;
+    shim_hex(&i, (unsigned long)addr, 12);
+    p = " fl="; while (*p) *i++ = *p++;
+    shim_hex(&i, (unsigned long)(unsigned)flags, 6);
+    p = " -> "; while (*p) *i++ = *p++;
+    shim_hex(&i, (unsigned long)res, 12);
+    p = " err="; while (*p) *i++ = *p++;
+    shim_hex(&i, (unsigned long)(unsigned)rerr, 2);
+    if (addr && res && res != (void *)-1)
+        *i++ = (res == addr) ? 'M' : 'X';
+    *i++ = '\n';
+    shim_raw_syscall6(64, 2, (long)b, (long)(i - b), 0, 0, 0);
+}
 static void *shim_mmap_common(void *addr, unsigned long len, int prot,
                               int flags, int fd, long off) {
+    int dbg = (addr != NULL) || (len >= (1UL << 30));
     if (addr && (flags & (int)SHIM_MAP_FIXED_NOREPLACE)) {
         unsigned long a = (unsigned long)addr;
         if (!shim_addr_range_free(a, a + len)) {
             errno = 17;                       /* EEXIST */
+            if (dbg) shim_mmap_log(len, addr, flags, (void *)-1, 17);
             return (void *)-1;
         }
         flags = (flags & ~(int)SHIM_MAP_FIXED_NOREPLACE) | (int)SHIM_MAP_FIXED;
@@ -1747,12 +1774,20 @@ static void *shim_mmap_common(void *addr, unsigned long len, int prot,
         flags = flags & ~(int)SHIM_MAP_FIXED_NOREPLACE;
     }
     fp_mmap f = (fp_mmap)elf_scope_lookup(g_shim_scope, "mmap");
+    void *r; int e = 0;
     if (!f) {
         /* fallback: raw mmap syscall (aarch64 222) */
-        return (void *)shim_raw_syscall6(222, (long)addr, (long)len, prot,
-                                         flags, fd, off);
+        long raw = shim_raw_syscall6(222, (long)addr, (long)len, prot,
+                                     flags, fd, off);
+        r = (void *)raw;
+        if (raw < 0 && raw > -4096) { e = (int)-raw; r = (void *)-1; }
+    } else {
+        errno = 0;
+        r = f(addr, len, prot, flags, fd, off);
+        e = errno;
     }
-    return f(addr, len, prot, flags, fd, off);
+    if (dbg) shim_mmap_log(len, addr, flags, r, e);
+    return r;
 }
 static void *shim_mmap(void *a, unsigned long l, int p, int fl, int fd, long o) {
     return shim_mmap_common(a, l, p, fl, fd, o);
