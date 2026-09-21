@@ -3796,7 +3796,7 @@ static void fault_handler(int sig, siginfo_t *si, void *ctx) {
     {
         static volatile int fault_seq;
         int myseq = ++fault_seq;
-        char b[176]; int i = 0;
+        char b[384]; int i = 0;
         const char *p = "FAULT#";
         while (*p) b[i++] = *p++;
         b[i++] = (char)('0' + (myseq % 10));
@@ -3834,6 +3834,35 @@ static void fault_handler(int sig, siginfo_t *si, void *ctx) {
         const unsigned char *gg = (const unsigned char *)elf_get_guest_fatal(sig);
         unsigned long ghv = gg ? *(const unsigned long *)(gg + GUEST_SA_HANDLER_OFF) : 0;
         for (int sh = 60; sh >= 0; sh -= 4) b[i++] = hxd[(ghv >> sh) & 0xf];
+        /* V8 InterpreterEntryTrampoline faultuje na `sturh [x5,#67]`, kde
+         * x5 = ldur [x1,#31]. Instrukce ldur UZ PROBLA (pc je na sturh),
+         * takze x1 i x1+31 jsou citelne - muzeme je bezpecne precist.
+         * Zajima nas: co je x1 (JSFunction), jeji map pointer [x1] a pole
+         * code_entry [x1+31] (=x5). Kdyz je [x1] nesmysl -> korupce haldy;
+         * kdyz je x1 mimo mapy -> korupce roots/GOT. */
+        {
+            unsigned long x1v = (unsigned long)uc->uc_mcontext.regs[1];
+            p = " x1="; while (*p) b[i++] = *p++;
+            for (int sh = 60; sh >= 0; sh -= 4) b[i++] = hxd[(x1v >> sh) & 0xf];
+            p = " [x1]="; while (*p) b[i++] = *p++;
+            unsigned long m0 = (x1v > 0x1000) ? *(volatile unsigned long *)x1v : 0;
+            for (int sh = 60; sh >= 0; sh -= 4) b[i++] = hxd[(m0 >> sh) & 0xf];
+            p = " [x1+31]="; while (*p) b[i++] = *p++;
+            unsigned long m1 = (x1v > 0x1000) ? *(volatile unsigned long *)(x1v + 31) : 0;
+            for (int sh = 60; sh >= 0; sh -= 4) b[i++] = hxd[(m1 >> sh) & 0xf];
+            /* x5 (=ldur [x1,#31]) je konzistentne nenulove (si_addr=x5+67).
+             * Precist [x5] a [x5+7] rozhodne, zda x5 je platny tagged
+             * pointer na objekt, nebo ukazuje do kratkeho/zeroveho regionu. */
+            unsigned long x5r2 = (unsigned long)uc->uc_mcontext.regs[5];
+            p = " [x5]="; while (*p) b[i++] = *p++;
+            unsigned long m2 = (x5r2 > 0x1000) ? *(volatile unsigned long *)x5r2 : 0;
+            for (int sh = 60; sh >= 0; sh -= 4) b[i++] = hxd[(m2 >> sh) & 0xf];
+            p = " [x5+7]="; while (*p) b[i++] = *p++;
+            unsigned long m3 = (x5r2 > 0x1000) ? *(volatile unsigned long *)(x5r2 + 7) : 0;
+            for (int sh = 60; sh >= 0; sh -= 4) b[i++] = hxd[(m3 >> sh) & 0xf];
+            p = " len="; while (*p) b[i++] = *p++;
+            for (int sh = 28; sh >= 0; sh -= 4) b[i++] = hxd[((unsigned long)i >> sh) & 0xf];
+        }
         b[i++] = '\n';
         sys_write(2, b, (size_t)i);
     }
