@@ -3786,6 +3786,36 @@ const void *elf_get_guest_fatal(int sig) {
     return NULL;
 }
 
+
+/* Vypis objektu V8 haldy pri faultu: zarovnane qwordy + ASCII. Tagged pointer
+ * (bit0=1) zarovname dolu. Slouzi k identifikaci, ktera funkce/modul fault
+ * zpusobil (jmeno SFI je retezec v halde). Bezi v signal handleru -> jen
+ * sys_write, zadna libc. */
+static void fault_obj_dump(const char *label, unsigned long tagged, int nq)
+{
+    if (tagged <= 0x1000 || nq <= 0 || nq > 12) return;
+    static const char hxd[] = "0123456789abcdef";
+    unsigned long base = tagged & ~7UL;
+    char b[512]; int i = 0;
+    const char *p = label;
+    while (*p) b[i++] = *p++;
+    b[i++] = '@';
+    for (int sh = 60; sh >= 0; sh -= 4) b[i++] = hxd[(base >> sh) & 0xf];
+    b[i++] = ':';
+    for (int q = 0; q < nq; q++) {
+        unsigned long v = *(volatile unsigned long *)(base + (unsigned long)q * 8);
+        b[i++] = ' ';
+        for (int sh = 60; sh >= 0; sh -= 4) b[i++] = hxd[(v >> sh) & 0xf];
+    }
+    p = " |"; while (*p) b[i++] = *p++;
+    for (int q = 0; q < nq * 8; q++) {
+        unsigned char c = *(volatile unsigned char *)(base + (unsigned long)q);
+        b[i++] = (c >= 0x20 && c < 0x7f) ? (char)c : '.';
+    }
+    b[i++] = '|';
+    b[i++] = '\n';
+    sys_write(2, b, (size_t)i);
+}
 static void fault_handler(int sig, siginfo_t *si, void *ctx) {
     ucontext_t *uc = (ucontext_t *)ctx;
 
@@ -3865,6 +3895,22 @@ static void fault_handler(int sig, siginfo_t *si, void *ctx) {
         }
         b[i++] = '\n';
         sys_write(2, b, (size_t)i);
+
+        /* Identifikace objektu: x1 = JSFunction, x5 = SharedFunctionInfo.
+         * Z SFI nas zajima pole +16 a +24 (name_or_scope_info / script),
+         * ktera vedou na retezce - ASCII vypis rekne, ktery builtin modul
+         * se prave volal. */
+        if (getenv("ELF_LOADER_OBJ_DUMP")) {
+            unsigned long x1v = (unsigned long)uc->uc_mcontext.regs[1];
+            unsigned long x5v2 = (unsigned long)uc->uc_mcontext.regs[5];
+            fault_obj_dump("JSFUNC", x1v, 8);
+            fault_obj_dump("SFI", x5v2, 12);
+            unsigned long sb = x5v2 & ~7UL;
+            for (int off = 16; off <= 32; off += 8) {
+                unsigned long fv = *(volatile unsigned long *)(sb + (unsigned long)off);
+                if (fv > 0x10000 && (fv & 1)) fault_obj_dump("SFIFIELD", fv, 8);
+            }
+        }
     }
 
     /* NEJDRIV chain na guest handler. Guest (glibc/V8) si instaluje vlastni
