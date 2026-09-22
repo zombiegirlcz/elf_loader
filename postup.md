@@ -1310,3 +1310,86 @@ ktera vytvari lazy accessor funkce). Nastroje (`ELF_LOADER_TRACE_CALL`,
 pro dalsi hookovani libovolne adresy bez dalsich zmen v loaderu — dalsi
 krok je pravdepodobne hookovat GetNamedPropertyHandler (0x1b2cde0) samotny
 a sledovat, kde presne se JSFunction.code pro nove vytvorenou funkci pise.
+
+## 2026-09-22 (pokracovani 4): V8 zdrojovy kod — potvrzeni struktur, prehodnoceni hypotezy
+
+### Stazeny V8 source (node v26.8.2, V8 14.6.202.34-node.28)
+V8 je v node repu VENDOROVANY PRIMO (ne submodul) — `deps/v8/` na tagu `v26.8.2`
+na GitHubu odpovida presne nasi binarce (`v8-version.h`: MAJOR=14 MINOR=6
+BUILD=202 PATCH=34). Stazeno a overeno lokalne:
+- `src/objects/shared-function-info.tq` — SKUTECNY layout SharedFunctionInfo
+- `src/roots/roots.h`, `src/execution/isolate-data.h` — mechanismus root tabulky
+- `src/codegen/arm64/register-arm64.h` — potvrzeno `kRootRegister = x26`
+- `src/init/heap-symbols.h` — seznam vsech "internalized string" rootu
+
+### DULEZITA OPRAVA: "eval_string" NENI nazev node modulu
+`eval_string` je V8-INTERNI STRING ROOT pro **JS klicove slovo "eval"**
+(`V(_, eval_string, "eval")` v heap-symbols.h — pouziva ho PARSER pro
+detekci primeho `eval()` volani, viz `preparser.cc`/`parser.h`). Nesouvisi
+s node modulem `internal/main/eval_string.js` (ktery pouziva SVE VLASTNI,
+oddelene retezcove literaly v C++ kodu, ne tento V8 root). Moje puvodni
+teorie "kolize v modul-cache lookupu" byla zalozena na NAHODNE SHODE JMEN,
+ne na realne souvislosti — zavrzeno.
+
+### Overeni SharedFunctionInfo layoutu (POTVRZENO SPRAVNE)
+Torque `.tq` definice: `trusted_function_data` (offset+8), `untrusted_
+function_data` (offset+16), `name_or_scope_info` (offset+24) — PRESNE
+odpovida drive namerenym hodnotam (offset+8=0 [zadny bytecode],
+offset+16=Smi(0x206) [64bit Smi encoding: horni 32b=hodnota, dolni=0,
+presne 0x0000020600000000 namereno], offset+24=tagovany pointer na string
+"getOffsetNanosecondsFor"). **Nase cteni SFI polí bylo od pocatku spravne
+— funkce SKUTECNE existuje a SKUTECNE se jmenuje presne takto**, neni to
+chyba v nasem cteni pameti.
+
+### `getOffsetNanosecondsFor` je implementovana pres Rust (`temporal_rs`/
+`temporal_capi`), ne jako klasicky V8 CSA builtin
+`deps/v8/BUILD.gn`: `v8_maybe_temporal` -> `//third_party/rust/
+temporal_capi` (`v8_enable_temporal_support`). Existuje `builtins-
+temporal.cc` a `js-temporal-objects.tq`, ale ANI jeden neobsahuje
+literarni "getOffsetNanosecondsFor" text — presna instalace tohoto jmena
+na JS-viditelny prototyp se v GitHub code search NENASLA nikde v deps/v8
+(mimo definici root-u v heap-symbols.h/static-roots-*.h a Rust zdrojaky
+temporal_rs, ktere referencuji "GetOffsetNanosecondsFor" jen jako Rust
+identifikator, ne string). Instalace se pravdepodobne deje pres
+makro-generovany seznam (Torque `@export` mechanismus nebo `temporal_capi`
+FFI glue), ktery GitHub code search nedokaze plne indexovat.
+
+### Root tabulka — mechanismus potvrzen, ale hypoteza OSLABENA
+`RootsTable roots_table_` je EMBEDDED clen `IsolateData`. `kRootRegister
+(x26) = IsolateData* + kIsolateRootBias`. Kazdy root: `x26 +
+roots_table_offset() + RootIndex*8`. `eval_string`/`getOffsetNanosecondsFor`
+jsou v `heap-symbols.h` 22 radku od sebe — PRESNE odpovida drive namerenemu
+rozdilu offsetu (6112 vs 6288 B = 22 * 8B) ve FactoryBase accessorech
+(coz jsou ALE potvrzene DEAD-PATH funkce, viz nize).
+
+**PROTI hypoteze o posunute/spatne root tabulce svedci dulezity fakt:**
+`ELF_LOADER_TRACE_RING=0x199d560` (drivejsi test) cetl `x21 = [x26, #22328]`
+(interpreter dispatch_table_, JINY root/tabulka nez string-rooty, ale
+POUZIVA STEJNY x26 base register) a vratil **SPRAVNE, PLATNE adresy**
+(Builtins_GetNamedPropertyHandler, Builtins_LdaImmutableCurrentContext
+SlotHandler). Pokud by x26 nebo obecny mechanismus "x26+offset->root" byl
+pod loaderem posunuty/rozbity, TATO tabulka by take vracela spatna data —
+nevraci. **x26 (kRootRegister) je tedy pravdepodobne nastaveny spravne**,
+a bug neni v obecnem "root register" mechanismu.
+
+### Shrnuti: co V8 source PRIDAL k diagnoze
+1. Potvrdil SPRAVNOST naseho cteni SFI poli (nebyla to chyba interpretace).
+2. Vyvratil "eval_string = nazev modulu" teorii (je to JS klicove slovo).
+3. Odhalil, ze Temporal je implementovana pres Rust FFI (temporal_capi),
+   ne standardni CSA builtin — MOZNA jina trida chyby (FFI/CallHandlerInfo
+   mechanismus misto klasickeho Builtins:: ID dispatch).
+4. Oslabil (ale nevyvratil zcela) hypotezu o posunute root tabulce, protoze
+   STEJNY x26-relativni mechanismus funguje spravne pro dispatch_table_.
+
+### Otevreno pro dalsiho reseitele
+- Overit PRIMO obsah roots tabulky (x26 + roots_table_offset + index*8)
+  pro eval_string/getOffsetNanosecondsFor konkretne — `roots_table_offset()`
+  jeste nebyl numericky odvozen (je to compile-time konstanta v generated
+  headers, ktere nejsou v repu primo — bylo by nutne bud spocitat z
+  `RootsTable::offset_of()` + `kIsolateRootBias`, nebo experimentalne najit
+  skenovanim pameti okolo x26).
+- Vzhledem k Rust FFI implementaci Temporalu: overit, zda `untrusted_
+  function_data = Smi(0x206)` je skutecne "builtin ID" nebo neco jineho
+  specifickeho pro CallHandlerInfo/FunctionTemplate-based API funkce
+  (mechanismus pro C++/Rust-backed funkce se muze lisit od standardnich
+  CSA builtinu, na ktere byla puvodni analyza zalozena).
