@@ -1879,3 +1879,110 @@ behem - pokud se LISI (loader vytvari JINOU funkci jako prvni mutable
 zaznam nez nativne), je to silny signal, ze poradi/pocet bootstrap kroku
 je pod loaderem odlisny (mozna vestigialni-funkce specificke), ne ze by
 tabulka byla "poskozena" v tradicnim slova smyslu.
+
+## 2026-09-22 (pokracovani 12): PRUELOM #2 — presne lokalizovan zapis, ktery pad zpusobuje
+
+### Cíl (navazuje na "a) fallback b)" z minula, vetev (a))
+Najit KDE se bere hodnota registru/pole vedouci k padu — misto dalsiho
+srovnavani syrovych bajtu JSDispatchTable (cast (b), viz predchozi zaznam),
+pouzit GDB (ted uz plne funkcni, viz pokracovani 7-8) primo na
+`v8::internal::JSDispatchTable::TryAllocateAndInitializeEntry`
+(`nm` adresa `0xe0ffa4`) a na WATCHPOINT nad konkretnim zaznamem tabulky.
+
+### KLICOVE zjisteni #1: entry #4096 (prvni mutable index) ma JINOU IDENTITU nativne vs. pod loaderem
+Pomoci `break *0x199a700` (Builtins_JSEntryTrampoline, x26 uz platny) +
+`watch *(unsigned long*)($tbl + 4096*16)` (code-pointer pole prvniho
+mutable zaznamu, `$tbl = *(x26+360)`):
+
+**Nativne** (3x nezavisle overeno, VZDY IDENTICKY vysledek):
+```
+table base = 0x7f90000000   (VZDY STEJNA adresa, 3/3 behu — sandbox cage
+                              neni v tomto V8 buildu ASLR-ovany)
+entry #4096 initial/final = 0x1ac1040 = Builtins_ProxyRevoke
+```
+Watchpoint NIKDY nefiroval po zbytek behu (az do dokonceni `console.log(42)`
+a exitu) — `ProxyRevoke` zaznam je zapsan JEDNOU a uz nikdy prepsan.
+
+**Pod loaderem** (attach pres frozen PAUSE_CALL, stejna metoda):
+```
+table base = 0x70ec000000   (jina adresa nez nativne — ocekavane, jiny
+                              cely pamet'ovy layout Android app procesu)
+entry #4096 initial = 0x199e720 = Builtins_CompileLazy   <- JINÝ VLASTNIK!
+```
+**Watchpoint VYSTRELIL** — zaznam byl PREPSAN na `0x199d440 =
+Builtins_InterpreterEntryTrampoline` volanim
+`v8::internal::JSFunction::UpdateCodeImpl` (adresa zapisujici instrukce
+`0xc6aa20` presne odpovida teto funkci v `nm` vypisu). **SIGSEGV nasledoval
+TEMER OKAMZITE po tomto zapisu** (dalsi udalost v gdb logu byl primo
+`SIGSEGV` na jiz znamem miste `0x199d444`).
+
+### Interpretace — nejsilnejsi zjisteny dukaz doposud
+1. **Entry #4096 pod loaderem NENI `ProxyRevoke`** — je to JSFunction, ktery
+   jeste NEMA kod (placeholder `CompileLazy`, standardni V8 stav pro
+   "cerstve vytvorenou, jeste nezkompilovanou" closure).
+2. Tento JSFunction pak projde `JSFunction::UpdateCodeImpl`, ktera ho
+   PRESUNE na `InterpreterEntryTrampoline` — coz je SPRAVNY krok POUZE
+   pokud uz existuje `BytecodeArray` (`trusted_function_data` != 0).
+   Nase drive JIZ OVERENA SFI struktura (pokracovani 4) ukazala presne
+   OPACNE: `trusted_function_data = 0` (ZADNE bytecode). Tzn. tento zapis
+   je **PROVEDEN PRO FUNKCI, KTERA NIKDY NEDOSTALA SKUTECNE ZKOMPILOVANE
+   BYTECODE** — pri prvnim vstupu do interpretu pak trampolina cte
+   neexistujici/nulovy BytecodeArray → SIGSEGV.
+3. Protoze `untrusted_function_data = Smi(0x206)` (pravdepodobny builtin-ID
+   pro Rust FFI Temporal implementaci), SPRAVNY postup by mel byt: rozpoznat
+   "ma builtin ID" a nastavit kod PRIMO na `Builtins::code(0x206)`
+   (analogicky k tomu, jak `ProxyRevoke` nativne dostava svuj FINALNI kod
+   RUCE, bez CompileLazy mezikroku — viz nize) — MISTO prochazeni
+   "kompiluj bytecode" vetve, ktera zjevne NEUSPEJE (ticho, bez chyby) a
+   presto zavola `UpdateCodeImpl(InterpreterEntryTrampoline)`, jako by
+   kompilace uspela.
+
+### KLICOVE zjisteni #2: `Isolate::Init` provadi HROMADNOU inicializaci ~3352 dispatch zaznamu
+`ELF_LOADER`-nezavisly test: hook na kazde volani
+`TryAllocateAndInitializeEntry` (bez `finish`, jen backtrace) beham CELEHO
+`node -e "console.log(42)"` — **3352 volani celkem**, VSECHNY s callerem
+`v8::internal::Isolate::Init` (pravdepodobne inlinovana deserializace
+NODE VLASTNIHO custom snapshotu — kazda jiz-zkompilovana/pre-existujici
+funkce v deserializovanem grafu potrebuje CERSTVY dispatch handle, protoze
+JSDispatchTable je per-proces/per-sandbox struktura, kterou nelze primo
+serializovat jako absolutni adresy).
+
+`ProxyRevoke` je (stabilne, 3/3 nativnich behu) PRVNI v tomto poradi.
+Pod loaderem je PRVNI misto toho nas padajici, dosud-nezkompilovany
+JSFunction. **Poradi/pocet volani v teto hromadne inicializaci se tedy
+LISI mezi loaderem a nativnim behem** — bud je jedna polozka pod loaderem
+PRESKOCENA (posun o 1), nebo cely traversal poradi grafu je jiny.
+
+### Vyloucena hypoteza: nahodnost/ASLR
+Table base I `entry #4096` obsah jsou nativne **100% deterministicke
+napric 3 nezavislymi behy** — vylucuje to teorii "hash-order/pointer-
+dependent" nahodnosti. Rozdil loader-vs-nativne je tedy STRUKTURALNI bug,
+ne nahoda.
+
+### Otevreno pro pokracovani
+- Zjistit PRESNOU velikost/poradi teto ~3352-prvkove hromadne inicializace
+  pod loaderem (ma take 3352 volani, nebo mene/vice?) — pripravene
+  nastroje: `/tmp/trace_alloc_seq_native.gdb` / `/tmp/trace_alloc_seq_
+  loader.gdb` (breakpoint na `0xe0ffa4`, bez `finish`, jen `bt 4` + x0).
+- Zjistit, CO PRESNE `Isolate::Init` prochazi (jaky graf/seznam) — bez V8
+  debug symbolu nejspis vyzaduje bud (a) narocnou rucni disassembly kolem
+  `0xe07888`, nebo (b) V8 debug build (nedostupny v tomto prostredi).
+- Alternativni, LEVNEJSI test: porovnat x2 (Code arg) PRI SAMOTNEM VOLANI
+  (ne pri pozdejsim cteni tabulky) pro HIT #1 loader vs. nativne — pokud
+  se LISI LOGICKA IDENTITA jiz na vstupu (ne az na vystupu), potvrzuje
+  to "jiny prvni prvek v seznamu", ne "spatny kod pro stejny prvek".
+  POZOR: prvni pokus o cteni x1/x2 v tomto bode vratil podezrele hodnoty
+  (x1 vypadalo jako pointer, ne uint16; x2=0x1) — ABI mapovani registru
+  na tomto miste (pravdepodobne uvnitr optimalizovaneho inline volani, ne
+  cistý prologue) je potreba nejdriv overit z disassembly pred dalsim
+  pokusem o cteni argumentu.
+
+### Nastroje pripravene pro pokracovani (vsechny funkcni, overene)
+- `/tmp/watch_entry4096_native.gdb` / `_loader.gdb` — watchpoint na entry
+  #4096 code-pointer pole, break na `0x199a700` (JSEntryTrampoline, x26
+  platny), funguje spolehlive v obou prostredich.
+- `/tmp/trace_alloc_seq_native.gdb` / `_loader.gdb` — logovani KAZDEHO
+  volani `TryAllocateAndInitializeEntry` (x0 + bt 4), bez `finish`
+  (predchozi verze s `finish`+`if/else` v `commands` bloku TICHO SELHALA
+  po 1. hitu — `finish` v teto batch-rezimu kombinaci nespolehlivy,
+  vyhybat se mu pro opakovane hity).
