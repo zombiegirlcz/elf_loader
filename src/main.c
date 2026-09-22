@@ -512,6 +512,18 @@ static void trace_call_logger(unsigned long *regs) {
     /* jeste zkusit fd 2 (nekdy funguje, malo stoji navic) */
     shim_raw_syscall6(64, 2, (long)b, (long)(i - b), 0, 0, 0);
 }
+/* ELF_LOADER_PAUSE_CALL=<hex_addr>: jako TRACE_CALL, ale navic uspi 30s
+ * (SYS_nanosleep) pred provedenim puvodni BLR instrukce. Na rozdil od
+ * PAUSE_ENTRY (hookuje uvnitr InterpreterEntryTrampoline, ktera se pod
+ * --inspect-brk chova jinak/nedosahne se stejne) cili na CALL SITE
+ * `v8::internal::Invoke` -> JSEntryTrampoline (0xde9854) - prvni skok do
+ * V8 JS vubec, PRED bootstrap skripty, nezavisly na interpreter dispatch
+ * detailech. */
+static void trace_call_pause_logger(unsigned long *regs) {
+    trace_call_logger(regs);
+    struct { long tv_sec; long tv_nsec; } ts = { 30, 0 };
+    shim_raw_syscall6(101 /* nanosleep */, (long)(unsigned long)&ts, 0, 0, 0, 0, 0);
+}
 static uint32_t tc_enc_str(int rt, int rn, int off) {
     return 0xF9000000u | (((uint32_t)(off / 8)) << 10) | ((uint32_t)rn << 5) | (uint32_t)rt;
 }
@@ -603,6 +615,9 @@ static void install_call_trace(void *target) {
 }
 static void install_ring_trace(void *target) {
     install_call_trace_with(target, (void *)ring_logger, "TRACE_RING");
+}
+static void install_pause_call_trace(void *target) {
+    install_call_trace_with(target, (void *)trace_call_pause_logger, "PAUSE_CALL");
 }
 
 /* ELF_LOADER_TRACE_ENTRY=<hex_addr>: jako install_call_trace, ale pro
@@ -2821,6 +2836,22 @@ static int run_ownall(const char *path, int argc, char **argv, char **envp) {
             for (char *tok = strtok(buf, ","); tok; tok = strtok(NULL, ",")) {
                 unsigned long addr = strtoul(tok, NULL, 0);
                 if (addr) install_call_trace((void *)addr);
+            }
+        }
+    }
+    /* ELF_LOADER_PAUSE_CALL=0xADDR[,...]: jako TRACE_CALL, ale navic uspi
+     * 30s (viz trace_call_pause_logger) - cili na CALL SITE (blr), napr.
+     * v8::internal::Invoke->JSEntryTrampoline (0xde9854), PRED bootstrap
+     * JS - nezavisle na --inspect-brk chovani InterpreterEntryTrampoline. */
+    {
+        const char *pc = getenv("ELF_LOADER_PAUSE_CALL");
+        if (pc && pc[0]) {
+            char buf[512];
+            strncpy(buf, pc, sizeof buf - 1);
+            buf[sizeof buf - 1] = '\0';
+            for (char *tok = strtok(buf, ","); tok; tok = strtok(NULL, ",")) {
+                unsigned long addr = strtoul(tok, NULL, 0);
+                if (addr) install_pause_call_trace((void *)addr);
             }
         }
     }
