@@ -1090,3 +1090,90 @@ loader prepisuje `mmap64`, `munmap`, `mprotect`, `dlopen`, `dlsym`, `dlclose`,
 Navrh: logovat kazdou JUMP_SLOT/GLOB_DAT vazbu hlavniho programu (symbol ->
 modul + adresa) a porovnat vzorek proti nativnim adresam z `nm` guest glibc;
 zacit u `tolower` (kvuli stope vyse) a u prepisovanych symbolu.
+
+## 2026-09-22 (pokracovani): call-site/entry tracer — presna lokalizace pádu node
+
+### Nova diagnostika (viz `src/main.c`)
+Pridana obecna infrastruktura pro runtime inline-hook libovolne adresy v guest
+kodu (staví na existujicim `patch_branch`/`alloc_near`/`branch_insn`):
+- `ELF_LOADER_TRACE_CALL=0xADDR[,...]` — hookuje CALLER-side `blr xN` instrukci
+  (jedina bez PC-relativni zavislosti, tudiz bezpecne relokovatelna do
+  trampoliny beze zmeny). Loguje x0-x11 PRED provedenim puvodni instrukce.
+- `ELF_LOADER_TRACE_ENTRY=0xADDR[,...]` — hookuje ENTRY libovolne funkce
+  (libovolna instrukce, ne nutne `blr`). Na rozdil od TRACE_CALL musi
+  explicitne ulozit/obnovit `x30` (LR), protoze puvodni instrukce ho
+  nemeni a vlastni `blr` do loggeru by ho jinak prepsal. Loguje x1
+  (JSFunction) + puvodni x30 (adresa volajiciho).
+- Log jde do `files/usr/trace_call.txt` (ne do `diag.txt` — ten SIGSYS
+  handler pravidelne O_TRUNCuje).
+
+### DVA REALNE BUGY nalezene a opravene PRI STAVBE tohoto nastroje
+1. **`alloc_near()` uintptr_t underflow** pro `addr < 0x7800000` (~120 MB):
+   `mina = want - 0x7800000` podtekla na hodnotu blizko UINT64_MAX, takze
+   `gs >= mina` nemohla projit zadnou realnou mezerou → `alloc_near` vzdy
+   spadl na vzdaleny `mmap(NULL,...)` → nasledny `patch_branch` selhal
+   (branch mimo dosah). Bug byl skryty roky, protoze VSECHNA existujici
+   volani (`hook_install` pro glibc .so) adresuji vysoke ASLR adresy.
+   Poprve odhaleno hookovanim node (non-PIE, base 0x400000). **Oprava**:
+   `mina = (want > 0x7800000) ? want - 0x7800000 : 0x10000`.
+2. **Logovani pod guest TP nesmi pouzivat fprintf/libc stdio** — shim se
+   INSTALUJE pod loader TP, ale SPOUSTI se pozdeji pod guest/parrot TP.
+   `fprintf` cte bionicky stack-guard/errno/FILE* pres TP → divoky pointer
+   → SIGSEGV bez jakehokoli vystupu (i mimo nas fault handler). **Oprava**:
+   logger pise vyhradne raw syscallem (`shim_raw_syscall6`), presne jako
+   existujici `shim_mmap_log`/`shim_mprotect`.
+3. **Vlastni bug v shimu**: sekvencni provadeni ARM64 NEPRESKOCI vlozeny
+   8B literal (adresu loggeru) sam od sebe — bez explicitni vetve pred nim
+   CPU spadne do literalu jako do instrukci (SIGSYS/SIGILL presne na
+   literal bytech). **Oprava**: `b +12` pred literal.
+
+### VYSLEDEK: presna sekvence volani pred padem (`ELF_LOADER_TRACE_ENTRY=0x199d440`)
+Jen 3 vstupy do `Builtins_InterpreterEntryTrampoline` pred SIGSEGV:
+```
+1. x1=0x3019548909  volajici=0x199a7a8  (Builtins_JSEntryTrampoline+0xa8)
+2. x1=0x12f816d3d1  volajici=0x199d564  (Builtins_InterpreterEntryTrampoline+0x124)
+3. x1=0x0a7f3c61b1  volajici=0x199d564  (Builtins_InterpreterEntryTrampoline+0x124) <- PAD
+```
+- Volani #1 = vnejsi vstup z C++ (`v8::internal::Invoke` → `JSEntryTrampoline`) —
+  toto ma spravne argumenty (overeno drive přes `ELF_LOADER_TRACE_CALL=0xde9854`:
+  x0-x5/x8 pri prechodu C++→JS vypadaji zcela validne — tagged pointery,
+  argc=5, argv na stacku).
+- Volani #2 a #3 maji **STEJNOU adresu volajiciho** (0x199d564) = misto
+  uvnitr samotne interpreter dispatch smycky, kde bytecode `Call` handler
+  vola DALSI JS funkci PRIMO (bez navratu do C++ Invoke). Tzn. **puvodni
+  ELF_LOADER_TRACE_CALL na `v8::internal::Invoke` nemohl tento pad nikdy
+  zachytit** — jde o vnorene JS→JS volani, ne C++→JS prechod.
+- Volani #2 (jina funkce, x1=0x12f816d3d1) USPESNE DOBEHNE (ma bytecode) a
+  BEHEM SVEHO VLASTNIHO behu zavola volani #3 (getOffsetNanosecondsFor —
+  Temporal builtin BEZ bytecode, viz drivejsi OBJ_DUMP nález), ktere spadne.
+
+### Zpresnena hypoteza
+Pad neni "nahodna korupce pameti" (RO heap, TLS, ctype, memcpy, relokace —
+vsechno overeno v poradku, viz predchozi zaznam v tomto souboru). Presny
+mechanismus: bytecode `Call` handler v interpreteru cte `JSFunction::code`
+(cached Code objekt na JSFunction, OD SharedFunctionInfo NEZAVISLE pole) a
+BLR na nej primo. Pro `getOffsetNanosecondsFor` (CSA/nativni builtin bez
+bytecode) tohle pole MUSI ukazovat na BUILTIN'S OWN nativni entry (ne na
+InterpreterEntryTrampoline) — pokud misto toho ukazuje na
+InterpreterEntryTrampoline, dostaneme presne pozorovany pad (trampolina
+cte SFI, ktera nema `trusted_function_data`, a spadne na zapisu
+`age=0` do read-only Temporal SFI objektu — puvodni prvni nalez).
+
+### Dalsi krok (nedokonceno, viz [[elf-loader-open-bugs]] v pameti)
+Zjistit, ODKUD funkce #3 (x1=0x0a7f3c61b1) ziskala svuj `code` field a
+proc ukazuje na InterpreterEntryTrampoline. Kandidati:
+1. Hookovat generickou bytecode `Call` builtin handler (napr.
+   `Builtins::kCallFunction_ReceiverIsAny` nebo `InterpreterPushArgsThenCall*`)
+   pomoci `ELF_LOADER_TRACE_ENTRY` a zjistit, jakou hodnotu cte z
+   `JSFunction+kCodeOffset` TESNE PRED `blr` na ni.
+2. Overit, zda V8 embedded builtins blob (`EmbeddedData::code()`,
+   staticka RO data zapecena v node binarce) je pod loaderem namapovan a
+   cten identicky jako nativne — pokud je nejaky OFF-BY-N v tom, jak V8
+   vypocitava adresu konkretniho builtinu z tabulky indexovane
+   `Builtins::Name`, mohlo by to systematicky mirit "lazy"/pozdeji
+   pridane builtiny (Temporal je relativne novejsi V8 feature) na
+   spatnou adresu — analogie s jiz drive nalezenym `locale::id::_M_id()`
+   bugem (numericky index → tabulka → spatny/nulovy zaznam).
+3. `ELF_LOADER_TRACE_CALL`/`ELF_LOADER_TRACE_ENTRY` infrastruktura je
+   hotova a znovupouzitelna pro libovolnou dalsi adresu bez dalsich
+   zmen v loaderu.
