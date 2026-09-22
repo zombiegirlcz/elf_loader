@@ -471,6 +471,22 @@ static int patch_branch(void *target, void *dst) {
 static void shim_hex(char **pp, unsigned long v, int nib);
 static long shim_raw_syscall6(long nr, long a0, long a1, long a2, long a3, long a4, long a5);
 static void trace_call_logger(unsigned long *regs) {
+    /* Marker NEZAVISLY na 'regs' - overuje jestli sem vubec dorazime,
+     * bez ohledu na to, jestli je pointer/stack v poradku. */
+    {
+        long fd0 = shim_raw_syscall6(56, (long)0xFFFFFFFFFFFFFF9CL,
+            (long)(unsigned long)"/data/user/0/com.linux_core/files/usr/trace_call.txt",
+            0x441L, 0644L, 0, 0);
+        if (fd0 >= 0) {
+            const char m0[] = "TC-ENTER\n";
+            shim_raw_syscall6(64, fd0, (long)(unsigned long)m0, sizeof(m0) - 1, 0, 0, 0);
+            shim_raw_syscall6(57, fd0, 0, 0, 0, 0, 0);
+        }
+    }
+    /* fd 2 muze byt v tuto chvili (runtime, ne load-time) prepsany/zavreny
+     * node/libuv vlastni stdio inicializaci - zapis radeji do vlastniho
+     * pevneho souboru (stejny vzor jako diag.txt zapisy jinde v projektu),
+     * O_APPEND, nezavisle na aktualnim stavu fd 0/1/2. */
     char b[300]; char *i = b;
     const char *p = "[TRACE_CALL] x0="; while (*p) *i++ = *p++;
     shim_hex(&i, regs[0], 16);
@@ -486,6 +502,14 @@ static void trace_call_logger(unsigned long *regs) {
     p = " x10="; while (*p) *i++ = *p++; shim_hex(&i, regs[10], 16);
     p = " x11="; while (*p) *i++ = *p++; shim_hex(&i, regs[11], 16);
     *i++ = '\n';
+    long fd = shim_raw_syscall6(56, (long)0xFFFFFFFFFFFFFF9CL,
+                                 (long)(unsigned long)"/data/user/0/com.linux_core/files/usr/trace_call.txt",
+                                 0x441L /*O_WRONLY|O_CREAT|O_APPEND*/, 0644L, 0, 0);
+    if (fd >= 0) {
+        shim_raw_syscall6(64, fd, (long)b, (long)(i - b), 0, 0, 0);
+        shim_raw_syscall6(57, fd, 0, 0, 0, 0, 0);
+    }
+    /* jeste zkusit fd 2 (nekdy funguje, malo stoji navic) */
     shim_raw_syscall6(64, 2, (long)b, (long)(i - b), 0, 0, 0);
 }
 static uint32_t tc_enc_str(int rt, int rn, int off) {
