@@ -1815,3 +1815,67 @@ node v26.8.2) — presny vyznam kontroly
   se kazi az POZDEJI (runtime update).
 - Zjistit přesnou adresu `[x26,#360]` rootu (JSDispatchTable base v
   IsolateData) a sledovat VŠECHNY zapisy do ni/skrz ni behem startupu.
+
+## 2026-09-22 (pokracovani 11): raw-byte srovnani JSDispatchTable — cast (b), nuancovany vysledek
+
+### Metoda
+Dump 0x11000 B JSDispatchTable regionu (`[x26,#360]` root + tato delka)
+z OBOU behu na STEJNY relativni offset (ne absolutni adresu, ta se lisi
+ASLR):
+- **Loader**: `ELF_LOADER_PAUSE_ENTRY=0x199d440` (zamrazeni), gdb attach,
+  `dump binary memory`.
+- **Nativne**: gdb `run` primo v chrootu (zadny elf_loader), breakpoint na
+  `Builtins_JSEntryTrampoline` (0x199a700 - MUSI byt uvnitr GENEROVANEHO
+  kodu, ne C++ `v8::internal::Invoke` primo, kde `x26`=0 jeste neni
+  nastaveny - overeno empiricky, `Invoke()`'s C++ prolog x26 nenastavuje,
+  jen generovany kod to dela na sve prvni instrukci).
+
+### Vysledek: cmp
+`cmp -l dispatch_loader.bin dispatch_native.bin` → **3007 odlisnych bajtu
+z 69632 (~4.3 %)**. **Prvni odlisny bajt je presne na offsetu 65538**
+(bajt #2 zaznamu s indexem **4096** = 4096*16), tzn. **VSECHNY predchozi
+bajty (offset 0-65535, indexy 0-4095) jsou BAJTOVE IDENTICKE**.
+
+### V8 zdroj potvrzuje vyznam hranice 4096
+`src/sandbox/external-entity-table.h`:
+```cpp
+static constexpr uint32_t kEndOfReadOnlyIndex =
+    kEntriesPerSegment * kNumReadOnlySegments;
+```
+`InReadOnlySegment(handle)` vraci true pro `index <= kEndOfReadOnlyIndex`.
+Nase namerena hranice 4096 tedy odpovida **presne** kompilacni konstante
+oddelujici READ-ONLY (snapshot, staticky) segment tabulky od MUTABLE
+(runtime-alokovaneho) segmentu.
+
+### Interpretace — NUANCOVANEJSI nez doufano
+**Read-only/snapshot cast tabulky (indexy 0-4095) je bajtove identicka**
+mezi loaderem a nativnim behem → **deserializace JSDispatchTable ze
+snapshotu je v poradku**, ZADNA korupce tam neni. Rozdil zacina PRESNE
+na prvnim MUTABLE zaznamu (index 4096) — nase padajici funkce
+(`getOffsetNanosecondsFor`, dispatch_handle=0x100000 → index 4096) je
+**doslova PRVNI dynamicky alokovany zaznam v cele tabulce, v OBOU
+behach**. To muze byt (a) skutecny bug specificky pro tenhle prvni slot,
+NEBO (b) OCEKAVANA divergence — mutable oblast se prirozene lisi mezi
+dvema ruznymi behy (jina posloupnost/timing alokaci za behu), i BEZ
+jakekoli chyby v loaderu. **Tento test tedy NEPOTVRZUJE ani NEVYVRACI
+"tabulka je poskozena pod loaderem" jednoznacne** - jen presne lokalizuje
+KDE (hranice read-only/mutable) k dalsimu zkoumani.
+
+### Sladeni s `--always-sparkplug` nalezem
+`--always-sparkplug` SBXCHECK selhani (viz predchozi zaznam) se tyka
+INSTALACE noveho kodu do NEJAKEHO mutable zaznamu (nevime jisté, jestli
+presne indexu 4096) — kombinace obou nalezu ukazuje na **prvni mutable
+zaznam(y) tabulky** jako spolecneho podezreleho: bud je jejich
+`parameter_count`/`code` pri VYTVORENI (ne pri pozdejsim update) spatne
+inicializovan pod loaderem, nebo jde o funkci, ktera se pod loaderem
+vytvari JINAK/DRIV nez nativne (jiny bootstrap poradi).
+
+### Dalsi krok (nedokonceno)
+Zjistit, KTERA konkretni funkce/SFI vytvari PRVNI mutable dispatch-table
+zaznam pri bootstrapu (hookovat `JSDispatchTable::AllocateAndInitializeEntry`
+nebo `TryAllocateAndInitializeEntry`, viz `js-dispatch-table-inl.h` radek
+~178) a porovnat JMENO/identitu teto funkce mezi loaderem a nativnim
+behem - pokud se LISI (loader vytvari JINOU funkci jako prvni mutable
+zaznam nez nativne), je to silny signal, ze poradi/pocet bootstrap kroku
+je pod loaderem odlisny (mozna vestigialni-funkce specificke), ne ze by
+tabulka byla "poskozena" v tradicnim slova smyslu.
