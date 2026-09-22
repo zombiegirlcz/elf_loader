@@ -97,6 +97,55 @@ cp /tmp/elf_loader /root/elf_loader/files/usr/bin/elf_loader && chmod 755 /root/
 # gbsh je už po buildu v files/usr/bin/gbsh
 ```
 
+## Node.js pod loaderem
+
+**Funguje spolehlivě jen Node.js ≤ 22 (LTS).** Node 23+ používá V8 verzi
+s `JSDispatchTable` (indirekce pro tiering kódu, nesouvisí s `V8 Sandbox` —
+ten Node.js oficiálně vypíná natvrdo, viz `configure.py`), kde `Isolate::Init`
+bootstrap loop pod loaderem nedeterministicky zapíše jiný builtin do dispatch
+tabulky než nativně → SIGSEGV v `InterpreterEntryTrampoline`, obvykle ještě
+před vykonáním uživatelského kódu. Node 22 (a starší) tenhle mechanismus
+vůbec nemá — spouští se **100% spolehlivě**, včetně reálných npm balíčků
+(ověřeno na `cowsay`). Node 23 je nedeterministicky flaky (občas projde,
+občas spadne se stejným crashem jako 26); Node 26 (LTS default) padá vždy.
+Plná diagnostika (28položková bootstrap smyčka, `Builtins::code()` lookup,
+GDB watchpointy na dispatch entry) je v [`postup.md`](postup.md).
+
+Instalace a spuštění (na zařízení, `$ROOTFS` = Parrot rootfs):
+```sh
+# instalace přes nvm (v rootfs, jednou):
+nvm install 22            # nebo stáhnout oficiální tarball z nodejs.org/dist
+
+# spuštění pod loaderem:
+export ROOTFS=/cesta/k/distro
+elf_loader --ownall "$ROOTFS/root/.nvm/versions/node/v22.11.0/bin/node" skript.js
+# nebo npm balíček:
+elf_loader --ownall "$ROOTFS/.../node" "$ROOTFS/.../node_modules/<balik>/cli.js" [args]
+```
+
+Zdroj Node.js: oficiální prebuilt tarbally z
+[nodejs.org/dist](https://nodejs.org/dist/) (žádný custom build nebyl
+potřeba — Node.js build už `v8_enable_sandbox=0` nastavuje sám, vlastní
+kompilace by nic nezměnila, protože `js_dispatch_table_` v `isolate-data.h`
+není za žádným build flagem, je povinná součást V8 bez ohledu na sandbox).
+
+Proces po úspěšném vykonání skriptu skončí s `EXIT=134` (=128+SIGABRT) kvůli
+samostatnému, loaderem nezpůsobenému `double free` bugu v glibc teardownu
+oficiálních Node.js buildů — to je **očekávané a neškodné**, výstup skriptu
+je před tím vždy kompletní a správný.
+
+**Fix, díky kterému tohle vůbec funguje:** větev `fix-guest-sigaction`
+(commity `e93e08d`, `8e48207`, `2bcf9a4`) — chybějící `SIGABRT` handler
+způsoboval, že i tenhle neškodný `double free` skončil sekundárním SIGSEGV
+místo čistého ukončení procesu. Detaily v `postup.md`, sekce
+"SKUTEČNÝ FIX — SIGABRT handler bug".
+
+**Bun (např. `claude` CLI z `@anthropic-ai/claude-code`, kompilovaný jako
+samostatná binárka) zatím nefunguje** — jiný JS engine (JavaScriptCore, ne
+V8), padá na jiném místě (SIGSEGV na divoké adrese, chaining na Bunův
+vlastní crash handler funguje správně, ale samotný běh ne). Ladění viz
+větev `dev`.
+
 ## Magisk modul
 `magisk-module/` se instaluje do `/data/adb/modules/…`. Rootfs detekuje
 **univerzálně** (skenuje `/data/user/0/*/files`, `/data/data/*/files`,
