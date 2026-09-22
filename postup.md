@@ -1673,3 +1673,70 @@ JSFunkce, ne spatny dispatch).
   (kazdy bytecode handler konci `mov x17,X; br x17`), da kompletni
   retezec bez nutnosti hadat konkretni adresy predem. `thread 1` NUTNE -
   bez nej flooduje log ze zcela nesouvisejiciho pozadioveho vlakna.
+
+## 2026-09-22 (pokracovani 9): fallback (b) — nativni srovnani odhalilo PRAVDEPODOBNOU skutecnou pricinu
+
+### Metoda (b): primy dump JSDispatchTable zaznamu pod loaderem
+Na `HIT3` (pred padem) precten `dispatch_handle` (JSFunction+23, 4B) a
+odpovidajici zaznam v JSDispatchTable (`[x26,#360]` root + `(handle>>8)*16`):
+```
+x1 (JSFunction)   = 0x228a9061b1
+dispatch_handle   = 0x00100000  (index=4096)
+tabulka[4096]     = { code=0x000000000199d440 (=Builtins_InterpreterEntryTrampoline!),
+                       flags=0x003f0b8ca6d80002 }
+```
+Zaznam v tabulce **DOSLOVA obsahuje adresu InterpreterEntryTrampoline** jako
+"code" pole — neni to nahodny smetí/garbage, je to KOHERENTNI, platny
+zaznam ktery rika "tahle funkce potrebuje interpret". Problem tedy neni
+"tabulka je rozbita" v smyslu poskozene pameti.
+
+### KLICOVY TEST: stejny beh NATIVNE (bez elf_loaderu, gdb `run` primo v chrootu)
+Spusten **identicky** `node -e 'console.log(42)'`, ale nativne uvnitr Parrot
+chrootu (zadny elf_loader, zadne own-loading) pod gdb OD ZACATKU
+(`tools`/scratch `gdb_native.sh` + `trace_native.gdb`), s breakpointem na
+STEJNE fixni adrese `Builtins_InterpreterEntryTrampoline` (0x199d440,
+node je ET_EXEC, adresa je stabilni napric behy/prostredimi).
+
+**VYSLEDEK: breakpoint na 0x199d440 se NIKDY netrefil — 0 (nula) zasahu
+za celou dobu behu skriptu (proces normalne dobehl, vytiskl "42",
+`exited normally`).** Pod nasim loaderem se STEJNA adresa trefi 3x (call#1,
+call#2, call#3=pad) pro STEJNY skript.
+
+### Interpretace (nova, silna hypoteza)
+Nativne `node -e 'console.log(42)'` **vubec nepouziva Ignition interpreter
+dispatch cestou pres tuto trampolinu** — cely bootstrap + skript bezi
+pravdepodobne pres **Sparkplug/baseline JIT-kompilovany kod** (nebo jinou
+optimalizovanou cestu), ktera `Builtins_InterpreterEntryTrampoline`
+jednoduse NIKDY nevyvola. **Pod nasim loaderem VSECHNO (vc. bootstrap)
+bezi cistou bytecode interpretaci** (3 vstupy do trampoliny pro trivialni
+skript, ktery by nativne mel bezet skoro bez interpretace vubec).
+
+To premisťuje teziste problemu: **nejde primarne o "spatny JSFunction/
+poskozeny dispatch handle"** (JSDispatchTable mechanismus samotny funguje
+korektne — jen se pod loaderem VYUZIVA jinak/vic nez nativne). Skutecna
+otazka je: **proc V8 pod nasim loaderem nedokaze/nechce JIT-kompilovat
+(Sparkplug) a padne zpet na cistou interpretaci?** Kandidati:
+- Loader nejak brani alokaci/mprotect W^X (RWX nebo RX) stranky potrebne
+  pro JIT-generovany strojovy kod (mprotect/mmap interception v loaderu,
+  nebo SELinux/seccomp blokujici jit-relevantni syscall).
+- ICache invalidation (`__builtin___clear_cache` ekvivalent pro V8's
+  vlastni JIT output) muze pod loaderem chybet/selhavat, coz by V8 mohlo
+  detekovat a preventivne VYPNOUT JIT (fallback na interpreter jako
+  bezpecnostni/robustness opatreni).
+- Nejaky V8 startup-check (feature detection, capability probe) selze
+  pod loaderem a V8 se sam rozhodne bezet v "jitless"-like rezimu, i bez
+  explicitniho `--jitless` flagu.
+
+**Pokud se tohle potvrdi a opravi** (aby V8 pod loaderem normalne
+JIT-kompiloval), je dost mozne, ze cely getOffsetNanosecondsFor pad
+ZMIZI SAM OD SEBE — protoze normalne kompilovana verze call#2 by
+pravdepodobne vubec nikdy nedosahla teto vestigialni/mrtve funkce (jiny
+code-gen pro property access/call by ji nikdy nezvolil).
+
+### Dalsi krok (nedokonceno)
+Zjistit PROC V8 pod loaderem nepouziva JIT: zkusit `--sparkplug`/
+`--always-sparkplug` explicitne (overit, jestli jde force-nout), hookovat
+mista, kde V8 alokuje JIT code stranky (`mmap`/`mprotect` s PROT_EXEC) a
+porovnat chovani/navratove hodnoty loader vs. nativne, nebo zkusit najit
+V8 log/trace flag (`--trace-opt`, `--print-code`) k potvrzeni, ze
+kompilace vubec probiha/neprobiha.
