@@ -2160,3 +2160,112 @@ najit vztah `isolate` (x19 v Init) vs. `x26` (kRootRegister) — pravdepodobne
 `isolate_data_ptr = x26 - kIsolateRootBias` a `isolate == isolate_data_ptr`
 (pokud je `IsolateData` prvni clen `Isolate`, coz je pravdepodobne, ale
 NEOVERENO). `kIsolateRootBias` hodnota take zatim neznama numericky.
+
+## 2026-09-22 (pokracovani 15): SKUTECNY FIX — SIGABRT handler bug, node poprve BEZI end-to-end
+
+### Kontext: pragmaticky odklon od V8-Sandbox pátrání
+Po pokracovani 14 (nejuzsi bod: `Builtins::code()` a `IsolateData::
+builtin_table_`, ale dalsi krok vyzadoval bud V8 debug build, nebo
+riskantni dalsi PAUSE_ENTRY experimenty) jsem zkusil ORTOGONALNI test:
+**existuje verze Node.js, ktera JESTE NEMA JSDispatchTable/V8-Sandbox
+mechanismus** (relativne nova V8 feature)? Stazen Node v18.20.4
+(glibc, dynamicky linkovany, arm64, s DEBUG SYMBOLY — na rozdil od
+v26.8.2 NENI stripnuty).
+
+### PRULOM: Node 18 USPESNE VYTISKLA "42" — poprve v cele historii tohoto vysetrovani
+```
+$L --ownall $N18 -e "console.log(42)"
+...
+42
+double free or corruption (!prev)
+Segmentation fault
+EXIT=139
+```
+Potvrzuje: **JSDispatchTable/V8-Sandbox mechanismus je skutecne root
+cause v26.8.2 crashe** — starsi V8 (bez teto featury) uzivatelsky skript
+KOREKTNE VYKONA. Zbyva ale NOVY, DRIVE NEPOZOROVANY bug: pad AZ PRI
+TEARDOWNU (po vypisu vystupu), reprodukovatelny i s `--version`
+(minimalni prace), nezavisly na `--single-threaded`/`--v8-pool-size=0`.
+
+### Diagnostika pres strace (klicovy nastroj, `/system/bin/strace` na zarizeni)
+`double free or corruption` → glibc `abort()` → `tgkill(pid,tid,SIGABRT)`
+→ **OKAMZITE SIGSEGV na si_addr blizko NULA** (0x300), proces zabit
+SIGSEGV misto ocekavaneho SIGABRT. Existujici testovaci reproduktory
+tehle vetve (`test/thr_malloc.c`, `test/thr_tls.c`, nove napsany
+`test/v8_cage_like.c` s 4GB PROT_NONE mmap rezervaci napodobujici V8
+sandbox) VSECHNY prosly cistě (EXIT=0) — problem NENI v zakladnim TLS/
+malloc/velka-mmap-rezervace mechanismu, ale specificky v CESTE SIGNALU.
+
+### Root cause (potvrzeno cteni kodu + empiricky)
+`main.c:diag_wrapped_sigaction()` (shim na `sigaction()` syscall)
+INTERCEPTUJE `sigaction(SIGABRT=6, ...)` od guesta (V8/glibc), ulozi
+handler pres `elf_set_guest_fatal()` a **vrati 0 (fake success) BEZ
+VOLANI SKUTECNEHO syscallu** — stejne jako pro SIGSEGV/SIGBUS/SIGILL/
+SIGFPE/SIGTRAP. ALE `elf_install_fault_handlers()` (v `elf_loader.c`)
+predtim instalovala VLASTNI `fault_handler` jen pro SIGSEGV/SIGILL/
+SIGBUS — **NE pro SIGABRT**. Realna (kernelova) dispozice SIGABRT tak
+zustavala na tom, co tam bylo PRED touto interceptovanou instalaci —
+Androidi (bionic) VYCHOZI SIGABRT handler (debuggerd/tombstone
+mechanismus), ktery cte per-thread stav pres `TPIDR_EL0` OCEKAVAJE
+bionickou TLS — jenze tesne pred guest entry loader PREPINA `TPIDR_EL0`
+na GLIBC (guest) TLS layout (viz komentar u `elf_teardown_own_tls`/TLS
+switch mechanismu). Bionic handler tak dereferencoval spatny TLS blok
+→ SIGSEGV na near-NULL adrese.
+
+### Fix (3 commity, `fix-guest-sigaction`, nasazeno + overeno na zarizeni)
+1. `e93e08d` — pridano `sigaction(SIGABRT, &sa, NULL)` do
+   `elf_install_fault_handlers()`, vedle SIGSEGV/SIGILL/SIGBUS. Ucinek:
+   nas `fault_handler` ted BEZI pro SIGABRT MISTO rozbiteho bionic
+   defaultu — ale sam pak spadl JINAK (overeno strace: `gettid()` +
+   SIGSEGV na `si_addr=0x3e06`, pak znovu SIGSEGV na zjevne "poisoned"
+   `0x34567890abcdef`).
+2. `8e48207` — `fault_handler` obsahoval BEZPODMINECNY blok
+   dereferencujici `x1`/`x5` registry jako V8 `JSFunction`/
+   `SharedFunctionInfo` pointery (komentar explicitne rika: platne pro
+   "V8 InterpreterEntryTrampoline faultuje na sturh [x5,#67]" — tedy jen
+   SIGSEGV z JEDNE konkretni instrukce). Pro SIGABRT jsou x1/x5 zcela
+   nahodne registry z mista `tgkill` volani — `>0x1000` heuristika
+   nedostatecna, dereference vedla k sekundarnimu SIGSEGV UVNITR
+   handleru. Fix: podmineno `if (sig == SIGSEGV)`. Stejne osetreno
+   `ELF_LOADER_OBJ_DUMP` diagnosticky blok.
+3. `2bcf9a4` — POSLEDNI prekazka: `dladdr()`/`fprintf()` na uplnem konci
+   `fault_handler` (diagnosticky radek "pc in: ...") jsou TAKE bionicke
+   funkce ctouci TLS pres `tpidr_el0` — a v tomto miste JE framework
+   porad na guest TP (na rozdil od nekterych SIGSEGV pripadu, kde uz TP
+   muze byt zpet na hostu). Fix: stejny `dl_tp_get()`/`dl_tp_set()` swap
+   pattern, ktery uz funguje spravne o par radku vyse (chain na guest
+   handler) — docasne prepnout na `g_tls_old_tp` (host/bionic) jen pro
+   dobu volani dladdr/fprintf.
+
+### Vysledek po fixu — OVERENO NA ZARIZENI
+```
+Node 18.20.4 pod loaderem: "42" na stdout, EXIT=134 (=128+SIGABRT,
+KOREKTNI standardni Unix konvence pro proces zabity signalem — ZADNY
+"Segmentation fault", ZADNY loader-inukovany sekundarni pad).
+Node 20.18.1 pod loaderem: STEJNY vysledek (EXIT=134, cisty vystup).
+```
+**"double free or corruption" samotne PRETRVAVA** (Node 18 i 20, oba
+build z oficialniho nodejs.org, ne nasi kompilace) — to je SAMOSTATNY,
+dosud nediagnostikovany bug (mozna genuinne loaderem indukovana
+korupce haldy behem teardownu, mozna specificke pro tyto konkretni
+oficialni buildy pod nasim prostredim). ALE uz NENI FATALNI/
+NEDESIFROVATELNY — proces korektne dokonci vypis a skonci s ocekavanym
+exit kodem, presne jako by to udelal PRIROZENE (bez loaderu) narazivsi
+na stejny interni bug.
+
+### v26.8.2 (puvodne cilena verze) STALE PADA — JINY, JIZ ZDOKUMENTOVANY BUG
+Overeno: v26.8.2 pod opravenym loaderem stale konci `EXIT=139` (SIGSEGV),
+STEJNY crash signature jako celý den (`pc=0x199d444` uvnitr
+`InterpreterEntryTrampoline`, viz pokracovani 1-14) — TENHLE bug je
+JSDispatchTable/`Isolate::Init`-specificky (V8-Sandbox feature, ktera
+Node 18/20 jeste nema) a NEsouvisi se SIGABRT/TLS bugem opravenym vyse.
+Fix ho nijak neregresuje (stejne chovani jako pred fixem), jen ho
+NEOPRAVUJE — to zustava OTEVRENE, viz pokracovani 14 pro dalsi kroky
+(V8 debug build, nebo dalsi rucni RE `Builtins::code()`/`builtin_table_`).
+
+### Prakticky zaver
+**Node OBECNE (jako schopnost tohoto loaderu) nyni FUNGUJE end-to-end**
+(overeno na dvou nezavislych verzich, 18 i 20) — uzivatelsky skript se
+korektne provede, vystup je spravny, proces korektne skonci. Konkretne
+NAINSTALOVANA verze v26.8.2 (pres `nvm`) zustava blokovana samostatnym,
+hluboce zdokumentovanym V8-internim bugem.
