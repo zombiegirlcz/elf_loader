@@ -1393,3 +1393,47 @@ a bug neni v obecnem "root register" mechanismu.
   specifickeho pro CallHandlerInfo/FunctionTemplate-based API funkce
   (mechanismus pro C++/Rust-backed funkce se muze lisit od standardnich
   CSA builtinu, na ktere byla puvodni analyza zalozena).
+
+## 2026-09-22 (pokracovani 5): getOffsetNanosecondsFor je pravdepodobne VESTIGIALNI
+
+### Zadny C++ kod v aktualnim V8 source tuto metodu neinstaluje
+`builtins-temporal.cc` obsahuje jen KONSTRUKTORY (`BUILTIN(TemporalPlainDate
+Constructor)` atd.), zadny `BUILTIN(...)` s "GetOffsetNanosecondsFor" v
+nazvu. `js-temporal-objects.h`/`.tq` take neobsahuji instalacni kod pro
+tuto metodu. Historicky (starsi TC39 Temporal navrh) mela `TimeZone`
+byt OBJEKT s uzivatelsky-pluggable metodou `getOffsetNanosecondsFor` —
+soucasna specifikace tento OOP TimeZone protokol ODSTRANILA (pouziva jen
+string identifikatory). String root v `heap-symbols.h` je pravdepodobne
+**pozustatek** — macro-generovany seznam se nerevidoval, i kdyz uzivani
+kod zmizel.
+
+### Prehodnocena hypoteza
+Pokud ZADNY BEZNY KOD nikdy nevytvari JSFunction s timto jmenem, pak
+NASE VOLANI #3 (crash) NENI "spravny vysledek nejake (spatne)
+lookup operace na getOffsetNanosecondsFor" — je to spis **NAHODNE/
+STALE cteni pameti**, ktere SKONCI na tomto vzacne referencovanem,
+ale platnem objektu v RO-space (protoze STRING ROOT existuje a NEKDE
+v RO-space snapshotu je i prislusny SharedFunctionInfo — mozna vestigialni
+testovaci/placeholder objekt z V8 build-time nastroju, nikdy urceny
+k RUNTIME VOLANI). To by vysvetlovalo, proc zadne primo-instalacni
+mechanismy (CompileLazy, FastNewClosure) nikdy nefirovaly — SPRAVNY
+kod tenhle objekt vubec nema volat, jen NAHODOU/CHYBOU na nej narazi.
+
+Toto DOPLNUJE (nenahrazuje) predchozi zaver o oslabene "posunute root
+tabulky" hypoteze (viz predchozi zaznam — [x26,#22328] dispatch_table_
+funguje spravne). Kombinace obou zjisteni ukazuje na: **spatne cteni
+NA STRANE VOLAJICIHO KODU (call#2, behem jeho vlastniho bytecode)**,
+ktere melo cist NEJAKY JINY (spravny) objekt/pole/kontext-slot, ale
+misto toho vratilo pointer na tento vzacne pouzity, vestigialni objekt.
+To je blize klasicke "off-by-N pri cteni pole/kontextu" nez "spatny
+builtin-ID lookup".
+
+### Zaver pro pokracovani
+Bez skutecneho debuggeru (gdb s V8 debug symboly, coz v tomto prostredi
+neni k dispozici — mame jen release binarku bez symbolu krome exportovanych
+nm jmen) je DALSI zuzeni na konkretni chybnou INSTRUKCI v call#2's vlastnim
+bytecode provadeni prakticky nedosazitelne cistou disassembly-based
+diagnostikou v rozumnem case. Vsechny pripravene nastroje
+(`ELF_LOADER_TRACE_CALL/ENTRY/RING/STRROOT`) zustavaji funkcni a
+pripravene, kdyby se nasel pristup k V8 build s debug symboly nebo
+gdbserver pro toto zarizeni.
