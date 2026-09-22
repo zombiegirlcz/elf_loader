@@ -366,7 +366,13 @@ typedef struct f2_hook { const char *n; void *shim; void **orig; } f2_hook_t;
  * mimo dosah vetve. */
 static void *alloc_near(void *addr) {
     uintptr_t want = (uintptr_t)addr;
-    uintptr_t mina = want - 0x7800000;
+    /* uintptr_t underflow guard: pro `want` < 0x7800000 (napr. non-PIE ET_EXEC
+     * nacteny nizko, jako node na 0x400000) by `want - 0x7800000` podteklo na
+     * hodnotu blizko UINT64_MAX, cimz by `gs >= mina` NIKDY neprosla zadnou
+     * realnou mezerou -> alloc_near vzdy spadne na vzdaleny mmap(NULL,...) a
+     * nasledny patch_branch selze (branch mimo dosah). Zjisteno empiricky:
+     * ELF_LOADER_TRACE_CALL na adresu uvnitr node binarky (~0xde9854). */
+    uintptr_t mina = (want > 0x7800000) ? want - 0x7800000 : 0x10000;
     uintptr_t maxa = want + 0x7800000;
     char line[256];
     uintptr_t prev = 0;
