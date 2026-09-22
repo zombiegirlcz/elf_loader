@@ -453,14 +453,34 @@ static int patch_branch(void *target, void *dst) {
  * x8 = cilova adresa) spravne UZ NA VSTUPU do generovaneho kodu, nebo je
  * korupce/spatna hodnota pritomna uz na C++ strane (Invoke/Execution::Call)
  * pred timto volanim. `blr xN` je jedina instrukce bez PC-relativni zavislosti,
- * takze ji lze bezpecne zkopirovat do trampoliny beze zmeny. */
+ * takze ji lze bezpecne zkopirovat do trampoliny beze zmeny.
+ *
+ * POZOR TP: shim se instaluje pod LOADER TP (run_ownall, pred elf_run), ale
+ * SPOUSTI se az PO prepnuti na guest/parrot TP (blr x8 je uvnitr node/V8
+ * kodu). Logger proto NESMI volat fprintf/libc stdio - ty ctou bionicky
+ * stack-guard/errno/FILE* pres TP, ktery uz ukazuje do parrot TLS layoutu
+ * (divoky pointer -> SIGSEGV BEZ jakehokoliv vystupu, i mimo nas fault
+ * handler). Log jde vyhradne raw syscallem (shim_raw_syscall6), presne jako
+ * shim_mmap_log/shim_mprotect o par set radku niz. */
+static void shim_hex(char **pp, unsigned long v, int nib);
+static long shim_raw_syscall6(long nr, long a0, long a1, long a2, long a3, long a4, long a5);
 static void trace_call_logger(unsigned long *regs) {
-    fprintf(stderr, "[TRACE_CALL] x0=%016lx x1=%016lx x2=%016lx x3=%016lx\n"
-                     "             x4=%016lx x5=%016lx x6=%016lx x7=%016lx\n"
-                     "             x8=%016lx x9=%016lx x10=%016lx x11=%016lx\n",
-            regs[0], regs[1], regs[2], regs[3], regs[4], regs[5], regs[6],
-            regs[7], regs[8], regs[9], regs[10], regs[11]);
-    fflush(stderr);
+    char b[300]; char *i = b;
+    const char *p = "[TRACE_CALL] x0="; while (*p) *i++ = *p++;
+    shim_hex(&i, regs[0], 16);
+    p = " x1="; while (*p) *i++ = *p++; shim_hex(&i, regs[1], 16);
+    p = " x2="; while (*p) *i++ = *p++; shim_hex(&i, regs[2], 16);
+    p = " x3="; while (*p) *i++ = *p++; shim_hex(&i, regs[3], 16);
+    p = "\n             x4="; while (*p) *i++ = *p++; shim_hex(&i, regs[4], 16);
+    p = " x5="; while (*p) *i++ = *p++; shim_hex(&i, regs[5], 16);
+    p = " x6="; while (*p) *i++ = *p++; shim_hex(&i, regs[6], 16);
+    p = " x7="; while (*p) *i++ = *p++; shim_hex(&i, regs[7], 16);
+    p = "\n             x8="; while (*p) *i++ = *p++; shim_hex(&i, regs[8], 16);
+    p = " x9="; while (*p) *i++ = *p++; shim_hex(&i, regs[9], 16);
+    p = " x10="; while (*p) *i++ = *p++; shim_hex(&i, regs[10], 16);
+    p = " x11="; while (*p) *i++ = *p++; shim_hex(&i, regs[11], 16);
+    *i++ = '\n';
+    shim_raw_syscall6(64, 2, (long)b, (long)(i - b), 0, 0, 0);
 }
 static uint32_t tc_enc_str(int rt, int rn, int off) {
     return 0xF9000000u | (((uint32_t)(off / 8)) << 10) | ((uint32_t)rn << 5) | (uint32_t)rt;
