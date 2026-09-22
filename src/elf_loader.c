@@ -387,7 +387,10 @@ void ldso_install_exe_linkmap(elf_object_t *exe, const char *name) {
     memset(ldso_exe_linkmap, 0, sizeof ldso_exe_linkmap);
     unsigned char *lm = (unsigned char *)ldso_exe_linkmap;
     uintptr_t base = (uintptr_t)exe->base_addr;
-    *(uintptr_t *)(lm + 0x00) = base;                       /* l_addr */
+    /* l_addr je load BIAS (base - nejnizsi p_vaddr), ne adresa mapovani.
+     * U ET_EXEC (node 0x400000, Bun 0x200000) musi byt 0: glibc ho vraci
+     * jako dlpi_addr/dlfo_addr a Bun jim posouva adresu sekce .bun. */
+    *(uintptr_t *)(lm + 0x00) = base - map_base_vaddr(exe); /* l_addr */
     if (name) {
         strncpy(ldso_exe_name, name, sizeof ldso_exe_name - 1);
         ldso_exe_name[sizeof ldso_exe_name - 1] = 0;
@@ -537,14 +540,14 @@ static void *ldso_tls_get_addr_soft(void *l) {
 /* Zaregistruje linkmap pro modul (i dynamicky nacteny za behu pres dlopen).
  * Bez tohoto zaznamu v ldso_module_linkmaps vraci ldso_linkmap_for fallback
  * ldso_exe_linkmap, takze glibc pocita adresy symbolu proti spatnemu base ->
- * flaky SIGSEGV zavisly na ASLR layoutu. Dedup podle l_addr. */
+ * flaky SIGSEGV zavisly na ASLR layoutu. Dedup podle l_map_start (=base_addr). */
 size_t ldso_register_linkmap(elf_object_t *m) {
     if (!m)
         return (size_t)-1;
     uintptr_t base = (uintptr_t)m->base_addr;
     for (size_t i = 0; i < ldso_module_count; i++) {
         unsigned char *b = (unsigned char *)ldso_module_linkmaps[i];
-        if (*(uintptr_t *)(b + 0x00) == base)
+        if (*(uintptr_t *)(b + 0x398) == base)   /* l_map_start */
             return i;
     }
     if (ldso_module_count >= LDSO_MAX_MODULES)
@@ -556,7 +559,7 @@ size_t ldso_register_linkmap(elf_object_t *m) {
     strncpy(ldso_module_names[ldso_module_count], name,
             sizeof ldso_module_names[0] - 1);
     ldso_module_names[ldso_module_count][sizeof ldso_module_names[0] - 1] = 0;
-    *(uintptr_t *)(b + 0x00) = base;                          /* l_addr */
+    *(uintptr_t *)(b + 0x00) = base - map_base_vaddr(m);      /* l_addr (bias) */
     *(uintptr_t *)(b + 0x08) = (uintptr_t)ldso_module_names[ldso_module_count];
     *(uintptr_t *)(b + 0x28) = (uintptr_t)lm;                 /* l_real */
     *(uintptr_t *)(b + 0x2f0) = (uintptr_t)m->phdr;           /* l_phdr */
@@ -571,11 +574,11 @@ static void *ldso_linkmap_for(elf_object_t *m) {
     if (!m)
         return NULL;
     uintptr_t base = (uintptr_t)m->base_addr;
-    if (*(uintptr_t *)((unsigned char *)ldso_exe_linkmap + 0x00) == base)
+    if (*(uintptr_t *)((unsigned char *)ldso_exe_linkmap + 0x398) == base)
         return ldso_exe_linkmap;
     for (size_t i = 0; i < ldso_module_count; i++) {
         unsigned char *b = (unsigned char *)ldso_module_linkmaps[i];
-        if (*(uintptr_t *)(b + 0x00) == base)
+        if (*(uintptr_t *)(b + 0x398) == base)
             return ldso_module_linkmaps[i];
     }
     /* Modul nacteny za behu (dlopen/NSS/ctypes/Go) - zaregistruj linkmap,
@@ -3009,7 +3012,7 @@ static void apply_relr(elf_object_t *obj) {
     uint64_t *where = NULL;
     uint64_t *r = (uint64_t *)relr;
     uint64_t *end = (uint64_t *)((char *)relr + relrsz);
-    uintptr_t l_addr = (uintptr_t)obj->base_addr;
+    uintptr_t l_addr = (uintptr_t)obj->base_addr - map_base_vaddr(obj);
     for (; r < end; r++) {
         uint64_t entry = *r;
         if ((entry & 1) == 0) {
