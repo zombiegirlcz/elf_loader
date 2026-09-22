@@ -1594,3 +1594,82 @@ uspesnem volani PRED padem) a `stepi`/`watch` sledovat, kde presne se
 misto, kde postup.md dlouho oznacuje jako "otevreno pro dalsiho resitele".
 Infrastruktura (launch+attach skripty, `PAUSE_CALL`) je hotova a
 znovupouzitelna.
+
+## 2026-09-22 (pokracovani 8): GDB pripojeny PRED padem — zmapovan cely retezec az k JSDispatchTable
+
+### Metodika
+Pomoci `tools/gdb_launch.sh`/`gdb_attach.sh` (viz predchozi zaznam) + noveho
+`ELF_LOADER_PAUSE_CALL=0xde9854` zamrazeni + postupne zpresnovane gdb
+skripty (`break`/`watch $x17 thread 1`/`commands`) byl zmapovan **cely
+retezec bytecode handleru** mezi call#2 (uspesna funkce) a call#3 (PAD),
+kombinaci ziveho gdb trasovani (identifikace handleru podle adresy pres
+`nm`) a staticke disassembly (`objdump`) jednotlivych nalezenych handleru.
+
+**Poznamka k prostredi**: `su 0` je pro GDB kroky STALE potreba (ne kvuli
+rootu/permission na soubory — ashell/parrot uz bezi pod uid 10323 a maji
+pristup) — je to kvuli **seccomp**. Primy pokus spustit gdb bez su/chrootu
+(`$R/lib/ld-linux-aarch64.so.1 ... $R/usr/bin/gdb`) skoncil "Bad system
+call" — nemodifikovany glibc binar narazi na zygote-zdedeny seccomp filtr
+appky (presne duvod, proc `elf_loader` ma vlastni seccomp compat vrstvu).
+`su 0 -c` obchazi tohle, protoze proces spusteny pres Magisk `su` daemon
+NENI potomkem zygote stromu appky. `unshare -r` (unprivileged userns,
+alternativa k su) selhalo "Invalid argument" — na zarizeni je zjevne
+zakazane `unprivileged_userns_clone`.
+
+### Zmapovany retezec (bytecode -> handler -> handler -> ...)
+```
+call#2 bytecode (min. 2x, presne poradi nejasne):
+  LdaImmutableCurrentContextSlot (0x1b25840) -> ThrowReferenceErrorIfHole (0x1b44080)
+    [normalni pruchod - hodnota NENI hole, throw-cesta se NEAKTIVUJE]
+  -> (inline tail-dispatch, LR se NEMENI) ...
+  -> Builtins_CallProperty1Handler (0x1b38d00)
+       - nacte x1 = interpreter_register[operand] (JSFUNKCE - JIZ DRIVE ulozena
+         do registru, puvod TETO hodnoty je pred zacatkem naseho gdb trasovani)
+       - aktualizuje IC feedback (map checks - vsechny konvergovaly na 0x1b38fc0)
+       - argc=2 (receiver+1 arg), PLAIN BRANCH (ne blr) do:
+  -> Builtins_Call_ReceiverIsAny (0x19923e0)
+       - cte instance_type z x1's map, pro normalni JSFunction (0x812-0x821):
+  -> Builtins_CallFunction_ReceiverIsAny (0x1991ba0)
+       - x2 = SFI (x1+31), x27 = context (x1+39)
+       - receiver boxing (ToObject pokud treba), argument adaptation
+       - **x4 = *(uint32_t*)(x1+23)**  <- KLICOVE
+       - x20 = [x26,#360] (root - JSDispatchTable base)
+       - x20 = x20 + (x4>>8)*16   (indexovana tabulka, 16B/zaznam)
+       - x2 = [x20]  (CODE POINTER z tabulky!)
+       - br x2   <- FINALNI SKOK (na 0x199d440 pro call#3 = PAD)
+```
+
+### KLICOVY NOVY NALEZ: JSDispatchTable (V8 Sandbox / code pointer indirection)
+Posledni krok NENI primy nacteni `JSFunction.code` pole (jak jsme celou
+dobu predpokladali) — je to **indirektni dispatch pres globalni tabulku**
+(moderni V8 "JSDispatchTable"/Sandbox feature): JSFunction ukladá 32bit
+"dispatch_handle" na offsetu +23 (misto primeho code pointeru), ktery se
+pouzije jako index do `[x26,#360]`-rootovane tabulky (16 B na zaznam,
+pravdepodobne {code_pointer, parameter_count/flags}). **Tento mechanismus
+NENI specificky pro getOffsetNanosecondsFor** — pouziva se pro VSECHNY
+JSFunction volani (call#2 taky timhle prochazi a funguje spravne), takze
+tabulka/mechanismus SAMY O SOBE nejsou obecne rozbite.
+
+### Zuzeni: bug je bud (a) ve KONKRETNIM dispatch_handle/tabulkovem
+zaznamu pro tuto SFI, nebo (b) x1 samotne je od pocatku SPATNA JSFunkce
+Zbyva zjistit: (1) odkud presne x1 (JSFunkce pro call#3) dostal svou
+hodnotu PRED vstupem do CallProperty1Handler (interpreter register byl
+nastaven drive - pravdepodobne pres "Star"/property-load-and-store
+sekvenci, kterou nase gdb trasovani jeste nezachytilo, protoze zacalo az
+u LdaImmutableCurrentContextSlot); (2) porovnat OBSAH JSDispatchTable
+zaznamu (na indexu odvozenem z x1+23) MEZI nasim loaderem a nativnim
+behem na STEJNEM relativnim indexu - pokud se lisi, mame primy dukaz
+poskozene tabulky; pokud je stejny, bug je v x1 samotnem (spatna
+JSFunkce, ne spatny dispatch).
+
+### Pripravene nastroje pro pokracovani
+- `tools/gdb_launch.sh` + `tools/gdb_attach.sh` (v repu) — funkcni zaklad.
+- Postup pro dalsi gdb skripty: psat je jako SAMOSTATNY `.gdb` soubor do
+  `/tmp/<jmeno>.gdb` (== `$R/tmp/`, sdileny s touto Claude Code session —
+  `/tmp` zde JE `$R/tmp`), spustit `gdb -p $PID -x /tmp/<jmeno>.gdb`.
+  Vicerádkové `commands` bloky NELZE spolehlive predat pres `-ex` retezec
+  (mangling pres 3 vrstvy shellu) — vzdy pouzit `.gdb` soubor.
+- `watch $x17 thread 1` — sleduje VSECHNY inline tail-dispatch skoky
+  (kazdy bytecode handler konci `mov x17,X; br x17`), da kompletni
+  retezec bez nutnosti hadat konkretni adresy predem. `thread 1` NUTNE -
+  bez nej flooduje log ze zcela nesouvisejiciho pozadioveho vlakna.
