@@ -590,6 +590,84 @@ static void install_call_trace(void *target) {
     }
 }
 
+/* ELF_LOADER_TRACE_ENTRY=<hex_addr>: jako install_call_trace, ale pro
+ * instrukce, ktere NEJSOU `blr` (napr. entry do Builtins_InterpreterEntry-
+ * Trampoline, `ldur x5,[x1,#31]`). Rozdil oproti install_call_trace:
+ * puvodni instrukce NEMENI x30 (LR) - kdyz nas shim provede VLASTNI blr
+ * (volani loggeru), MUSI x30 pred tim ulozit a po nem obnovit, jinak by
+ * trampolina po navratu z InterpreterEntryTrampoline skocila do nasi
+ * logovaci funkce misto ke skutecnemu volajicimu. Loguje x1 (JSFunction)
+ * a puvodni x30 (adresa volajiciho) - odhali KDO volal do trampoliny
+ * tesne pred padem. Instrukce se PREBIRA BEZE ZMENY (nekontroluje se typ,
+ * volajici musi vedet, ze je bezpecna k relokaci - zadna PC-relativni
+ * zavislost). */
+static void trace_entry_logger(unsigned long *regs) {
+    char b[200]; char *i = b;
+    const char *p = "[TRACE_ENTRY] x1(JSFunction)="; while (*p) *i++ = *p++;
+    shim_hex(&i, regs[0], 16);
+    p = " x30(caller)="; while (*p) *i++ = *p++;
+    shim_hex(&i, regs[1], 16);
+    *i++ = '\n';
+    long fd = shim_raw_syscall6(56, (long)0xFFFFFFFFFFFFFF9CL,
+                                 (long)(unsigned long)"/data/user/0/com.linux_core/files/usr/trace_call.txt",
+                                 0x441L, 0644L, 0, 0);
+    if (fd >= 0) {
+        shim_raw_syscall6(64, fd, (long)b, (long)(i - b), 0, 0, 0);
+        shim_raw_syscall6(57, fd, 0, 0, 0, 0, 0);
+    }
+}
+static void install_entry_trace(void *target) {
+    uint32_t ins0 = *(const uint32_t *)target;
+    void *tramp = alloc_near(target);
+    if (tramp == MAP_FAILED) { fprintf(stderr, "[TRACE_ENTRY] alloc_near(tramp) FAIL\n"); return; }
+    *(uint32_t *)tramp = ins0;
+    uint32_t back = branch_insn((char *)tramp + 4, (char *)target + 4);
+    if (back) {
+        *(uint32_t *)((char *)tramp + 4) = back;
+    } else {
+        void *bb = make_bridge((char *)target + 4);
+        if (!bb) { fprintf(stderr, "[TRACE_ENTRY] make_bridge FAIL\n"); return; }
+        uint32_t b2 = branch_insn((char *)tramp + 4, bb);
+        if (!b2) { fprintf(stderr, "[TRACE_ENTRY] tramp->back OOR\n"); return; }
+        *(uint32_t *)((char *)tramp + 4) = b2;
+    }
+    __builtin___clear_cache(tramp, (char *)tramp + 8);
+    mprotect(tramp, 4096, PROT_READ | PROT_EXEC);
+
+    void *shim = alloc_near((char *)target + 64);
+    if (shim == MAP_FAILED) { fprintf(stderr, "[TRACE_ENTRY] alloc_near(shim) FAIL\n"); return; }
+    uint32_t *sc = (uint32_t *)shim;
+    int i = 0;
+    /* ulozit x1 (JSFunction, arg pro logger) a x30 (LR, MUSI se obnovit -
+     * puvodni instrukce ho nemeni). sub sp,#32 (16-align, 16 B potreba).
+     * Logger cte regs[0]=[sp,#0] (x1 puvodni), regs[1]=[sp,#8] (x30
+     * puvodni) - primo z ulozeneho mista, zadna extra kopie netreba. */
+    sc[i++] = 0xD10083FFu;                    /* sub sp, sp, #32 */
+    sc[i++] = tc_enc_str(1, 31, 0);           /* str x1, [sp, #0]  (ulozit JSFunction) */
+    sc[i++] = tc_enc_str(30, 31, 8);          /* str x30,[sp, #8]  (ulozit LR) */
+    sc[i++] = 0x910003E0u;                    /* mov x0, sp (arg logger = &[x1,x30]) */
+    sc[i++] = 0x14000003u;                    /* b +12 (preskoc literal) */
+    uint64_t *lit = (uint64_t *)&sc[i];
+    *lit = (uint64_t)(uintptr_t)trace_entry_logger;
+    i += 2;
+    sc[i++] = 0x58FFFFC9u;                    /* ldr x9, [pc, #-8] */
+    sc[i++] = 0xD63F0120u;                    /* blr x9 */
+    sc[i++] = tc_enc_ldr(30, 31, 8);          /* ldr x30,[sp, #8]  (obnov PUVODNI LR) */
+    sc[i++] = tc_enc_ldr(1, 31, 0);           /* ldr x1, [sp, #0]  (obnov PUVODNI x1) */
+    sc[i++] = 0x910083FFu;                    /* add sp, sp, #32 */
+    uint32_t jb = branch_insn((char *)shim + (size_t)i * 4, tramp);
+    if (!jb) { fprintf(stderr, "[TRACE_ENTRY] shim->tramp OOR\n"); return; }
+    sc[i++] = jb;
+    __builtin___clear_cache(shim, (char *)shim + (size_t)i * 4);
+    mprotect(shim, 4096, PROT_READ | PROT_EXEC);
+
+    if (patch_branch(target, shim) == 0)
+        fprintf(stderr, "[TRACE_ENTRY] installed at %p (tramp=%p shim=%p)\n",
+                target, tramp, shim);
+    else
+        fprintf(stderr, "[TRACE_ENTRY] patch_branch FAILED at %p\n", target);
+}
+
 /* Nahradi prvni instrukci targetu vetvim na shim. Vytvori trampolinu orig,
  * ktera zavola realni glibc funkci (puvodni prolog + navrat, nebo nasledovani
  * B-thunku na realni impl). Vraci 0, pokud nelze (PC-relativni prolog). */
@@ -2567,6 +2645,22 @@ static int run_ownall(const char *path, int argc, char **argv, char **envp) {
             for (char *tok = strtok(buf, ","); tok; tok = strtok(NULL, ",")) {
                 unsigned long addr = strtoul(tok, NULL, 0);
                 if (addr) install_call_trace((void *)addr);
+            }
+        }
+    }
+    /* ELF_LOADER_TRACE_ENTRY=0xADDR[,...]: jako vyse, ale pro instrukce
+     * ktere nejsou `blr` (viz install_entry_trace) - loguje x1(JSFunction)
+     * a x30(volajici) pri KAZDEM vstupu do dane funkce, napr. entry do
+     * Builtins_InterpreterEntryTrampoline pred padem. */
+    {
+        const char *te = getenv("ELF_LOADER_TRACE_ENTRY");
+        if (te && te[0]) {
+            char buf[512];
+            strncpy(buf, te, sizeof buf - 1);
+            buf[sizeof buf - 1] = '\0';
+            for (char *tok = strtok(buf, ","); tok; tok = strtok(NULL, ",")) {
+                unsigned long addr = strtoul(tok, NULL, 0);
+                if (addr) install_entry_trace((void *)addr);
             }
         }
     }
