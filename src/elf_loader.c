@@ -3870,7 +3870,14 @@ static void fault_handler(int sig, siginfo_t *si, void *ctx) {
          * Zajima nas: co je x1 (JSFunction), jeji map pointer [x1] a pole
          * code_entry [x1+31] (=x5). Kdyz je [x1] nesmysl -> korupce haldy;
          * kdyz je x1 mimo mapy -> korupce roots/GOT. */
-        {
+        /* POZOR: tenhle blok DEREFERENCUJE x1/x5 jako V8 JSFunction/SFI
+         * pointery - platne jen pro SIGSEGV z InterpreterEntryTrampoline.
+         * Pro SIGABRT (napr. glibc abort() po "double free") jsou x1/x5
+         * naprosto nesouvisejici registry (cokoliv, co tam bylo v miste
+         * tgkill volani) - ">0x1000" heuristika je nedostatecna ochrana
+         * a dereference tak snadno zpusobi DALSI (sekundarni) SIGSEGV
+         * uvnitr sameho fault handleru. Omezit jen na SIGSEGV. */
+        if (sig == SIGSEGV) {
             unsigned long x1v = (unsigned long)uc->uc_mcontext.regs[1];
             p = " x1="; while (*p) b[i++] = *p++;
             for (int sh = 60; sh >= 0; sh -= 4) b[i++] = hxd[(x1v >> sh) & 0xf];
@@ -3900,7 +3907,7 @@ static void fault_handler(int sig, siginfo_t *si, void *ctx) {
          * Z SFI nas zajima pole +16 a +24 (name_or_scope_info / script),
          * ktera vedou na retezce - ASCII vypis rekne, ktery builtin modul
          * se prave volal. */
-        if (getenv("ELF_LOADER_OBJ_DUMP")) {
+        if (sig == SIGSEGV && getenv("ELF_LOADER_OBJ_DUMP")) {
             unsigned long x1v = (unsigned long)uc->uc_mcontext.regs[1];
             unsigned long x5v2 = (unsigned long)uc->uc_mcontext.regs[5];
             fault_obj_dump("JSFUNC", x1v, 8);
