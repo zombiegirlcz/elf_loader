@@ -4560,6 +4560,15 @@ void elf_install_fault_handlers(void) {
     sigaction(SIGSEGV, &sa, NULL);
     sigaction(SIGILL, &sa, NULL);
     sigaction(SIGBUS, &sa, NULL);
+    /* SIGABRT: bez tohoto zustava aktivni Androidi (bionic) vychozi
+     * SIGABRT handler, ktery cte bionic TLS pres TPIDR_EL0 - tesne pred
+     * guest entry ale prepneme TPIDR_EL0 na glibc (guest) TLS layout
+     * (viz elf_tls_switch/elf_teardown_own_tls), takze bionic handler
+     * dereferencuje spatny TLS blok -> SIGSEGV na malé/near-NULL adrese
+     * (napr. si_addr=0x300). Guestuv sigaction(SIGABRT,...) uz je diag_
+     * wrapped_sigaction v main.c intercepted (elf_set_guest_fatal), takze
+     * fault_handler ho spravne dochainuje - staci ho i sem nainstalovat. */
+    sigaction(SIGABRT, &sa, NULL);
 }
 
 /* DEBUG (ELF_LOADER_DEBUG_PC): zablokuj rt_sigaction(SIGSEGV) -> EPERM,
