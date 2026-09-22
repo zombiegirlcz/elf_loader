@@ -1177,3 +1177,79 @@ proc ukazuje na InterpreterEntryTrampoline. Kandidati:
 3. `ELF_LOADER_TRACE_CALL`/`ELF_LOADER_TRACE_ENTRY` infrastruktura je
    hotova a znovupouzitelna pro libovolnou dalsi adresu bez dalsich
    zmen v loaderu.
+
+## 2026-09-22 (pokracovani 2): deterministicky cil pádu, ne Temporal-specificky
+
+### ELF_LOADER_TRACE_RING (novy)
+Pridan kruhovy buffer pro hot-path mista (`ELF_LOADER_TRACE_RING=0xADDR`,
+`ring_logger` v `src/main.c`, vypis pri padu z `fault_handler` v
+`elf_loader.c`) — bez souboroveho zapisu v hot path. Pouzita mechanika
+`install_call_trace_with()` (parametrizovana puvodni funkce, zadny novy
+strojovy kod, jen jina embed-literal adresa).
+
+### Zjisteni: `0x199d560` (blr x2 uvnitr InterpreterEntryTrampoline+0x120)
+NENI obecna dispatch smycka volana na kazdy bytecode (jak jsem puvodne
+predpokladal ze statickeho disassembly) — je to konkretni misto volane jen
+JEDNOU za vstup do interpreteru. V beznem `node -e` behu se aktivovalo jen
+2x (pro volani #2 a #3 z drivejsi TRACE_ENTRY sekvence), s cili:
+```
+volani #2 (uspesne): x2 -> Builtins_GetNamedPropertyHandler
+volani #3 (PAD nasleduje): x2 -> Builtins_LdaImmutableCurrentContextSlotHandler
+```
+Obe jsou REALNE, legitimni bytecode handlery (ne InterpreterEntryTrampoline
+samotna) — potvrzuje se tim korektni fungovani INTERPRETER DISPATCH TABLE
+(`x21 = [x26, #22328]`, indexovana bytecode opcode bytem) pro tyto 2
+konkretni polozky. Kombinovany beh (`ELF_LOADER_TRACE_ENTRY` +
+`ELF_LOADER_TRACE_RING` soucasne) potvrdil, ze x30 (caller) hlasene
+TRACE_ENTRY pro InterpreterEntryTrampoline vstupy #2/#3 odpovida presne
+teto instrukci (adresa se lisi jen kvuli relokaci do trampoliny).
+
+### KLICOVY TEST: `--no-harmony-temporal` NEPOMAHA
+`ELF_LOADER_OBJ_DUMP=1 elf_loader --ownall node --no-harmony-temporal -e ...`
+→ **STEJNY pad, STEJNA funkce** (`getOffsetNanosecondsFor`) i se zcela
+vypnutym Temporal harmony flagem. Duvod pravdepodobne: `--no-harmony-temporal`
+jen zabrani EXPOZICI Temporal objektu do `globalThis` pro uzivatelsky JS,
+ale odpovidajici `SharedFunctionInfo`/builtin-ID zaznam pro tuto funkci
+zustava soucasti EMBEDDED SNAPSHOTU/BUILTINS TABULKY nezavisle na flagu —
+tzn. **PAD NENI vyvolany uzivatelskym volanim Temporal API**, ale nejakym
+INTERNIM BOOTSTRAP MECHANISMEM, ktery na tuto SFI narazi DETERMINISTICKY
+(vzdy STEJNA LOGICKA funkce, i kdyz absolutni pamet'ove adresy se mezi
+behy lisi kvuli nahodne zakladni adrese V8 4GB cage).
+
+### Zpresnena hypoteza (aktualni stav)
+Nejde o nahodnou korupci (RO heap, TLS, ctype, memcpy, relokace, locale —
+vse overeno OK, viz predchozi zaznamy). Jde o DETERMINISTICKY, FIXNI-OFFSET
+bug: nejaka V8-interni tabulka/feedback-vector/dispatch-mechanismus na
+KONSTANTNI relativni pozici (vzhledem k zakladu V8 cage/RO-space, ktery se
+DETERMINISTICKY deserializuje pri kazdem behu) obsahuje/vypocitava spatnou
+hodnotu, ktera VZDY vede na stejnou logickou SFI (`getOffsetNanosecondsFor`)
+bez ohledu na uzivatelsky skript. Analogie k jiz drive nalezenemu
+`locale::id::_M_id()` bugu (numericky index → tabulka → spatny zaznam) —
+mozna JINY, ale STRUKTURALNE PODOBNY bug (off-by-N v tom, jak loader mapuje/
+pocita adresy v NEJAKE V8-interni indexovane strukture, napr. embedded
+builtins blob nebo feedback-vector allocation).
+
+### Proc dalsi postup vyzaduje V8 zdrojove kody / debug symboly
+Bez V8 source (matchujiciho verzi v26.8.2) nelze spolehlive urcit VYZNAM
+konkretnich poli/tabulek jen z disassembly (identifikace `x21 = [x26,#22328]`
+jako "dispatch_table_" je odhad z chovani, ne overeny fakt; `untrusted_
+function_data = Smi(0x206)` interpretace jako "builtin ID" je take odhad).
+Dalsi smysluplny krok BEZ V8 source: porovnat SUROVE BAJTY V8 embedded
+builtins blob / feedback-vector-relevantnich struktur MEZI loaderem a
+nativnim behem NA STEJNEM RELATIVNIM OFFSETU OD ZAKLADU CAGE (podobne jako
+drivejsi uspesny test RO-heap objektu, ktery vysel IDENTICKY a vyloucil
+deserializacni bug) — cilenejsi na FEEDBACK VECTOR / INLINE CACHE
+strukturu okolo volani #2 (GetNamedPropertyHandler), protoze IC/feedback
+vector je znama trida struktur citliva na write-barrier/GC-generation
+problemy v nestandardnich pamet'ovych spravach (jako je nase own-loading).
+
+### Nastroje pripravene pro pokracovani
+- `ELF_LOADER_TRACE_CALL=0xADDR[,...]` — loguje x0-x11 pri kazdem `blr xN`
+  na danou adresu (soubor, kazde volani).
+- `ELF_LOADER_TRACE_ENTRY=0xADDR[,...]` — loguje x1(JSFunction)+x30(caller)
+  pri kazdem vstupu do funkce (libovolna instrukce, zachovava LR).
+- `ELF_LOADER_TRACE_RING=0xADDR[,...]` — kruhovy buffer (16 zaznamu x0-x2)
+  pro hot-path mista, vypis az pri padu.
+- Vsechny tri sdileji `install_call_trace_with()` — bit-presne overena
+  shim/tramp mechanika (viz predchozi zaznam), zadne dalsi rucni
+  strojove kody potreba pro novou adresu.
