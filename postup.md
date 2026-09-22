@@ -1534,3 +1534,63 @@ Nastroje pripravene pro pokracovani (vsechny commitnute, overene funkcni):
 dostupny `/system/bin/strace` na zarizeni (skutecny root, `su 0 -c` z
 `ashell` kontextu) — dosud nevyuzity, muze pomoct pri diagnostice bugu #2
 (vlaknovy crash) bez nutnosti gdb.
+
+## 2026-09-22 (pokracovani 7): PRUELOM — funkcni GDB pres chroot-jen-pro-gdb + attach podle PID
+
+### Napad uzivatele: gdb "pres Magisk modul"
+Misto stavby Magisk modulu (reboot cyklus) rychlejsi cesta: `apt-get install
+gdb` **primo v tomto prostredi** (`/root` teto Claude Code session JE fyzicky
+Parrot rootfs `$R` = `/data/user/0/com.linux_core/files/nh/distro/parrot` —
+overeno shodou `/root/.nvm/...` s `$R/root/.nvm/...`; `apt` zde pouziva
+Parrot repo `deb.parrot.sh`). Nainstalovan **gdb 16.3-1** (Debian/Parrot
+balicek, glibc aarch64) — zabralo par sekund, zadny reboot.
+
+### Proc primy chroot-exec elf_loaderu selhal (a proc to neni potreba resit)
+`chroot $R /usr/bin/elf_loader` hazi "No such file or directory" — elf_loader
+je **bionic** binarka (`PT_INTERP=/system/bin/linker64`), ktery je uvnitr
+Parrot chrootu nedohledatelny (zadne `/system` tam neni). Bind-mount `/system`
+→ `$R/system` nestaci, protoze `linker64` je jen symlink na
+`/apex/com.android.runtime/bin/linker64` a **APEX mounty se nedaji proste
+"--rbind" prenest do noveho mount namespace** (apexd je spravuje speciálně,
+per-namespace). **Reseni: NECHROOTOVAT elf_loader vubec** — bezi jako vzdy
+primo na realnem android rootu (presne jak doted), zatimco **jen gdb**
+(ktery potrebuje `$R` pro svuj vlastni `ld-linux-aarch64.so.1`) se chrootuje
+SAMOSTATNE a pripoji se **podle PID** (`gdb -p <pid>`). `ptrace` funguje
+napric chrootem bez problemu (chroot neizoluje PID namespace) — jen
+`$R/proc` musi byt bind-mount realneho `/proc` (kvuli `/proc/<pid>/mem`
+pristupu, ktery gdb pouziva pro cteni pameti mimo `PTRACE_PEEKTEXT`).
+
+### Funkcni postup (2 kroky, viz `tools/gdb_launch.sh`/`gdb_attach2.sh` v postupu)
+1. **Launch** (realny root, bez chrootu): spustit
+   `ELF_LOADER_PAUSE_CALL=0xde9854 elf_loader --ownall node -e '...'` na
+   pozadi pod `su 0` (drzi cely `ashell -c` session nazivu dost dlouho, aby
+   dite preziilo) — 30s zamrazeni na `v8::internal::Invoke` callsite dava
+   dost casu na pripojeni.
+2. **Attach** (chroot JEN pro gdb, samostatny prikaz): `unshare -m` +
+   `mount --make-rprivate` + bind `/proc` do `$R/proc` + `chroot $R
+   /usr/bin/gdb -batch -ex "handle SIGSEGV stop print nopass" -ex "attach
+   $PID" -ex continue -ex "info registers" -ex "bt full" -ex "x/10i $pc"`.
+
+### VYSLEDEK: SIGSEGV chycen NATIVNE, plny registr dump
+```
+Thread 1 "node-MainThread" received signal SIGSEGV, Segmentation fault.
+0x000000000199d444 in ?? ()
+x0=0x2 x1=0x22e5bc61b1 (JSFunction, tagovany ptr) x2=0x199d440
+x5=0xa8dd93bb1 (SharedFunctionInfo) x30=0x199d564 (caller, presne
+InterpreterEntryTrampoline+0x124 - odpovida drivejsim TRACE_ENTRY zjistenim)
+pc=0x199d444 => sturh wzr, [x5, #67]   (presne znamy FAULT bod)
+```
+`bt full` je jen 2 ramce ("corrupt stack?") — ocekavane, V8 generovany kod
+nema CFI/unwind info, ktere by gdb znalo bez V8 debug symbolu. To ale
+NEVADI: ted mame **plny nativni debugger** — `stepi`, watchpointy na
+konkretni adresy, `x/` libovolne pameti PRED padem — poprve v cele
+diagnostice muzeme SLEDOVAT, jak/kde presne x1/x5 dostaly spatnou hodnotu,
+misto pouhe post-mortem disassembly.
+
+### Dalsi krok (pripraveno, nedokonceno)
+Misto `continue`+catch na finalni pad: attachnout **DRIV** (pri call#2,
+uspesnem volani PRED padem) a `stepi`/`watch` sledovat, kde presne se
+`x1`/`JSFunction.code` pro nasledujici volani (#3) nastavuje - to je presne
+misto, kde postup.md dlouho oznacuje jako "otevreno pro dalsiho resitele".
+Infrastruktura (launch+attach skripty, `PAUSE_CALL`) je hotova a
+znovupouzitelna.
