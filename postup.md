@@ -1000,3 +1000,89 @@ s libtinfo.so.6.5 (SONAME match splní DT_NEEDED). Rozbité symlinky EPERM trvaj
 - `gbsh -dw -c 'cd; pwd; cd ..; pwd; cd; pwd'` → `/root`, `/`, `/root`.
 - Prompt oprava je v kódu; interaktivní TTY test nutný v terminálu appky
   (nelze přes `-c`).
+
+## 2026-09-22: node pod loaderem — diagnostika (Modal nedostupny, build pres GitHub Actions)
+
+### Testovaci smycka bez Modalu
+- `.github/workflows/build.yml` (job `build-elf-loader`) dela stejny NDK
+  cross-compile jako `finale_loader_build.py`. Spousti se pri kazdem pushi.
+- Nova smycka: `git push` -> `gh run watch <id>` -> `gh run download <id>
+  -n elf_loader_ndk -D /tmp/ndkart` -> kontrola `readelf -l` (interpreter
+  musi byt `/system/bin/linker64`) -> deploy -> `ashell -c`.
+- **`files/` v repu UZ NENI bind-mount na device** (SKILL.md je v tomto bode
+  zastaraly). Funkcni kanal: `/data/user/0/com.linux_core/files/tmp/` je
+  zapisovatelny z prootu i viditelny na device, takze
+  `cp bin $D/tmp/elf_loader.new` + `ashell -c 'cp $D/tmp/elf_loader.new
+  $D/usr/bin/elf_loader'`. Zadne base64 chunkovani neni potreba.
+- ashell limit 1024 znaku se obchazi tak, ze se testovaci skript zapise z
+  prootu do `$D/tmp/t.sh` a pres ashell se jen spusti s presmerovanim do
+  souboru. POZOR: stdout je pri presmerovani plne bufferovany -> testy musi
+  mit `setvbuf(_IONBF)`, jinak se vystup pri SIGSEGV ztrati.
+- ashell bezi nyni pod uid **10323** (u0_a323), ne 10310.
+
+### Stav node v26.8.2 (`--ownall`)
+- `node --version` -> vypise verzi, pak `free(): invalid pointer` + SIGSEGV
+  v teardownu (RC=139).
+- `node -e 'console.log(42)'` -> SIGSEGV pred jakymkoli vystupem.
+
+### Presna lokalizace padu
+Fault je v `Builtins_InterpreterEntryTrampoline` (node je ET_EXEC nahrany na
+svem link adrese 0x400000, takze `pc` odpovida primo binarce):
+```
+199d440: ldur  x5, [x1, #31]   ; x5 = SharedFunctionInfo z JSFunction
+199d444: sturh wzr, [x5, #67]  ; ResetSharedFunctionInfoAge  <- FAULT
+199d448: ldur  x20, [x5, #7]   ; SFI.trusted_function_data
+```
+Symbolizovany stack (`nm` nad node binarkou):
+```
+Builtins_InterpreterEntryTrampoline <- Builtins_JSEntryTrampoline <- JSEntry
+<- v8::internal::Invoke <- Execution::Call <- v8::Function::Call
+<- node::builtins::BuiltinLoader::CompileAndCall
+<- node::Realm::ExecuteBootstrapper <- node::StartExecution
+<- node::LoadEnvironment <- node::NodeMainInstance::Run
+```
+`ELF_LOADER_OBJ_DUMP=1` (novy) ukazal identitu objektu: SFI ma
+`trusted_function_data == 0`, `untrusted_function_data == Smi(0x206)` a jmeno
+**`getOffsetNanosecondsFor`** (Temporal builtin). Jde tedy o builtin bez
+bytecode, ktery do interpreter trampoliny nemel vubec vstoupit — node pri
+kompilaci sveho bootstrap modulu dostal k zavolani CIZI funkci.
+
+### Co bylo OVERENO a vylouceno
+- **Seal read-only heapu neni anomalie**: nativni node v prootu ma uplne
+  stejny `r--p` region velikosti 0x17000 a v nem na stejnem offsetu
+  (+0x13bb0) bajtove IDENTICKY objekt (mapa, null data, Smi 0x206).
+  Deserializace snapshotu je tedy v poradku.
+- `ELF_LOADER_VMTRACE=1` (novy): region vznikl jako RW (`prot=03`), byl
+  orezan munmapy a read-only ho udelal az V8 seal. Loader do nej nezasahuje.
+- `ELF_LOADER_RO_KEEP_WRITE=1` (novy): store projde, ale hned padne
+  nasledujici instrukce na `SFI.trusted_function_data == 0` — potvrzeno, ze
+  RO stranka je dusledek, ne pricina.
+- V8 flagy nic nemeni: `--jitless`, `--single-threaded`, `--predictable`,
+  `--no-opt`, `--no-node-snapshot`, `--no-lazy` -> vzdy stejny SIGSEGV.
+- **memcpy/memmove/strlen/memchr jsou pod loaderem spravne** (torture test
+  ruznych delek a zarovnani, `fails=0`) -> IFUNC/string funkce vylouceny.
+- **TLS neprekryva**: `__thread` promenne hlavniho programu maji stejne
+  offsety od TP jako nativne (TP+64/+72/+128/+144), `errno` je jinde,
+  hodnoty prezijí volani libc, druhe vlakno OK -> TLS aliasing vyloucen.
+- **ctype tabulky jsou inicializovane** (`__ctype_b_loc()`/`tolower()` OK
+  v hlavnim vlakne i ve vlakne) -> `__ctype_init` neni problem.
+- node je **ET_EXEC** s 836 relokacemi a BIND_NOW, zadny DT_RELR -> chyba
+  v relokacich hlavniho programu vyloucena.
+- 7x logovane "own-loading dependency: libc.so.6" NENI duplicitni nahrani —
+  jen log pred cache checkem (`dynsym` se parsuje jen jednou).
+
+### Druha, samostatna stopa
+S `NODE_DEBUG_NATIVE=CODE_CACHE` pada node **driv a jinde**:
+`node::ToLower<std::string>+0xb0` volany z `EnabledDebugList::Parse`, se
+`si_addr=0x43` — tedy presne hodnota znaku `'C'` z "CODE_CACHE"
+dereferencovana jako ukazatel. Vypada to na spatne navazany import (funkce
+dostane znak a pouzije ho jako pointer). Samostatny ctype test pritom
+`tolower()` zvladne, takze jde o neco specifickeho pro node binarku.
+
+### Dalsi krok
+Overit vazbu importu hlavniho programu: node ma 676 undefined symbolu, z toho
+loader prepisuje `mmap64`, `munmap`, `mprotect`, `dlopen`, `dlsym`, `dlclose`,
+`dladdr`, `dlerror`, `pthread_create`, `pthread_getattr_np`, `sigaction`.
+Navrh: logovat kazdou JUMP_SLOT/GLOB_DAT vazbu hlavniho programu (symbol ->
+modul + adresa) a porovnat vzorek proti nativnim adresam z `nm` guest glibc;
+zacit u `tolower` (kvuli stope vyse) a u prepisovanych symbolu.
