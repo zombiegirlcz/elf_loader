@@ -2131,3 +2131,32 @@ volajici smycka, `Isolate::Init` struktura) jsou prokazatelne identicke.
 Tohle je nejuzsi bod celeho vysetrovani doposud — dalsi krok je bud
 rucni RE teto jedne funkce, nebo maly loader patch (novy TRACE_ENTRY
 varianta logujici x0) + CI rebuild pro primy empiricky dukaz.
+
+### Doplnek: `Builtins::code()` rozlusteno — presny vzorec
+```
+0xcf1d18 <Builtins::code(Builtin id)>:
+  x8 = *(x0)                    // x0="this"=isolate+0x10160; *(this) = zpetny pointer (pravdepodobne == isolate sam)
+  x0 = *(x8 + id*8 + 0xa798)    // finalni lookup: IsolateData::builtin_table_[id], 8B/zaznam
+```
+Tzn. `Builtins::code(id) == *(isolate_data_base + 0xa798 + id*8)` — presne
+odpovida `Address builtin_table_[Builtins::kBuiltinCount]` z `isolate-
+data.h` (radek 426). **DULEZITE**: tato smycka bezi PRED `Builtins::
+InitializeIsolateDataTables` (volanym az na `0xe078f0`, PO smycce) —
+tzn. `builtin_table_` MUSI byt v tomto bode JIZ naplneny JINYM
+mechanismem, nejpravdepodobneji primo jako soucast `StartupDeserializer::
+DeserializeIntoIsolate()` (volano drive, na `0xe07814` — kopirovani/
+relokace IsolateData regionu ze snapshotu). **Pracovni hypoteza pro
+priste**: pokud loader nekorektne kopiruje/relokuje TUTO KONKRETNI cast
+IsolateData behem snapshot deserializace (napr. pri prekladu
+embedded-blob-relativnich adres na absolutni, nebo kvuli page-alignment
+rozdilu), zaznam `builtin_table_[0x4ab]` (a mozna par dalsich blizkych)
+skonci spatne, zatimco VETSINA tabulky (ostatnich ~2400 zaznamu) zustane
+spravna (proto vse ostatni v cele V8/node funguje).
+
+**Pro priste**: overit `builtin_table_[0x4ab]` primo (2-uroven dereference:
+`base = *(isolate+0x10160)`, `entry = *(base + 0x4ab*8 + 0xa798)`) na
+STEJNEM breakpointu `0x199a700`, kde uz mame funkcni x26 → je treba jen
+najit vztah `isolate` (x19 v Init) vs. `x26` (kRootRegister) — pravdepodobne
+`isolate_data_ptr = x26 - kIsolateRootBias` a `isolate == isolate_data_ptr`
+(pokud je `IsolateData` prvni clen `Isolate`, coz je pravdepodobne, ale
+NEOVERENO). `kIsolateRootBias` hodnota take zatim neznama numericky.
