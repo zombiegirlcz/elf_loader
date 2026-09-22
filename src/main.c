@@ -518,26 +518,43 @@ static uint32_t tc_enc_str(int rt, int rn, int off) {
 static uint32_t tc_enc_ldr(int rt, int rn, int off) {
     return 0xF9400000u | (((uint32_t)(off / 8)) << 10) | ((uint32_t)rn << 5) | (uint32_t)rt;
 }
-static void install_call_trace(void *target) {
+/* ELF_LOADER_TRACE_RING=<hex_addr>: pro HOT-PATH mista (napr. interpreter
+ * dispatch loop, volana na KAZDY bytecode - stovky tisic za beh) je
+ * souborovy/syscallovy logger prilis pomaly a zaplavi log. ring_logger misto
+ * toho jen ulozi x0-x2 do staticke kruhove pameti (zadny syscall v hot
+ * path) - obsah se vypise az z fault_handleru pri padu (elf_dispatch_ring_dump
+ * v elf_loader.c), takze vidime POSLEDNICH N volani PRED SIGSEGV. */
+#define DISPATCH_RING_N 16
+unsigned long g_dispatch_ring[DISPATCH_RING_N][3];
+int g_dispatch_ring_idx;
+static void ring_logger(unsigned long *regs) {
+    int i = g_dispatch_ring_idx % DISPATCH_RING_N;
+    g_dispatch_ring[i][0] = regs[0];
+    g_dispatch_ring[i][1] = regs[1];
+    g_dispatch_ring[i][2] = regs[2];
+    g_dispatch_ring_idx++;
+}
+
+static void install_call_trace_with(void *target, void *logger_fn, const char *tag) {
     uint32_t ins0 = *(const uint32_t *)target;
     /* BLR Xn kontrola: bity [31:10] = 1101011 0 001 11111 000000, Rn v [9:5]. */
     if ((ins0 & 0xFFFFFC1Fu) != 0xD63F0000u) {
-        fprintf(stderr, "[TRACE_CALL] %p: ins=%08x neni BLR Xn, preskakuji\n",
-                target, ins0);
+        fprintf(stderr, "[%s] %p: ins=%08x neni BLR Xn, preskakuji\n",
+                tag, target, ins0);
         return;
     }
     /* tramp: [puvodni BLR instrukce beze zmeny][skok zpet na target+4] */
     void *tramp = alloc_near(target);
-    if (tramp == MAP_FAILED) { fprintf(stderr, "[TRACE_CALL] alloc_near(tramp) FAIL\n"); return; }
+    if (tramp == MAP_FAILED) { fprintf(stderr, "[%s] alloc_near(tramp) FAIL\n", tag); return; }
     *(uint32_t *)tramp = ins0;
     uint32_t back = branch_insn((char *)tramp + 4, (char *)target + 4);
     if (back) {
         *(uint32_t *)((char *)tramp + 4) = back;
     } else {
         void *b = make_bridge((char *)target + 4);
-        if (!b) { fprintf(stderr, "[TRACE_CALL] make_bridge(back) FAIL\n"); return; }
+        if (!b) { fprintf(stderr, "[%s] make_bridge(back) FAIL\n", tag); return; }
         uint32_t b2 = branch_insn((char *)tramp + 4, b);
-        if (!b2) { fprintf(stderr, "[TRACE_CALL] tramp->back OOR\n"); return; }
+        if (!b2) { fprintf(stderr, "[%s] tramp->back OOR\n", tag); return; }
         *(uint32_t *)((char *)tramp + 4) = b2;
     }
     __builtin___clear_cache(tramp, (char *)tramp + 8);
@@ -547,7 +564,7 @@ static void install_call_trace(void *target) {
      * obnovi x0-x17, skoci na tramp. Zadna PC-relativni zavislost krome
      * literalu (ldr x9,[pc,#-8]), ktery je pred nim - vzdy v dosahu. */
     void *shim = alloc_near((char *)target + 64);
-    if (shim == MAP_FAILED) { fprintf(stderr, "[TRACE_CALL] alloc_near(shim) FAIL\n"); return; }
+    if (shim == MAP_FAILED) { fprintf(stderr, "[%s] alloc_near(shim) FAIL\n", tag); return; }
     uint32_t *sc = (uint32_t *)shim;
     int i = 0;
     sc[i++] = 0xD10403FFu;                    /* sub sp, sp, #256 (16-align, 144 potreba) */
@@ -561,7 +578,7 @@ static void install_call_trace(void *target) {
     sc[i++] = 0x14000003u;                    /* b +12 (preskoc literal) */
     /* literal (8 B) pred ldr, ldr cte [pc,#-8] */
     uint64_t *lit = (uint64_t *)&sc[i];
-    *lit = (uint64_t)(uintptr_t)trace_call_logger;
+    *lit = (uint64_t)(uintptr_t)logger_fn;
     i += 2;
     sc[i++] = 0x58FFFFC9u;                    /* ldr x9, [pc, #-8] -> logger addr */
     sc[i++] = 0xD63F0120u;                    /* blr x9 */
@@ -569,25 +586,23 @@ static void install_call_trace(void *target) {
         sc[i++] = tc_enc_ldr(r, 31, r * 8);   /* ldr xR, [sp, #R*8] */
     sc[i++] = 0x910403FFu;                    /* add sp, sp, #256 */
     uint32_t jb = branch_insn((char *)shim + (size_t)i * 4, tramp);
-    if (!jb) { fprintf(stderr, "[TRACE_CALL] shim->tramp OOR\n"); return; }
+    if (!jb) { fprintf(stderr, "[%s] shim->tramp OOR\n", tag); return; }
     sc[i++] = jb;
     __builtin___clear_cache(shim, (char *)shim + (size_t)i * 4);
     mprotect(shim, 4096, PROT_READ | PROT_EXEC);
 
     if (patch_branch(target, shim) == 0) {
-        fprintf(stderr, "[TRACE_CALL] installed at %p (tramp=%p shim=%p) logger=%p n_instr=%d\n",
-                target, tramp, shim, (void *)trace_call_logger, i);
-        fprintf(stderr, "[TRACE_CALL] tramp bytes:");
-        for (int k = 0; k < 8; k++) fprintf(stderr, " %08x", ((uint32_t *)tramp)[k]);
-        fprintf(stderr, "\n[TRACE_CALL] shim bytes:");
-        for (int k = 0; k < i; k++) fprintf(stderr, " %08x", sc[k]);
-        fprintf(stderr, "\n[TRACE_CALL] literal readback (as u64 at sc[21]): %016lx\n",
-                *(uint64_t *)&sc[21]);
-        fprintf(stderr, "[TRACE_CALL] target bytes: %08x (patched, should be far-branch or B)\n",
-                *(uint32_t *)target);
+        fprintf(stderr, "[%s] installed at %p (tramp=%p shim=%p) logger=%p n_instr=%d\n",
+                tag, target, tramp, shim, logger_fn, i);
     } else {
-        fprintf(stderr, "[TRACE_CALL] patch_branch FAILED at %p\n", target);
+        fprintf(stderr, "[%s] patch_branch FAILED at %p\n", tag, target);
     }
+}
+static void install_call_trace(void *target) {
+    install_call_trace_with(target, (void *)trace_call_logger, "TRACE_CALL");
+}
+static void install_ring_trace(void *target) {
+    install_call_trace_with(target, (void *)ring_logger, "TRACE_RING");
 }
 
 /* ELF_LOADER_TRACE_ENTRY=<hex_addr>: jako install_call_trace, ale pro
@@ -2661,6 +2676,22 @@ static int run_ownall(const char *path, int argc, char **argv, char **envp) {
             for (char *tok = strtok(buf, ","); tok; tok = strtok(NULL, ",")) {
                 unsigned long addr = strtoul(tok, NULL, 0);
                 if (addr) install_entry_trace((void *)addr);
+            }
+        }
+    }
+    /* ELF_LOADER_TRACE_RING=0xADDR[,...]: jako TRACE_CALL, ale bez souboroveho
+     * zapisu v hot path - ulozi x0-x2 do kruhoveho bufferu (viz ring_logger),
+     * vypis az z fault_handleru (elf_dispatch_ring_dump). Pro mista volana
+     * na kazdy bytecode (interpreter dispatch loop). */
+    {
+        const char *tr = getenv("ELF_LOADER_TRACE_RING");
+        if (tr && tr[0]) {
+            char buf[512];
+            strncpy(buf, tr, sizeof buf - 1);
+            buf[sizeof buf - 1] = '\0';
+            for (char *tok = strtok(buf, ","); tok; tok = strtok(NULL, ",")) {
+                unsigned long addr = strtoul(tok, NULL, 0);
+                if (addr) install_ring_trace((void *)addr);
             }
         }
     }

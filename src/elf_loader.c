@@ -3911,6 +3911,50 @@ static void fault_handler(int sig, siginfo_t *si, void *ctx) {
                 if (fv > 0x10000 && (fv & 1)) fault_obj_dump("SFIFIELD", fv, 8);
             }
         }
+
+        /* ELF_LOADER_TRACE_RING: posledni N zaznamu z kruhoveho bufferu
+         * (viz ring_logger/install_ring_trace v main.c) - pro hot-path
+         * mista (interpreter dispatch loop) volana na kazdy bytecode,
+         * kde souborovy log v realnem case neni prakticky. */
+        if (getenv("ELF_LOADER_TRACE_RING")) {
+            extern unsigned long g_dispatch_ring[][3];
+            extern int g_dispatch_ring_idx;
+            int n = g_dispatch_ring_idx;
+            int cap = 16; /* DISPATCH_RING_N v main.c */
+            int cnt = (n < cap) ? n : cap;
+            int start = (n < cap) ? 0 : (n % cap);
+            char rb[160]; const char *rp;
+            {
+                const char *hdr = "[RING] posledni ";
+                int ri = 0; rp = hdr; while (*rp) rb[ri++] = *rp++;
+                unsigned long cv = (unsigned long)cnt; char ct[8]; int cti = 0;
+                if (!cv) ct[cti++] = '0';
+                while (cv) { ct[cti++] = (char)('0' + (cv % 10)); cv /= 10; }
+                while (cti > 0) rb[ri++] = ct[--cti];
+                rp = " zaznamu (idx="; while (*rp) rb[ri++] = *rp++;
+                unsigned long nv = (unsigned long)n; char nt[12]; int nti = 0;
+                if (!nv) nt[nti++] = '0';
+                while (nv) { nt[nti++] = (char)('0' + (nv % 10)); nv /= 10; }
+                while (nti > 0) rb[ri++] = nt[--nti];
+                rp = "):\n"; while (*rp) rb[ri++] = *rp++;
+                sys_write(2, rb, (size_t)ri);
+            }
+            for (int k = 0; k < cnt; k++) {
+                int idx = (start + k) % cap;
+                char b2[160]; int i2 = 0;
+                const char *p2 = "[RING] x0="; while (*p2) b2[i2++] = *p2++;
+                unsigned long v = g_dispatch_ring[idx][0];
+                for (int sh = 60; sh >= 0; sh -= 4) b2[i2++] = hxd[(v >> sh) & 0xf];
+                p2 = " x1="; while (*p2) b2[i2++] = *p2++;
+                v = g_dispatch_ring[idx][1];
+                for (int sh = 60; sh >= 0; sh -= 4) b2[i2++] = hxd[(v >> sh) & 0xf];
+                p2 = " x2(target)="; while (*p2) b2[i2++] = *p2++;
+                v = g_dispatch_ring[idx][2];
+                for (int sh = 60; sh >= 0; sh -= 4) b2[i2++] = hxd[(v >> sh) & 0xf];
+                b2[i2++] = '\n';
+                sys_write(2, b2, (size_t)i2);
+            }
+        }
     }
 
     /* NEJDRIV chain na guest handler. Guest (glibc/V8) si instaluje vlastni
