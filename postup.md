@@ -1986,3 +1986,60 @@ ne nahoda.
   (predchozi verze s `finish`+`if/else` v `commands` bloku TICHO SELHALA
   po 1. hitu — `finish` v teto batch-rezimu kombinaci nespolehlivy,
   vyhybat se mu pro opakovane hity).
+
+## 2026-09-22 (pokracovani 13): dalsi pokusy o zachyceni cele bootstrap sekvence — negativni vysledek, poucenie
+
+### Pokus: PAUSE_ENTRY primo na zacatku `Isolate::Init` (0xe0671c)
+Cil: zachytit VSECHNY volani `TryAllocateAndInitializeEntry` od uplneho
+zacatku (drivejsi pokus s PAUSE_CALL na `v8::internal::Invoke` 0xde9854 je
+PRILIS POZDE — Isolate::Init uz v tu chvili davno dobehl, proto breakpoint
+na `0xe0ffa4` mel 0 zasahu — nejde o chybu loaderu, jen o spatne zvoleny
+bod pro tento konkretni test).
+
+**Vysledek: 30s zamrazeni PRIMO na prvni instrukci `Isolate::Init` zpusobilo
+JINY, umely pad** (uvnitr `Isolate::Init` samotne, na `0xe06748`, tesne za
+zacatkem, 0 zasahu na `TryAllocateAndInitializeEntry`). Pravdepodobne
+vysvetleni: V8 pouziva bekhroundova vlakna (compiler/GC) uz behem tak
+rane faze bootstrapu, a NEPRIROZENE zmrazeni hlavniho vlakna na 30s presne
+zde vytvari race/artefakt, ktery normalne nenastava (30s zamrazeni na
+POZDEJSICH bodech jako `Invoke` nezpusobovalo tento problem — bootstrap uz
+je tou dobou stabilizovany). **PAUSE_ENTRY/PAUSE_CALL mechanismus neni
+bezpecny pro velmi rane hookovaci body** — pro budouci pouziti preferovat
+TRACE_ENTRY/TRACE_RING (bez sleep) pro rane body, PAUSE_* jen pro pozdejsi,
+uz stabilizovane casti bootstrapu.
+
+Take vyzkouseno: `PAUSE_ENTRY=0x8898e8` (`_start` node binarky, uplne
+nejranejsi mozny bod) — proces skoncil BEZ VYSTUPU a bez zachytitelneho
+PID pro gdb attach (pravdepodobne podobny problem, nebo hook na tomto
+konkretnim miste neni kompatibilni s instrukcnim vzorem, ktery
+`install_entry_trace_with` ocekava).
+
+### Shrnuti relevantnich dat pro tuto vetev vyzkumu
+Nejsilnejsi a NEJSPOLEHLIVEJSI zjisteni zustava z pokracovani 12 (watch-
+based pristup, ktery NEPOTREBUJE rany freeze bod — cte uz hotovy stav az
+po dobehnuti Isolate::Init): **entry #4096 = `Builtins_ProxyRevoke`
+nativne (3/3 deterministicky), vs. dosud-nezkompilovana funkce (CompileLazy
+-> InterpreterEntryTrampoline pres `JSFunction::UpdateCodeImpl`) pod
+loaderem — SIGSEGV nasleduje okamzite.** Toto zustava nejsilnejsi, plne
+reprodukovatelny dukaz bez rizika artefaktu z predcasneho zamrazeni.
+
+### Doporuceni pro dalsi pokracovani (otevreno, nedokonceno)
+1. **Nejperspektivnejsi, ale nakladne**: V8/node debug build (DWARF
+   symboly) pres CI — umoznilo by primo pojmenovat KONKRETNI inlinovanou
+   funkci uvnitr `Isolate::Init`, ktera prochazi/pocita poradi teto
+   ~3352-prvkove hromadne inicializace, misto slepe disassembly.
+   Realisticky NAROCNE — V8 build z zdroje trva radove hodiny i s cache,
+   presahuje typicky rozsah existujici GitHub Actions smycky teto projekty
+   (ktera byla stavena pro elf_loader samotny, ne pro V8).
+2. Alternativa: zkusit najit KONEC teto ~3352-prvkove smycky uvnitr
+   `Isolate::Init` diassembly (mezi 0xe0671c a nasledujicim symbolem) a
+   hledat RUCNE viditelny CITAC/LOOP CONDITION, ktery by mohl odhalit
+   OD CEHO se pocet/poradi odvijí (napr. iterace nad FixedArray v RO-heapu,
+   jejiz delka/zacatek by mohla byt citliva na loader-specificky layout).
+3. Vyloucena tento sezeni: `--no-node-snapshot` (uz drive testovano,
+   nepomahaji — logicky: `Isolate::Init` je CISTE V8-urovnova bootstrap,
+   nezavisla na NODE VLASTNIM custom snapshotu, ktery tento flag vypina).
+
+Vsechny GDB skripty a nastroje z teto session (`/tmp/watch_entry4096_*.gdb`,
+`/tmp/trace_alloc_seq_*.gdb`, `/tmp/check_hit1_arg_*.gdb`) zustavaji funkcni
+a pripravene pro pristi pokracovani.
