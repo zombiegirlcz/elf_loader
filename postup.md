@@ -2043,3 +2043,91 @@ reprodukovatelny dukaz bez rizika artefaktu z predcasneho zamrazeni.
 Vsechny GDB skripty a nastroje z teto session (`/tmp/watch_entry4096_*.gdb`,
 `/tmp/trace_alloc_seq_*.gdb`, `/tmp/check_hit1_arg_*.gdb`) zustavaji funkcni
 a pripravene pro pristi pokracovani.
+
+## 2026-09-22 (pokracovani 14): NEJPRESNEJSI nalez zatim — konkretni 28-polozkova smycka a podezrely volany mechanismus
+
+### Rucni disassembly `Isolate::Init` (0xe0671c) — nalezena PRESNA smycka pro entry #4096
+Prvni volani `TryAllocateAndInitializeEntry` (return addr `0xe07888`, presne
+odpovida HIT1 ze vsech predchozich testu) pochazi z MALE, PEVNE 28-iteracni
+smycky (ne z hromadne ~3352-polozkove deserializace, jak jsem drive
+predpokladal — ta ma sve JINE volaci misto, `0xe08528`, druhy nalezeny
+call site v teto funkci, dosud neprozkoumano). Smycka (`e07848`-`e078a4`):
+
+```
+x26 = adresa staticke tabulky v .rodata (0x3e12140)   <- FIXNI, na disku
+x25 = isolate + 0xf340   (pole "flags/valid" pro kazdy index)
+x24 = 0xf540             (offset pro Space* arg)
+x20 = 0x10160             (offset pro Builtins* "this" arg)
+
+LOOP (x22 = byte offset, 0..0x70 krok 4, tedy 28 iteraci):
+  w1 = *(x26 + x22)                    // Builtin enum ID ze staticke tabulky
+  x0 = isolate + x20                   // Builtins* this
+  x0 = Builtins::code(x0, w1)          // ZISKEJ Code objekt pro tento builtin ID
+  if (code->flags & bit4) skip;        // preskoc "nedostupne" buildy
+  w2 = code->parameter_count (+87)
+  x3 = code                            // 3. arg TryAllocateAndInitializeEntry
+  x0 = isolate + 0x268                 // JSDispatchTable* this
+  x1 = isolate + x24                   // Space* (dispatch space pro builtiny)
+  TryAllocateAndInitializeEntry(this=JSDispatchTable@+0x268, space, paramcount, code)
+```
+
+**Prvni iterace (x22=0) cte `static_table[0]`.** Pro NASI padajici entry
+#4096 je to TEDY VYSLEDEK teto UPLNE PRVNI iterace.
+
+### KLICOVY test: .rodata staticka tabulka JE BAJTOVE IDENTICKA (loader == nativne)
+`objdump -s` z binarky na disku I runtime cteni pres GDB (na stejne
+virtualni adrese `0x3e12140`, break na `0x199a700` po nastaveni x26):
+```
+NATIVE: 000004ab 00000323 00000109 0000010a
+LOADER: 000004ab 00000323 00000109 0000010a   <- IDENTICKE
+```
+`static_table[0] = 0x4ab = 1195` (Builtin enum ID). **VYLUCUJE hypotezu o
+spatnem .rodata mapovani/segmentovani pod loaderem** — vstup do teto
+smycky je 100% stejny v obou bezich.
+
+### Zuzeny zaver — podezrely je PRIMO `Builtins::code(Builtin)`
+Protoze (a) vstupni ID je stejne, (b) smycka sama je staticky kompilovany,
+nemenny kod (stejna binarka), **jedine misto, kde se muze vysledek
+LISIT, je NAVRATOVA HODNOTA `Builtins::code(0x4ab)` samotna** (nm adresa
+`0xcf1d18`). Nativne tento builtin ID zjevne rozresi na `ProxyRevoke`
+(0x1ac1040, viz pokracovani 12). Pod loaderem konecny stav entry #4096 je
+`CompileLazy`/`InterpreterEntryTrampoline` — coz odpovida SPIS
+NEROZRESENEMU/PLACEHOLDER stavu nez platnemu builtinu. Hypoteza:
+`Builtins::code()` pod loaderem vraci pro STEJNY numericky ID JINY
+(spatny) Code objekt — mozny kandidat: `IsolateData::builtin_table_`
+(viz `isolate-data.h`, pole `Address builtin_table_[Builtins::kBuiltinCount]`)
+nebo primo embedded-blob offset tabulka, ktere `Builtins::code()` muze
+pouzivat k lookupu MISTO/PRED `InitializeIsolateDataTables` (ktery se
+vola AZ PO teto smycce, na `0xe078f0`!) — tzn. na TOMTO MISTE jeste
+`builtin_table_` NEMUSI byt vubec inicializovany a `Builtins::code()`
+tedy pouziva JINY, drivejsi mechanismus (pravdepodobne primo cteni z
+embedded blob metadata), ktery muze byt pod loaderem posunuty/spatny.
+
+### Dalsi krok (pripraveno, NEPROVEDENO — vyzaduje bud novy TRACE hook + rebuild, nebo rucni RE `Builtins::code`)
+Nejcistsi test: zalogovat x0 (navratovou hodnotu) PRESNE na `0xe0786c`
+(instrukce hned po `bl Builtins::code`) v obou bezich. **POZOR**: tohle
+misto je porad "brzo" v bootstrapu (uvnitr Isolate::Init) — PAUSE_ENTRY/
+PAUSE_CALL (s 30s nanosleep) na takhle ranem miste JIZ ZPUSOBILO umely
+pad (viz pokracovani 13, race s bekhroundovymi V8 thready). Pro tenhle
+konkretni test je tedy nutne bud (a) pouzit TRACE_ENTRY (bez sleep, jen
+log) MISTO PAUSE_ENTRY — ale soucasna `trace_entry_logger` v `src/main.c`
+loguje jen x1+x30 (hardcoded, radek 634-636), NE x0 — vyzaduje malou
+rozsirujici zmenu (novy logger varianta ulozit i x0) + rebuild pres
+GitHub Actions smycku ([[elf-loader-build-loop-github-actions]]); nebo
+(b) rucni disassembly `Builtins::code()` (`0xcf1d18`) a `IsolateData::
+builtin_table_`/embedded-blob-offset mechanismu, hledat KONKRETNI
+tabulku/vypocet, ktery by mohl byt loader-specificky spatny (napr.
+zavisly na `AT_SYSINFO_EHDR`/jinem auxv poli, ktere `elf_loader.c` NEPOSILA
+— viz `src/elf_loader.c:4719-4733`, chybi `AT_SYSINFO_EHDR`, `AT_PLATFORM`,
+`AT_CLKTCK` oproti standardnimu Linux auxv — nepravdepodobne prima
+pricina SIGSEGV, ale nebylo explicitne vyloucene).
+
+### Shrnuti pro navazujiciho reseitele (stav k 2026-09-22, konec session)
+Retezec pricin je nyni zuzeny na JEDNU KONKRETNI FUNKCI:
+**`v8::internal::Builtins::code(Builtin)` @ nm `0xcf1d18`** — vraci pro
+builtin ID `0x4ab` (1195) pod loaderem jiny/nespravny Code objekt nez
+nativne, pricemz VSECHNY vstupni podminky (staticka .rodata tabulka,
+volajici smycka, `Isolate::Init` struktura) jsou prokazatelne identicke.
+Tohle je nejuzsi bod celeho vysetrovani doposud — dalsi krok je bud
+rucni RE teto jedne funkce, nebo maly loader patch (novy TRACE_ENTRY
+varianta logujici x0) + CI rebuild pro primy empiricky dukaz.
