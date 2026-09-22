@@ -2269,3 +2269,36 @@ NEOPRAVUJE — to zustava OTEVRENE, viz pokracovani 14 pro dalsi kroky
 korektne provede, vystup je spravny, proces korektne skonci. Konkretne
 NAINSTALOVANA verze v26.8.2 (pres `nvm`) zustava blokovana samostatnym,
 hluboce zdokumentovanym V8-internim bugem.
+
+## pokračování 16: Bun (claude.exe) FUNGUJE — špatný l_addr v link_map
+
+Větev `dev`, commit `3001dd8`.
+
+### Příznak
+`claude.exe --version` (Bun 1.4.3, ET_EXEC, báze 0x200000) padal po 4 ms na
+`SIGSEGV si_addr=0x1C12F6978803FA`, pc=`0x31c0228`. Deterministicky, stejně
+i s `BUN_JSC_useJIT=0` → nesouvisí s JIT.
+
+### Diagnóza (čistě statická, bez GDB)
+1. Disassembly kolem pc: kód porovnává 16 bajtů s konstantami
+   `"\n---- Bun! ----\n"` = trailer přibaleného JS balíku.
+2. Balík je v ELF sekci `.bun` (vaddr `0x5660000`, uvnitř RW LOAD segmentu).
+   Na disku je v pořádku: prvních 8 B = délka `0x89f6864`, trailer přesně sedí.
+3. Adresa sekce se bere z proměnné `[0x54424a8]` (= `0x5660000`, bez relokace)
+   a přičítá se k ní hodnota z callbacku `dl_iterate_phdr` = `dlpi_addr`.
+4. Loader ve falešném glibc `link_map` (`ldso_install_exe_linkmap`,
+   `ldso_register_linkmap`) plnil `l_addr = base_addr` = adresa namapování
+   nejnižšího segmentu (`0x200000`), ne load bias (`base - min_vaddr` = 0).
+   Bun tedy četl délku o 2 MB vedle → divoký ukazatel.
+
+### Fix
+- `l_addr = base_addr - map_base_vaddr(obj)` pro exe i moduly.
+- Dedup/lookup link_map podle `l_map_start` místo `l_addr`.
+- Stejná chyba opravena v RELR relokacích (`l_addr` = bias).
+- Dopad i na `_dl_find_object` (`dlfo_addr`) a na node (ET_EXEC 0x400000);
+  node 22 po fixu dál funguje (42, teardown EXIT=134 jako dřív).
+
+### Výsledek
+`claude.exe --version` → `2.1.280 (Claude Code)`, EXIT=0. `--help` EXIT=0.
+Poznámka: `[MMAP]` log ukazuje, že Bun žádá 1 GB s hintem adresy a dostává
+jinou — neškodné, Bun hint nevyžaduje.

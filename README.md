@@ -140,11 +140,18 @@ způsoboval, že i tenhle neškodný `double free` skončil sekundárním SIGSEG
 místo čistého ukončení procesu. Detaily v `postup.md`, sekce
 "SKUTEČNÝ FIX — SIGABRT handler bug".
 
-**Bun (např. `claude` CLI z `@anthropic-ai/claude-code`, kompilovaný jako
-samostatná binárka) zatím nefunguje** — jiný JS engine (JavaScriptCore, ne
-V8), padá na jiném místě (SIGSEGV na divoké adrese, chaining na Bunův
-vlastní crash handler funguje správně, ale samotný běh ne). Ladění viz
-větev `dev`.
+**Bun funguje** (ověřeno na `claude` CLI z `@anthropic-ai/claude-code`,
+samostatná binárka Bun 1.4.3). `claude.exe --version` i `--help` proběhnou
+s kódem 0 (větev `dev`, commit `3001dd8`). Příčinou pádu byl špatný
+`l_addr` ve falešném `link_map`: loader hlásil adresu mapování místo load
+biasu, takže `dl_iterate_phdr` vracel u ET_EXEC nenulový `dlpi_addr`.
+Bun si tím posouval adresu sekce `.bun` s přibaleným JS a četl nesmysly.
+
+```sh
+elf_loader --ownall "$ROOTFS/root/claudetest/claude.exe" --version
+```
+
+Binárka musí ležet uvnitř Parrot rootfs, jinak loader nenajde `librt.so.1`.
 
 ## Magisk modul
 `magisk-module/` se instaluje do `/data/adb/modules/…`. Rootfs detekuje
