@@ -455,12 +455,9 @@ static int patch_branch(void *target, void *dst) {
  * pred timto volanim. `blr xN` je jedina instrukce bez PC-relativni zavislosti,
  * takze ji lze bezpecne zkopirovat do trampoliny beze zmeny. */
 static void trace_call_logger(unsigned long *regs) {
-    fprintf(stderr, "[TRACE_CALL] x0=%016lx x1=%016lx x2=%016lx x3=%016lx
-"
-                     "             x4=%016lx x5=%016lx x6=%016lx x7=%016lx
-"
-                     "             x8=%016lx x9=%016lx x10=%016lx x11=%016lx
-",
+    fprintf(stderr, "[TRACE_CALL] x0=%016lx x1=%016lx x2=%016lx x3=%016lx\n"
+                     "             x4=%016lx x5=%016lx x6=%016lx x7=%016lx\n"
+                     "             x8=%016lx x9=%016lx x10=%016lx x11=%016lx\n",
             regs[0], regs[1], regs[2], regs[3], regs[4], regs[5], regs[6],
             regs[7], regs[8], regs[9], regs[10], regs[11]);
     fflush(stderr);
@@ -475,26 +472,22 @@ static void install_call_trace(void *target) {
     uint32_t ins0 = *(const uint32_t *)target;
     /* BLR Xn kontrola: bity [31:10] = 1101011 0 001 11111 000000, Rn v [9:5]. */
     if ((ins0 & 0xFFFFFC1Fu) != 0xD63F0000u) {
-        fprintf(stderr, "[TRACE_CALL] %p: ins=%08x neni BLR Xn, preskakuji
-",
+        fprintf(stderr, "[TRACE_CALL] %p: ins=%08x neni BLR Xn, preskakuji\n",
                 target, ins0);
         return;
     }
     /* tramp: [puvodni BLR instrukce beze zmeny][skok zpet na target+4] */
     void *tramp = alloc_near(target);
-    if (tramp == MAP_FAILED) { fprintf(stderr, "[TRACE_CALL] alloc_near(tramp) FAIL
-"); return; }
+    if (tramp == MAP_FAILED) { fprintf(stderr, "[TRACE_CALL] alloc_near(tramp) FAIL\n"); return; }
     *(uint32_t *)tramp = ins0;
     uint32_t back = branch_insn((char *)tramp + 4, (char *)target + 4);
     if (back) {
         *(uint32_t *)((char *)tramp + 4) = back;
     } else {
         void *b = make_bridge((char *)target + 4);
-        if (!b) { fprintf(stderr, "[TRACE_CALL] make_bridge(back) FAIL
-"); return; }
+        if (!b) { fprintf(stderr, "[TRACE_CALL] make_bridge(back) FAIL\n"); return; }
         uint32_t b2 = branch_insn((char *)tramp + 4, b);
-        if (!b2) { fprintf(stderr, "[TRACE_CALL] tramp->back OOR
-"); return; }
+        if (!b2) { fprintf(stderr, "[TRACE_CALL] tramp->back OOR\n"); return; }
         *(uint32_t *)((char *)tramp + 4) = b2;
     }
     __builtin___clear_cache(tramp, (char *)tramp + 8);
@@ -504,8 +497,7 @@ static void install_call_trace(void *target) {
      * obnovi x0-x17, skoci na tramp. Zadna PC-relativni zavislost krome
      * literalu (ldr x9,[pc,#-8]), ktery je pred nim - vzdy v dosahu. */
     void *shim = alloc_near((char *)target + 64);
-    if (shim == MAP_FAILED) { fprintf(stderr, "[TRACE_CALL] alloc_near(shim) FAIL
-"); return; }
+    if (shim == MAP_FAILED) { fprintf(stderr, "[TRACE_CALL] alloc_near(shim) FAIL\n"); return; }
     uint32_t *sc = (uint32_t *)shim;
     int i = 0;
     sc[i++] = 0xD10403FFu;                    /* sub sp, sp, #256 (16-align, 144 potreba) */
@@ -522,19 +514,16 @@ static void install_call_trace(void *target) {
         sc[i++] = tc_enc_ldr(r, 31, r * 8);   /* ldr xR, [sp, #R*8] */
     sc[i++] = 0x910403FFu;                    /* add sp, sp, #256 */
     uint32_t jb = branch_insn((char *)shim + (size_t)i * 4, tramp);
-    if (!jb) { fprintf(stderr, "[TRACE_CALL] shim->tramp OOR
-"); return; }
+    if (!jb) { fprintf(stderr, "[TRACE_CALL] shim->tramp OOR\n"); return; }
     sc[i++] = jb;
     __builtin___clear_cache(shim, (char *)shim + (size_t)i * 4);
     mprotect(shim, 4096, PROT_READ | PROT_EXEC);
 
     if (patch_branch(target, shim) == 0)
-        fprintf(stderr, "[TRACE_CALL] installed at %p (tramp=%p shim=%p)
-",
+        fprintf(stderr, "[TRACE_CALL] installed at %p (tramp=%p shim=%p)\n",
                 target, tramp, shim);
     else
-        fprintf(stderr, "[TRACE_CALL] patch_branch FAILED at %p
-", target);
+        fprintf(stderr, "[TRACE_CALL] patch_branch FAILED at %p\n", target);
 }
 
 /* Nahradi prvni instrukci targetu vetvim na shim. Vytvori trampolinu orig,
@@ -2499,6 +2488,24 @@ static int run_ownall(const char *path, int argc, char **argv, char **envp) {
      * napr. OpenSSL ctor v node (staticky linkovany) -> zadny provider ->
      * CHECK(ncrypto::CSPRNG(nullptr,0)) assert. */
     elf_queue_module_inits(obj);
+
+    /* ELF_LOADER_TRACE_CALL=0xADDR[,0xADDR...]: nainstaluj call-site tracer
+     * (viz install_call_trace) na kazdou zadanou adresu. Diagnostika node
+     * SIGSEGV v Builtins_InterpreterEntryTrampoline - overuje, zda jsou
+     * argumenty do V8 JSEntry (x0-x5/x8) uz spatne PRED volanim generovaneho
+     * kodu, nebo se korupce deje az uvnitr. */
+    {
+        const char *tc = getenv("ELF_LOADER_TRACE_CALL");
+        if (tc && tc[0]) {
+            char buf[512];
+            strncpy(buf, tc, sizeof buf - 1);
+            buf[sizeof buf - 1] = '\0';
+            for (char *tok = strtok(buf, ","); tok; tok = strtok(NULL, ",")) {
+                unsigned long addr = strtoul(tok, NULL, 0);
+                if (addr) install_call_trace((void *)addr);
+            }
+        }
+    }
 
     g_exe_base = (uintptr_t)obj->base_addr;
     scope->exe = obj;   /* fallback pro symboly z hlavniho exe (PyExc_*, _PyRuntime) */
