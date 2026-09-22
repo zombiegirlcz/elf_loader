@@ -631,6 +631,69 @@ static void trace_entry_logger(unsigned long *regs) {
         shim_raw_syscall6(57, fd, 0, 0, 0, 0, 0);
     }
 }
+/* ELF_LOADER_PAUSE_ENTRY=<hex_addr>: jako install_entry_trace, ale logger
+ * navic zavola raw nanosleep(30s) skrz shim_raw_syscall6 (SYS_nanosleep=101
+ * na arm64). Ucel: "Debugger listening on ws://..." se vypise driv, nez
+ * node zavola prvni JS (bootstrap) - pad je ale bezprostredne poté a
+ * vnejsi TCP connect race (curl/dev-tcp) okno spolehlive netrefi (overeno,
+ * desitky tisic pokusu bez zasahu). Hookovanim VSTUPU do prvniho volani
+ * (napr. Builtins_JSEntryTrampoline pred JS bootstrapem) a vlozenim pevne
+ * pauzy se okno prodlouzi na desitky sekund - trepan-ni/websocket klient
+ * se pripoji BEZ zavodeni o cas. */
+static void trace_entry_pause_logger(unsigned long *regs) {
+    trace_entry_logger(regs);
+    struct { long tv_sec; long tv_nsec; } ts = { 30, 0 };
+    shim_raw_syscall6(101 /* nanosleep */, (long)(unsigned long)&ts, 0, 0, 0, 0, 0);
+}
+static void install_entry_trace_with(void *target, void *logger_fn, const char *tag) {
+    uint32_t ins0 = *(const uint32_t *)target;
+    void *tramp = alloc_near(target);
+    if (tramp == MAP_FAILED) { fprintf(stderr, "[%s] alloc_near(tramp) FAIL\n", tag); return; }
+    *(uint32_t *)tramp = ins0;
+    uint32_t back = branch_insn((char *)tramp + 4, (char *)target + 4);
+    if (back) {
+        *(uint32_t *)((char *)tramp + 4) = back;
+    } else {
+        void *bb = make_bridge((char *)target + 4);
+        if (!bb) { fprintf(stderr, "[%s] make_bridge FAIL\n", tag); return; }
+        uint32_t b2 = branch_insn((char *)tramp + 4, bb);
+        if (!b2) { fprintf(stderr, "[%s] tramp->back OOR\n", tag); return; }
+        *(uint32_t *)((char *)tramp + 4) = b2;
+    }
+    __builtin___clear_cache(tramp, (char *)tramp + 8);
+    mprotect(tramp, 4096, PROT_READ | PROT_EXEC);
+
+    void *shim = alloc_near((char *)target + 64);
+    if (shim == MAP_FAILED) { fprintf(stderr, "[%s] alloc_near(shim) FAIL\n", tag); return; }
+    uint32_t *sc = (uint32_t *)shim;
+    int i = 0;
+    sc[i++] = 0xD10083FFu;                    /* sub sp, sp, #32 */
+    sc[i++] = tc_enc_str(1, 31, 0);           /* str x1, [sp, #0]  (ulozit JSFunction) */
+    sc[i++] = tc_enc_str(30, 31, 8);          /* str x30,[sp, #8]  (ulozit LR) */
+    sc[i++] = 0x910003E0u;                    /* mov x0, sp (arg logger = &[x1,x30]) */
+    sc[i++] = 0x14000003u;                    /* b +12 (preskoc literal) */
+    uint64_t *lit = (uint64_t *)&sc[i];
+    *lit = (uint64_t)(uintptr_t)logger_fn;
+    i += 2;
+    sc[i++] = 0x58FFFFC9u;                    /* ldr x9, [pc, #-8] */
+    sc[i++] = 0xD63F0120u;                    /* blr x9 */
+    sc[i++] = tc_enc_ldr(30, 31, 8);          /* ldr x30,[sp, #8]  (obnov PUVODNI LR) */
+    sc[i++] = tc_enc_ldr(1, 31, 0);           /* ldr x1, [sp, #0]  (obnov PUVODNI x1) */
+    sc[i++] = 0x910083FFu;                    /* add sp, sp, #32 */
+    uint32_t jb = branch_insn((char *)shim + (size_t)i * 4, tramp);
+    if (!jb) { fprintf(stderr, "[%s] shim->tramp OOR\n", tag); return; }
+    sc[i++] = jb;
+    __builtin___clear_cache(shim, (char *)shim + (size_t)i * 4);
+    mprotect(shim, 4096, PROT_READ | PROT_EXEC);
+
+    if (patch_branch(target, shim) == 0)
+        fprintf(stderr, "[%s] installed at %p (tramp=%p shim=%p)\n", tag, target, tramp, shim);
+    else
+        fprintf(stderr, "[%s] patch_branch FAILED at %p\n", tag, target);
+}
+static void install_pause_entry_trace(void *target) {
+    install_entry_trace_with(target, (void *)trace_entry_pause_logger, "PAUSE_ENTRY");
+}
 static void install_entry_trace(void *target) {
     uint32_t ins0 = *(const uint32_t *)target;
     void *tramp = alloc_near(target);
@@ -2790,6 +2853,22 @@ static int run_ownall(const char *path, int argc, char **argv, char **envp) {
             for (char *tok = strtok(buf, ","); tok; tok = strtok(NULL, ",")) {
                 unsigned long addr = strtoul(tok, NULL, 0);
                 if (addr) install_ring_trace((void *)addr);
+            }
+        }
+    }
+    /* ELF_LOADER_PAUSE_ENTRY=0xADDR[,...]: jako TRACE_ENTRY, ale navic uspi
+     * bezi vlakno na 30s (viz install_pause_entry_trace/trace_entry_pause_
+     * logger) - okno pro pripojeni externiho debuggeru (trepan-ni pres
+     * --inspect-brk) bez zavodeni o cas. */
+    {
+        const char *pe = getenv("ELF_LOADER_PAUSE_ENTRY");
+        if (pe && pe[0]) {
+            char buf[512];
+            strncpy(buf, pe, sizeof buf - 1);
+            buf[sizeof buf - 1] = '\0';
+            for (char *tok = strtok(buf, ","); tok; tok = strtok(NULL, ",")) {
+                unsigned long addr = strtoul(tok, NULL, 0);
+                if (addr) install_pause_entry_trace((void *)addr);
             }
         }
     }
