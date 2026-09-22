@@ -1740,3 +1740,78 @@ mista, kde V8 alokuje JIT code stranky (`mmap`/`mprotect` s PROT_EXEC) a
 porovnat chovani/navratove hodnoty loader vs. nativne, nebo zkusit najit
 V8 log/trace flag (`--trace-opt`, `--print-code`) k potvrzeni, ze
 kompilace vubec probiha/neprobiha.
+
+## 2026-09-22 (pokracovani 10): --always-sparkplug odhaluje PRAVDEPODOBNY skutecny root cause
+
+### Test podle zadani: --always-sparkplug + --trace-baseline
+```
+ELF_LOADER... $L --ownall $N --always-sparkplug --trace-baseline -e "console.log(42)"
+```
+Vysledek (KOMPLETNE JINY nez bez teto flagy):
+```
+[compiling method 0x001d95a54611 <SharedFunctionInfo> (target BASELINE)]
+[completed compiling 0x001d95a54611 <SharedFunctionInfo> (target BASELINE) - took 0.142 ms]
+[compiling method 0x001d95a54739 <SharedFunctionInfo> (target BASELINE)]
+[completed compiling 0x001d95a54739 <SharedFunctionInfo> (target BASELINE) - took 0.230 ms]
+
+# Fatal error in , line 0
+# Check failed: IsCompatibleCode(new_code, GetParameterCount(handle)).
+```
+**Sparkplug KOMPILUJE USPESNE** (2 metody, zadny problem s W^X/RWX
+strankami ani ICache) — to VYVRACI puvodni hypotezu "loader brani JIT
+alokacim". Pad je jinde: **V8-interni SBXCHECK v JSDispatchTable
+(`SetCodeAndEntrypointNoWriteBarrier`)** selze pri POKUSU O INSTALACI
+nove zkompilovaneho Sparkplug kodu do existujiciho dispatch-table
+zaznamu.
+
+### V8 zdrojovy kod (`src/sandbox/js-dispatch-table-inl.h`, stazeno pro
+node v26.8.2) — presny vyznam kontroly
+`IsCompatibleCode(code, parameter_count)`:
+- Projde, pokud `code->parameter_count() == parameter_count` (STORED v
+  tabulce) — normalni pripad.
+- Projde i pri neshode, ALE JEN pro "trampoline"-style kod
+  (`Builtins::IsJSTrampoline`, komentar VYSLOVNE zminuje
+  **`InterpreterEntryTrampoline`** a `CompileLazy` jako priklady) —
+  tyto builtiny urcuji skutecny parameter count az za behu.
+- **JINAK SELZE** (SBXCHECK = fatal, ne DCHECK) — presne nas pripad:
+  Sparkplug-zkompilovany kod (NENI trampoline) ma jiny parameter_count
+  nez to, co je ULOZENE v dispatch-table zaznamu pro dany handle.
+
+### Sladeni se vsemi predchozimi nalezy (nova, silnejsi hypoteza)
+1. Nase drivejsi zjisteni ("nativne 0 vstupu do InterpreterEntryTrampoline
+   pro trivialni skript, pod loaderem 3") ted davá jeste vetsi smysl:
+   nativne V8 SNAPSHOT jiz obsahuje PRE-ZKOMPILOVANY (embedded builtins/
+   baseline) kod pro bootstrap funkce — zadna runtime kompilace ani
+   interpretace neni potreba. **Pod loaderem tyto SFI/dispatch-handle
+   zaznamy neodkazuji na spravny pre-kompilovany kod ze snapshotu, ale
+   padaji zpet na InterpreterEntryTrampoline** (generic "not yet
+   compiled" stav) — a protoze prislusna SFI NEMA bytecode (byla urcena
+   JEN pro pre-kompilovany kod, nikdy pro interpretaci), pad nastane
+   presne tak, jak jsme zdokumentovali (`sturh wzr,[x5,#67]` na SFI v
+   read-only pameti).
+2. `--always-sparkplug` tohle jen ODHALI JINAK: misto "tise" spadnout na
+   InterpreterEntryTrampoline (ktery je vyjimka z kontroly parametru),
+   force-kompilace VYTVORI SKUTECNY kod se SKUTECNYM parameter_count,
+   ktery narazi na SBXCHECK, protoze dispatch-table zaznam MA ULOZENOU
+   JINOU (spatnou) hodnotu parameter_count.
+3. Zaver: **problem neni "V8 nemuze JIT-kompilovat pod loaderem"** (to je
+   vyvraceno — kompiluje uspesne), ale **"JSDispatchTable zaznamy
+   (code pointer A/NEBO parameter_count) nejsou pod loaderem spravne
+   inicializovany/synchronizovane se snapshotem"** — pravdepodobne
+   souvisi s tim, JAK/KDE loader mapuje/relokuje JSDispatchTable pamet
+   (samostatny "sandbox" region, MOZNA jiny nez RO-heap region, ktery uz
+   byl drive overen jako byte-identicky).
+
+### Dalsi krok (nedokonceno, jasny smer)
+- Najit, KDE/JAK se JSDispatchTable alokuje a inicializuje pri snapshot
+  deserializaci (`src/sandbox/js-dispatch-table.cc`,
+  `Isolate::InitializeIsolateDataObjects` / snapshot deserializer) —
+  hledat konkretni `mmap`/pamet'ovou operaci, kterou loader muze
+  zpracovavat jinak nez nativni exec.
+- Porovnat SUROVE BAJTY JSDispatchTable regionu (ne jen SFI/RO-heap)
+  mezi loaderem a nativnim behem na stejnem relativnim offsetu — presne
+  ten test, ktery uz drive fungoval pro RO-heap (vysel identicky) a
+  odhalil by, jestli je table region JIZ SPATNY pri deserializaci, nebo
+  se kazi az POZDEJI (runtime update).
+- Zjistit přesnou adresu `[x26,#360]` rootu (JSDispatchTable base v
+  IsolateData) a sledovat VŠECHNY zapisy do ni/skrz ni behem startupu.
