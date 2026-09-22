@@ -1437,3 +1437,100 @@ diagnostikou v rozumnem case. Vsechny pripravene nastroje
 (`ELF_LOADER_TRACE_CALL/ENTRY/RING/STRROOT`) zustavaji funkcni a
 pripravene, kdyby se nasel pristup k V8 build s debug symboly nebo
 gdbserver pro toto zarizeni.
+
+## 2026-09-22 (pokracovani 6): trepan-ni jako debugger — infra hotova, blokuje rozbity inspector
+
+### Cil
+Na uzivatelsky pozadavek vyzkouset `trepan-ni` (nainstalovan `npm install -g
+trepan-ni`, `/root/.nvm/versions/node/v26.8.1/bin/trepan-ni`) jako externi
+JS-level debugger pripojeny pres `--inspect-brk` k node bezicimu pod
+loaderem — cil obejit limit "zadny gdb s V8 debug symboly".
+
+### Nova infrastruktura: ELF_LOADER_PAUSE_ENTRY / ELF_LOADER_PAUSE_CALL
+Rozsireni `install_entry_trace`/`install_call_trace_with` o variantu, ktera
+navic zavola raw `nanosleep(30s)` (SYS_nanosleep=101, `shim_raw_syscall6`)
+pred provedenim puvodni instrukce — hooknuty bod se "zamrazi" na 30s, aby
+mel externi debugger cas se pripojit bez zavodeni o cas (viz `src/main.c`,
+`trace_entry_pause_logger`/`install_pause_entry_trace`,
+`trace_call_pause_logger`/`install_pause_call_trace`). Obe varianty
+OVERENY funkcni samostatne (bez `--inspect-brk`):
+- `ELF_LOADER_PAUSE_ENTRY=0x199d440` (Builtins_InterpreterEntryTrampoline
+  entry) → 3 zastaveni × 30s = 90s celkem, presne odpovida znamym 3 vstupum.
+- `ELF_LOADER_PAUSE_CALL=0xde9854` (`v8::internal::Invoke`→JSEntryTrampoline
+  callsite) → 1 zastaveni × 30s, spolehlive, PRED bootstrap JS.
+
+**DULEZITE zjisteni**: `PAUSE_ENTRY=0x199d440` v kombinaci s
+`--inspect-brk` VUBEC NEFIRUJE (0 novych logu, proces spadne za <10s misto
+90s) — pod debug rezimem jde bytecode/interpreter evidentne jinou cestou.
+`PAUSE_CALL=0xde9854` (drivejsi, C++→JS hranice) funguje spolehlive i s
+`--inspect-brk` — pouzitelny hook bod nezavisly na debug-mode detailech.
+
+### TCP race na inspector port — nespolehlivy, ale NENI to namespace/permission problem
+- Prvni testy (curl smycka, `/dev/tcp` smycka) — desitky tisic pokusu,
+  0 zasahu. Duvod z casti: **default shell teto session je zsh**, ne bash
+  (`/dev/tcp/...` v zsh bez `zmodload zsh/net/tcp` selze s "no such file or
+  directory", ne "connection refused" — cast pokusu byla od zacatku
+  nefunkcni, ne jen pomala).
+- **Overeno**: `/root` shell (tato session) sdili net namespace se skutecnym
+  Android hostem (`readlink /proc/self/ns/net` = `net:[4026531935]`, default
+  init ns) — curl z tohoto shellu dostava skutecne `ECONNREFUSED`, ne
+  namespace-izolovane ticho. `su 0 -c` **z teto session selhava** ("user 0
+  does not exist"), ale **funguje z `ashell -c` kontextu** (uid 10323 →
+  `su 0 -c` → skutecny Magisk root, `context=u:r:magisk:s0`). `su 2000 -c
+  "cat /proc/net/tcp"` z ashell funguje a ukazuje CELOSYSTEMOVE sockety
+  (potvrzuje jednu sdilenou netns pro cely device).
+- **Bonus zjisteni z su 0 pristupu**: `/system/bin/strace` EXISTUJE na
+  tomto zarizeni (skutecny root) — nebyl drive vyzkousen, moznost pro
+  budouci diagnostiku bez gdb. `gdb`/`gdbserver` NENALEZENY nikde
+  (Android system ani Parrot rootfs).
+
+### S PAUSE_CALL: TCP connect USPESNY, ale HTTP/WS vrstva NEODPOVIDA
+Kdyz je proces zamrazeny (`ELF_LOADER_PAUSE_CALL=0xde9854` + `--inspect-brk`),
+`curl http://127.0.0.1:9229/json/version` **se pripoji** ("Connected to
+127.0.0.1 port 9229"), ale dostane **"Empty reply from server" OKAMZITE**
+(ne az po 30s pauze) → `curl: (52)`. `trepan-ni 127.0.0.1:9229` selze
+identicky ("failed to connect, please retry" po ~12 pokusech).
+
+**Interpretace**: TCP handshake uspeje na urovni kernelu (listen() backlog),
+ale **inspector agent samotny spojeni okamzite zavre bez odpovedi** — jeho
+vlastni I/O zpracovani (typicky bezi na samostatnem vlakne, nezavisle na
+hlavnim JS vlakne, aby DevTools fungoval i behem pauzy) je pod loaderem
+NEFUNKCNI. To NENI dusledek naseho umeleho nanosleep-hooku (ten blokuje jen
+volajici/hlavni vlakno) — jde o samostatnou chybu v inspector agentovi.
+
+**Toto pravdepodobne vysvetluje i drivejsi pozorovani** (viz predchozi
+zaznamy), ze `--inspect-brk`'s vestavene "cekej na pripojeni debuggeru"
+NIKDY skutecne neblokuje pod nasim loaderem (proces pokracuje a spadne
+temer okamzite po vypsani "Debugger listening...") — jde pravdepodobne o
+STEJNY rozbity synchronizacni/vlaknovy mechanismus (inspector I/O vlakno
+vytvorene pres `pthread_create`, ktery loader prepisuje/hookuje).
+
+### NOVY crash signature pod --inspect-brk: presna shoda se starou "CODE_CACHE" stopou
+S `PAUSE_CALL` + `--inspect-brk` pada proces **na POZADIOVEM vlakne**
+(vytvoreno pres `__clone`, ne hlavni vlakno), `si_addr=0x43` (ASCII 'C'),
+`pc=0xb96c58`. `0x43` = presne hodnota znaku `'C'` — **IDENTICKA stopa**
+jako drive zdokumentovany bug (`node::ToLower<std::string>+0xb0` volany z
+`EnabledDebugList::Parse` s `NODE_DEBUG_NATIVE=CODE_CACHE`, viz zaznam z
+"2026-09-22: node pod loaderem — diagnostika"). Inspector agent
+pravdepodobne pri startu parsuje vlastni seznam kategorii/enable-list
+stejnym mechanismem a naravi na stejny bug — **znak pouzity jako pointer**,
+tedy zrejme spatne navazany/ABI-nekompatibilni import nejake `ToLower`-like
+funkce v hlavnim programu. Toto je SAMOSTATNY, uzsi a pravdepodobne
+snadneji opravitelny bug NEZ getOffsetNanosecondsFor, a jeho oprava by
+MOZNA zpristupnila funkcni inspector (a tim i trepan-ni/DevTools debugging
+pro VSECHNY budouci node problemy, ne jen tento jeden pad).
+
+### Zaver a doporuceni pro pokracovani
+`trepan-ni` NELZE aktualne pripojit — ne kvuli casovani/race, ale protoze
+node inspector agent je pod loaderem sam o sobe nefunkcni (pravdepodobne
+vlaknovy/pthread problem). Dva ruzne, oba potvrzene reprodukovatelne bugy:
+1. **getOffsetNanosecondsFor** (hlavni vlakno, puvodni cil vysetrovani).
+2. **`ToLower`+char-as-pointer @0x43** (nyni potvrzeno i mimo
+   `NODE_DEBUG_NATIVE`, i pod `--inspect-brk`, na POZADIOVEM vlakne) —
+   NOVY, uzsi kandidat k opravě, ktery by mohl odemknout funkcni inspector.
+
+Nastroje pripravene pro pokracovani (vsechny commitnute, overene funkcni):
+`ELF_LOADER_TRACE_CALL/ENTRY/RING/STRROOT/PAUSE_ENTRY/PAUSE_CALL`. Dale
+dostupny `/system/bin/strace` na zarizeni (skutecny root, `su 0 -c` z
+`ashell` kontextu) — dosud nevyuzity, muze pomoct pri diagnostice bugu #2
+(vlaknovy crash) bez nutnosti gdb.
