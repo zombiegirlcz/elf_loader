@@ -1009,11 +1009,15 @@ s libtinfo.so.6.5 (SONAME match splní DT_NEEDED). Rozbité symlinky EPERM trvaj
 - Nova smycka: `git push` -> `gh run watch <id>` -> `gh run download <id>
   -n elf_loader_ndk -D /tmp/ndkart` -> kontrola `readelf -l` (interpreter
   musi byt `/system/bin/linker64`) -> deploy -> `ashell -c`.
-- **`files/` v repu UZ NENI bind-mount na device** (SKILL.md je v tomto bode
-  zastaraly). Funkcni kanal: `/data/user/0/com.linux_core/files/tmp/` je
-  zapisovatelny z prootu i viditelny na device, takze
-  `cp bin $D/tmp/elf_loader.new` + `ashell -c 'cp $D/tmp/elf_loader.new
-  $D/usr/bin/elf_loader'`. Zadne base64 chunkovani neni potreba.
+- **Spravny bind je `/mnt/app`** = `/data/user/0/com.linux_core` (cely app
+  data dir). Deploy je tedy prosty `cp` z prootu:
+  `cp -f /tmp/ndkart/elf_loader_ndk /mnt/app/files/usr/bin/elf_loader.new`
+  + `mv` (prepis bezici binarky pada na "Text file busy"). Zadny ashell,
+  zadne base64 chunkovani. Rootfs = `/mnt/app/files/nh/distro/parrot`,
+  sdcard = `/mnt/sdcard`.
+  `files/` v repu bind-mount NENI (SKILL.md je v tomto bode zastaraly).
+- Cely krok build+deploy dela `tools/gh_build_deploy.sh` (ceka na run pro
+  HEAD, stahne artefakt, overi AArch64 + `/system/bin/linker64`, nasadi).
 - ashell limit 1024 znaku se obchazi tak, ze se testovaci skript zapise z
   prootu do `$D/tmp/t.sh` a pres ashell se jen spusti s presmerovanim do
   souboru. POZOR: stdout je pri presmerovani plne bufferovany -> testy musi
