@@ -445,6 +445,98 @@ static int patch_branch(void *target, void *dst) {
     mprotect((void *)pg, 4096, PROT_READ | PROT_EXEC);
     return 0;
 }
+/* ELF_LOADER_TRACE_CALL=<hex_addr>: genericky "call-site" tracer. Patchuje
+ * PRESNE JEDNU instrukci `blr xN` na danem miste (napr. volani Builtins_JSEntry
+ * z v8::internal::Invoke) tak, aby se pred jejim provedenim zalogovaly
+ * registry x0-x17, a pak se instrukce provede BEZE ZMENY (trampolina).
+ * Cil: zjistit, zda jsou argumenty predavane do V8 JSEntry (x0-x5 dle V8 ABI,
+ * x8 = cilova adresa) spravne UZ NA VSTUPU do generovaneho kodu, nebo je
+ * korupce/spatna hodnota pritomna uz na C++ strane (Invoke/Execution::Call)
+ * pred timto volanim. `blr xN` je jedina instrukce bez PC-relativni zavislosti,
+ * takze ji lze bezpecne zkopirovat do trampoliny beze zmeny. */
+static void trace_call_logger(unsigned long *regs) {
+    fprintf(stderr, "[TRACE_CALL] x0=%016lx x1=%016lx x2=%016lx x3=%016lx
+"
+                     "             x4=%016lx x5=%016lx x6=%016lx x7=%016lx
+"
+                     "             x8=%016lx x9=%016lx x10=%016lx x11=%016lx
+",
+            regs[0], regs[1], regs[2], regs[3], regs[4], regs[5], regs[6],
+            regs[7], regs[8], regs[9], regs[10], regs[11]);
+    fflush(stderr);
+}
+static uint32_t tc_enc_str(int rt, int rn, int off) {
+    return 0xF9000000u | (((uint32_t)(off / 8)) << 10) | ((uint32_t)rn << 5) | (uint32_t)rt;
+}
+static uint32_t tc_enc_ldr(int rt, int rn, int off) {
+    return 0xF9400000u | (((uint32_t)(off / 8)) << 10) | ((uint32_t)rn << 5) | (uint32_t)rt;
+}
+static void install_call_trace(void *target) {
+    uint32_t ins0 = *(const uint32_t *)target;
+    /* BLR Xn kontrola: bity [31:10] = 1101011 0 001 11111 000000, Rn v [9:5]. */
+    if ((ins0 & 0xFFFFFC1Fu) != 0xD63F0000u) {
+        fprintf(stderr, "[TRACE_CALL] %p: ins=%08x neni BLR Xn, preskakuji
+",
+                target, ins0);
+        return;
+    }
+    /* tramp: [puvodni BLR instrukce beze zmeny][skok zpet na target+4] */
+    void *tramp = alloc_near(target);
+    if (tramp == MAP_FAILED) { fprintf(stderr, "[TRACE_CALL] alloc_near(tramp) FAIL
+"); return; }
+    *(uint32_t *)tramp = ins0;
+    uint32_t back = branch_insn((char *)tramp + 4, (char *)target + 4);
+    if (back) {
+        *(uint32_t *)((char *)tramp + 4) = back;
+    } else {
+        void *b = make_bridge((char *)target + 4);
+        if (!b) { fprintf(stderr, "[TRACE_CALL] make_bridge(back) FAIL
+"); return; }
+        uint32_t b2 = branch_insn((char *)tramp + 4, b);
+        if (!b2) { fprintf(stderr, "[TRACE_CALL] tramp->back OOR
+"); return; }
+        *(uint32_t *)((char *)tramp + 4) = b2;
+    }
+    __builtin___clear_cache(tramp, (char *)tramp + 8);
+    mprotect(tramp, 4096, PROT_READ | PROT_EXEC);
+
+    /* shim: ulozi x0-x17 (18 regs, 144 B) na stack, zavola logger(sp),
+     * obnovi x0-x17, skoci na tramp. Zadna PC-relativni zavislost krome
+     * literalu (ldr x9,[pc,#-8]), ktery je pred nim - vzdy v dosahu. */
+    void *shim = alloc_near((char *)target + 64);
+    if (shim == MAP_FAILED) { fprintf(stderr, "[TRACE_CALL] alloc_near(shim) FAIL
+"); return; }
+    uint32_t *sc = (uint32_t *)shim;
+    int i = 0;
+    sc[i++] = 0xD10403FFu;                    /* sub sp, sp, #256 (16-align, 144 potreba) */
+    for (int r = 0; r <= 17; r++)
+        sc[i++] = tc_enc_str(r, 31, r * 8);   /* str xR, [sp, #R*8] */
+    sc[i++] = 0x910003E0u;                    /* mov x0, sp (arg logger) */
+    /* literal (8 B) pred ldr, ldr cte [pc,#-8] */
+    uint64_t *lit = (uint64_t *)&sc[i];
+    *lit = (uint64_t)(uintptr_t)trace_call_logger;
+    i += 2;
+    sc[i++] = 0x58FFFFC9u;                    /* ldr x9, [pc, #-8] -> logger addr */
+    sc[i++] = 0xD63F0120u;                    /* blr x9 */
+    for (int r = 0; r <= 17; r++)
+        sc[i++] = tc_enc_ldr(r, 31, r * 8);   /* ldr xR, [sp, #R*8] */
+    sc[i++] = 0x910403FFu;                    /* add sp, sp, #256 */
+    uint32_t jb = branch_insn((char *)shim + (size_t)i * 4, tramp);
+    if (!jb) { fprintf(stderr, "[TRACE_CALL] shim->tramp OOR
+"); return; }
+    sc[i++] = jb;
+    __builtin___clear_cache(shim, (char *)shim + (size_t)i * 4);
+    mprotect(shim, 4096, PROT_READ | PROT_EXEC);
+
+    if (patch_branch(target, shim) == 0)
+        fprintf(stderr, "[TRACE_CALL] installed at %p (tramp=%p shim=%p)
+",
+                target, tramp, shim);
+    else
+        fprintf(stderr, "[TRACE_CALL] patch_branch FAILED at %p
+", target);
+}
+
 /* Nahradi prvni instrukci targetu vetvim na shim. Vytvori trampolinu orig,
  * ktera zavola realni glibc funkci (puvodni prolog + navrat, nebo nasledovani
  * B-thunku na realni impl). Vraci 0, pokud nelze (PC-relativni prolog). */
