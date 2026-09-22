@@ -1253,3 +1253,60 @@ problemy v nestandardnich pamet'ovych spravach (jako je nase own-loading).
 - Vsechny tri sdileji `install_call_trace_with()` — bit-presne overena
   shim/tramp mechanika (viz predchozi zaznam), zadne dalsi rucni
   strojove kody potreba pro novou adresu.
+
+## 2026-09-22 (pokracovani 3): vyloucene hypotezy — IC/feedback, CompileLazy, verze node
+
+### Dalsi testy (vsechny NEGATIVNI — pad se nezmeni)
+- `--no-use-ic` (vypnuti inline cache) — stejny pad
+- `--no-lazy-feedback-allocation` — stejny pad
+- oba soucasne — stejny pad
+- **node v26.8.1 misto v26.8.2** (uplne jina verze V8/node v rootfs) —
+  **IDENTICKY pad, IDENTICKA funkce** (`getOffsetNanosecondsFor`). Bug tedy
+  NENI vazany na konkretni V8/node verzi.
+
+### KLICOVE zjisteni: `Builtins_CompileLazy` se NEVOLA pro padajici funkci
+Soucasny hook na `Builtins_InterpreterEntryTrampoline` (0x199d440) I
+`Builtins_CompileLazy` (0x199e720, ma STEJNY vzor `ldur xN,[x1,#31]` jako
+InterpreterEntryTrampoline — take cte SFI z JSFunction, take hookovatelne
+pres TRACE_ENTRY) ukazal:
+```
+1. CompileLazy   x1=A caller=JSEntryTrampoline   <- top-level script (nema bytecode zkompilovany)
+2. InterpEntry   x1=A caller=JSEntryTrampoline   <- CompileLazy TAIL-DISPATCHUJE (LR nezmenen)
+3. InterpEntry   x1=B caller=dispatch-loop        <- call#2, BEZ predchoziho CompileLazy
+4. InterpEntry   x1=C caller=dispatch-loop        <- call#3 (PAD), BEZ predchoziho CompileLazy
+```
+Funkce B a C (vc. padajici C=`getOffsetNanosecondsFor`) NIKDY neprojdou
+`CompileLazy` — jejich `JSFunction.code` pole UZ OD VYTVORENI objektu
+ukazuje primo na `InterpreterEntryTrampoline`, ne pres runtime redirect,
+ktery by selhal. Bug tedy NENI "CompileLazy spatne presmerovava", ale
+**"pri LAZY INSTANCIACI JSFunction z SFI (pravdepodobne behem pristupu k
+vlastnosti/property, viz prvni bytecode call#2 = GetNamedPropertyHandler)
+se `code` pole inicializuje na InterpreterEntryTrampoline MISTO na
+skutecny nativni builtin entry point"**.
+
+### Shrnuti vyloucenych hypotez (kumulativne, cely den)
+RO-heap seal, V8 snapshot deserializace, V8 flagy (jitless/single-threaded/
+predictable/no-opt/no-node-snapshot/no-lazy), memcpy/memmove/strlen/IFUNC,
+TLS aliasing (__thread/errno), glibc ctype init, libstdc++ std::locale
+facet (`use_facet<ctype<char>>`), relokace hlavniho exe (ET_EXEC, BIND_NOW,
+836 relokaci), duplicitni nahrani libc, Temporal-specificnost
+(`--no-harmony-temporal`), IC/feedback vector (`--no-use-ic`,
+`--no-lazy-feedback-allocation`), CompileLazy redirect, verze node
+(v26.8.1 vs v26.8.2) — VSECHNY vyvraceny/vyloucene.
+
+### Otevreno pro dalsiho reseitele
+Bug je nyni zuzen na: **mechanismus, ktery pri prvnim pristupu k builtin
+"accessor" property (pravdepodobne behem property-load bytecode handleru,
+GetNamedPropertyHandler) vytvari novy JSFunction ze sdilene SharedFunctionInfo
+a nastavuje jeho `code` pole — pod nasim loaderem toto pole dostane spatnou
+hodnotu (InterpreterEntryTrampoline misto skutecneho nativniho builtin
+entry)**. Bez V8 source (matchujici verzi, v idealne s debug symboly) nelze
+z pouheho disassembly jednoznacne identifikovat KONKRETNI V8 funkci/pole
+zodpovedne za tento krok (kandidati z V8 zdrojoveho kodu, NEOVERENO:
+`Factory::JSFunctionBuilder::Build`, `JSFunction::UpdateCode`,
+`SharedFunctionInfo::GetCode`, nebo cast property-access/IC mechanismu,
+ktera vytvari lazy accessor funkce). Nastroje (`ELF_LOADER_TRACE_CALL`,
+`ELF_LOADER_TRACE_ENTRY`, `ELF_LOADER_TRACE_RING`) jsou hotove a pripravene
+pro dalsi hookovani libovolne adresy bez dalsich zmen v loaderu — dalsi
+krok je pravdepodobne hookovat GetNamedPropertyHandler (0x1b2cde0) samotny
+a sledovat, kde presne se JSFunction.code pro nove vytvorenou funkci pise.
