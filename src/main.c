@@ -683,6 +683,104 @@ static void install_entry_trace(void *target) {
         fprintf(stderr, "[TRACE_ENTRY] patch_branch FAILED at %p\n", target);
 }
 
+/* ELF_LOADER_TRACE_STRROOT=<hex_addr>: jednorazovy experiment. Hookuje
+ * vstup do `v8::internal::FactoryBase<LocalFactory>::eval_string()`
+ * (x0 = factory/isolate "this"). Tato a analogicke *_string() funkce
+ * pocitaji adresu interniho stringu jako `*(x0+1960) + staticky_offset`
+ * (offset zjisten z disassembly: eval_string=6112, getOffsetNanosecondsFor
+ * =6288, rozdil 176 B = 22 slotu). Hypoteza: base pointer `*(x0+1960)`
+ * je pod loaderem posunuty o konstantu, takze "eval_string" hledani
+ * systematicky trefi getOffsetNanosecondsFor slot - to by vysvetlilo,
+ * proc VZDY tahle funkce padne v kazdem eval-modu (-e/-p/--check), bez
+ * ohledu na --no-harmony-temporal/verzi node. Logger vypise RAW BAJTY
+ * na obou adresach (eval_string ocekavana pozice + getOffsetNanosecondsFor
+ * ocekavana pozice), aby se hypoteza dala primo overit/vyvratit. */
+static void strroot_logger(unsigned long *regs) {
+    unsigned long x0 = regs[0];
+    char b[400]; char *i = b;
+    const char *p = "[STRROOT] factory_this="; while (*p) *i++ = *p++;
+    shim_hex(&i, x0, 16);
+    if (x0 > 0x10000) {
+        unsigned long base = *(volatile unsigned long *)(x0 + 1960);
+        p = " base=[x0+1960]="; while (*p) *i++ = *p++;
+        shim_hex(&i, base, 16);
+        if (base > 0x10000) {
+            unsigned long a1 = base + 6112;  /* ocekavano: eval_string */
+            unsigned long a2 = base + 6288;  /* ocekavano: getOffsetNanosecondsFor_string */
+            p = "\n[STRROOT] @eval_string(base+6112)="; while (*p) *i++ = *p++;
+            shim_hex(&i, a1, 16);
+            p = " bytes="; while (*p) *i++ = *p++;
+            for (int k = 0; k < 24; k++) {
+                unsigned char c = *(volatile unsigned char *)(a1 + (unsigned long)k);
+                *i++ = (c >= 0x20 && c < 0x7f) ? (char)c : '.';
+            }
+            p = "\n[STRROOT] @getOffsetNS(base+6288)="; while (*p) *i++ = *p++;
+            shim_hex(&i, a2, 16);
+            p = " bytes="; while (*p) *i++ = *p++;
+            for (int k = 0; k < 24; k++) {
+                unsigned char c = *(volatile unsigned char *)(a2 + (unsigned long)k);
+                *i++ = (c >= 0x20 && c < 0x7f) ? (char)c : '.';
+            }
+        }
+    }
+    *i++ = '\n';
+    long fd = shim_raw_syscall6(56, (long)0xFFFFFFFFFFFFFF9CL,
+                                 (long)(unsigned long)"/data/user/0/com.linux_core/files/usr/trace_call.txt",
+                                 0x441L, 0644L, 0, 0);
+    if (fd >= 0) {
+        shim_raw_syscall6(64, fd, (long)b, (long)(i - b), 0, 0, 0);
+        shim_raw_syscall6(57, fd, 0, 0, 0, 0, 0);
+    }
+}
+static void install_strroot_probe(void *target) {
+    uint32_t ins0 = *(const uint32_t *)target;
+    void *tramp = alloc_near(target);
+    if (tramp == MAP_FAILED) { fprintf(stderr, "[STRROOT] alloc_near(tramp) FAIL\n"); return; }
+    *(uint32_t *)tramp = ins0;
+    uint32_t back = branch_insn((char *)tramp + 4, (char *)target + 4);
+    if (back) {
+        *(uint32_t *)((char *)tramp + 4) = back;
+    } else {
+        void *bb = make_bridge((char *)target + 4);
+        if (!bb) { fprintf(stderr, "[STRROOT] make_bridge FAIL\n"); return; }
+        uint32_t b2 = branch_insn((char *)tramp + 4, bb);
+        if (!b2) { fprintf(stderr, "[STRROOT] tramp->back OOR\n"); return; }
+        *(uint32_t *)((char *)tramp + 4) = b2;
+    }
+    __builtin___clear_cache(tramp, (char *)tramp + 8);
+    mprotect(tramp, 4096, PROT_READ | PROT_EXEC);
+
+    void *shim = alloc_near((char *)target + 64);
+    if (shim == MAP_FAILED) { fprintf(stderr, "[STRROOT] alloc_near(shim) FAIL\n"); return; }
+    uint32_t *sc = (uint32_t *)shim;
+    int i = 0;
+    /* ulozit x0 (arg logger) a x30 (LR, MUSI se obnovit). */
+    sc[i++] = 0xD10083FFu;                    /* sub sp, sp, #32 */
+    sc[i++] = tc_enc_str(0, 31, 0);           /* str x0, [sp, #0] */
+    sc[i++] = tc_enc_str(30, 31, 8);          /* str x30,[sp, #8] */
+    sc[i++] = 0x910003E0u;                    /* mov x0, sp (arg logger = &[x0,x30]) */
+    sc[i++] = 0x14000003u;                    /* b +12 (preskoc literal) */
+    uint64_t *lit = (uint64_t *)&sc[i];
+    *lit = (uint64_t)(uintptr_t)strroot_logger;
+    i += 2;
+    sc[i++] = 0x58FFFFC9u;                    /* ldr x9, [pc, #-8] */
+    sc[i++] = 0xD63F0120u;                    /* blr x9 */
+    sc[i++] = tc_enc_ldr(30, 31, 8);          /* ldr x30,[sp, #8]  (obnov PUVODNI LR) */
+    sc[i++] = tc_enc_ldr(0, 31, 0);           /* ldr x0, [sp, #0]  (obnov PUVODNI x0) */
+    sc[i++] = 0x910083FFu;                    /* add sp, sp, #32 */
+    uint32_t jb = branch_insn((char *)shim + (size_t)i * 4, tramp);
+    if (!jb) { fprintf(stderr, "[STRROOT] shim->tramp OOR\n"); return; }
+    sc[i++] = jb;
+    __builtin___clear_cache(shim, (char *)shim + (size_t)i * 4);
+    mprotect(shim, 4096, PROT_READ | PROT_EXEC);
+
+    if (patch_branch(target, shim) == 0)
+        fprintf(stderr, "[STRROOT] installed at %p (tramp=%p shim=%p)\n",
+                target, tramp, shim);
+    else
+        fprintf(stderr, "[STRROOT] patch_branch FAILED at %p\n", target);
+}
+
 /* Nahradi prvni instrukci targetu vetvim na shim. Vytvori trampolinu orig,
  * ktera zavola realni glibc funkci (puvodni prolog + navrat, nebo nasledovani
  * B-thunku na realni impl). Vraci 0, pokud nelze (PC-relativni prolog). */
@@ -2693,6 +2791,16 @@ static int run_ownall(const char *path, int argc, char **argv, char **envp) {
                 unsigned long addr = strtoul(tok, NULL, 0);
                 if (addr) install_ring_trace((void *)addr);
             }
+        }
+    }
+    /* ELF_LOADER_TRACE_STRROOT=0xADDR: jednorazovy experiment - overeni
+     * hypotezy o posunutem base pointeru interniho string-rootu (viz
+     * install_strroot_probe/strroot_logger). */
+    {
+        const char *ts = getenv("ELF_LOADER_TRACE_STRROOT");
+        if (ts && ts[0]) {
+            unsigned long addr = strtoul(ts, NULL, 0);
+            if (addr) install_strroot_probe((void *)addr);
         }
     }
 
