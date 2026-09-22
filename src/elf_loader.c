@@ -4113,13 +4113,26 @@ static void fault_handler(int sig, siginfo_t *si, void *ctx) {
         #undef DFLUSH
     }
 
-    Dl_info di;
-    if (dladdr((void *)uc->uc_mcontext.pc, &di) && di.dli_fname)
-        fprintf(stderr, "  pc in: %s (%s+%#lx)\n", di.dli_fname,
-                di.dli_sname ? di.dli_sname : "?",
-                (unsigned long)((char *)uc->uc_mcontext.pc -
-                                (char *)di.dli_fbase));
-    fflush(stderr);
+    /* dladdr/fprintf jsou bionicke funkce a ctou bionickou TLS pres
+     * tpidr_el0 - pokud v tuto chvili bezime pod guest (glibc/parrot) TP
+     * (typicky pro SIGABRT z hluboka v glibc/V8, na rozdil od nekterych
+     * SIGSEGV pripadu, kde uz TP muze byt zpet na hostu), spadnou na
+     * spatnem TLS bloku. Docasne prepnout na host TP, stejne jako u
+     * guest-handler-chain vyse. */
+    {
+        extern uintptr_t g_tls_new_tp, g_tls_old_tp;
+        uintptr_t saved_tp2 = dl_tp_get();
+        int sw2 = (g_tls_new_tp && saved_tp2 == g_tls_new_tp && g_tls_old_tp);
+        if (sw2) dl_tp_set(g_tls_old_tp);
+        Dl_info di;
+        if (dladdr((void *)uc->uc_mcontext.pc, &di) && di.dli_fname)
+            fprintf(stderr, "  pc in: %s (%s+%#lx)\n", di.dli_fname,
+                    di.dli_sname ? di.dli_sname : "?",
+                    (unsigned long)((char *)uc->uc_mcontext.pc -
+                                    (char *)di.dli_fbase));
+        fflush(stderr);
+        if (sw2) dl_tp_set(saved_tp2);
+    }
     /* Chain na puvodni (guest) handler, pokud ho nekdo (V8/node) instaloval.
      * Musime nejdriv obnovit jeho sigaction a znovu vyvolat signal, aby se
      * spustil s plnym kontextem (my uz jsme v handleru). Jednoduseji:
