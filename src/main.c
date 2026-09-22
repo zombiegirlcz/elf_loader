@@ -545,11 +545,20 @@ static void install_call_trace(void *target) {
     __builtin___clear_cache(shim, (char *)shim + (size_t)i * 4);
     mprotect(shim, 4096, PROT_READ | PROT_EXEC);
 
-    if (patch_branch(target, shim) == 0)
-        fprintf(stderr, "[TRACE_CALL] installed at %p (tramp=%p shim=%p)\n",
-                target, tramp, shim);
-    else
+    if (patch_branch(target, shim) == 0) {
+        fprintf(stderr, "[TRACE_CALL] installed at %p (tramp=%p shim=%p) logger=%p n_instr=%d\n",
+                target, tramp, shim, (void *)trace_call_logger, i);
+        fprintf(stderr, "[TRACE_CALL] tramp bytes:");
+        for (int k = 0; k < 8; k++) fprintf(stderr, " %08x", ((uint32_t *)tramp)[k]);
+        fprintf(stderr, "\n[TRACE_CALL] shim bytes:");
+        for (int k = 0; k < i; k++) fprintf(stderr, " %08x", sc[k]);
+        fprintf(stderr, "\n[TRACE_CALL] literal readback (as u64 at sc[20]): %016lx\n",
+                *(uint64_t *)&sc[20]);
+        fprintf(stderr, "[TRACE_CALL] target bytes: %08x (patched, should be far-branch or B)\n",
+                *(uint32_t *)target);
+    } else {
         fprintf(stderr, "[TRACE_CALL] patch_branch FAILED at %p\n", target);
+    }
 }
 
 /* Nahradi prvni instrukci targetu vetvim na shim. Vytvori trampolinu orig,
