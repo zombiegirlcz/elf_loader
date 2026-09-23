@@ -153,6 +153,18 @@ elf_loader --ownall "$ROOTFS/root/claudetest/claude.exe" --version
 
 Binárka musí ležet uvnitř Parrot rootfs, jinak loader nenajde `librt.so.1`.
 
+## tmux pod loaderem
+
+Funguje (větev `dev`). Guest glibc potřebuje cestu k locale a tmux potřebuje `SHELL`:
+
+```sh
+D=/data/user/0/com.linux_core/files; R=$D/nh/distro/parrot
+export LOCPATH=$R/usr/lib/locale LC_ALL=C.UTF-8 SHELL=$R/bin/bash
+$D/usr/bin/elf_loader --ownall $R/usr/bin/tmux
+```
+
+Jako shell jde i bionic zsh (`SHELL=$D/usr/bin/zsh`). Detaily v `postup.md`, pokračování 17.
+
 ## Magisk modul
 `magisk-module/` se instaluje do `/data/adb/modules/…`. Rootfs detekuje
 **univerzálně** (skenuje `/data/user/0/*/files`, `/data/data/*/files`,

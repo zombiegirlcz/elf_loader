@@ -2302,3 +2302,34 @@ i s `BUN_JSC_useJIT=0` → nesouvisí s JIT.
 `claude.exe --version` → `2.1.280 (Claude Code)`, EXIT=0. `--help` EXIT=0.
 Poznámka: `[MMAP]` log ukazuje, že Bun žádá 1 GB s hintem adresy a dostává
 jinou — neškodné, Bun hint nevyžaduje.
+
+## pokračování 17: tmux pod loaderem FUNGUJE
+
+Větev `dev`, commity `cb1e442` (execl shimy) a `3b23f93` (SIGSYS v sigaction shimu).
+
+### Nálezy po cestě
+1. **Locale:** guest glibc hledá `/usr/lib/locale` na hostu → `tmux: need UTF-8
+   locale`. Řešení bez změny loaderu: `LOCPATH=$R/usr/lib/locale LC_ALL=C.UTF-8`.
+2. **Chybějící `SHELL`:** v ashellu není nastavený → tmux vzal `/usr/sbin/nologin`,
+   panel hned skončil, session zanikla a server se ukončil.
+3. **`execl` obcházel exec shim** (`strace` pod `su 0`: `execve(".../bin/bash")
+   = -1 ENOENT`). tmux spouští shell přes `execl`; loader přesměrovával jen
+   `execve/execv/execvp/execvpe/execveat/posix_spawn*`. Doplněny `execl`,
+   `execlp`, `execle` → sbírají argumenty a volají `shim_execve`.
+4. **Login bash v panelu umřel na signál 31.** Bisekce `bash -l -i -x`: pád na
+   `[ -r /etc/debian_chroot ]` = `faccessat`, který loader chytá seccomp TRAPem.
+   Interaktivní bash si instaluje handler pro všechny "terminating" signály
+   včetně SIGSYS a přepsal tím `sigsys_handler` loaderu (diag.txt neukázal
+   žádné `ENTER`). `diag_wrapped_sigaction` teď SIGSYS chrání stejně jako
+   SIGSEGV/SIGBUS/...: guest handler uloží, reálný nechá.
+
+### Použití
+```sh
+D=/data/user/0/com.linux_core/files; R=$D/nh/distro/parrot
+export LOCPATH=$R/usr/lib/locale LC_ALL=C.UTF-8 SHELL=$R/bin/bash   # nebo SHELL=$D/usr/bin/zsh (bionic)
+$D/usr/bin/elf_loader --ownall $R/usr/bin/tmux
+```
+Ověřeno: `new-session`, `send-keys`, `capture-pane`, `ls`, `kill-server`
+s Parrot bashem, bionic zsh i `/system/bin/sh`. Bun a Node 22 bez regrese.
+Poznámka: `strace` přes `su 0` nereprodukuje seccomp chování aplikace
+(magisk kontext nemá zygote filtr) a pozor na `pkill -f` — trefí i vlastní shell.
