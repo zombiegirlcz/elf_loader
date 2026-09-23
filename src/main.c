@@ -232,6 +232,15 @@ static int diag_wrapped_sigaction(int signum, const struct sigaction *act,
         elf_set_guest_fatal(signum, act);
         return 0;
     }
+    /* SIGSYS: loader pres seccomp TRAP emuluje/preklada syscally (faccessat,
+     * openat, ...) ve svem sigsys_handleru. Interaktivni bash si pri startu
+     * instaluje vlastni handler pro vsechny "terminating" signaly vcetne
+     * SIGSYS -> dalsi TRAP skoncil v bashovem handleru a proces umrel na
+     * signal 31 (tmux panel s login bashem). Guest handler jen ulozime. */
+    if (act && signum == 31) {
+        elf_set_guest_fatal(signum, act);
+        return 0;
+    }
     return diag_real_sigaction ? diag_real_sigaction(signum, act, oldact) : -1;
 }
 /* Rucni string copy bez bionic libc (v parrot TLS kontextu by strncmp/snprintf
