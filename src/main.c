@@ -337,7 +337,8 @@ static void *g_orig_symlink = NULL, *g_orig_symlinkat = NULL, *g_orig_link = NUL
             *g_orig_rename = NULL, *g_orig_unlink = NULL, *g_orig_mkdir = NULL,
             *g_orig_mkdirat = NULL, *g_orig_rmdir = NULL;
 static void *g_orig_execve = NULL, *g_orig_execv = NULL, *g_orig_execvp = NULL,
-            *g_orig_execvpe = NULL, *g_orig_execveat = NULL;
+            *g_orig_execvpe = NULL, *g_orig_execveat = NULL,
+            *g_orig_execl = NULL, *g_orig_execlp = NULL, *g_orig_execle = NULL;
 static void *g_orig_fopen = NULL, *g_orig_fopen64 = NULL,
             *g_orig___xstat64 = NULL, *g_orig___lxstat64 = NULL, *g_orig___fxstatat64 = NULL,
             *g_orig_faccessat2 = NULL,
@@ -1716,6 +1717,44 @@ static int shim_execvpe(const char *p, char *const argv[], char *const envp[]) {
     return shim_execve(p, argv, envp);
 }
 
+/* execl/execlp/execle: variadicke varianty. glibc je vola interne pres
+ * __execve (mimo PLT), takze bez vlastniho shimu obchazely preklad cesty
+ * a guest binarka dostala ENOENT na PT_INTERP. Prakticky: tmux spousti
+ * shell panelu pres execl(shell, "-bash", NULL). */
+#define SHIM_EXECL_MAX 1024
+static int shim_execl(const char *p, const char *arg, ...) {
+    char *av[SHIM_EXECL_MAX]; int n = 0; va_list ap;
+    av[n++] = (char *)arg;
+    va_start(ap, arg);
+    while (arg && n < SHIM_EXECL_MAX - 1 && (av[n] = va_arg(ap, char *)) != NULL) n++;
+    va_end(ap);
+    av[n] = NULL;
+    return shim_execve(p, av, guest_environ());
+}
+static int shim_execlp(const char *p, const char *arg, ...) {
+    char *av[SHIM_EXECL_MAX]; int n = 0; va_list ap;
+    av[n++] = (char *)arg;
+    va_start(ap, arg);
+    while (arg && n < SHIM_EXECL_MAX - 1 && (av[n] = va_arg(ap, char *)) != NULL) n++;
+    va_end(ap);
+    av[n] = NULL;
+    return shim_execve(p, av, guest_environ());
+}
+static int shim_execle(const char *p, const char *arg, ...) {
+    char *av[SHIM_EXECL_MAX]; int n = 0; va_list ap;
+    av[n++] = (char *)arg;
+    va_start(ap, arg);
+    if (arg) {
+        while (n < SHIM_EXECL_MAX - 1 && (av[n] = va_arg(ap, char *)) != NULL) n++;
+        if (n == SHIM_EXECL_MAX - 1)   /* dotahni zbytek az po NULL */
+            while (va_arg(ap, char *) != NULL) ;
+    }
+    char *const *envp = va_arg(ap, char *const *);
+    va_end(ap);
+    av[n] = NULL;
+    return shim_execve(p, av, envp);
+}
+
 #ifndef AT_FDCWD
 #define AT_FDCWD -100
 #endif
@@ -2404,6 +2443,8 @@ static f2_hook_t g_f2_hooks[] = {
     {"execve",(void*)shim_execve,&g_orig_execve},{"execv",(void*)shim_execv,&g_orig_execv},
     {"execvp",(void*)shim_execvp,&g_orig_execvp},{"execvpe",(void*)shim_execvpe,&g_orig_execvpe},
     {"execveat",(void*)shim_execveat,&g_orig_execveat},
+    {"execl",(void*)shim_execl,&g_orig_execl},{"execlp",(void*)shim_execlp,&g_orig_execlp},
+    {"execle",(void*)shim_execle,&g_orig_execle},
     {"posix_spawnp",(void*)shim_posix_spawnp,&g_orig_posix_spawnp},
     {"posix_spawn",(void*)shim_posix_spawnp,&g_orig_posix_spawn},
     {"opendir",(void*)shim_opendir,&g_orig_opendir},
