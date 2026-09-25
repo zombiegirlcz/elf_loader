@@ -165,6 +165,22 @@ $D/usr/bin/elf_loader --ownall $R/usr/bin/tmux
 
 Jako shell jde i bionic zsh (`SHELL=$D/usr/bin/zsh`). Detaily v `postup.md`, pokračování 17.
 
+## Helper knihovny (ELF_LOADER_HELPER)
+
+Vlastní `.so` zkompilované proti glibc se načtou do guesta před všechny ostatní
+moduly a přebijí funkce volané přes PLT. Kód helperu běží v glibc světě, takže
+může normálně používat `printf`, `malloc` nebo `getenv`. Reálnou funkci najde přes
+`dlsym(RTLD_NEXT, ...)`.
+
+```sh
+gcc -shared -fPIC -O2 -o muj_helper.so muj_helper.c -ldl     # v Parrotu
+ELF_LOADER_HELPER=$ROOTFS/cesta/muj_helper.so elf_loader --ownall $ROOTFS/usr/bin/uname -r
+```
+
+Více knihoven se odděluje dvojtečkou a proměnná se dědí do spuštěných dětí.
+Omezení: funkce, které přebíjí loader sám (open, stat, exec...), mají přednost
+a volání uvnitř glibc mimo PLT helper nezachytí. Příklady jsou v `helper/`.
+
 ## Magisk modul
 `magisk-module/` se instaluje do `/data/adb/modules/…`. Rootfs detekuje
 **univerzálně** (skenuje `/data/user/0/*/files`, `/data/data/*/files`,

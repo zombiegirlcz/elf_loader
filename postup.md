@@ -2333,3 +2333,41 @@ Ověřeno: `new-session`, `send-keys`, `capture-pane`, `ls`, `kill-server`
 s Parrot bashem, bionic zsh i `/system/bin/sh`. Bun a Node 22 bez regrese.
 Poznámka: `strace` přes `su 0` nereprodukuje seccomp chování aplikace
 (magisk kontext nemá zygote filtr) a pozor na `pkill -f` — trefí i vlastní shell.
+
+## pokračování 18: helper knihovny, náhodný SIGSEGV a double free Node při exitu
+
+Větev `dev`. Tři opravy a jedna nová schopnost.
+
+### ELF_LOADER_HELPER (nová schopnost)
+`ELF_LOADER_HELPER=/a.so[:/b.so]` own-loadne vlastní .so (zkompilované v Parrotu
+obyčejným `gcc`) před všechny moduly. Symboly helperu vyhrají pro PLT volání,
+reálnou funkci najde `dlsym(RTLD_NEXT)`. Kód helperu běží v glibc světě pod guest
+TP, takže smí používat printf/malloc/getenv. Dědí se do re-exec dětí. Symboly
+z override tabulky loaderu mají přednost, volání uvnitř glibc (mimo PLT) nechytí.
+- `helper/lxhelper_test.c` – test: přebije `uname` (release + "+lxhelper").
+- `helper/lxfree_trace.c` – diagnostika: obal `free`, `operator delete`, `realloc`,
+  `__cxa_atexit`, hlídání konkrétního ukazatele, backtrace přes frame pointery
+  (glibc `backtrace()` pod loaderem nefunguje).
+
+### Náhodný SIGSEGV ~5 % (opraveno, commit „fix(heap)“)
+Pád bez výstupu i u `echo`. Nejdřív přidán fault handler od začátku `main`
+(dřív až v `elf_run`) – nic nevypsal. `strace` přes `/product/bin/su 0`:
+`mmap(0x7f00000000, 1G, MAP_FIXED)` a hned `SEGV_ACCERR` na `0x7f34af805c`.
+`ldso_private_heap_init` mapoval parrot haldu s `MAP_FIXED` a přemapoval, co
+tam ASLR zrovna dalo. Adresa je teď jen hint. Výsledek: 0/200 pádů (dřív 3–10 %).
+
+### Node ≤22 teardown `free(): invalid pointer`, EXIT=134 (opraveno)
+Backtrace z fault handleru (nový, přes FP + `process_vm_readv`):
+`exit → __run_exit_handlers → node::SnapshotData::~SnapshotData → free → abort`.
+`lxfree_trace` ukázal: nativně 249 `delete` ve smyčce, pod loaderem 250; vadný
+prvek je začátek už uvolněného bufferu (fd/bk glibc). `__cxa_atexit` obal:
+destruktor registrován **dvakrát** – jednou z init loaderu, jednou z
+`__libc_start_main`. Binárky proti glibc < 2.34 (`__libc_start_main@GLIBC_2.17`:
+node 18–26, Bun) předávají z `_start` `init=__libc_csu_init` a glibc 2.41 ho
+zavolá → konstruktory hlavní binárky běžely dvakrát. Oprava: PLT override
+`__libc_start_main`, který `init` vynuluje. Node 22 teď končí EXIT=0.
+
+### Stav
+`lxtest`: 9 PASS, 1 FAIL (Node 26 – známý bug JSDispatchTable, stejný pád
+`Builtins_InterpreterEntryTrampoline+4` při bootstrapu, dvojí init ho nevysvětlil).
+tmux session 6/6, echo 0/200.
