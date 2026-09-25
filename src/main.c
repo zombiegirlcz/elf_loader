@@ -2429,6 +2429,16 @@ static int shim_munmap(void *addr, unsigned long len) {
     return r;
 }
 
+/* Viz registrace v run_ownall. Bezi pod guest TP: zadny bionic kod. */
+static void *g_real_libc_start_main;
+typedef int (*fp_libc_start_main)(void *, int, char **, void *, void *, void *, void *);
+static int shim_libc_start_main(void *main_fn, int argc, char **argv, void *init,
+                                void *fini, void *rtld_fini, void *stack_end) {
+    (void)init;   /* konstruktory exe uz spustil loader */
+    return ((fp_libc_start_main)g_real_libc_start_main)(main_fn, argc, argv, NULL,
+                                                        fini, rtld_fini, stack_end);
+}
+
 static f2_hook_t g_f2_hooks[] = {
     {"open",(void*)shim_open,&g_orig_open},{"open64",(void*)shim_open64,&g_orig_open64},
     {"__open",(void*)shim_open,&g_orig_open},{"__open64",(void*)shim_open64,&g_orig_open64},
@@ -2743,6 +2753,13 @@ static int run_ownall(const char *path, int argc, char **argv, char **envp) {
         elf_register_override("__assert_fail", (void *)shim_assert_fail);
     /* pthread_create fix: vzdy - glibc EINVAL kvuli velkemu TLS static size. */
     elf_register_override("pthread_create", (void *)shim_pthread_create);
+    /* Stara ABI (__libc_start_main@GLIBC_2.17, binarky linkovane proti glibc
+     * < 2.34: node, Bun...) predava z _start init=__libc_csu_init a nova glibc
+     * ho zavola -> konstruktory hlavni binarky bezely PODRUHE (loader je uz
+     * spustil v elf_run_final). Dvakrat registrovany static destruktor pak
+     * pri exitu delal double free (node: ~SnapshotData -> free(): invalid
+     * pointer, EXIT=134). Shim init vynuluje; nova ABI predava NULL stejne. */
+    elf_register_override("__libc_start_main", (void *)shim_libc_start_main);
     elf_register_override("pthread_getattr_np", (void *)shim_pthread_getattr_np);
     /* mmap/mmap64: emulace MAP_FIXED_NOREPLACE (kernel 4.14 ho nezna).
      * V8/Node s nim rezervuje 4GB pointer-compression cage na presne adrese;
@@ -2817,6 +2834,7 @@ static int run_ownall(const char *path, int argc, char **argv, char **envp) {
     }
     shim_install_hooks();    /* patch glibc leaf funkci (F2 / re-exec) */
     shim_resolve_fallback(); /* fallback real funkci (W^X) */
+    g_real_libc_start_main = elf_scope_lookup(scope, "__libc_start_main");
 
     /* FAKEROOT mod (volitelne): kdyz ELF_LOADER_FAKEROOT urcuje cestu k
      * libfakeroot-tcp.so, own-loadneme ji jako PRVNI modul ve scope (pred
