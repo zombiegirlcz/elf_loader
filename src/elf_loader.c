@@ -847,9 +847,13 @@ static char *parrot_brk_cur;
 static void ldso_private_heap_init(void) {
     if (parrot_heap_base)
         return;
+    /* Adresa je jen HINT, ne MAP_FIXED: MAP_FIXED tise premapoval cokoli,
+     * co tam ASLR zrovna umistil (bionic knihovny, kod loaderu) -> nahodny
+     * SIGSEGV_ACCERR ~5 % behu hned po nacteni libc. Jadro 4.14 nezna
+     * MAP_FIXED_NOREPLACE, hint bez FIXED nikdy nic neprepise. */
     void *base = mmap((void *)0x7f00000000UL, PARROT_HEAP_SIZE,
                       PROT_READ | PROT_WRITE,
-                      MAP_PRIVATE | MAP_ANONYMOUS | MAP_FIXED, -1, 0);
+                      MAP_PRIVATE | MAP_ANONYMOUS, -1, 0);
     if (base == MAP_FAILED)
         base = mmap(NULL, PARROT_HEAP_SIZE, PROT_READ | PROT_WRITE,
                     MAP_PRIVATE | MAP_ANONYMOUS, -1, 0);
