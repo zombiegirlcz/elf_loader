@@ -4022,6 +4022,27 @@ static void fault_handler(int sig, siginfo_t *si, void *ctx) {
         HX(uc->uc_mcontext.regs[i]); RAW(' ');
     }
     RAW('\n');
+    /* Backtrace pres retez frame pointeru (x29 -> {prev_fp, lr}). Pamet cteme
+     * pres process_vm_readv na sebe: spatny pointer vrati EFAULT misto
+     * dalsiho SIGSEGV uvnitr handleru. Adresy prirad k modulum podle
+     * nasledujiciho [maps] vypisu. */
+    {
+        long self = raw_syscall6(172 /* getpid */, 0, 0, 0, 0, 0, (long)F2_SENTINEL);
+        uintptr_t fp = uc->uc_mcontext.regs[29];
+        RAW(' '); RAW(' '); RAW('b'); RAW('t'); RAW(':'); RAW(' ');
+        HX(uc->uc_mcontext.pc); RAW(' '); HX(uc->uc_mcontext.regs[30]);
+        for (int fr = 0; fr < 24 && fp && !(fp & 7); fr++) {
+            uintptr_t rec[2] = { 0, 0 };
+            struct { void *b; size_t l; } liov = { rec, sizeof rec }, riov = { (void *)fp, sizeof rec };
+            long got = raw_syscall6(270 /* process_vm_readv */, self, (long)&liov, 1,
+                                    (long)&riov, 1, 0);
+            if (got != (long)sizeof rec || !rec[1]) break;
+            RAW(' '); HX(rec[1]);
+            if (rec[0] <= fp) break;          /* stack roste dolu -> fp musi rust */
+            fp = rec[0];
+        }
+        RAW('\n');
+    }
     #undef RAW
     #undef HX
     {
