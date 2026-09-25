@@ -3111,8 +3111,11 @@ int main(int argc, char **argv, char **envp) {
      * ELF_LOADER_NO_COMPAT=1 filtr preskoci (izolace, zda SIGSYS neni nas). */
     if (!getenv("ELF_LOADER_NO_COMPAT"))
         elf_install_compat();
-    else
-        elf_install_fault_handlers();
+    /* Fault handler hned od zacatku (driv jen s NO_COMPAT): jinak pady behem
+     * nacitani modulu (pred elf_run) koncily tichym "Segmentation fault"
+     * bez PC/adresy - napr. nahodny SIGSEGV ~5 % po "tls-done" libc.
+     * elf_run ho pred skokem do guesta stejne reinstaluje. */
+    elf_install_fault_handlers();
     /* The own-loaded parrot libc and the loader's host libc share the same
        process brk.  Both allocators must never shrink the heap (brk): a trim
        by either one unmaps live chunks of the other.  Set MALLOC_* tunables

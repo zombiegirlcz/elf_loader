@@ -11,7 +11,9 @@
 # takze /mnt/app/files/... je primo device. Zadny ashell, zadne base64.
 set -e
 
+# bind app data dir: dřív /mnt/app, po reinstalaci (2026-09-25) původní cesta
 APP=/mnt/app
+[ -d "$APP/files" ] || APP=/data/user/0/com.linux_core
 DEST=$APP/files/usr/bin/elf_loader
 OUT=/tmp/ndkart
 BR=$(git rev-parse --abbrev-ref HEAD)
