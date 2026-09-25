@@ -2847,6 +2847,48 @@ static int run_ownall(const char *path, int argc, char **argv, char **envp) {
         }
     }
 
+    /* GUEST HELPER knihovny (volitelne): ELF_LOADER_HELPER=/a.so[:/b.so...]
+     * Vlastni .so zkompilovane proti glibc (v Parrotu obycejnym gcc), ktere
+     * own-loadneme PRED vsechny ostatni moduly (i pred fakeroot a libc).
+     * Jejich symboly tak vyhraji v elf_scope_find pro PLT volani guestu.
+     * Vyhoda proti shimum v loaderu: kod bezi v glibc svete pod guest TP,
+     * smi normalne volat printf/malloc/getenv bez prepinani TPIDR_EL0.
+     * Realnou funkci najde pres dlsym(RTLD_NEXT, ...).
+     * Omezeni: (1) symboly z override tabulky loaderu (open/stat/exec...)
+     * maji porad prednost; (2) volani uvnitr glibc (mimo PLT) nechyti.
+     * Promenna se dedi do re-exec deti, takze helper plati i pro ne. */
+    {
+        const char *hp = getenv("ELF_LOADER_HELPER");
+        if (hp && hp[0]) {
+            char hbuf[4096];
+            strncpy(hbuf, hp, sizeof hbuf - 1);
+            hbuf[sizeof hbuf - 1] = '\0';
+            size_t ins = 0;
+            char *save = NULL;
+            for (char *tok = strtok_r(hbuf, ":", &save); tok;
+                 tok = strtok_r(NULL, ":", &save)) {
+                if (!tok[0]) continue;
+                elf_object_t *hm = elf_load_shared(tok, scope);
+                if (!hm) {
+                    fprintf(stderr, "[helper] load FAILED: %s\n", tok);
+                    continue;
+                }
+                size_t fi = ins;
+                for (size_t k = 0; k < scope->count; k++)
+                    if (scope->mods[k] == hm) { fi = k; break; }
+                if (fi > ins) {
+                    for (size_t k = fi; k > ins; k--)
+                        scope->mods[k] = scope->mods[k-1];
+                    scope->mods[ins] = hm;
+                }
+                if (elf_debug())
+                    fprintf(stderr, "[helper] load OK: %s (idx %zu, count=%zu)\n",
+                            tok, ins, scope->count);
+                ins++;
+            }
+        }
+    }
+
     void *libc_obj = NULL;
     for (size_t mi = 0; mi < scope->count; mi++)
         if (scope->mods[mi]->soname && strstr(scope->mods[mi]->soname, "libc.so.6"))
