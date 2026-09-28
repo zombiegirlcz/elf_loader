@@ -4722,11 +4722,6 @@ int elf_run(elf_object_t *obj, int argc, char **argv, char **envp) {
     g_guest_stack_size = stack_map;
 
     char *stack_top = stack + stack_size;
-    /* Nastav __libc_stack_end na horni mez guest stacku. Exe ho ma v .bss
-     * pres COPY relokaci z libc, ale ta probehla drive, nez stack existoval
-     * -> slot je NULL. Zapiseme spravnou hodnotu (a i nas ldso_stack_end
-     * pro override). Bez toho cte V8/glibc NULL -> SIGSEGV. */
-    ldso_set_stack_end(stack_top);
 
     size_t str_total = 256 + argc * 128 + env_count * 256;
 
@@ -4740,6 +4735,16 @@ int elf_run(elf_object_t *obj, int argc, char **argv, char **envp) {
     size_t frame = 8 + (argc + 1) * 8 + (env_count + 1) * 8 + 24 * 2 * 8 + 16 + str_total;
     char *sp = stack_top - frame;
     sp = (char *)((uintptr_t)sp & ~(uintptr_t)15);
+
+    /* Nastav __libc_stack_end na vstupni SP (= slot s argc), NE na exkluzivni
+     * top regionu. glibc __pthread_getattr_np (main thread) hleda v
+     * /proc/self/maps region s `from <= __libc_stack_end < to`; kdyz sem
+     * zapiseme stack_top (o bajt za koncem mmap regionu), match selze /
+     * chyti sousedni region -> stacksize se spocita podtecenim a Go runtime
+     * pak abortuje "runtime/cgo: bad stack bounds" (stacklo > stackhi).
+     * Skutecny kernel take nastavuje __libc_stack_end = SP na vstupu (argc).
+     * Zaroven ho i nase ldso_override cte (V8/glibc). */
+    ldso_set_stack_end(sp);
 
     uint64_t *argc_slot = (uint64_t *)sp;
     uint64_t *argv_arr = argc_slot + 1;

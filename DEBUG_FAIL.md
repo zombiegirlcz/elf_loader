@@ -9,7 +9,30 @@ Tento soubor zaznamenává konkrétní binárky a testy, které padají nebo tim
 - `rc` — exit kód / signál
 - `note` — poznámka
 
-## 2026-09-04
+## 2026-09-04 — ✅ VYŘEŠENO (ověřeno 2026-09-28)
+
+> **RESOLVED.** Všech 7 případů níže bylo znovu otestováno na device přes
+> `ashell -c` s aktuálním `elf_loader` (sha256
+> `68fbb372beda26252a751c928b176cc000bb482f2dd7cbf694831e8ecb33be2d`) — **rc=0**,
+> žádný timeout. Sekce je ponechána jen jako historie původního nálezu.
+>
+> Co to opravilo:
+> - `7a6d761` (2026-09-02) — `fileno`/`fileno_unlocked` hooky (I/O kompatibilita; přesně
+>   `fileno(stdin=NULL)` u pythonu).
+> - `23bcc8a` (2026-08-23) — seccomp compat filtr (`clone3`→`ENOSYS`) + fork veneer →
+>   pipe/pipeline cesta funguje.
+> - Další srovnání fork/exec a stdin fd v navazujících commitech.
+>
+> Ověřené příkazy (2026-09-28, rc=0):
+> - `grep -q root /etc/passwd`
+> - `awk 'BEGIN{print 1+2}'` → `3`
+> - `gawk 'BEGIN{print 1+2}'` → `3`
+> - `mawk 'BEGIN{print 1+2}'` → `3`
+> - `echo 'a' | xargs echo` → `a`
+> - `patch -p0 < /dev/null`
+> - `python3 -c 'print(1+1)'` → `2`
+
+Původní nález (2026-09-04, dnes už neplatí):
 
 - `grep` | `cmd=grep -q root /etc/passwd` | `rc=124` | `note=TIMEOUT 5s; repeatable on device`
 - `awk` | `cmd=awk 'BEGIN{print 1+2}'` | `rc=124` | `note=TIMEOUT 5s; repeatable on device`
