@@ -2334,7 +2334,7 @@ static void shim_guest_errno_set(int v) {
 
 static void *shim_mmap_common(void *addr, unsigned long len, int prot,
                               int flags, int fd, long off) {
-    int dbg = g_vmtrace || (addr != NULL) || (len >= (1UL << 30));
+    int dbg = g_vmtrace;   /* [MMAP] jen s ELF_LOADER_VMTRACE (jinak rusi TUI, napr. tmux) */
     if (addr && (flags & (int)SHIM_MAP_FIXED_NOREPLACE)) {
         unsigned long a = (unsigned long)addr;
         if (!shim_addr_range_free(a, a + len)) {

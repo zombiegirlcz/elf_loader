@@ -2585,7 +2585,10 @@ elf_object_t *elf_load_shared(const char *path, elf_scope_t *scope) {
     resolve_symlinks_under_root(path, resolved, sizeof resolved);
     int fd = open(resolved, O_RDONLY);
     if (fd < 0) {
-        fprintf(stderr, "[-] open(%s): %s\n", resolved, strerror(errno));
+        /* ENOENT je u dlopen() bezne (glibc NSS zkousi libnss_nis apod.);
+         * chybejici DT_NEEDED hlasi volajici ("dep X not found"). */
+        if (errno != ENOENT)
+            fprintf(stderr, "[-] open(%s): %s\n", resolved, strerror(errno));
         return NULL;
     }
     struct stat st;
