@@ -1259,6 +1259,11 @@ void *ldso_dlsym(void *handle, const char *name) {
     return ret;
 }
 
+void *ldso_dlvsym(void *handle, const char *name, const char *version) {
+    (void)version;   /* verze se v dynsym-scan cestě neuplatňuje */
+    return ldso_dlsym(handle, name);
+}
+
 const char *ldso_dlerror(void) {
     if (!g_dl_err_valid) return NULL;
     g_dl_err_valid = 0;
@@ -1343,6 +1348,13 @@ static void *ldso_lookup(const char *name) {
         return (void *)ldso_dlopen;
     if (strcmp(name, "dlsym") == 0 || strcmp(name, "__dlsym") == 0)
         return (void *)ldso_dlsym;
+    /* dlvsym pouziva glibc NSS pro verzovane symboly
+     * (_nss_*_gethostbyname*_r@GLIBC_PRIVATE). Bez shim si volaji svoji
+     * interni dlvsym, ktera nezna nase fake link_map -> vrati st_value + 0
+     * misto va(obj,st_value) -> skok na raw offset (napr. 0x2290
+     * = _nss_mdns4_minimal_gethostbyname2_r). Verzi zatim ignorujeme. */
+    if (strcmp(name, "dlvsym") == 0 || strcmp(name, "__dlvsym") == 0)
+        return (void *)ldso_dlvsym;
     if (strcmp(name, "dlerror") == 0)
         return (void *)ldso_dlerror;
     if (strcmp(name, "dlclose") == 0)
