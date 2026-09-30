@@ -1580,15 +1580,30 @@ static int shim_execve(const char *p, char *const argv[], char *const envp[]) {
     /* Symlink pre-resolve: device-side symlinky (napr. $D/usr/bin/git ->
      * $R/usr/bin/git) padaji jinak do shim_excluded() (/data/*), coz je poslalo
      * na raw execve a bionic je nespusti (chybi PT_INTERP). Kdyz cil symlinku
-     * lezi pod ROOTFS, pouzij ho jako 'p'. */
+     * lezi pod ROOTFS, pouzij ho jako 'p'.
+     *
+     * Android alias /data/user/0/ == /data/data/: symlink target casto pouziva
+     * /data/user/0/... zatimco ROOTFS je /data/data/... - normalizujeme oba
+     * prefixy pred porovnanim. */
     if (rl && p[0] == '/' &&
         !(shim_strncmp(p, g_shim_root, rl) == 0 && (p[rl] == '/' || p[rl] == 0))) {
-        char linkres[8192];
-        if (shim_resolve_symlinks(p, linkres, sizeof(linkres)) &&
-            shim_strncmp(linkres, g_shim_root, rl) == 0 &&
-            (linkres[rl] == '/' || linkres[rl] == 0)) {
-            shim_strcpy(resolved, sizeof(resolved), linkres);
-            p = resolved;
+        char linkbuf[8192];
+        ssize_t lr = raw_readlinkat(p, linkbuf, sizeof(linkbuf) - 1);
+        if (lr > 0) {
+            linkbuf[lr] = 0;
+            char norm[8192];
+            const char *cand = linkbuf;
+            if (shim_strncmp(linkbuf, "/data/user/0/", 13) == 0) {
+                shim_strcpy(norm, sizeof(norm), "/data/data/");
+                shim_strcat(norm, sizeof(norm), linkbuf + 13);
+                cand = norm;
+            }
+            if (linkbuf[0] == '/' &&
+                shim_strncmp(cand, g_shim_root, rl) == 0 &&
+                (cand[rl] == '/' || cand[rl] == 0)) {
+                shim_strcpy(resolved, sizeof(resolved), cand);
+                p = resolved;
+            }
         }
     }
 

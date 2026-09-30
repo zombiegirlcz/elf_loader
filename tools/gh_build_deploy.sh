@@ -48,7 +48,7 @@ rm -rf "$OUT"
 gh run download "$RUN" -n elf_loader_ndk -D "$OUT"
 
 # POVINNA kontrola: musi to byt bionic binarka, ne glibc build (viz SKILL.md)
-readelf -h "$OUT/elf_loader_ndk" | grep -q AArch64 || { echo "[-] neni AArch64"; exit 1; }
+readelf -h "$OUT/elf_loader_ndk" | grep -Eiq 'AArch64|arm64' || { echo "[-] neni AArch64"; exit 1; }
 readelf -l "$OUT/elf_loader_ndk" | grep -q '/system/bin/linker64' \
     || { echo "[-] spatny interpreter (glibc build?)"; exit 1; }
 
