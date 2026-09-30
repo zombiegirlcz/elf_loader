@@ -3025,6 +3025,23 @@ static int run_ownall(const char *path, int argc, char **argv, char **envp) {
     if (g_shim_root && g_shim_root[0]) {
         g_f2_active = 1;
         setenv("ROOTFS", g_shim_root, 1);
+        /* Interaktivni shell/tmux compat defaulty (viz postup.md pokracovani 17):
+         * bez LOCPATH/LC_ALL hlasi tmux "need UTF-8 locale" (glibc hleda
+         * /usr/lib/locale na hostu, ne v rootfs); bez SHELL padne na
+         * /usr/sbin/nologin. setenv(...,0) - nepreepise, co uz nastavil
+         * uzivatel/prostredi. access() check, aby se nenastavilo na
+         * neexistujici cestu v rootfs, ktery tohle nema. */
+        char locpath[1024], shellpath[1024];
+        int n;
+        n = snprintf(locpath, sizeof locpath, "%s/usr/lib/locale", g_shim_root);
+        if (n > 0 && (size_t)n < sizeof locpath && access(locpath, F_OK) == 0)
+            setenv("LOCPATH", locpath, 0);
+        /* C.UTF-8 je vestaveny glibc locale (od 2.35, bez potreby locale-archive
+         * dat) - nastavit vzdy, nezavisi na existenci LOCPATH adresare. */
+        setenv("LC_ALL", "C.UTF-8", 0);
+        n = snprintf(shellpath, sizeof shellpath, "%s/bin/bash", g_shim_root);
+        if (n > 0 && (size_t)n < sizeof shellpath && access(shellpath, X_OK) == 0)
+            setenv("SHELL", shellpath, 0);
     }
     if (!g_shim_loader || !g_shim_loader[0]) {
         static char self_exe[1024];
