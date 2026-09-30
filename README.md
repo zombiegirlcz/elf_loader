@@ -165,6 +165,29 @@ $D/usr/bin/elf_loader --ownall $R/usr/bin/tmux
 
 Jako shell jde i bionic zsh (`SHELL=$D/usr/bin/zsh`). Detaily v `postup.md`, pokračování 17.
 
+## Go binárky pod loaderem (Go mód)
+
+Go runtime volá syscally přímo (`svc` v Go kódu), takže PLT overridy loaderu
+nevidí jeho `openat("/etc/resolv.conf")`, `stat("/usr/bin/git")` ani `execve`.
+Loader proto Go binárku pozná (PT_NOTE `Go`, typ 4) a nainstaluje seccomp
+filtr, který TRAPuje path syscally **jen z text segmentu Go binárky**
+(`seccomp_data.instruction_pointer`). cgo/glibc kód dál jede přes PLT overridy.
+
+- cesta `/X` → `$ROOTFS/X`, když tam existuje ona nebo její rodič; jinak host
+  (`/data`, `/sdcard`, `/storage`, `/proc`, `/dev`... vždy host),
+- `execve` glibc ELF / skriptu → re-exec `elf_loader --ownall`,
+- `rt_sigaction(SIGSYS)` z Go se předstírá; `rt_sigprocmask` i `sa_mask`
+  nikdy neblokují SIGSYS (kernel 4.14 při blokovaném SIGSYS resetuje handler
+  na SIG_DFL → TRAP zabije proces i vfork rodiče, exit 159).
+
+Ověřeno: `gh`, `glab`, `git-lfs`, `fzf` (cgo) a statický `render` — DNS, TLS,
+HTTP, goroutiny, signály, `os/exec` (git-lfs → git, git → git-lfs).
+Vypnutí: `ELF_LOADER_GOMODE=0`, diagnostika: `ELF_LOADER_DIAG=1`.
+
+Souvisí: glibc 2.41 má v `open64`/`openat64` PAC prolog, takže klasické inline
+hooky se nenainstalovaly a `fopen()` četl host cesty (git: „error processing
+config file(s)“). Teď se hookují PAC-safe trampolínou (`F2_NO_OPEN_HOOK=1` vypne).
+
 ## Helper knihovny (ELF_LOADER_HELPER)
 
 Vlastní `.so` zkompilované proti glibc se načtou do guesta před všechny ostatní

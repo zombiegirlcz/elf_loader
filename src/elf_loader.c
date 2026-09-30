@@ -4277,6 +4277,7 @@ static char f2_rp_cur[8192];
 static char f2_rp_next[8192];
 static char f2_rp_link[8192];
 #define F2_RP_SZ 8192
+__attribute__((no_stack_protector))
 static void f2_realpath(const char *guest, char *out, size_t outsz) {
     (void)outsz;
     if (!guest || !guest[0]) { if (out) out[0] = 0; return; }
@@ -4400,26 +4401,292 @@ static void f2_reinstall_sigsys(void) {
         unsigned long mask;
     } ka;
     ka.h = (void (*)(int, void *, void *))sigsys_handler;
-    ka.flags = 4UL;   /* SA_SIGINFO */
+    ka.flags = 4UL | 0x08000000UL;   /* SA_SIGINFO | SA_ONSTACK (Go vlakna: gsignal stack) */
     ka.r = 0;
     ka.mask = 0;
     raw_syscall6(134, 31L /* SIGSYS */, (long)(unsigned long)&ka, 0L, 8L, 0L,
                  (long)F2_SENTINEL);
 }
 
-static void sigsys_handler(int sig, siginfo_t *si, void *uc) {
+/* ===== Go mod =====
+ * Go runtime dela syscally napric (svc v Go kodu), takze PLT overridy ani
+ * glibc shimy loaderu nevidi jeho openat("/etc/resolv.conf"), stat
+ * ("/usr/bin/git"), execve atd. -> DNS, TLS (CA v /etc/ssl) i os/exec
+ * pod Androidem selhavaji. Resenim je seccomp filtr, ktery TRAPuje path
+ * syscally JEN KDYZ instruction_pointer lezi v text segmentu Go binarky:
+ *  - glibc/cgo kod (mimo rozsah) jede dal pres PLT overridy beze zmeny,
+ *  - handler bezi v loaderu (mimo rozsah) -> jeho raw syscally se netrapuji,
+ *  - po execve (re-exec loaderu) linker64 v rozsahu nebezi.
+ * Cesta /X se prelozi na $ROOTFS/X, pokud tam (nebo jeji rodic) existuje;
+ * jinak zustava hostova. execve se prepise na re-exec pres loader.
+ * rt_sigaction(SIGSYS) z Go se predstira (jinak si Go SIGSYS prebere
+ * a kazdy TRAP skonci "SIGSYS: bad system call"). */
+#define NOSP __attribute__((no_stack_protector))
+static unsigned long g_go_lo, g_go_hi;
+static const char *g_go_loader;
+static volatile int g_go_lock;
+static const char *g_go_host[] = {
+    "/data", "/sdcard", "/storage", "/acct", "/config", "/linkerconfig",
+    "/debug_ramdisk", NULL
+};
+void f2_set_loader(const char *p) { g_go_loader = p; }
+
+NOSP static int go_exists(const char *p) {
+    struct f2_kstat st;
+    return raw_syscall6(79, -100L, (long)p, (long)&st, F2_AT_SYMLINK_NOFOLLOW,
+                        0, (long)F2_SENTINEL) == 0;
+}
+
+/* in (guest cesta) -> out. Vraci 1, kdyz se cesta prelozila do ROOTFS. */
+NOSP static int go_translate(const char *in, char *out, size_t outsz) {
+    if (!in || in[0] != '/' || !g_f2_root) { f2_scpy(out, in ? in : ""); return 0; }
+    size_t rl = f2_slen(g_f2_root);
+    if (f2_sncmp(in, g_f2_root, rl) == 0 && (in[rl] == '/' || in[rl] == 0)) {
+        f2_scpy(out, in); return 0;
+    }
+    for (int i = 0; g_go_host[i]; i++) {
+        size_t el = f2_slen(g_go_host[i]);
+        if (f2_sncmp(in, g_go_host[i], el) == 0 && (in[el] == '/' || in[el] == 0)) {
+            f2_scpy(out, in); return 0;
+        }
+    }
+    if (rl + f2_slen(in) + 1 > outsz || rl + f2_slen(in) + 1 > F2_RP_SZ) {
+        f2_scpy(out, in); return 0;
+    }
+    while (__atomic_exchange_n(&g_go_lock, 1, __ATOMIC_ACQUIRE)) { }
+    f2_realpath(in, out, outsz);          /* exclude -> beze zmeny */
+    __atomic_store_n(&g_go_lock, 0, __ATOMIC_RELEASE);
+    if (f2_sncmp(out, g_f2_root, rl) != 0) return 0;   /* host (exclude) */
+    if (go_exists(out)) return 1;
+    /* neexistuje: vytvareni (O_CREAT/mkdir/rename) -> ROOTFS, kdyz tam je rodic */
+    size_t n = f2_slen(out);
+    while (n > rl && out[n - 1] == '/') n--;
+    while (n > rl && out[n - 1] != '/') n--;
+    if (n > rl + 1) {
+        char c = out[n - 1];
+        out[n - 1] = 0;
+        int pe = go_exists(out);
+        out[n - 1] = c;
+        if (pe) return 1;
+    }
+    f2_scpy(out, in);
+    return 0;
+}
+
+/* execve z Go: glibc ELF / skript -> loader --ownall <cesta> argv[1..] */
+NOSP static long go_execve(const char *p, char *const *argv, char *const *envp) {
+    char tp[4096];
+    go_translate(p, tp, sizeof tp);
+    size_t rl = f2_slen(g_f2_root);
+    if (f2_sncmp(tp, g_f2_root, rl) != 0)       /* host binarka */
+        return raw_syscall6(221, (long)tp, (long)argv, (long)envp, 0, 0, (long)F2_SENTINEL);
+    char hdr[256];
+    long n = 0;
+    long fd = raw_syscall6(56, -100L, (long)tp, 0L /*O_RDONLY*/, 0, 0, (long)F2_SENTINEL);
+    if (fd < 0) return fd;
+    n = raw_syscall6(63, fd, (long)hdr, sizeof hdr - 1, 0, 0, (long)F2_SENTINEL);
+    raw_syscall6(57, fd, 0, 0, 0, 0, (long)F2_SENTINEL);
+    if (n < 0) n = 0;
+    hdr[n] = 0;
+    char interp[1024]; interp[0] = 0;
+    char *iarg = NULL;
+    if (n >= 2 && hdr[0] == '#' && hdr[1] == '!') {
+        char *l = hdr + 2;
+        while (*l == ' ' || *l == '\t') l++;
+        char *e = l;
+        while (*e && *e != '\n' && *e != '\r') e++;
+        *e = 0;
+        char *a = l;
+        while (*a && *a != ' ' && *a != '\t') a++;
+        if (*a) { *a++ = 0; while (*a == ' ' || *a == '\t') a++; if (*a) iarg = a; }
+        go_translate(l, interp, sizeof interp);
+    } else if (!(n >= 4 && hdr[0] == 0x7f && hdr[1] == 'E' && hdr[2] == 'L' && hdr[3] == 'F')) {
+        return raw_syscall6(221, (long)tp, (long)argv, (long)envp, 0, 0, (long)F2_SENTINEL);
+    }
+    const char *ld = g_go_loader && g_go_loader[0] ? g_go_loader : "/proc/self/exe";
+    char *na[256];
+    int k = 0;
+    na[k++] = (char *)ld;
+    na[k++] = (char *)"--ownall";
+    if (interp[0]) {
+        na[k++] = interp;
+        if (iarg) na[k++] = iarg;
+    }
+    na[k++] = tp;
+    for (int i = 1; argv && argv[i] && k < 254; i++) na[k++] = argv[i];
+    na[k] = NULL;
+    return raw_syscall6(221, (long)ld, (long)na, (long)envp, 0, 0, (long)F2_SENTINEL);
+}
+
+/* Vraci 1, kdyz syscall obslouzil (regs[0] = vysledek). */
+NOSP static int go_handle(long nr, ucontext_t *ctx) {
+    unsigned long long *r = ctx->uc_mcontext.regs;
+    int pa = -1, pb = -1;           /* indexy registru s cestou */
+    switch (nr) {
+        case 135: {   /* rt_sigprocmask: emulace nad uc_sigmask, SIGSYS nikdy blokovany.
+                       * Kernel 4.14 force_sig_info() pri blokovanem SIGSYS resetuje
+                       * handler na SIG_DFL -> TRAP pak zabije proces (a pres coredump
+                       * i vfork rodice). Syscall primo v handleru by prepsal sigreturn. */
+            unsigned long *m = (unsigned long *)(void *)&ctx->uc_sigmask;
+            unsigned long cur = *m;
+            long how = (long)r[0];
+            const unsigned long *set = (const unsigned long *)r[1];
+            unsigned long *old = (unsigned long *)r[2];
+            if (set && how != 0 && how != 1 && how != 2) { r[0] = (unsigned long long)-22L; return 1; }
+            if (old) *old = cur;
+            if (set) {
+                if (how == 0) cur |= *set;
+                else if (how == 1) cur &= ~*set;
+                else cur = *set;
+            }
+            *m = cur & ~(1UL << 30);
+            r[0] = 0;
+            return 1;
+        }
+        case 134: {   /* rt_sigaction(sig != SIGSYS): sa_mask bez SIGSYS */
+            if ((long)r[0] == 31 || !r[1]) return 0;   /* SIGSYS -> predstirany uspech nize */
+            struct { unsigned long h, fl, rst, mask; } ka;
+            const unsigned long *src = (const unsigned long *)r[1];
+            ka.h = src[0]; ka.fl = src[1]; ka.rst = src[2]; ka.mask = src[3] & ~(1UL << 30);
+            r[0] = (unsigned long long)raw_syscall6(134, (long)r[0], (long)&ka, (long)r[2],
+                                                    (long)r[3], 0, (long)F2_SENTINEL);
+            return 1;
+        }
+        case 221: r[0] = (unsigned long long)go_execve((const char *)r[0],
+                         (char *const *)r[1], (char *const *)r[2]);
+                  return 1;
+        case 49:  pa = 0; break;                 /* chdir */
+        case 56: case 79: case 48: case 78: case 291: case 34: case 35:
+        case 53: case 54: case 88: pa = 1; break;
+        case 38: case 276: pa = 1; pb = 3; break; /* renameat(2) */
+        case 37:  pa = 1; pb = 3; break;         /* linkat */
+        case 36:  pa = 2; break;                 /* symlinkat: jen linkpath */
+        default: return 0;
+    }
+    char ta[4096], tb[4096];
+    long a[6] = { (long)r[0], (long)r[1], (long)r[2], (long)r[3], (long)r[4], (long)r[5] };
+    if (pa >= 0 && a[pa] && ((const char *)a[pa])[0] == '/') {
+        go_translate((const char *)a[pa], ta, sizeof ta);
+        a[pa] = (long)ta;
+    }
+    if (pb >= 0 && a[pb] && ((const char *)a[pb])[0] == '/') {
+        go_translate((const char *)a[pb], tb, sizeof tb);
+        a[pb] = (long)tb;
+    }
+    r[0] = (unsigned long long)raw_syscall6(nr, a[0], a[1], a[2], a[3], a[4], (long)F2_SENTINEL);
+    return 1;
+}
+
+/* Go binarka? PT_NOTE s name "Go" (type 4 = GO_BUILDID). */
+static int go_is_go(const elf_object_t *m, unsigned long bias) {
+    for (int i = 0; i < m->phdr_count; i++) {
+        const Elf64_Phdr *ph = &m->phdr[i];
+        if (ph->p_type != PT_NOTE) continue;
+        const unsigned char *p = (const unsigned char *)(bias + ph->p_vaddr);
+        const unsigned char *e = p + ph->p_memsz;
+        while (p + 12 <= e) {
+            unsigned nsz = *(const unsigned *)p, dsz = *(const unsigned *)(p + 4);
+            unsigned typ = *(const unsigned *)(p + 8);
+            if ((nsz == 3 || nsz == 4) && typ == 4 && p[12] == 'G' && p[13] == 'o' && p[14] == 0) return 1;
+            p += 12 + ((nsz + 3) & ~3u) + ((dsz + 3) & ~3u);
+        }
+    }
+    return 0;
+}
+
+int elf_go_mode_setup(elf_object_t *m) {
+    unsigned long bias = (unsigned long)m->base_addr - map_base_vaddr(m);
+    int isgo = go_is_go(m, bias);
+    if (getenv("ELF_LOADER_DIAG"))
+        fprintf(stderr, "[go] root=%s base=%p bias=%lx phdrs=%d go=%d\n",
+                g_f2_root ? g_f2_root : "(null)", m->base_addr, bias, m->phdr_count, isgo);
+    if (!g_f2_root || !isgo) return 0;
+    unsigned long lo = ~0UL, hi = 0;
+    for (int i = 0; i < m->phdr_count; i++) {
+        const Elf64_Phdr *ph = &m->phdr[i];
+        if (ph->p_type != PT_LOAD || !(ph->p_flags & PF_X)) continue;
+        unsigned long s = bias + ph->p_vaddr, e = s + ph->p_memsz;
+        if (s < lo) lo = s;
+        if (e > hi) hi = e;
+    }
+    if (hi <= lo || (lo >> 32) != ((hi - 1) >> 32)) {
+        fprintf(stderr, "[go] text range %lx-%lx nepodporovan, Go mod vypnut\n", lo, hi);
+        return 0;
+    }
+    static const unsigned nrs[] = { 56, 79, 48, 78, 291, 221, 49, 34, 35, 38,
+                                    276, 53, 54, 88, 37, 36, 135 };
+    struct sock_filter prog[64];
+    size_t n = 0;
+    const size_t NN = sizeof nrs / sizeof nrs[0];
+    /* pozice: 0..4 IP check, 5 LD nr, 6..6+NN-1 JEQ, 3 instr. sigaction blok, ALLOW, TRAP */
+    size_t i_allow = 6 + NN + 3, i_trap = i_allow + 1;
+    prog[n++] = (struct sock_filter)BPF_STMT(BPF_LD | BPF_W | BPF_ABS,
+                   offsetof(struct seccomp_data, instruction_pointer) + 4);
+    prog[n] = (struct sock_filter)BPF_JUMP(BPF_JMP | BPF_JEQ | BPF_K, (unsigned)(lo >> 32), 0, 0);
+    prog[n].jf = (unsigned char)(i_allow - n - 1); n++;
+    prog[n++] = (struct sock_filter)BPF_STMT(BPF_LD | BPF_W | BPF_ABS,
+                   offsetof(struct seccomp_data, instruction_pointer));
+    prog[n] = (struct sock_filter)BPF_JUMP(BPF_JMP | BPF_JGE | BPF_K, (unsigned)lo, 0, 0);
+    prog[n].jf = (unsigned char)(i_allow - n - 1); n++;
+    prog[n] = (struct sock_filter)BPF_JUMP(BPF_JMP | BPF_JGE | BPF_K, (unsigned)hi, 0, 0);
+    prog[n].jt = (unsigned char)(i_allow - n - 1); n++;
+    prog[n++] = (struct sock_filter)BPF_STMT(BPF_LD | BPF_W | BPF_ABS,
+                   offsetof(struct seccomp_data, nr));
+    /* n == 6 */
+    for (size_t k = 0; k < NN; k++) {
+        prog[n] = (struct sock_filter)BPF_JUMP(BPF_JMP | BPF_JEQ | BPF_K, nrs[k], 0, 0);
+        prog[n].jt = (unsigned char)(i_trap - n - 1); n++;
+    }
+    /* rt_sigaction(act != NULL) -> TRAP: SIGSYS predstirany uspech, ostatni
+     * dostanou sa_mask bez SIGSYS (viz go_handle) */
+    prog[n] = (struct sock_filter)BPF_JUMP(BPF_JMP | BPF_JEQ | BPF_K, 134, 0, 0);
+    prog[n].jf = (unsigned char)(i_allow - n - 1); n++;
+    prog[n++] = (struct sock_filter)BPF_STMT(BPF_LD | BPF_W | BPF_ABS,
+                   offsetof(struct seccomp_data, args[1]));
+    prog[n] = (struct sock_filter)BPF_JUMP(BPF_JMP | BPF_JEQ | BPF_K, 0, 0, 0);
+    prog[n].jt = (unsigned char)(i_allow - n - 1);   /* low32(act)==0 -> jen cteni */
+    prog[n].jf = (unsigned char)(i_trap - n - 1); n++;
+    if (n != i_allow) {
+        fprintf(stderr, "[go] BUG: filtr n=%zu i_allow=%zu\n", n, i_allow);
+        return 0;
+    }
+    prog[n++] = (struct sock_filter)BPF_STMT(BPF_RET | BPF_K, SECCOMP_RET_ALLOW);
+    prog[n++] = (struct sock_filter)BPF_STMT(BPF_RET | BPF_K, SECCOMP_RET_TRAP);
+    struct sock_fprog fp = { .len = (unsigned short)n, .filter = prog };
+    prctl(PR_SET_NO_NEW_PRIVS, 1, 0, 0, 0);
+    long rs = syscall((long)277, 1UL, 0UL, &fp);
+    if (rs != 0) {
+        fprintf(stderr, "[go] seccomp filtr selhal (%ld), Go mod vypnut\n", rs);
+        return 0;
+    }
+    g_go_lo = lo;
+    g_go_hi = hi;
+    f2_reinstall_sigsys();
+    if (getenv("ELF_LOADER_DIAG"))
+        fprintf(stderr, "[go] Go mod: text %lx-%lx\n", lo, hi);
+    return 1;
+}
+
+NOSP static void sigsys_handler(int sig, siginfo_t *si, void *uc) {
     (void)sig;
-    { static const char _m[] = "HANDLER-ENTER\n"; int _fd = raw_syscall6(56, (long)0xFFFFFFFFFFFFFF9CL, (long)(unsigned long)"/data/user/0/com.linux_core/files/usr/diag.txt", 0x441L, 0644L, 0, (long)F2_SENTINEL); if (_fd >= 0) { raw_syscall6(64, _fd, (long)(unsigned long)_m, sizeof(_m) - 1, 0, 0, (long)F2_SENTINEL); raw_syscall6(57, _fd, 0, 0, 0, 0, (long)F2_SENTINEL); } }
+    /* Go mod: syscall z text segmentu Go binarky (pc uz ukazuje za svc). */
+    if (g_go_hi) {
+        ucontext_t *gctx = (ucontext_t *)uc;
+        unsigned long gpc = (unsigned long)gctx->uc_mcontext.pc - 4;
+        if (gpc >= g_go_lo && gpc < g_go_hi && go_handle(si->si_syscall, gctx))
+            return;
+    }
+    if (g_tls_trace) { static const char _m[] = "HANDLER-ENTER\n"; int _fd = raw_syscall6(56, (long)0xFFFFFFFFFFFFFF9CL, (long)(unsigned long)"/data/user/0/com.linux_core/files/usr/diag.txt", 0x441L, 0644L, 0, (long)F2_SENTINEL); if (_fd >= 0) { raw_syscall6(64, _fd, (long)(unsigned long)_m, sizeof(_m) - 1, 0, 0, (long)F2_SENTINEL); raw_syscall6(57, _fd, 0, 0, 0, 0, (long)F2_SENTINEL); } }
     if (g_tls_trace) {
         static const char _m[] = "[SIGSYS] handler entered\n";
         raw_syscall6(64, 2, (long)(unsigned long)_m, sizeof(_m) - 1, 0, 0,
                      (long)F2_SENTINEL);
     }
-    { static const char _m[] = "ENTER\n"; int _fd = raw_syscall6(56, (long)0xFFFFFFFFFFFFFF9CL, (long)(unsigned long)"/data/user/0/com.linux_core/files/usr/diag.txt", 0x241L, 0644L, 0, (long)F2_SENTINEL); if (_fd >= 0) { raw_syscall6(64, _fd, (long)(unsigned long)_m, 6, 0, 0, (long)F2_SENTINEL); raw_syscall6(57, _fd, 0, 0, 0, 0, (long)F2_SENTINEL); } }
+    if (g_tls_trace) { static const char _m[] = "ENTER\n"; int _fd = raw_syscall6(56, (long)0xFFFFFFFFFFFFFF9CL, (long)(unsigned long)"/data/user/0/com.linux_core/files/usr/diag.txt", 0x241L, 0644L, 0, (long)F2_SENTINEL); if (_fd >= 0) { raw_syscall6(64, _fd, (long)(unsigned long)_m, 6, 0, 0, (long)F2_SENTINEL); raw_syscall6(57, _fd, 0, 0, 0, 0, (long)F2_SENTINEL); } }
     ucontext_t *ctx = (ucontext_t *)uc;
     f2_reinstall_sigsys();   /* drz nas handler i kdyz ho guest resetuje */
     long nr = si->si_syscall;
-    { char _b[32]; int _i = 0; const char *_p = "SIGSYS nr=";
+    if (g_tls_trace) { char _b[32]; int _i = 0; const char *_p = "SIGSYS nr=";
       while (*_p) _b[_i++] = *_p++;
       unsigned long _n = (unsigned long)nr; char _t[24]; int _ti = 0;
       if (_n == 0) _t[_ti++] = '0';

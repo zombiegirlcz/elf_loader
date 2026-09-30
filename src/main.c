@@ -2429,6 +2429,32 @@ static int shim_munmap(void *addr, unsigned long len) {
     return r;
 }
 
+/* sigprocmask/pthread_sigmask: SIGSYS nikdy neblokovat. SIGSYS nese
+ * loaderovy seccomp TRAP (Go mod, Android emulace) a kernel 4.14
+ * force_sig_info() pri blokovanem SIGSYS resetuje handler na SIG_DFL ->
+ * dalsi TRAP proces zabije. Typicky: cgo x_cgo_thread_start blokuje vse
+ * pres pthread_sigmask, nove Go vlakno pak v minit dela raw rt_sigprocmask.
+ * Bezi pod guest TP: zadny bionic kod, glibc sigset_t = 128 B. */
+static void *g_real_sigprocmask, *g_real_pthread_sigmask;
+typedef int (*fp_sigmask)(int, const void *, void *);
+static const void *shim_sigset_nosys(const void *set, unsigned long *buf) {
+    if (!set) return NULL;
+    const unsigned long *s = (const unsigned long *)set;
+    for (int i = 0; i < 16; i++) buf[i] = s[i];
+    buf[0] &= ~(1UL << 30);                  /* SIGSYS = 31 */
+    return buf;
+}
+static int shim_sigprocmask(int how, const void *set, void *old) {
+    unsigned long b[16];
+    if (!g_real_sigprocmask) return -1;
+    return ((fp_sigmask)g_real_sigprocmask)(how, how == 1 ? set : shim_sigset_nosys(set, b), old);
+}
+static int shim_pthread_sigmask(int how, const void *set, void *old) {
+    unsigned long b[16];
+    if (!g_real_pthread_sigmask) return 38;
+    return ((fp_sigmask)g_real_pthread_sigmask)(how, how == 1 ? set : shim_sigset_nosys(set, b), old);
+}
+
 /* Viz registrace v run_ownall. Bezi pod guest TP: zadny bionic kod. */
 static void *g_real_libc_start_main;
 typedef int (*fp_libc_start_main)(void *, int, char **, void *, void *, void *, void *);
@@ -2627,6 +2653,30 @@ static void shim_install_hooks(void) {
             fprintf(stderr, "[hook] __open64_nocancel inline FAIL\n");
         }
     }
+    /* glibc 2.41 ma na zacatku open64/openat64 PAC `paciasp` -> hook_install
+     * (jen B-thunky) je preskoci a glibc-interni volani (fopen -> __open64)
+     * cetla host cesty: git "fatal: error processing config file(s)" pri
+     * fopen("/etc/gitconfig"). Stejny preklad jako PLT override (shim_open64)
+     * pres PAC-safe inline hook. open/__open/__open64 sdileji adresu s open64.
+     * Vypnout lze F2_NO_OPEN_HOOK=1. */
+    if (g_shim_scope && !getenv("F2_NO_OPEN_HOOK")) {
+        static const struct { const char *n; void *shim; void **orig; void **alias; } oh[] = {
+            { "open64",   (void *)shim_open64,   &g_orig_open64,   &g_orig_open },
+            { "openat64", (void *)shim_openat64, &g_orig_openat64, &g_orig_openat },
+        };
+        for (size_t i = 0; i < sizeof oh / sizeof oh[0]; i++) {
+            if (*oh[i].orig) continue;             /* uz hooknuto (B-thunk) */
+            void *t = elf_scope_lookup(g_shim_scope, oh[i].n);
+            void *tramp = NULL;
+            if (t && hook_inline_prologue(t, oh[i].shim, &tramp) && tramp) {
+                *oh[i].orig = tramp;
+                if (!*oh[i].alias) *oh[i].alias = tramp;
+                ok++;
+                if (elf_debug())
+                    fprintf(stderr, "[hook] %s inline (PAC) OK\n", oh[i].n);
+            }
+        }
+    }
     if (elf_debug())
         fprintf(stderr, "[F2-hooks] inline-patchnuto %d glibc funkci\n", ok);
 }
@@ -2753,6 +2803,8 @@ static int run_ownall(const char *path, int argc, char **argv, char **envp) {
         elf_register_override("__assert_fail", (void *)shim_assert_fail);
     /* pthread_create fix: vzdy - glibc EINVAL kvuli velkemu TLS static size. */
     elf_register_override("pthread_create", (void *)shim_pthread_create);
+    elf_register_override("sigprocmask", (void *)shim_sigprocmask);
+    elf_register_override("pthread_sigmask", (void *)shim_pthread_sigmask);
     /* Stara ABI (__libc_start_main@GLIBC_2.17, binarky linkovane proti glibc
      * < 2.34: node, Bun...) predava z _start init=__libc_csu_init a nova glibc
      * ho zavola -> konstruktory hlavni binarky bezely PODRUHE (loader je uz
@@ -2832,9 +2884,21 @@ static int run_ownall(const char *path, int argc, char **argv, char **envp) {
         elf_scope_destroy(scope);
         return 1;
     }
+    /* Go binarky volaji syscally napric (mimo PLT overridy) -> seccomp
+     * path-preklad omezeny na jejich text segment. ELF_LOADER_GOMODE=0 vypne. */
+    if (g_shim_root && g_shim_root[0]) {
+        const char *gm = getenv("ELF_LOADER_GOMODE");
+        if (!gm || gm[0] != '0') {
+            f2_set_root(g_shim_root);
+            f2_set_loader(g_shim_loader);
+            elf_go_mode_setup(obj);
+        }
+    }
     shim_install_hooks();    /* patch glibc leaf funkci (F2 / re-exec) */
     shim_resolve_fallback(); /* fallback real funkci (W^X) */
     g_real_libc_start_main = elf_scope_lookup(scope, "__libc_start_main");
+    g_real_sigprocmask = elf_scope_lookup(scope, "sigprocmask");
+    g_real_pthread_sigmask = elf_scope_lookup(scope, "pthread_sigmask");
 
     /* FAKEROOT mod (volitelne): kdyz ELF_LOADER_FAKEROOT urcuje cestu k
      * libfakeroot-tcp.so, own-loadneme ji jako PRVNI modul ve scope (pred
