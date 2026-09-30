@@ -492,7 +492,20 @@ static int ldso_find_object_impl(uintptr_t pc, void *result) {
     for (int i = 0; i < 12; i++) dlfo[i] = 0;
     void *lm = ldso_find_dso_for_object(pc, 0, 0, 0, 0, 0, 0);
     if (getenv("ELF_LOADER_DLFO_TRACE")) {
-        dprintf(2, "[DLFO] pc=%p lm=%p\n", (void*)pc, lm);
+        dprintf(2, "[DLFO] pc=%p lm=%p (mod_count=%zu)\n",
+                (void*)pc, lm, ldso_module_count);
+        if (!lm) {
+            uintptr_t es = *(uintptr_t *)((unsigned char *)ldso_exe_linkmap + 0x398);
+            uintptr_t ee = *(uintptr_t *)((unsigned char *)ldso_exe_linkmap + 0x3a0);
+            dprintf(2, "[DLFO]   exe=[%p..%p]\n", (void*)es, (void*)ee);
+            for (size_t i = 0; i < ldso_module_count && i < 8; i++) {
+                unsigned char *b = (unsigned char *)ldso_module_linkmaps[i];
+                dprintf(2, "[DLFO]   mod[%zu]=[%p..%p] %s\n", i,
+                        (void*)*(uintptr_t*)(b+0x398),
+                        (void*)*(uintptr_t*)(b+0x3a0),
+                        (const char*)*(uintptr_t*)(b+0x08));
+            }
+        }
     }
     if (!lm) return -1;
     unsigned char *b = (unsigned char *)lm;
