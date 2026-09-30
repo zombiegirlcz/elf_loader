@@ -491,6 +491,9 @@ static int ldso_find_object_impl(uintptr_t pc, void *result) {
     if (!dlfo) return -1;
     for (int i = 0; i < 12; i++) dlfo[i] = 0;
     void *lm = ldso_find_dso_for_object(pc, 0, 0, 0, 0, 0, 0);
+    if (getenv("ELF_LOADER_DLFO_TRACE")) {
+        dprintf(2, "[DLFO] pc=%p lm=%p\n", (void*)pc, lm);
+    }
     if (!lm) return -1;
     unsigned char *b = (unsigned char *)lm;
     uintptr_t l_addr = *(uintptr_t *)(b + 0x00);
@@ -503,6 +506,10 @@ static int ldso_find_object_impl(uintptr_t pc, void *result) {
     dlfo[2] = *(uintptr_t *)(b + 0x3a0);  /* dlfo_map_end */
     dlfo[3] = (uintptr_t)lm;              /* dlfo_link_map */
     dlfo[4] = eh;                         /* dlfo_eh_frame */
+    if (getenv("ELF_LOADER_DLFO_TRACE")) {
+        dprintf(2, "[DLFO]   map=[%p..%p] l_addr=%p eh=%p phnum=%u\n",
+                (void*)dlfo[1], (void*)dlfo[2], (void*)l_addr, (void*)eh, phnum);
+    }
     return 0;
 }
 
