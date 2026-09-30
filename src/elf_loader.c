@@ -34,7 +34,7 @@ static size_t sys_page_size(void) {
 #define ALIGN_UP(x, align) (((x) + (align) - 1) & ~((align) - 1))
 #define ALIGN_DOWN(x, align) ((x) & ~((align) - 1))
 
-#define MAX_OVERRIDES 64
+#define MAX_OVERRIDES 256   /* 64 bylo malo: shimy za 64. (readlinkat, realpath, chdir, fopen...) se tise zahazovaly */
 
 typedef struct {
     const char *name;
@@ -1234,7 +1234,10 @@ void *ldso_dlsym(void *handle, const char *name) {
             else dl_set_err(name);
         }
     } else if (handle == (void *)g_crash_scope) {
-        void *p = g_crash_scope ? elf_scope_lookup(g_crash_scope, name) : NULL;
+        /* dlopen(NULL) = hlavni program: stejne jako RTLD_DEFAULT nejdriv
+         * override (ctypes.CDLL(None).realpath jinak obesel path shim). */
+        void *p = override_lookup(name);
+        if (!p && g_crash_scope) p = elf_scope_lookup(g_crash_scope, name);
         if (p) { g_dl_err_valid = 0; ret = p; }
         else dl_set_err(name);
     } else {
@@ -1446,13 +1449,18 @@ void *elf_lazy_resolve(uintptr_t got_slot) {
 }
 
 void elf_register_override(const char *name, void *fn) {
-    if (!name || !fn || override_count >= MAX_OVERRIDES)
+    if (!name || !fn)
         return;
     for (size_t i = 0; i < override_count; i++) {
         if (strcmp(overrides[i].name, name) == 0) {
             overrides[i].fn = fn;
             return;
         }
+    }
+    if (override_count >= MAX_OVERRIDES) {
+        fprintf(stderr, "[-] override tabulka plna (%d): %s se NEPOUZIJE\n",
+                MAX_OVERRIDES, name);
+        return;
     }
     overrides[override_count].name = name;
     overrides[override_count].fn = fn;
@@ -1893,7 +1901,11 @@ static void resolve_symlinks_under_root(const char *path, char *out, size_t outs
         if (lr < 0) { strncpy(out, cur, outsz-1); out[outsz-1] = 0; return; }
         linkbuf[lr] = 0;
         char next[4096];
-        if (linkbuf[0] == '/') {
+        if (linkbuf[0] == '/' && strncmp(linkbuf, root, rl) == 0 &&
+            (linkbuf[rl] == '/' || linkbuf[rl] == 0)) {
+            /* uz pod ROOTFS (proot link2symlink .l2s cile jsou hostove absolutni) */
+            strncpy(next, linkbuf, sizeof(next) - 1); next[sizeof(next) - 1] = 0;
+        } else if (linkbuf[0] == '/') {
             /* absolute target: prepend ROOTFS */
             if (rl + strlen(linkbuf) + 1 < sizeof(next)) {
                 memcpy(next, root, rl);

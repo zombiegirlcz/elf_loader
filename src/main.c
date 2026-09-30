@@ -1270,7 +1270,12 @@ static int shim_resolve_symlinks(const char *path, char *out, size_t outsz) {
 
         /* Resolve the target */
         char next[8192];
-        if (linkbuf[0] == '/') {
+        size_t rrl = shim_strlen(g_shim_root);
+        if (linkbuf[0] == '/' && shim_strncmp(linkbuf, g_shim_root, rrl) == 0 &&
+            (linkbuf[rrl] == '/' || linkbuf[rrl] == 0)) {
+            /* Uz pod ROOTFS (proot link2symlink .l2s cile jsou hostove absolutni) */
+            shim_strcpy(next, sizeof(next), linkbuf);
+        } else if (linkbuf[0] == '/') {
             /* Absolute target: prepend ROOTFS */
             shim_strcpy(next, sizeof(next), g_shim_root);
             shim_strcat(next, sizeof(next), linkbuf);
@@ -1832,9 +1837,33 @@ static ssize_t shim_readlinkat(int d, const char *p, char *b, size_t n) {
     if (d == -100 && p && p[0] == '/') { if (shim_translate(p, x, sizeof x)) path = x; }
     fp_readlinkat f = (fp_readlinkat)g_orig_readlinkat; return f ? f(d, path, b, n) : -1;
 }
+/* Vysledek realpath pod ROOTFS -> guest pohled (/usr/...), aby program videl
+ * stejne cesty jako v proot; pri dalsim pouziti projdou beznym prekladem. */
+static char *shim_strip_root(char *r) {
+    if (!r || !g_shim_root || !g_shim_root[0]) return r;
+    size_t rl = shim_strlen(g_shim_root);
+    if (shim_strncmp(r, g_shim_root, rl) != 0) return r;
+    if (r[rl] == 0) { r[0] = '/'; r[1] = 0; return r; }
+    if (r[rl] != '/') return r;
+    size_t i = 0;
+    do { r[i] = r[rl + i]; } while (r[i++]);
+    return r;
+}
 static char *shim_realpath(const char *p, char *b) {
     char x[8192]; const char *path = p; if (shim_translate(p, x, sizeof x)) path = x;
-    fp_realpath f = (fp_realpath)g_orig_realpath; return f ? f(path, b) : NULL;
+    fp_realpath f = (fp_realpath)g_orig_realpath;
+    return shim_strip_root(f ? f(path, b) : NULL);
+}
+static void *g_real_canonicalize, *g_real_realpath_chk;
+static char *shim_canonicalize_file_name(const char *p) {
+    char x[8192]; const char *path = p; if (shim_translate(p, x, sizeof x)) path = x;
+    char *(*f)(const char *) = (char *(*)(const char *))g_real_canonicalize;
+    return shim_strip_root(f ? f(path) : NULL);
+}
+static char *shim_realpath_chk(const char *p, char *b, size_t n) {
+    char x[8192]; const char *path = p; if (shim_translate(p, x, sizeof x)) path = x;
+    char *(*f)(const char *, char *, size_t) = (char *(*)(const char *, char *, size_t))g_real_realpath_chk;
+    return shim_strip_root(f ? f(path, b, n) : NULL);
 }
 static void *shim_dlopen(const char *p, int f) {
     char b[8192]; const char *path = p;
@@ -2061,26 +2090,19 @@ static int shim_mprotect(void *addr, unsigned long len, int prot) {
 typedef void (*fp_flockfile)(FILE *);
 
 static int shim_fileno_unlocked(FILE *fp) {
-    if (elf_debug()) fprintf(stderr, "[dbg] fileno_unlocked called with fp=%p\n", fp);
-    if (!fp) {
-        errno = EBADF;
-        return -1;
-    }
+    if (!fp) return -1;   /* guest TP: zadny bionic errno/fprintf */
     fp_fileno_unlocked f = (fp_fileno_unlocked)g_orig_fileno_unlocked;
     return f ? f(fp) : -1;
 }
 
 static int shim_fileno(FILE *fp) {
-    if (elf_debug()) fprintf(stderr, "[dbg] fileno called with fp=%p\n", fp);
-    if (!fp) {
-        errno = EBADF;
-        return -1;
-    }
+    /* bezi pod guest TP: zadny bionic errno/fprintf */
+    if (!fp) return -1;
     fp_fileno f = (fp_fileno)g_orig_fileno;
     return f ? f(fp) : -1;
 }
 
-static void shim_flockfile(FILE *fp) {
+__attribute__((unused)) static void shim_flockfile(FILE *fp) {
     if (elf_debug()) fprintf(stderr, "[dbg] flockfile called with fp=%p\n", fp);
     fp_flockfile f = (fp_flockfile)g_orig_flockfile;
     if (f) f(fp);
@@ -2207,7 +2229,7 @@ static int shim_pthread_create(void *th, const void *attr, void *(*fn)(void*), v
 
 
 typedef int (*fp_close)(int);
-static int shim_close(int fd) {
+__attribute__((unused)) static int shim_close(int fd) {
     if (fd <= 2) {
         char b[80]; int i = 0;
         const char *p = "[CLOSE] fd=";
@@ -2230,8 +2252,10 @@ static int shim_close(int fd) {
  * handler). glibc/libtinfo je volaji (napr. _nc_safe_fopen pred fopen, aby
  * docasne zmenily fsuid). Na Androidu nejsou potreba (app uid je fsuid) ->
  * predstirejme uspech a vrat uid/gid bez zmeny. */
-static int shim_setfsuid(unsigned int uid) { (void)uid; return (int)getuid(); }
-static int shim_setfsgid(unsigned int gid) { (void)gid; return (int)getgid(); }
+static long main_raw_syscall4(long nr, long a0, long a1, long a2, long a3);
+/* raw getuid(174)/getgid(176): bionic getuid() pod guest TP nelze volat */
+static int shim_setfsuid(unsigned int uid) { (void)uid; return (int)main_raw_syscall4(174, 0, 0, 0, 0); }
+static int shim_setfsgid(unsigned int gid) { (void)gid; return (int)main_raw_syscall4(176, 0, 0, 0, 0); }
 
 /* ===== MAP_FIXED_NOREPLACE emulace (kernel 4.14) =====
  * Android kernel 4.14 flag MAP_FIXED_NOREPLACE (0x100000) NEZNA -> ignoruje
@@ -2500,13 +2524,12 @@ static f2_hook_t g_f2_hooks[] = {
     {"__xstat64",(void*)shim___xstat64,&g_orig___xstat64},{"__lxstat64",(void*)shim___lxstat64,&g_orig___lxstat64},
     {"__fxstatat64",(void*)shim___fxstatat64,&g_orig___fxstatat64},{"faccessat2",(void*)shim_faccessat2,&g_orig_faccessat2},
     {"getrlimit",(void*)shim_getrlimit,&g_orig_getrlimit},{"__getrlimit",(void*)shim_getrlimit,&g_orig_getrlimit},
-    {"prlimit64",(void*)shim_getrlimit,&g_orig_prlimit64},
     {"fileno_unlocked",(void*)shim_fileno_unlocked,&g_orig_fileno_unlocked},{"fileno",(void*)shim_fileno,&g_orig_fileno},
-    {"flockfile",(void*)shim_flockfile,&g_orig_flockfile},
-    {"close",(void*)shim_close,&g_orig_close},
     {"setfsuid",(void*)shim_setfsuid,&g_orig_setfsuid},
     {"setfsgid",(void*)shim_setfsgid,&g_orig_setfsgid},
-    {"mprotect",(void*)shim_mprotect,&g_orig_mprotect},
+    /* close/flockfile/mprotect jsou diagnosticke shimy (Node ladeni) a
+     * prlimit64 mel spatnou signaturu - dokud MAX_OVERRIDES=64 zahazoval vse
+     * od 65. polozky, nikdy nebezely. Registrovat jen explicitne. */
 };
 
 static int f2_only_match(const char *name) {
@@ -2804,6 +2827,8 @@ static int run_ownall(const char *path, int argc, char **argv, char **envp) {
     /* pthread_create fix: vzdy - glibc EINVAL kvuli velkemu TLS static size. */
     elf_register_override("pthread_create", (void *)shim_pthread_create);
     elf_register_override("sigprocmask", (void *)shim_sigprocmask);
+    elf_register_override("canonicalize_file_name", (void *)shim_canonicalize_file_name);
+    elf_register_override("__realpath_chk", (void *)shim_realpath_chk);
     elf_register_override("pthread_sigmask", (void *)shim_pthread_sigmask);
     /* Stara ABI (__libc_start_main@GLIBC_2.17, binarky linkovane proti glibc
      * < 2.34: node, Bun...) predava z _start init=__libc_csu_init a nova glibc
@@ -2898,6 +2923,8 @@ static int run_ownall(const char *path, int argc, char **argv, char **envp) {
     shim_resolve_fallback(); /* fallback real funkci (W^X) */
     g_real_libc_start_main = elf_scope_lookup(scope, "__libc_start_main");
     g_real_sigprocmask = elf_scope_lookup(scope, "sigprocmask");
+    g_real_canonicalize = elf_scope_lookup(scope, "canonicalize_file_name");
+    g_real_realpath_chk = elf_scope_lookup(scope, "__realpath_chk");
     g_real_pthread_sigmask = elf_scope_lookup(scope, "pthread_sigmask");
 
     /* FAKEROOT mod (volitelne): kdyz ELF_LOADER_FAKEROOT urcuje cestu k
