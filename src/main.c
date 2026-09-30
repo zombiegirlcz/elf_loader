@@ -1577,6 +1577,21 @@ static int shim_execve(const char *p, char *const argv[], char *const envp[]) {
     resolved[0] = 0;
     size_t rl = g_shim_root ? shim_strlen(g_shim_root) : 0;
 
+    /* Symlink pre-resolve: device-side symlinky (napr. $D/usr/bin/git ->
+     * $R/usr/bin/git) padaji jinak do shim_excluded() (/data/*), coz je poslalo
+     * na raw execve a bionic je nespusti (chybi PT_INTERP). Kdyz cil symlinku
+     * lezi pod ROOTFS, pouzij ho jako 'p'. */
+    if (rl && p[0] == '/' &&
+        !(shim_strncmp(p, g_shim_root, rl) == 0 && (p[rl] == '/' || p[rl] == 0))) {
+        char linkres[8192];
+        if (shim_resolve_symlinks(p, linkres, sizeof(linkres)) &&
+            shim_strncmp(linkres, g_shim_root, rl) == 0 &&
+            (linkres[rl] == '/' || linkres[rl] == 0)) {
+            shim_strcpy(resolved, sizeof(resolved), linkres);
+            p = resolved;
+        }
+    }
+
     /* Path resolution — check ROOTFS prefix FIRST, before exclusion list.
      * ROOTFS lives under /data/... which is in the exclude list; without this
      * ordering, guest binaries referenced by device-absolute path would be
