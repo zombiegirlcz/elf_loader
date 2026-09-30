@@ -479,26 +479,30 @@ static inline void dl_leave_host(int sw, uintptr_t saved) {
     if (sw) dl_tp_set(saved);
 }
 
-/* glibc 2.41+ _dl_find_object: (const void *pc, struct dl_find_object *result).
-   Fills result for the object containing PC, returns 0 on success / -1 on
-   not-found.  Result layout: +0 dlfo_addr, +8 dlfo_name, +16 dlfo_phdr,
-   +24 dlfo_phnum, +32 dlfo_map_start, +40 dlfo_map_end, +48 dlfo_link_map.  */
+/* glibc 2.35+ _dl_find_object(pc, struct dl_find_object *): 0 = nalezeno,
+   -1 = ne.  Layout (aarch64, bez EH_DBASE/EH_COUNT):
+     +0 dlfo_flags, +8 dlfo_map_start, +16 dlfo_map_end, +24 dlfo_link_map,
+     +32 dlfo_eh_frame, +40 __dlfo_reserved[7].
+   Drive se sem psal dl_phdr_info layout -> libgcc na +32 cetl map_start misto
+   PT_GNU_EH_FRAME -> kazda C++ vyjimka skoncila abort() (onnxruntime, i
+   trivialni throw/catch).  */
 static int ldso_find_object_impl(uintptr_t pc, void *result) {
     uintptr_t *dlfo = (uintptr_t *)result;
+    if (!dlfo) return -1;
+    for (int i = 0; i < 12; i++) dlfo[i] = 0;
     void *lm = ldso_find_dso_for_object(pc, 0, 0, 0, 0, 0, 0);
-    if (!dlfo || !lm) {
-        if (dlfo)
-            dlfo[0] = 0;
-        return -1;
-    }
+    if (!lm) return -1;
     unsigned char *b = (unsigned char *)lm;
-    dlfo[0] = *(uintptr_t *)(b + 0x00);   /* dlfo_addr = l_addr */
-    dlfo[1] = *(uintptr_t *)(b + 0x08);   /* dlfo_name */
-    dlfo[2] = *(uintptr_t *)(b + 0x2f0);  /* dlfo_phdr */
-    *(uint16_t *)((unsigned char *)dlfo + 24) = *(uint16_t *)(b + 0x300);
-    dlfo[4] = *(uintptr_t *)(b + 0x398);  /* dlfo_map_start */
-    dlfo[5] = *(uintptr_t *)(b + 0x3a0);  /* dlfo_map_end */
-    dlfo[6] = (uintptr_t)lm;              /* dlfo_link_map */
+    uintptr_t l_addr = *(uintptr_t *)(b + 0x00);
+    const Elf64_Phdr *ph = *(const Elf64_Phdr **)(b + 0x2f0);
+    unsigned phnum = *(uint16_t *)(b + 0x300);
+    uintptr_t eh = 0;
+    for (unsigned i = 0; ph && i < phnum; i++)
+        if (ph[i].p_type == PT_GNU_EH_FRAME) { eh = l_addr + ph[i].p_vaddr; break; }
+    dlfo[1] = *(uintptr_t *)(b + 0x398);  /* dlfo_map_start */
+    dlfo[2] = *(uintptr_t *)(b + 0x3a0);  /* dlfo_map_end */
+    dlfo[3] = (uintptr_t)lm;              /* dlfo_link_map */
+    dlfo[4] = eh;                         /* dlfo_eh_frame */
     return 0;
 }
 

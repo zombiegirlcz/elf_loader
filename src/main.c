@@ -1837,6 +1837,116 @@ static ssize_t shim_readlinkat(int d, const char *p, char *b, size_t n) {
     if (d == -100 && p && p[0] == '/') { if (shim_translate(p, x, sizeof x)) path = x; }
     fp_readlinkat f = (fp_readlinkat)g_orig_readlinkat; return f ? f(d, path, b, n) : -1;
 }
+/* Guest-aware kanonizace: glibc realpath prochazi komponenty a absolutni cil
+ * symlinku (venv: .venv/bin/python -> /bin/python3) vyhodnoti proti HOST
+ * rootu (/bin -> /system/bin) -> ENOENT; uv pak venv povazuje za rozbity.
+ * Tady symlinky resime sami: absolutni cile pod ROOTFS, .l2s cile (uz pod
+ * ROOTFS) beze zmeny. Vysledek = hostova cesta bez symlinku (glibc realpath
+ * nad ni uz nic nepreklada a jen alokuje). Vraci 1 = host_out platny,
+ * 0 = neresit (mimo ROOTFS / exclude), -1 = chyba (errno v *err). */
+static void shim_guest_errno_set(int v);
+static int shim_guest_canon(const char *p, char *host_out, size_t n, int *err) {
+    if (!p || !p[0] || !g_shim_root || !g_shim_root[0]) return 0;
+    size_t rl = shim_strlen(g_shim_root);
+    char g[8192];                        /* guest cesta ke zpracovani */
+    if (p[0] == '/') {
+        if (shim_strncmp(p, g_shim_root, rl) == 0 && (p[rl] == '/' || p[rl] == 0))
+            shim_strcpy(g, sizeof g, p[rl] ? p + rl : "/");
+        else if (shim_excluded(p)) return 0;
+        else shim_strcpy(g, sizeof g, p);
+    } else {
+        char cwd[4096];
+        if (!raw_getcwd(cwd, sizeof cwd)) return 0;
+        if (!(shim_strncmp(cwd, g_shim_root, rl) == 0 && (cwd[rl] == '/' || cwd[rl] == 0)))
+            return 0;                     /* cwd mimo ROOTFS -> glibc */
+        shim_strcpy(g, sizeof g, cwd[rl] ? cwd + rl : "/");
+        shim_strcat(g, sizeof g, "/");
+        shim_strcat(g, sizeof g, p);
+    }
+    char out[8192];                      /* vyreseny guest prefix */
+    out[0] = 0;
+    char rest[8192];
+    shim_strcpy(rest, sizeof rest, g);
+    int links = 0;
+    const char *r = rest;
+    while (*r) {
+        while (*r == '/') r++;
+        if (!*r) break;
+        const char *e = r;
+        while (*e && *e != '/') e++;
+        size_t cl = (size_t)(e - r);
+        if (cl == 1 && r[0] == '.') { r = e; continue; }
+        if (cl == 2 && r[0] == '.' && r[1] == '.') {
+            size_t ol = shim_strlen(out);
+            while (ol > 0 && out[ol - 1] != '/') ol--;
+            if (ol > 0) ol--;
+            out[ol] = 0;
+            r = e; continue;
+        }
+        size_t ol = shim_strlen(out);
+        if (ol + 1 + cl + 1 > sizeof out) { *err = 36; return -1; }
+        out[ol] = '/';
+        shim_memcpy(out + ol + 1, r, cl);
+        out[ol + 1 + cl] = 0;
+        if (ol == 0 && shim_excluded(out)) {
+            /* host strom (/proc, /data...): zbytek resi glibc */
+            shim_strcat(out, sizeof out, e);
+            if (shim_strlen(out) + 1 > n) { *err = 36; return -1; }
+            shim_strcpy(host_out, n, out);
+            return 1;
+        }
+        char h[8192];
+        shim_strcpy(h, sizeof h, g_shim_root);
+        shim_strcat(h, sizeof h, out);
+        unsigned char st[256] __attribute__((aligned(16)));
+        long sr = shim_raw_syscall6(79, -100, (long)h, (long)st, 0x100, 0, 0);
+        if (sr != 0) { *err = (int)-sr; return -1; }
+        unsigned int mode = *(unsigned int *)(st + 16);
+        if ((mode & 0170000) == 0120000) {
+            if (++links > 40) { *err = 40; return -1; }
+            char lb[4096];
+            long lr = shim_raw_syscall6(78, -100, (long)h, (long)lb, sizeof lb - 1, 0, 0);
+            if (lr <= 0) { *err = lr < 0 ? (int)-lr : 2; return -1; }
+            lb[lr] = 0;
+            char nr[8192];
+            const char *tgt = lb;
+            if (lb[0] == '/' && shim_strncmp(lb, g_shim_root, rl) == 0 &&
+                (lb[rl] == '/' || lb[rl] == 0))
+                tgt = lb[rl] ? lb + rl : "/";          /* .l2s: hostova abs. */
+            if (tgt[0] == '/') {
+                out[0] = 0;                              /* absolutni: od koren */
+            } else {
+                size_t k = shim_strlen(out);             /* relativni: vuci adresari */
+                while (k > 0 && out[k - 1] != '/') k--;
+                if (k > 0) k--;
+                out[k] = 0;
+            }
+            shim_strcpy(nr, sizeof nr, tgt);
+            shim_strcat(nr, sizeof nr, e);
+            shim_strcpy(rest, sizeof rest, nr);
+            r = rest;
+            continue;
+        }
+        if (*e && (mode & 0170000) != 0040000) { *err = 20; return -1; }  /* ENOTDIR */
+        r = e;
+    }
+    if (!out[0]) shim_strcpy(out, sizeof out, "/");
+    if (rl + shim_strlen(out) + 1 > n) { *err = 36; return -1; }
+    shim_strcpy(host_out, n, g_shim_root);
+    if (!(out[0] == '/' && out[1] == 0)) shim_strcat(host_out, n, out);
+    return 1;
+}
+/* Spolecny vstup pro realpath rodinu: 1 = path prelozena/vyresena,
+ * -1 = chyba (errno uz nastaveno, vrat NULL). */
+static int shim_canon_path(const char *p, char *buf, size_t n, const char **path) {
+    int err = 0;
+    int r = shim_guest_canon(p, buf, n, &err);
+    if (r < 0) { shim_guest_errno_set(err); return -1; }
+    if (r > 0) { *path = buf; return 1; }
+    if (shim_translate(p, buf, n)) { *path = buf; return 1; }
+    return 0;
+}
+
 /* Vysledek realpath pod ROOTFS -> guest pohled (/usr/...), aby program videl
  * stejne cesty jako v proot; pri dalsim pouziti projdou beznym prekladem. */
 static char *shim_strip_root(char *r) {
@@ -1850,18 +1960,18 @@ static char *shim_strip_root(char *r) {
     return r;
 }
 static char *shim_realpath(const char *p, char *b) {
-    char x[8192]; const char *path = p; if (shim_translate(p, x, sizeof x)) path = x;
+    char x[8192]; const char *path = p; if (shim_canon_path(p, x, sizeof x, &path) < 0) return NULL;
     fp_realpath f = (fp_realpath)g_orig_realpath;
     return shim_strip_root(f ? f(path, b) : NULL);
 }
 static void *g_real_canonicalize, *g_real_realpath_chk;
 static char *shim_canonicalize_file_name(const char *p) {
-    char x[8192]; const char *path = p; if (shim_translate(p, x, sizeof x)) path = x;
+    char x[8192]; const char *path = p; if (shim_canon_path(p, x, sizeof x, &path) < 0) return NULL;
     char *(*f)(const char *) = (char *(*)(const char *))g_real_canonicalize;
     return shim_strip_root(f ? f(path) : NULL);
 }
 static char *shim_realpath_chk(const char *p, char *b, size_t n) {
-    char x[8192]; const char *path = p; if (shim_translate(p, x, sizeof x)) path = x;
+    char x[8192]; const char *path = p; if (shim_canon_path(p, x, sizeof x, &path) < 0) return NULL;
     char *(*f)(const char *, char *, size_t) = (char *(*)(const char *, char *, size_t))g_real_realpath_chk;
     return shim_strip_root(f ? f(path, b, n) : NULL);
 }
@@ -1934,7 +2044,13 @@ static int shim_posix_spawnp(pid_t *pid, const char *p, const void *fa,
     char resolved[8192];
     resolved[0] = 0;
     size_t rl = g_shim_root ? shim_strlen(g_shim_root) : 0;
-    if (p[0] == '/') {
+    if (p[0] == '/' && rl && shim_strncmp(p, g_shim_root, rl) == 0 &&
+        (p[rl] == '/' || p[rl] == 0)) {
+        /* Uz pod ROOTFS (napr. uv spousti $ROOTFS/.../.venv/bin/python):
+         * MUSI byt pred exclude testem - ROOTFS lezi pod /data, takze by
+         * jinak sel real posix_spawn bez loaderu -> exit 127. */
+        shim_strcpy(resolved, sizeof resolved, p);
+    } else if (p[0] == '/') {
         /* Excluded host cesty (/system, /vendor, /apex, /proc, ...) se
          * NESMI prekladat pod ROOTFS a NESMI se re-execovat pres loader.
          * Musi se spustit primo (real posix_spawnp), jinak loader pokusi
@@ -1956,8 +2072,16 @@ static int shim_posix_spawnp(pid_t *pid, const char *p, const void *fa,
             }
         }
     } else if (shim_strchr(p, '/')) {
-        if (rl) {
-            shim_strcpy(resolved, sizeof resolved, g_shim_root);
+        /* relativni cesta (./x, bin/x) je vuci cwd, ne vuci koreni ROOTFS */
+        char cwd[4096];
+        if (raw_getcwd(cwd, sizeof cwd)) {
+            if (rl && !(shim_strncmp(cwd, g_shim_root, rl) == 0 &&
+                        (cwd[rl] == '/' || cwd[rl] == 0)) && !shim_excluded(cwd)) {
+                shim_strcpy(resolved, sizeof resolved, g_shim_root);
+                shim_strcat(resolved, sizeof resolved, cwd);
+            } else {
+                shim_strcpy(resolved, sizeof resolved, cwd);
+            }
             shim_strcat(resolved, sizeof resolved, "/");
             shim_strcat(resolved, sizeof resolved, p);
         } else {
