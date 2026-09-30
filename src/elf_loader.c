@@ -1134,6 +1134,8 @@ void *ldso_dlopen(const char *file, int mode) {
     uintptr_t saved = dl_tp_get();
     int sw = (g_tls_old_tp && saved != g_tls_old_tp);
     if (sw) dl_tp_set(g_tls_old_tp);
+    if (getenv("ELF_LOADER_DL_TRACE") && file)
+        dprintf(2, "[DL] dlopen(%s)\n", file);
     void *ret = NULL;
     if (!file) {                 /* dlopen(NULL) = handle hlavniho programu */
         g_dl_err_valid = 0;
@@ -1196,6 +1198,8 @@ static void *mod_lookup_name(elf_object_t *m, const char *name) {
 
 void *ldso_dlsym(void *handle, const char *name) {
     if (!name) { dl_set_err("invalid symbol name"); return NULL; }
+    if (getenv("ELF_LOADER_DL_TRACE") && name && strncmp(name, "_nss_", 5) == 0)
+        dprintf(2, "[DL] dlsym(%p, %s)\n", handle, name);
     uintptr_t saved = dl_tp_get();
     int sw = (g_tls_old_tp && saved != g_tls_old_tp);
     if (sw) dl_tp_set(g_tls_old_tp);
