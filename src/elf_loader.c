@@ -613,6 +613,11 @@ static void *ldso_lookup_symbol_x_impl(const char *name, void *undef_map,
         return NULL;
     const Elf64_Sym *sym = NULL;
     elf_object_t *m = elf_scope_find(g_crash_scope, name, &sym);
+    if (getenv("ELF_LOADER_DL_TRACE") && name && strncmp(name, "_nss_", 5) == 0)
+        dprintf(2, "[DL] lookup_x(%s) -> m=%p sym=%p st_value=%llx soname=%s\n",
+                name, (void*)m, (void*)sym,
+                sym ? (unsigned long long)sym->st_value : 0,
+                (m && m->soname) ? m->soname : "?");
     if (!m || !sym)
         return NULL;
     if (ref)
@@ -724,6 +729,9 @@ static void *ldso_dl_open_impl(const char *file, int mode, const void *caller,
     }
     size_t prev_count = g_pending_count;
     elf_object_t *m = elf_load_shared(resolved, g_crash_scope);
+    if (getenv("ELF_LOADER_DL_TRACE"))
+        dprintf(2, "[DL] _dl_open: resolved=%s -> m=%p base=%p\n", resolved, (void*)m,
+                m ? (void*)m->base : NULL);
     /* Nove zarazene inity spust pod parrot TP - jsou to konstruktory guest
      * modulu (libcrypto OSSL ctor, libstdc++ atd.), ktere sahaji do guest TLS.
      * loader sam (a ldso_linkmap_for nize) musi zustat pod bionickym TP. */
