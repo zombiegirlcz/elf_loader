@@ -3038,6 +3038,75 @@ static int run_ownall(const char *path, int argc, char **argv, char **envp) {
     }
     if (g_shim_loader && g_shim_loader[0]) setenv("ELF_LOADER", g_shim_loader, 1);
 
+    /* Shebang podpora na urovni loader entry: `lx modal` predava
+     * /usr/local/bin/modal (Python skript s #!/usr/bin/python3), elf_load pak
+     * hlasi "Not an ELF file". Detekujeme #! v prvnim radku a prepiseme
+     * path/argv na [interp, (interp_arg,) script, orig_args...]. Interpret
+     * pod guest ROOTFS (napr. /usr/bin/python3 -> $ROOTFS/usr/bin/python3). */
+    {
+        int _fd = open(path, O_RDONLY | O_CLOEXEC);
+        if (_fd >= 0) {
+            char hdr[256];
+            ssize_t n = read(_fd, hdr, sizeof(hdr) - 1);
+            close(_fd);
+            if (n >= 2 && hdr[0] == '#' && hdr[1] == '!') {
+                hdr[n] = 0;
+                char *line = hdr + 2;
+                while (*line == ' ' || *line == '\t') line++;
+                char *eol = strchr(line, '\n');
+                if (eol) *eol = 0;
+                char *cr = strchr(line, '\r');
+                if (cr) *cr = 0;
+
+                char *arg1 = line;
+                while (*arg1 && *arg1 != ' ' && *arg1 != '\t') arg1++;
+                char *interp_arg = NULL;
+                if (*arg1) {
+                    *arg1 = 0; arg1++;
+                    while (*arg1 == ' ' || *arg1 == '\t') arg1++;
+                    if (*arg1) interp_arg = arg1;
+                }
+
+                static char interp_buf[4096];
+                interp_buf[0] = 0;
+                size_t rl = g_shim_root ? strlen(g_shim_root) : 0;
+                if (strcmp(line, "/usr/bin/env") == 0 && interp_arg) {
+                    char *sp = strchr(interp_arg, ' ');
+                    if (sp) *sp = 0;
+                    if (rl)
+                        snprintf(interp_buf, sizeof(interp_buf), "%s/usr/bin/%s", g_shim_root, interp_arg);
+                    else
+                        snprintf(interp_buf, sizeof(interp_buf), "%s", interp_arg);
+                    interp_arg = NULL;
+                } else if (rl && line[0] == '/' &&
+                           strncmp(line, g_shim_root, rl) != 0) {
+                    snprintf(interp_buf, sizeof(interp_buf), "%s%s", g_shim_root, line);
+                } else {
+                    snprintf(interp_buf, sizeof(interp_buf), "%s", line);
+                }
+
+                int extra = interp_arg ? 2 : 1;
+                int new_argc = argc + extra;
+                static char *new_argv[512];
+                if (new_argc + 1 <= (int)(sizeof(new_argv) / sizeof(new_argv[0]))) {
+                    int k = 0;
+                    new_argv[k++] = interp_buf;
+                    if (interp_arg) new_argv[k++] = interp_arg;
+                    new_argv[k++] = (char *)path;
+                    for (int i = 1; i < argc; i++) new_argv[k++] = argv[i];
+                    new_argv[k] = NULL;
+                    argc = new_argc;
+                    argv = new_argv;
+                    path = interp_buf;
+                    elf_init_argc = argc;
+                    elf_init_argv = argv;
+                    if (elf_debug())
+                        fprintf(stderr, "[+] shebang: interp=%s\n", interp_buf);
+                }
+            }
+        }
+    }
+
     shim_register_overrides();
 
     g_loader_active = 1;  /* loaderuv kod (bionic TLS): jeho open = bionicky */
