@@ -700,6 +700,18 @@ static void *ldso_dl_open_impl(const char *file, int mode, const void *caller,
         return NULL;
     if (getenv("ELF_LOADER_DL_TRACE"))
         dprintf(2, "[DL] _dl_open(%s)\n", file);
+    /* NSS mdns knihovny: glibc si spocita adresu symbolu pres LOOKUP_VALUE_ADDRESS
+     * z fake link_map, ale _dl_lookup_symbol_x v libc.so (dlvsym cesta) sahne po
+     * l_scope, ktere v nasi fake strukture chybi -> loadbase=0 nebo raw offset
+     * (pc=0x2290 = _nss_mdns4_minimal_gethostbyname2_r bez base). Vratit NULL,
+     * aby NSS oznacil modul jako nedostupny a preskocil na [NOTFOUND=return]
+     * dns fallback. */
+    {
+        const char *bn = strrchr(file, '/');
+        bn = bn ? bn + 1 : file;
+        if (strncmp(bn, "libnss_mdns", 11) == 0)
+            return NULL;
+    }
     char resolved[4096];
     const char *root = getenv("ROOTFS");
     size_t rl = root ? strlen(root) : 0;
