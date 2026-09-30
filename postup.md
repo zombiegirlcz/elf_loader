@@ -2391,3 +2391,138 @@ Všechny tři přes `setenv(..., 0)` – existující env (uživatelem nastaven�
 se nepřebíjí. Overhead je jen při `g_shim_root` (tzn. při `--ownall`, ne
 `--own`/`--run`/`--shim`). Ověřeno jen buildem (`make` čistě, `make test`
 beze změny výsledku) – na reálném zařízení zatím neotestováno.
+
+## pokračování 20 (2026-09-30): `elf_loader init zsh` + build/deploy na zařízení
+
+`setenv()` v `run_ownall()` (viz výš) mění jen prostředí loaderu a jeho dětí –
+neovlivní interaktivní hostitelskou zsh session, ze které se loader spouští
+(ta zůstává bez `LOCPATH`/`LC_ALL`, dokud si je sama neexportuje). Řešení:
+stejný shell-integrační vzor, jaký host `.zshrc` už používá pro `starship
+init zsh`/`zoxide init zsh` – nový subpříkaz **`elf_loader init zsh`**
+(`src/main.c`, `elf_print_init_zsh()` + dispatch v `main()` vedle
+`--help`/`--version`/`--check`) vypíše na stdout:
+
+```sh
+export LOCPATH=$ROOTFS/usr/lib/locale   # jen pokud adresar existuje
+export LC_ALL=${LC_ALL:-C.UTF-8}        # vzdy, bez prebiti uz nastaveneho
+```
+
+Čte `ROOTFS` z prostředí (musí být nastavený před voláním – v `.zshrc` už je,
+`export ROOTFS=$R`). Bez `ROOTFS` nevypíše nic a napíše varování na stderr
+(exit 0 – bezpečné i pro nepoužitý `eval "$(...)"`). `SHELL` záměrně
+vynecháno – host `.zshrc` má vlastní fallback na bionic zsh (`$D/usr/bin/
+zsh`), který `--ownall`'s guest-side default (`$ROOTFS/bin/bash`) nesmí
+přebít. Zdokumentováno i v `--help`.
+
+**Build a deploy:** `tools/gh_build_deploy.sh --push` (commit `96878d1`,
+GH Actions run `36751246794`) – bionic NDK build, kontroly `arm64` +
+interpreter `/system/bin/linker64` prošly. Nasazeno do `$D/usr/bin/
+elf_loader` (412 056 B). Ověřeno přes `ashell`: `--version`, `init zsh`
+s/bez `ROOTFS`, `--help` obsahuje novou volbu. Funkční test přímo v reálné
+bionic zsh session (`zsh -ic 'source ~/.zshrc; echo $LOCPATH $LC_ALL
+$SHELL'`) – `LOCPATH`/`LC_ALL` správně nastavené, `SHELL` zůstal bionic zsh.
+
+## pokračování 21 (2026-09-30): host `.zshrc` – `lx` toolkit (kompletní zápis)
+
+Zápis celé konfigurace hostitelské bionic zsh, `/data/user/0/com.linux_core/
+files/.zshrc` – **žije jen na zařízení, není v gitu elf_loaderu** (byl
+dosud jen v paměti/kontextu konverzací, ne v `postup.md`). Účel: pohodlné
+spouštění a ladění Parrot binárek pod `elf_loaderem` z interaktivní ashell/
+Termux-like session na Androidu.
+
+### Proměnné a cesty
+- `D=/data/user/0/com.linux_core/files` (app files = `$HOME`), `R=$D/nh/
+  distro/parrot` (Parrot rootfs), `ROOTFS=$R` (čte `elf_loader`),
+  `L=$D/usr/bin/elf_loader` (loader – všechny funkce volají přes `$L`,
+  nikdy hardcoded cestu).
+- `LX_LOG=$HOME/.cache/lx` (logy `lxlog`/`lxtest`).
+- `TMPDIR=$D/tmp` + `TMP`/`TEMP`/`TMPPREFIX`/`TMUX_TMPDIR` – na Androidu
+  neexistuje systémové `/tmp`, bez toho padají `mktemp`/here-docy/tmux
+  socket.
+- `TERMINFO_DIRS=$R/usr/share/terminfo:$R/etc/terminfo` – terminfo pro
+  guest ncurses (top/htop/btop/btm, viz `postup.md` sekce TUI testů).
+- `SHELL` fallback `$D/usr/bin/zsh` (bionic), jen když aktuální `$SHELL`
+  není spustitelný – jinak `tmux` vezme `nologin` z passwd.
+- `LX_PATH` (pole): `usr/local/sbin, usr/local/bin, usr/sbin, usr/bin,
+  sbin, bin` v `$R` + node z `nvm` (glob `$R/root/.nvm/versions/node/*/bin`)
+  + `$R/root/.local/bin` – prohledává `lxwhich`.
+- **2026-09-30 update:** `LOCPATH`/`LC_ALL` už nejsou ruční export, ale
+  `eval "$($L init zsh)"` (viz pokračování 20) – jediný zdroj pravdy je
+  teď v `src/main.c`, ne duplikovaný v shellu.
+
+### Prompt
+`PROMPT` dvouřádkový: `host %~ (větev repa, jen v $R/root/elf_loader)
+[doba běhu >2s] [✗exit SIGNAME při chybě]`. `_lx_preexec`/`_lx_precmd` přes
+`add-zsh-hook`, `EPOCHREALTIME` (zsh/datetime) pro měření doby; `$signals`
+pole (zsh builtin) pro překlad exit kódu >128 na jméno signálu (`139` →
+`SIGSEGV`).
+
+### Jádro – spouštění guest binárek
+- `lxwhich <jméno|cesta>` – najde binárku v `$LX_PATH` nebo normalizuje
+  absolutní/`$R`/`$D` cestu.
+- `lx <příkaz> [args]` – `env LC_ALL=... SHELL=${LX_SHELL:-$R/bin/bash}
+  ${=LX_ENV} $L --ownall <bin> [args]`. `LX_SHELL`/`LX_ENV` jako per-volání
+  override.
+- `lxq` – jako `lx`, ale stderr bez `[MMAP]` šumu (jen neinteraktivně –
+  `2> >(...)` process substitution rozbíjí TTY).
+- `lxdbg VAR=1 <příkaz>` – `LX_ENV="$LX_ENV VAR=1" lx ...` (ladicí env
+  proměnné loaderu).
+- `lxhelper <cesta.so> <příkaz>` – `LX_ENV+=ELF_LOADER_HELPER=<cesta> lx
+  ...` (viz `ELF_LOADER_HELPER`, pokračování 18).
+- `lxlog <příkaz>` – výstup do `$LX_LOG/<jméno>-<čas>.log`, na konci
+  posledních 20 řádků (bez `[MMAP]`) + exit kód + cesta k logu.
+- `lxdiag [-c]` – `tail -40 $D/usr/diag.txt` (SIGSYS/INIT stopy loaderu),
+  `-c` ho vyprázdní.
+- `lxinfo` – velikost/datum `$L`, `$R`, větev repa (`$R/root/elf_loader/
+  .git/HEAD`), `$LOCPATH`.
+- `lxfault <příkaz>` – `lx` filtrované na `FAULT#|pc in:|SIGSYS|panic|
+  Segmentation|Aborted|\[-\]`.
+
+### Regresní sada – `lxtest`
+Tabulka příkaz→očekávaný výstup (`true`, `echo`, `bash -c` aritmetika,
+`env`-chain re-exec, `python3`, node 22 z `nvm` i "nejnovější" `node`,
+`claude.exe` (Bun) `--version`, `tmux -V`, celá `tmux` session přes
+`_lxtest_tmux`). Pro každý: `SKIP`, pokud binárka v rootfs chybí (`needs[]`
++ `lxwhich`); jinak až 2 pokusy s `timeout 90` – 1. pokus projde → `PASS`,
+2. pokus → `FLAKY`, oba selžou → `FAIL`. Pády na `SIGSEGV/SIGBUS/SIGILL/
+SIGFPE/SIGSYS` (rc 139/135/132/136/159) jsou vždy `FAIL` bez ohledu na
+výstup; `ABRT` (node teardown, viz pokračování 18) je povolený/očekávaný.
+`_lxtest_tmux`: nová session, `send-keys` aritmetiky, `capture-pane`,
+`kill-server` – porovná se `AHOJ_42` v zachyceném panelu.
+
+### Automatika a pomocníci
+- `command_not_found_handler` – neznámý příkaz se zkusí najít přes
+  `lxwhich` a spustit `lx "$@"` (tichy fallback pro `starship`/`zoxide`,
+  jinak vypíše `[lx] <jméno> → <cesta v rootfs>` na stderr).
+- `help [téma]` – vestavěná česká nápověda (`prehled|vse|lx|test|debug|
+  helper|tmux|prompt|klavesy`), s příklady; alias `lxhelp`.
+- Aliasy: `ll=ls -la`, `cdr=cd $R`, `cdl=cd $R/root/elf_loader`, barevný
+  `rg`, `reload=source $HOME/.zshrc`. `[[ -f ~/.env ]] && source ~/.env`
+  pro lokální override bez zásahu do `.zshrc` samotného.
+
+### Integrace `starship`/`zoxide` (guest binárky, ale host prompt)
+Obě běží jako Parrot binárky, ale volají se z KAŽDÉHO promptu/`cd`, takže
+mají vlastní optimalizace:
+- `starship()` – funkce přebíjející `command starship`; `starship prompt`
+  se cachuje 2 s podle `$PWD + args` (`EPOCHREALTIME`), aby dvojí volání
+  v jednom renderu (viz pokračování 7, "dvojitý starship prompt") nespustilo
+  loader dvakrát. Init skript (`starship init zsh`) se generuje jednou,
+  cachuje do `~/.cache/starship-init.zsh` (invalidace podle mtime binárky)
+  – **`sed` přepisuje `$L` → `starship`**, protože starship do vlastního
+  initu zapisuje `/proc/self/exe` (což je pod loaderem `$L` samotný), a bez
+  přepisu by init volal loader přímo místo shell funkce.
+- `zoxide()` – analogicky, cache `~/.cache/zoxide-init.zsh`, `sed` přepisuje
+  `command zoxide` → `zoxide` (init by jinak obcházel funkci a spadl do
+  `command_not_found_handler`). `cd` je aliasované na `z` (zoxide).
+- `tmux=ltmux` alias – `ltmux` (funkce mimo tento soubor, dosud
+  nezdokumentovaná samostatně) pouští Parrot tmux přes loader s bionic zsh
+  jako `SHELL` (`LTMUX_SHELL` pro override na `$R/bin/bash`).
+
+### Ostatní
+`zsh-plugins.zshrc` (autosuggest + syntax-highlighting, bionic balíček)
+načten na konci (`ZSH_AUTOSUGGEST_STRATEGY`, barvy `ZSH_HIGHLIGHT_STYLES`).
+`nvm` (`$HOME/.nvm`) na úplném konci.
+
+**Poznámka k údržbě:** soubor není verzovaný (žije jen na zařízení) – tahle
+sekce je jediný zdroj pravdy mimo samotné zařízení. Při další úpravě
+`.zshrc` aktualizovat i tenhle zápis.

@@ -75,6 +75,14 @@ rychlejší alternativa jen s rootem.
   `libblas.so.3 -> /etc/alternatives/…`) — [postup.md#L674](postup.md#L674).
 - **LOCPATH/LC_ALL/SHELL defaulty natvrdo v `run_ownall`** (dřív ruční env
   před tmuxem/shellem) — [postup.md#L2376](postup.md#L2376).
+- **`elf_loader init zsh`** (shell-integrace vzor jako starship/zoxide,
+  `eval`-able LOCPATH/LC_ALL pro host zsh) + build/deploy na zařízení —
+  [postup.md#L2395](postup.md#L2395).
+- **Host `.zshrc` — `lx` toolkit (kompletní zápis)**: proměnné/cesty,
+  prompt, `lx`/`lxq`/`lxdbg`/`lxhelper`/`lxlog`/`lxdiag`/`lxinfo`/`lxfault`,
+  `lxtest` regresní sada, `command_not_found_handler`, `help`, starship/
+  zoxide integrace (cache + `/proc/self/exe` rewrite) — soubor žije jen
+  na zařízení, není v gitu — [postup.md#L2425](postup.md#L2425).
 
 ## 6. Seccomp compat filtr + fork veneer
 
