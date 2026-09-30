@@ -73,6 +73,8 @@ rychlejší alternativa jen s rootem.
   [postup.md#L662](postup.md#L662).
 - **Rootfs absolutní symlinky nefungují mimo chroot** (např.
   `libblas.so.3 -> /etc/alternatives/…`) — [postup.md#L674](postup.md#L674).
+- **LOCPATH/LC_ALL/SHELL defaulty natvrdo v `run_ownall`** (dřív ruční env
+  před tmuxem/shellem) — [postup.md#L2376](postup.md#L2376).
 
 ## 6. Seccomp compat filtr + fork veneer
 

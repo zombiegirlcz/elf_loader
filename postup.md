@@ -2371,3 +2371,23 @@ zavolá → konstruktory hlavní binárky běžely dvakrát. Oprava: PLT overrid
 `lxtest`: 9 PASS, 1 FAIL (Node 26 – známý bug JSDispatchTable, stejný pád
 `Builtins_InterpreterEntryTrampoline+4` při bootstrapu, dvojí init ho nevysvětlil).
 tmux session 6/6, echo 0/200.
+
+## pokračování 19 (2026-09-30): LOCPATH/LC_ALL/SHELL defaulty natvrdo v `run_ownall`
+
+Dřív se muselo ručně exportovat `LOCPATH=$R/usr/lib/locale LC_ALL=C.UTF-8
+SHELL=$R/bin/bash` před každým spuštěním interaktivního shellu/tmuxu (viz
+pokračování 17) – jinak tmux hlásí "need UTF-8 locale" a spuštěný shell dostane
+`SHELL=/usr/sbin/nologin`. Přesunuto z ruční/shellové vrstvy přímo do
+`run_ownall()` v `src/main.c`, hned za `setenv("ROOTFS", ...)`:
+
+- `LOCPATH` = `$ROOTFS/usr/lib/locale`, jen pokud adresář existuje (`access
+  F_OK`).
+- `LC_ALL=C.UTF-8` vždy (vestavěný glibc locale od 2.35, nezávisí na
+  `LOCPATH`).
+- `SHELL` = `$ROOTFS/bin/bash`, jen pokud je tam spustitelný soubor (`access
+  X_OK`).
+
+Všechny tři přes `setenv(..., 0)` – existující env (uživatelem nastavený)
+se nepřebíjí. Overhead je jen při `g_shim_root` (tzn. při `--ownall`, ne
+`--own`/`--run`/`--shim`). Ověřeno jen buildem (`make` čistě, `make test`
+beze změny výsledku) – na reálném zařízení zatím neotestováno.

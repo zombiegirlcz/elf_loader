@@ -16,6 +16,7 @@ static void print_help(const char *prog) {
         "  %s [--lazy] --own <elf> <shared.so> [args..]\n"
         "  %s [--lazy] --ownall <elf> [args..]\n"
         "  %s [--lazy] --shim <elf> [args..]\n"
+        "  %s init zsh\n"
         "  %s <elf>                        (introspect)\n"
         "\n"
         "Modes:\n"
@@ -23,6 +24,7 @@ static void print_help(const char *prog) {
         "  --own         own-load one shared module into a private scope\n"
         "  --ownall      own-load all distro deps + guest binary (parrot glibc)\n"
         "  --shim        F2 path-translation shim for chroot-less guest paths\n"
+        "  init zsh      print `eval`-able zsh env defaults (LOCPATH/LC_ALL) for ROOTFS\n"
         "  <elf>         introspect base/entry/symbols without execution\n"
         "\n"
         "Options:\n"
@@ -43,7 +45,7 @@ static void print_help(const char *prog) {
         "  ROOTFS=/data/.../parrot %s --ownall /data/.../parrot/bin/ls -la /etc\n"
         "  ROOTFS=/data/.../parrot %s --shim /data/.../parrot/usr/bin/awk 'BEGIN{print 1+2}'\n"
         "  %s /data/.../parrot/bin/cat /etc/hostname\n",
-        prog, prog, prog, prog, prog, prog, prog, prog,
+        prog, prog, prog, prog, prog, prog, prog, prog, prog,
         prog, prog, prog, prog, prog);
 }
 
@@ -3487,6 +3489,27 @@ static char **elf_guest_envp(char **envp) {
     return ne;
 }
 
+/* `elf_loader init zsh` — stejny shell-integrace vzor jako `starship init zsh`/
+ * `zoxide init zsh` (uz pouzivany v host .zshrc): vypise na stdout radky pro
+ * `eval`, misto aby menil vlastni prostredi (setenv v tomto procesu by na
+ * rodicovsky interaktivni shell nemel zadny vliv). Cte ROOTFS - musi byt uz
+ * v env, kdyz se vola (typicky za `export ROOTFS=$R` v .zshrc). Stejne
+ * defaulty jako v run_ownall() (LOCPATH/LC_ALL pro guest glibc pod tmuxem),
+ * tady jen jako text k eval misto primeho setenv. SHELL zamerne vynechano -
+ * host .zshrc ma vlastni, odlisny fallback (bionic zsh, ne rootfs bash). */
+static void elf_print_init_zsh(void) {
+    const char *root = getenv("ROOTFS");
+    if (!root || !root[0]) {
+        fprintf(stderr, "elf_loader: init zsh: ROOTFS neni nastaven, preskakuji\n");
+        return;
+    }
+    char locpath[1024];
+    int n = snprintf(locpath, sizeof locpath, "%s/usr/lib/locale", root);
+    if (n > 0 && (size_t)n < sizeof locpath && access(locpath, F_OK) == 0)
+        printf("export LOCPATH=%s\n", locpath);
+    printf("export LC_ALL=${LC_ALL:-C.UTF-8}\n");
+}
+
 int main(int argc, char **argv, char **envp) {
     /* ELF_DEBUG → unbuffered stdout, ať trace při SIGSEGV nekončí v bufferu */
     if (getenv("ELF_DEBUG"))
@@ -3548,6 +3571,16 @@ int main(int argc, char **argv, char **envp) {
         puts("elf_loader " ELF_LOADER_VERSION "\n"
              "  own-loading glibc launcher for Android (aarch64)\n"
              "  (c) elf_loader project");
+        return 0;
+    }
+
+    if (strcmp(argv[ai], "init") == 0) {
+        const char *shell = (ai + 1 < argc) ? argv[ai + 1] : "zsh";
+        if (strcmp(shell, "zsh") != 0) {
+            fprintf(stderr, "elf_loader: init: nepodporovany shell '%s' (jen 'zsh')\n", shell);
+            return 1;
+        }
+        elf_print_init_zsh();
         return 0;
     }
 
