@@ -3122,6 +3122,47 @@ static int run_ownall(const char *path, int argc, char **argv, char **envp) {
         }
     }
 
+    /* GUEST PRELOAD (analogicke k LD_PRELOAD, ale pro --ownall guest scope):
+     * ELF_LOADER_PRELOAD=/a.so[:/b.so...]. Guest ld.so pod --ownall nebezi,
+     * takze LD_PRELOAD v envp nikdo nezpracuje - loader tedy musi tyto .so
+     * pripojit do guest scope sam. Semanticky identicke s HELPER: own-load
+     * pred vsechny ostatni moduly (index 0), symboly vyhrajou v PLT lookupu
+     * guestu. Ctor sam volan pres queue_module_inits nize.
+     * Rozdil od HELPER: PRELOAD jsou "systemove" pomocnici (napr. exec_shim
+     * pro re-exec glibc binarek pres loader), typicky nastavene ze zshrc/lx.
+     * Vlozeni jde ZA HELPER, takze PRELOAD zaznamy skonci pred nimi. */
+    {
+        const char *pp = getenv("ELF_LOADER_PRELOAD");
+        if (pp && pp[0]) {
+            char pbuf[4096];
+            strncpy(pbuf, pp, sizeof pbuf - 1);
+            pbuf[sizeof pbuf - 1] = '\0';
+            size_t ins = 0;
+            char *save = NULL;
+            for (char *tok = strtok_r(pbuf, ":", &save); tok;
+                 tok = strtok_r(NULL, ":", &save)) {
+                if (!tok[0]) continue;
+                elf_object_t *pm = elf_load_shared(tok, scope);
+                if (!pm) {
+                    fprintf(stderr, "[preload] load FAILED: %s\n", tok);
+                    continue;
+                }
+                size_t fi = ins;
+                for (size_t k = 0; k < scope->count; k++)
+                    if (scope->mods[k] == pm) { fi = k; break; }
+                if (fi > ins) {
+                    for (size_t k = fi; k > ins; k--)
+                        scope->mods[k] = scope->mods[k-1];
+                    scope->mods[ins] = pm;
+                }
+                if (elf_debug())
+                    fprintf(stderr, "[preload] load OK: %s (idx %zu, count=%zu)\n",
+                            tok, ins, scope->count);
+                ins++;
+            }
+        }
+    }
+
     void *libc_obj = NULL;
     for (size_t mi = 0; mi < scope->count; mi++)
         if (scope->mods[mi]->soname && strstr(scope->mods[mi]->soname, "libc.so.6"))
