@@ -731,7 +731,7 @@ static void *ldso_dl_open_impl(const char *file, int mode, const void *caller,
     elf_object_t *m = elf_load_shared(resolved, g_crash_scope);
     if (getenv("ELF_LOADER_DL_TRACE"))
         dprintf(2, "[DL] _dl_open: resolved=%s -> m=%p base=%p\n", resolved, (void*)m,
-                m ? (void*)m->base : NULL);
+                m ? m->base_addr : NULL);
     /* Nove zarazene inity spust pod parrot TP - jsou to konstruktory guest
      * modulu (libcrypto OSSL ctor, libstdc++ atd.), ktere sahaji do guest TLS.
      * loader sam (a ldso_linkmap_for nize) musi zustat pod bionickym TP. */
