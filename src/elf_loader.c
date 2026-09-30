@@ -447,6 +447,19 @@ static void *ldso_find_dso_for_object(uintptr_t addr, long a1, long a2,
         if (addr >= start && addr < end)
             return ldso_module_linkmaps[i];
     }
+    /* Modul nacteny za behu (dlopen deps, napr. libgcc_s pod onnxruntime)
+     * dostane linkmap az pri prvnim symbol lookupu. _dl_find_object z unwinderu
+     * ale muze prijit driv -> NULL -> C++ vyjimka skonci abort(). Najdi ho
+     * ve scope podle adresy a zaregistruj (memset/strncpy: TP-safe). */
+    for (size_t i = 0; g_crash_scope && i < g_crash_scope->count; i++) {
+        elf_object_t *m = g_crash_scope->mods[i];
+        if (!m || !m->base_addr) continue;
+        uintptr_t start = (uintptr_t)m->base_addr;
+        if (addr >= start && addr < start + m->total_size) {
+            size_t idx = ldso_register_linkmap(m);
+            return idx != (size_t)-1 ? (void *)ldso_module_linkmaps[idx] : NULL;
+        }
+    }
     return NULL;
 }
 
