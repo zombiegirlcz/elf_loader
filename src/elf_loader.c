@@ -491,22 +491,6 @@ static int ldso_find_object_impl(uintptr_t pc, void *result) {
     if (!dlfo) return -1;
     for (int i = 0; i < 12; i++) dlfo[i] = 0;
     void *lm = ldso_find_dso_for_object(pc, 0, 0, 0, 0, 0, 0);
-    if (getenv("ELF_LOADER_DLFO_TRACE")) {
-        dprintf(2, "[DLFO] pc=%p lm=%p (mod_count=%zu)\n",
-                (void*)pc, lm, ldso_module_count);
-        if (!lm) {
-            uintptr_t es = *(uintptr_t *)((unsigned char *)ldso_exe_linkmap + 0x398);
-            uintptr_t ee = *(uintptr_t *)((unsigned char *)ldso_exe_linkmap + 0x3a0);
-            dprintf(2, "[DLFO]   exe=[%p..%p]\n", (void*)es, (void*)ee);
-            for (size_t i = 0; i < ldso_module_count && i < 8; i++) {
-                unsigned char *b = (unsigned char *)ldso_module_linkmaps[i];
-                dprintf(2, "[DLFO]   mod[%zu]=[%p..%p] %s\n", i,
-                        (void*)*(uintptr_t*)(b+0x398),
-                        (void*)*(uintptr_t*)(b+0x3a0),
-                        (const char*)*(uintptr_t*)(b+0x08));
-            }
-        }
-    }
     if (!lm) return -1;
     unsigned char *b = (unsigned char *)lm;
     uintptr_t l_addr = *(uintptr_t *)(b + 0x00);
@@ -519,10 +503,6 @@ static int ldso_find_object_impl(uintptr_t pc, void *result) {
     dlfo[2] = *(uintptr_t *)(b + 0x3a0);  /* dlfo_map_end */
     dlfo[3] = (uintptr_t)lm;              /* dlfo_link_map */
     dlfo[4] = eh;                         /* dlfo_eh_frame */
-    if (getenv("ELF_LOADER_DLFO_TRACE")) {
-        dprintf(2, "[DLFO]   map=[%p..%p] l_addr=%p eh=%p phnum=%u\n",
-                (void*)dlfo[1], (void*)dlfo[2], (void*)l_addr, (void*)eh, phnum);
-    }
     return 0;
 }
 
@@ -2832,6 +2812,11 @@ elf_object_t *elf_load_shared(const char *path, elf_scope_t *scope) {
         printf("[+] own-loaded module: %s (base %p, %zu dynsym)\n", path,
            (void *)base, m->dynsym_count);
     fflush(stdout);
+    /* Zaregistruj linkmap pro KAZDY nacteny .so (i transitivni NEEDED
+     * jako libgcc_s.so.1, libstdc++.so.6). Bez toho _dl_find_object shim
+     * vrati -1 -> libgcc unwinder nenajde FDE -> uncaught C++ throw v
+     * onnxruntime -> abort. ldso_register_linkmap deduplikuje. */
+    (void)ldso_register_linkmap(m);
     return m;
 }
 /* Runtime dlopen: guest požádal o modul, který ještě není načtený
@@ -2883,10 +2868,7 @@ static elf_object_t *ldso_load_new(const char *file) {
     free(search);
     if (!m)
         return NULL;
-    /* Zaregistruj linkmap pro dlopen-loaded .so, aby _dl_find_object nasel
-     * PT_GNU_EH_FRAME pro C++ unwinder. Bez toho libgcc _Unwind_RaiseException
-     * pro throw z pybind11 modulu (napr. onnxruntime) nenajde FDE a abortne. */
-    (void)ldso_register_linkmap(m);
+    /* Linkmap registruje uz elf_load_shared pro vsechny cesty. */
     /* Novy modul muze mit PT_TLS -> zkopiruj jeho .tdata do aktualniho
      * threadu (region ma fixni rezervu, takze se vejde). */
     if (m->has_tls)
