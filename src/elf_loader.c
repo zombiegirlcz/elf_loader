@@ -2239,10 +2239,11 @@ static char *derive_distro_libdirs(const char *origin_dir) {
 
     /* pořadí: multiarch, lib, usr/lib, lib — nejlepší match první */
     char tmp[2048];
-    snprintf(tmp, sizeof tmp,
+    int tl = snprintf(tmp, sizeof tmp,
              "%s/usr/lib/aarch64-linux-gnu:%s/lib/aarch64-linux-gnu:"
              "%s/usr/lib:%s/lib",
              buf, buf, buf, buf);
+    if (tl < 0 || (size_t)tl >= sizeof tmp) return NULL;
     snprintf(buf, sizeof buf, "%s", tmp);
     return buf;
 }
@@ -3967,7 +3968,8 @@ static void fault_handler(int sig, siginfo_t *si, void *ctx) {
             unsigned long m3 = (x5r2 > 0x1000) ? *(volatile unsigned long *)(x5r2 + 7) : 0;
             for (int sh = 60; sh >= 0; sh -= 4) b[i++] = hxd[(m3 >> sh) & 0xf];
             p = " len="; while (*p) b[i++] = *p++;
-            for (int sh = 28; sh >= 0; sh -= 4) b[i++] = hxd[((unsigned long)i >> sh) & 0xf];
+            unsigned long lenv = (unsigned long)i;
+            for (int sh = 28; sh >= 0; sh -= 4) b[i++] = hxd[(lenv >> sh) & 0xf];
         }
         b[i++] = '\n';
         sys_write(2, b, (size_t)i);
