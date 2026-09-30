@@ -687,6 +687,8 @@ static void *ldso_dl_open_impl(const char *file, int mode, const void *caller,
     (void)mode; (void)caller; (void)nsid; (void)argc; (void)argv; (void)env;
     if (!file || !file[0] || !g_crash_scope)
         return NULL;
+    if (getenv("ELF_LOADER_DL_TRACE"))
+        dprintf(2, "[DL] _dl_open(%s)\n", file);
     char resolved[4096];
     const char *root = getenv("ROOTFS");
     size_t rl = root ? strlen(root) : 0;
