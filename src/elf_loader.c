@@ -613,22 +613,11 @@ static void *ldso_lookup_symbol_x_impl(const char *name, void *undef_map,
         return NULL;
     const Elf64_Sym *sym = NULL;
     elf_object_t *m = elf_scope_find(g_crash_scope, name, &sym);
-    if (!m || !sym) {
-        if (getenv("ELF_LOADER_DL_TRACE") && name && strncmp(name, "_nss_", 5) == 0)
-            dprintf(2, "[DL] lookup_x(%s) -> NOT FOUND\n", name);
+    if (!m || !sym)
         return NULL;
-    }
     if (ref)
         *ref = sym;
-    void *lm = ldso_linkmap_for(m);
-    if (getenv("ELF_LOADER_DL_TRACE") && name && strncmp(name, "_nss_", 5) == 0)
-        dprintf(2, "[DL] lookup_x(%s) -> lm=%p l_addr=%llx st_value=%llx sum=%llx soname=%s\n",
-                name, lm,
-                lm ? (unsigned long long)(*(uintptr_t*)((unsigned char*)lm + 0x00)) : 0,
-                (unsigned long long)sym->st_value,
-                lm ? (unsigned long long)(*(uintptr_t*)((unsigned char*)lm + 0x00) + sym->st_value) : 0,
-                m->soname ? m->soname : "?");
-    return lm;
+    return ldso_linkmap_for(m);
 }
 
 /* Wrapper: bionicky loader kod (memset/strncpy v ldso_register_linkmap). */
@@ -698,8 +687,6 @@ static void *ldso_dl_open_impl(const char *file, int mode, const void *caller,
     (void)mode; (void)caller; (void)nsid; (void)argc; (void)argv; (void)env;
     if (!file || !file[0] || !g_crash_scope)
         return NULL;
-    if (getenv("ELF_LOADER_DL_TRACE"))
-        dprintf(2, "[DL] _dl_open(%s)\n", file);
     /* NSS mdns knihovny: glibc si spocita adresu symbolu pres LOOKUP_VALUE_ADDRESS
      * z fake link_map, ale _dl_lookup_symbol_x v libc.so (dlvsym cesta) sahne po
      * l_scope, ktere v nasi fake strukture chybi -> loadbase=0 nebo raw offset
@@ -747,9 +734,6 @@ static void *ldso_dl_open_impl(const char *file, int mode, const void *caller,
     }
     size_t prev_count = g_pending_count;
     elf_object_t *m = elf_load_shared(resolved, g_crash_scope);
-    if (getenv("ELF_LOADER_DL_TRACE"))
-        dprintf(2, "[DL] _dl_open: resolved=%s -> m=%p base=%p\n", resolved, (void*)m,
-                m ? m->base_addr : NULL);
     /* Nove zarazene inity spust pod parrot TP - jsou to konstruktory guest
      * modulu (libcrypto OSSL ctor, libstdc++ atd.), ktere sahaji do guest TLS.
      * loader sam (a ldso_linkmap_for nize) musi zustat pod bionickym TP. */
@@ -1162,8 +1146,6 @@ void *ldso_dlopen(const char *file, int mode) {
     uintptr_t saved = dl_tp_get();
     int sw = (g_tls_old_tp && saved != g_tls_old_tp);
     if (sw) dl_tp_set(g_tls_old_tp);
-    if (getenv("ELF_LOADER_DL_TRACE") && file)
-        dprintf(2, "[DL] dlopen(%s)\n", file);
     void *ret = NULL;
     if (!file) {                 /* dlopen(NULL) = handle hlavniho programu */
         g_dl_err_valid = 0;
@@ -1226,8 +1208,6 @@ static void *mod_lookup_name(elf_object_t *m, const char *name) {
 
 void *ldso_dlsym(void *handle, const char *name) {
     if (!name) { dl_set_err("invalid symbol name"); return NULL; }
-    if (getenv("ELF_LOADER_DL_TRACE") && name && strncmp(name, "_nss_", 5) == 0)
-        dprintf(2, "[DL] dlsym(%p, %s)\n", handle, name);
     uintptr_t saved = dl_tp_get();
     int sw = (g_tls_old_tp && saved != g_tls_old_tp);
     if (sw) dl_tp_set(g_tls_old_tp);
