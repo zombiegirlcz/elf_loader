@@ -286,8 +286,14 @@ static char **env_without_preload(char *const envp[]) {
 static int redirect_exec(const char *path, char *const argv[], char *const envp[],
                          int search_path) {
     char resolved[PATH_MAX];
-    if (!is_whitelisted(path) || !resolve_target(path, resolved, sizeof resolved, search_path))
+    if (!resolve_target(path, resolved, sizeof resolved, search_path))
         return 0;   /* 0 = not redirected */
+    /* whitelist se pouziva jen pro logovani (sber chyb k pozdejsimu ladeni),
+     * ne jako rozhodovaci gate — bionic neumi spustit guest glibc binarku
+     * primo (chybi PT_INTERP /lib/ld-linux-aarch64.so.1), takze re-exec pres
+     * elf_loader musi bezet vzdy. */
+    if (is_whitelisted(path))
+        white_log("[whitelist-hit] path=%s\n", path);
 
     char **na = build_loader_argv(resolved, argv);
     if (!na) {
@@ -317,7 +323,7 @@ static int redirect_exec(const char *path, char *const argv[], char *const envp[
 
 int execve(const char *path, char *const argv[], char *const envp[]) {
     ensure_init();
-    if (path && is_whitelisted(path)) {
+    if (path) {
         int r = redirect_exec(path, argv, envp, 0);
         if (r == -1) return -1;
     }
@@ -330,7 +336,7 @@ int execv(const char *path, char *const argv[]) {
 
 int execvp(const char *file, char *const argv[]) {
     ensure_init();
-    if (file && is_whitelisted(file)) {
+    if (file) {
         int r = redirect_exec(file, argv, environ, 1);
         if (r == -1) return -1;
     }
@@ -339,7 +345,7 @@ int execvp(const char *file, char *const argv[]) {
 
 int execvpe(const char *file, char *const argv[], char *const envp[]) {
     ensure_init();
-    if (file && is_whitelisted(file)) {
+    if (file) {
         int r = redirect_exec(file, argv, envp, 1);
         if (r == -1) return -1;
     }
@@ -352,7 +358,7 @@ int execvpe(const char *file, char *const argv[], char *const envp[]) {
 
 int execveat(int dirfd, const char *path, char *const argv[], char *const envp[], int flags) {
     ensure_init();
-    if (path && is_whitelisted(path)) {
+    if (path) {
         int r = redirect_exec(path, argv, envp, 0);
         if (r == -1) return -1;
     }
@@ -366,8 +372,10 @@ int posix_spawn(pid_t *pid, const char *path,
                 const posix_spawnattr_t *attr,
                 char *const argv[], char *const envp[]) {
     ensure_init();
-    if (!(path && is_whitelisted(path)))
+    if (!path)
         return real_posix_spawn(pid, path, fa, attr, argv, envp);
+    if (is_whitelisted(path))
+        white_log("[whitelist-hit] posix_spawn path=%s\n", path);
 
     char resolved[PATH_MAX];
     if (!resolve_target(path, resolved, sizeof resolved, 0))
@@ -391,8 +399,10 @@ int posix_spawnp(pid_t *pid, const char *file,
                  const posix_spawnattr_t *attr,
                  char *const argv[], char *const envp[]) {
     ensure_init();
-    if (!(file && is_whitelisted(file)))
+    if (!file)
         return real_posix_spawnp(pid, file, fa, attr, argv, envp);
+    if (is_whitelisted(file))
+        white_log("[whitelist-hit] posix_spawnp file=%s\n", file);
     /* posix_spawnp resolves via PATH like execvp; re-use that path logic then
      * call real posix_spawn (not spawnp) with the resolved loader target. */
     char resolved[PATH_MAX];
