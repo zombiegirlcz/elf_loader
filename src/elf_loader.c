@@ -613,16 +613,22 @@ static void *ldso_lookup_symbol_x_impl(const char *name, void *undef_map,
         return NULL;
     const Elf64_Sym *sym = NULL;
     elf_object_t *m = elf_scope_find(g_crash_scope, name, &sym);
-    if (getenv("ELF_LOADER_DL_TRACE") && name && strncmp(name, "_nss_", 5) == 0)
-        dprintf(2, "[DL] lookup_x(%s) -> m=%p sym=%p st_value=%llx soname=%s\n",
-                name, (void*)m, (void*)sym,
-                sym ? (unsigned long long)sym->st_value : 0,
-                (m && m->soname) ? m->soname : "?");
-    if (!m || !sym)
+    if (!m || !sym) {
+        if (getenv("ELF_LOADER_DL_TRACE") && name && strncmp(name, "_nss_", 5) == 0)
+            dprintf(2, "[DL] lookup_x(%s) -> NOT FOUND\n", name);
         return NULL;
+    }
     if (ref)
         *ref = sym;
-    return ldso_linkmap_for(m);
+    void *lm = ldso_linkmap_for(m);
+    if (getenv("ELF_LOADER_DL_TRACE") && name && strncmp(name, "_nss_", 5) == 0)
+        dprintf(2, "[DL] lookup_x(%s) -> lm=%p l_addr=%llx st_value=%llx sum=%llx soname=%s\n",
+                name, lm,
+                lm ? (unsigned long long)(*(uintptr_t*)((unsigned char*)lm + 0x00)) : 0,
+                (unsigned long long)sym->st_value,
+                lm ? (unsigned long long)(*(uintptr_t*)((unsigned char*)lm + 0x00) + sym->st_value) : 0,
+                m->soname ? m->soname : "?");
+    return lm;
 }
 
 /* Wrapper: bionicky loader kod (memset/strncpy v ldso_register_linkmap). */
