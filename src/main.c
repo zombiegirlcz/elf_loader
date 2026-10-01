@@ -559,10 +559,19 @@ static void ring_logger(unsigned long *regs) {
     g_dispatch_ring_idx++;
 }
 
+static void install_regs_trace_impl(void *target, void *logger_fn, const char *tag,
+                                    int require_blr);
 static void install_call_trace_with(void *target, void *logger_fn, const char *tag) {
+    install_regs_trace_impl(target, logger_fn, tag, 1);
+}
+/* require_blr=0: libovolna instrukce na vstupu funkce (ELF_LOADER_TRACE_REGS).
+ * Uklada x0-x17 + x30 (regs[18]), logger cte vsechny argumenty, po navratu
+ * se obnovi -> funkce bezi s puvodnimi registry. */
+static void install_regs_trace_impl(void *target, void *logger_fn, const char *tag,
+                                    int require_blr) {
     uint32_t ins0 = *(const uint32_t *)target;
     /* BLR Xn kontrola: bity [31:10] = 1101011 0 001 11111 000000, Rn v [9:5]. */
-    if ((ins0 & 0xFFFFFC1Fu) != 0xD63F0000u) {
+    if (require_blr && (ins0 & 0xFFFFFC1Fu) != 0xD63F0000u) {
         fprintf(stderr, "[%s] %p: ins=%08x neni BLR Xn, preskakuji\n",
                 tag, target, ins0);
         return;
@@ -594,6 +603,7 @@ static void install_call_trace_with(void *target, void *logger_fn, const char *t
     sc[i++] = 0xD10403FFu;                    /* sub sp, sp, #256 (16-align, 144 potreba) */
     for (int r = 0; r <= 17; r++)
         sc[i++] = tc_enc_str(r, 31, r * 8);   /* str xR, [sp, #R*8] */
+    sc[i++] = tc_enc_str(30, 31, 18 * 8);     /* str x30, [sp, #144] (regs[18]) */
     sc[i++] = 0x910003E0u;                    /* mov x0, sp (arg logger) */
     /* BUG (opraveno): sekvencni provadeni NEPRESKOCI literal samo od sebe -
      * bez explicitni vetve tu CPU spadne do 8 B literalu jako do instrukci
@@ -608,6 +618,7 @@ static void install_call_trace_with(void *target, void *logger_fn, const char *t
     sc[i++] = 0xD63F0120u;                    /* blr x9 */
     for (int r = 0; r <= 17; r++)
         sc[i++] = tc_enc_ldr(r, 31, r * 8);   /* ldr xR, [sp, #R*8] */
+    sc[i++] = tc_enc_ldr(30, 31, 18 * 8);     /* ldr x30, [sp, #144] */
     sc[i++] = 0x910403FFu;                    /* add sp, sp, #256 */
     uint32_t jb = branch_insn((char *)shim + (size_t)i * 4, tramp);
     if (!jb) { fprintf(stderr, "[%s] shim->tramp OOR\n", tag); return; }
@@ -621,6 +632,56 @@ static void install_call_trace_with(void *target, void *logger_fn, const char *t
     } else {
         fprintf(stderr, "[%s] patch_branch FAILED at %p\n", tag, target);
     }
+}
+/* ELF_LOADER_TRACE_REGS=<hex>[,...]: na vstupu funkce zaloguje x0-x3 + x30
+ * (raw zapis, guest TP-safe) do usr/trace_call.txt. */
+static void trace_regs_logger(unsigned long *regs) {
+    char b[200]; char *i = b;
+    const char *p = "[REGS] x0="; while (*p) *i++ = *p++;
+    shim_hex(&i, regs[0], 16);
+    p = " x1="; while (*p) *i++ = *p++; shim_hex(&i, regs[1], 16);
+    p = " x2="; while (*p) *i++ = *p++; shim_hex(&i, regs[2], 16);
+    p = " x3="; while (*p) *i++ = *p++; shim_hex(&i, regs[3], 16);
+    p = " x30="; while (*p) *i++ = *p++; shim_hex(&i, regs[18], 16);
+    *i++ = '\n';
+    long fd = shim_raw_syscall6(56, (long)0xFFFFFFFFFFFFFF9CL,
+                                 (long)(unsigned long)"/data/user/0/com.linux_core/files/usr/trace_call.txt",
+                                 0x441L, 0644L, 0, 0);
+    if (fd >= 0) {
+        shim_raw_syscall6(64, fd, (long)b, (long)(i - b), 0, 0, 0);
+        shim_raw_syscall6(57, fd, 0, 0, 0, 0, 0);
+    }
+}
+/* ELF_LOADER_TRACE_PEEK: k [REGS] pridat bezpecne cteni pameti
+ * (process_vm_readv) - qwordy na *x0, x2 a builtin_table_ isolate=x1. */
+static int peek_q(unsigned long a, unsigned long *out, int n) {
+    struct { void *b; unsigned long l; } lv = { out, (unsigned long)n * 8 }, rv = { (void *)a, (unsigned long)n * 8 };
+    long pid = shim_raw_syscall6(172, 0, 0, 0, 0, 0, 0);
+    return shim_raw_syscall6(270, pid, (long)&lv, 1, (long)&rv, 1, 0) == n * 8;
+}
+static void peek_line(const char *tag, unsigned long a, int n) {
+    unsigned long q[8]; char b[300]; char *i = b; const char *p = tag;
+    while (*p) *i++ = *p++;
+    shim_hex(&i, a, 16); *i++ = ':';
+    if (n > 8) n = 8;
+    if (a && peek_q(a, q, n)) {
+        for (int k = 0; k < n; k++) { *i++ = ' '; shim_hex(&i, q[k], 16); }
+    } else { p = " <neciteln>"; while (*p) *i++ = *p++; }
+    *i++ = '\n';
+    long fd = shim_raw_syscall6(56, (long)0xFFFFFFFFFFFFFF9CL,
+                                 (long)(unsigned long)"/data/user/0/com.linux_core/files/usr/trace_call.txt",
+                                 0x441L, 0644L, 0, 0);
+    if (fd >= 0) { shim_raw_syscall6(64, fd, (long)b, (long)(i - b), 0, 0, 0); shim_raw_syscall6(57, fd, 0, 0, 0, 0, 0); }
+}
+static int g_trace_peek = -1;
+static void trace_regs_peek_logger(unsigned long *regs) {
+    trace_regs_logger(regs);
+    unsigned long sfi = 0;
+    if (peek_q(regs[0], &sfi, 1) && (sfi & 1)) peek_line("  *x0-1=", sfi - 1, 8);
+    if (regs[2] & 1) peek_line("  x2-1=", regs[2] - 1, 8);
+    static const int ids[] = { 83, 104, 198, 518 };
+    for (int k = 0; k < 4; k++)
+        peek_line("  btab=", regs[1] + 0xa798 + (unsigned long)ids[k] * 8, 1);
 }
 static void install_call_trace(void *target) {
     install_call_trace_with(target, (void *)trace_call_logger, "TRACE_CALL");
@@ -3343,6 +3404,22 @@ static int run_ownall(const char *path, int argc, char **argv, char **envp) {
      * ktere nejsou `blr` (viz install_entry_trace) - loguje x1(JSFunction)
      * a x30(volajici) pri KAZDEM vstupu do dane funkce, napr. entry do
      * Builtins_InterpreterEntryTrampoline pred padem. */
+    {
+        const char *tr = getenv("ELF_LOADER_TRACE_REGS");
+        if (tr && tr[0]) {
+            char buf[512];
+            strncpy(buf, tr, sizeof buf - 1);
+            buf[sizeof buf - 1] = '\0';
+            for (char *tok = strtok(buf, ","); tok; tok = strtok(NULL, ",")) {
+                unsigned long addr = strtoul(tok, NULL, 0);
+                if (g_trace_peek < 0) g_trace_peek = getenv("ELF_LOADER_TRACE_PEEK") != NULL;
+                if (addr) install_regs_trace_impl((void *)addr,
+                                                  g_trace_peek ? (void *)trace_regs_peek_logger
+                                                               : (void *)trace_regs_logger,
+                                                  "TRACE_REGS", 0);
+            }
+        }
+    }
     {
         const char *te = getenv("ELF_LOADER_TRACE_ENTRY");
         if (te && te[0]) {
