@@ -330,7 +330,11 @@ static void *call_ifunc_resolver(void *resolver) {
     args.auxv[0].a_un.a_val = 0;
     args.auxv[1].a_type = AT_NULL;
     args.auxv[1].a_un.a_val = 0;
-    return ((void *(*)(struct ifunc_arg_t *))resolver)(&args);
+    /* glibc AArch64 konvence: resolver(hwcap | _IFUNC_ARG_HWCAP, &arg).
+     * Resolvery (libatomic, glibc string) testuji bity primo v x0 - drive
+     * jsme tam posilali ukazatel, takze volba varianty byla nahodna. */
+    return ((void *(*)(unsigned long, struct ifunc_arg_t *))resolver)(
+        args.hwcap | (1UL << 62), &args);
 }
 
 /* ---- emulation of glibc's ld.so-private runtime state ---- */
@@ -414,10 +418,9 @@ static uint64_t ldso_module_linkmaps[LDSO_MAX_MODULES][0x100];
 static char ldso_module_names[LDSO_MAX_MODULES][256];
 static size_t ldso_module_count;
 static int ldso_modules_built;
+size_t ldso_register_linkmap(elf_object_t *m);  /* definovan nize */
 
 void ldso_install_module_list(elf_object_t *const *mods, size_t count) {
-    /* ldso_register_linkmap je definovan nize; deklarace vpred. */
-    extern size_t ldso_register_linkmap(elf_object_t *m);
     if (count > LDSO_MAX_MODULES)
         count = LDSO_MAX_MODULES;
     for (size_t i = 0; i < count; i++)
@@ -1432,8 +1435,14 @@ static void *resolve_jmp_symbol(elf_object_t *obj, Elf64_Rela *r) {
                 }
             }
         } else {
+            /* Symbol definovany v tomtez modulu (napr. libatomic vola pres
+             * vlastni PLT svuj exportovany IFUNC __atomic_compare_exchange_8).
+             * Bez resolveru by GOT ukazoval na resolver -> "CAS" vrati adresu
+             * (true) a nic nezapise (V8 JSDispatchTable freelist). */
             via = "defined";
             addr = va(obj, s->st_value);
+            if (ELF64_ST_TYPE(s->st_info) == STT_GNU_IFUNC)
+                is_ifunc = 1;
         }
         if (is_ifunc && getenv("ELF_LOADER_RELOC_TRACE"))
             fprintf(stderr, "[ifunc] %s in %s -> resolver %p\n",
@@ -2132,8 +2141,12 @@ void elf_scope_add(elf_scope_t *s, elf_object_t *m) {
 void *elf_scope_lookup(const elf_scope_t *s, const char *name) {
     const Elf64_Sym *sym = NULL;
     elf_object_t *m = elf_scope_find(s, name, &sym);
-    if (m && sym)
-        return (char *)m->base_addr + (sym->st_value - map_base_vaddr(m));
+    if (m && sym) {
+        void *addr = (char *)m->base_addr + (sym->st_value - map_base_vaddr(m));
+        if (ELF64_ST_TYPE(sym->st_info) == STT_GNU_IFUNC)
+            addr = call_ifunc_resolver(addr);
+        return addr;
+    }
     return NULL;
 }
 
@@ -3098,6 +3111,47 @@ static void apply_relr(elf_object_t *obj) {
  * (stdin/stdout/stderr/__environ/__stack_chk_guard). Skutecna definice je
  * v libc (nebo v ldso override). Zkopiruj obsah do ciloveho slotu, aby exe
  * videl platny FILE* / hodnoty. Bez toho zustane stdin=NULL -> fileno(NULL) crash. */
+/* COPY interpozice: symbol zkopirovany do exe (R_AARCH64_COPY) musi i v
+ * knihovnach resolvovat na exe kopii, jako v ld.so (exe je prvni v lookup
+ * scope). Knihovny relokujeme drive nez exe a exe ve scope neni, takze
+ * jejich GLOB_DAT/ABS64 ukazuji na vlastni original -> dve kopie.
+ * Napr. std::ctype<char>::id: libstdc++ inicializuje _M_index ve sve
+ * kopii, exe (node) cte svou -> use_facet vrati smeti (pad v ToUpper). */
+static void interpose_copy_symbol(elf_object_t *exe, const char *name,
+                                  void *where) {
+    for (size_t i = 0; exe->scope && i < exe->scope->count; i++) {
+        elf_object_t *m = exe->scope->mods[i];
+        if (!m || m == exe || !m->dynsym || !m->dynstr)
+            continue;
+        Elf64_Dyn *dyn = find_dynamic(m);
+        Elf64_Rela *rela = NULL;
+        size_t rsz = 0;
+        for (Elf64_Dyn *d = dyn; d && d->d_tag != DT_NULL; d++) {
+            if (d->d_tag == DT_RELA)
+                rela = (Elf64_Rela *)va(m, d->d_un.d_ptr);
+            else if (d->d_tag == DT_RELASZ)
+                rsz = d->d_un.d_val;
+        }
+        size_t mbv = map_base_vaddr(m);
+        for (size_t off = 0; rela && off < rsz; off += sizeof(Elf64_Rela)) {
+            Elf64_Rela *r = (Elf64_Rela *)((char *)rela + off);
+            uint32_t t = ELF64_R_TYPE(r->r_info);
+            if (t != R_AARCH64_GLOB_DAT && t != R_AARCH64_ABS64)
+                continue;
+            size_t si = ELF64_R_SYM(r->r_info);
+            if (si == 0 || si >= m->dynsym_count)
+                continue;
+            if (strcmp(m->dynstr + m->dynsym[si].st_name, name) != 0)
+                continue;
+            uint64_t *slot = (uint64_t *)((char *)m->base_addr + (r->r_offset - mbv));
+            *slot = (uint64_t)where + (t == R_AARCH64_ABS64 ? r->r_addend : 0);
+            if (elf_debug())
+                fprintf(stderr, "[COPY-interpose] %s in %s -> %p\n", name,
+                        m->soname ? m->soname : "?", where);
+        }
+    }
+}
+
 static int do_copy_reloc(elf_object_t *obj, Elf64_Rela *r, void *where) {
     size_t sym_idx = ELF64_R_SYM(r->r_info);
     if (sym_idx >= obj->dynsym_count)
@@ -3139,11 +3193,25 @@ static int do_copy_reloc(elf_object_t *obj, Elf64_Rela *r, void *where) {
             ldso_stack_end_slots[ldso_stack_end_slot_count++] = (void **)where;
         if (elf_debug())
             fprintf(stderr, "[COPY] %s <- %p (%zu B)\n", name, src, sz);
+        if (!getenv("ELF_LOADER_NO_COPY_INTERPOSE"))
+            interpose_copy_symbol(obj, name, where);
         return 1;
     }
     fprintf(stderr, "[WARN] COPY reloc unresolved: %s in %s\n",
             name, obj->soname ? obj->soname : "EXE");
     return 0;
+}
+
+/* GLOB_DAT/ABS64/JUMP_SLOT, jehoz symbol je STT_GNU_IFUNC definovany v obj. */
+static int is_local_ifunc_reloc(const elf_object_t *obj, const Elf64_Rela *r) {
+    uint32_t t = ELF64_R_TYPE(r->r_info);
+    if (t != R_AARCH64_GLOB_DAT && t != R_AARCH64_ABS64 && t != R_AARCH64_JUMP_SLOT)
+        return 0;
+    size_t i = ELF64_R_SYM(r->r_info);
+    if (i == 0 || i >= obj->dynsym_count)
+        return 0;
+    const Elf64_Sym *s = &obj->dynsym[i];
+    return s->st_shndx != SHN_UNDEF && ELF64_ST_TYPE(s->st_info) == STT_GNU_IFUNC;
 }
 
 int elf_relocate(elf_object_t *obj) {
@@ -3224,6 +3292,8 @@ int elf_relocate(elf_object_t *obj) {
                 const char *name = obj->dynstr + s->st_name;
                 if (s->st_shndx == SHN_UNDEF)
                     addr = elf_resolve_import(obj, name);
+                else if (ELF64_ST_TYPE(s->st_info) == STT_GNU_IFUNC)
+                    break;  /* resolver az po apply_segment_prots (viz nize) */
                 else
                     addr = va(obj, s->st_value);
             }
@@ -3274,6 +3344,8 @@ int elf_relocate(elf_object_t *obj) {
             count++;
             continue;
         }
+        if (is_local_ifunc_reloc(obj, r))
+            continue;  /* resolver az po apply_segment_prots (viz nize) */
         void *addr = resolve_jmp_symbol(obj, r);
         if (addr) {
             *where = (uint64_t)addr;
@@ -3318,6 +3390,26 @@ int elf_relocate(elf_object_t *obj) {
             printf("[irel.plt] %s addend=%#lx off=%#lx -> %p\n", obj->soname, (unsigned long)r->r_addend, (unsigned long)r->r_offset, res2);
         *where = (uint64_t)res2;
         count++;
+    }
+
+    /* GLOB_DAT/ABS64/JUMP_SLOT na IFUNC definovany v tomtez modulu (napr.
+     * libatomic -> vlastni __atomic_compare_exchange_8). Resolver je kod
+     * modulu, takze stejne jako IRELATIVE az po apply_segment_prots. */
+    for (int pass = 0; pass < 2; pass++) {
+        Elf64_Rela *tab = pass ? jmp_rela : rela;
+        size_t tsz = pass ? (lazy_binding ? 0 : jmp_size) : rela_size;
+        for (size_t off = 0; tab && off < tsz; off += sizeof(Elf64_Rela)) {
+            Elf64_Rela *r = (Elf64_Rela *)((char *)tab + off);
+            if (!is_local_ifunc_reloc(obj, r))
+                continue;
+            uint64_t *where = (uint64_t *)(base + (r->r_offset - mbv));
+            const Elf64_Sym *s = &obj->dynsym[ELF64_R_SYM(r->r_info)];
+            uint64_t res = (uint64_t)call_ifunc_resolver(va(obj, s->st_value));
+            if (ELF64_R_TYPE(r->r_info) == R_AARCH64_ABS64)
+                res += r->r_addend;
+            *where = res;
+            count++;
+        }
     }
 
     if (elf_debug())
