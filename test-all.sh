@@ -603,6 +603,51 @@ category_python() {
     fi
 }
 
+# Regresni test: absolutni symlink venv/bin/python mirici MIMO ROOTFS
+# (uv managed Python pod /data/.../uv/python/...). resolve_symlinks_under_root()
+# ho NESMI prependnout pod ROOTFS, jinak $R/data/... -> ENOENT a venv je mrtvy.
+category_uv() {
+    echo ""
+    echo "=== uv (venv symlink mimo ROOTFS) ==="
+    local uv_bin="$R/usr/local/bin/uv"
+    if [ ! -x "$uv_bin" ]; then
+        echo "SKIP uv: not found at $uv_bin"
+        echo "SKIP: uv - not found" >> "$SKIP_LOG"
+        ((SKIP_COUNT++)) || true
+        return 0
+    fi
+
+    local vdir="$R/root/uv_regr_venv"
+    local env="ROOTFS=$R ELF_ROOTFS=$R ELF_LOADER=$L"
+    local rc out
+
+    # 1) vytvor venv (uv) a spust venv python pres absolutni symlink mimo ROOTFS
+    ashell -c "$env $L --ownall $uv_bin venv $vdir" >/dev/null 2>&1 || true
+    out=$(ashell_out "$env $L --ownall $vdir/bin/python -V")
+    if printf '%s' "$out" | grep -Fq "Python 3"; then
+        echo "PASS uv: venv python symlink mimo ROOTFS ($out)"
+        echo "PASS: uv - venv python symlink" >> "$PASS_LOG"
+        ((PASS_COUNT++)) || true
+    else
+        echo "FAIL uv: venv python | $out"
+        echo "FAIL: uv - venv python symlink | $out" >> "$FAIL_LOG"
+        ((FAIL_COUNT++)) || true
+    fi
+
+    # 2) uv pip install do venv + import z venv pythonu
+    rc=$(ashell_rc "$env $L --ownall $uv_bin pip install --python $vdir/bin/python six")
+    out=$(ashell_out "$env $L --ownall $vdir/bin/python -c 'import six; print(six.__version__)'")
+    if [ "$rc" = 0 ] && printf '%s' "$out" | grep -Fq "1."; then
+        echo "PASS uv: pip install + import six ($out)"
+        echo "PASS: uv - pip install six" >> "$PASS_LOG"
+        ((PASS_COUNT++)) || true
+    else
+        echo "FAIL uv: pip install/import RC=$rc out=$out"
+        echo "FAIL: uv - pip install six | RC=$rc | $out" >> "$FAIL_LOG"
+        ((FAIL_COUNT++)) || true
+    fi
+}
+
 print_summary() {
     echo ""
     echo "=== SUMMARY ==="
@@ -702,6 +747,10 @@ case "${1:-all}" in
         category_python
         print_summary
         ;;
+    uv)
+        category_uv
+        print_summary
+        ;;
         discovered)
             category_discovered
             print_summary
@@ -722,6 +771,7 @@ case "${1:-all}" in
         category_extra
         category_shell
         category_python
+        category_uv
         print_summary
         ;;
 esac
