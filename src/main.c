@@ -1300,6 +1300,50 @@ static int raw_path_exists(const char *path) {
     return r == 0;
 }
 
+/* 1 = cilova binarka je glibc ELF (PT_INTERP obsahuje "ld-linux"), tedy se
+ * NESMI spustit primym bionickym execve (host nema /lib/ld-linux-aarch64.so.1),
+ * ale MUSI projit pres loader - i kdyz lezi MIMO ROOTFS (napr. uv managed
+ * Python pod /data/user/0/com.linux_core/files/.local/share/uv/python/...).
+ * Bionicke binarky (linker64) vraceji 0. Raw syscally: bezpecne pod parrot TP. */
+static int is_glibc_elf(const char *path) {
+    int fd = raw_open(path, O_RDONLY);
+    if (fd < 0) return 0;
+    unsigned char h[64];
+    ssize_t n = raw_read(fd, h, sizeof h);
+    if (n < 64 || h[0] != 0x7f || h[1] != 'E' || h[2] != 'L' || h[3] != 'F') {
+        raw_close(fd);
+        return 0;
+    }
+    uint64_t phoff = *(uint64_t *)(void *)(h + 32);
+    uint16_t phentsize = *(uint16_t *)(void *)(h + 54);
+    uint16_t phnum = *(uint16_t *)(void *)(h + 56);
+    if (phentsize < 56 || phnum == 0 || phnum > 1024) { raw_close(fd); return 0; }
+    int found = 0;
+    for (int i = 0; i < phnum && !found; i++) {
+        unsigned char ph[64];
+        shim_raw_syscall6(62 /*lseek*/, fd,
+                          (long)(phoff + (uint64_t)i * phentsize), 0, 0, 0, 0);
+        if (raw_read(fd, ph, sizeof ph) < 56) break;
+        uint32_t p_type = *(uint32_t *)(void *)ph;
+        if (p_type != 3 /*PT_INTERP*/) continue;
+        uint64_t p_offset = *(uint64_t *)(void *)(ph + 8);
+        uint64_t p_filesz = *(uint64_t *)(void *)(ph + 32);
+        if (p_filesz == 0 || p_filesz > 256) continue;
+        char interp[300];
+        shim_raw_syscall6(62, fd, (long)p_offset, 0, 0, 0, 0);
+        ssize_t r = raw_read(fd, interp, p_filesz);
+        if (r > 0) {
+            interp[r] = 0;
+            for (ssize_t k = 0; k + 8 <= r; k++)
+                if (interp[k] == 'l' && shim_strncmp(interp + k, "ld-linux", 8) == 0) {
+                    found = 1; break;
+                }
+        }
+    }
+    raw_close(fd);
+    return found;
+}
+
 /* TLS-safe symlink resolver for paths under ROOTFS. Resolves symlink chains
  * where targets are guest-absolute (e.g. /etc/alternatives/awk -> /usr/bin/mawk)
  * by prepending ROOTFS to absolute targets. Returns 1 if resolved, 0 if not a
@@ -1638,6 +1682,7 @@ static int shim_execve(const char *p, char *const argv[], char *const envp[]) {
 
     char resolved[8192];
     resolved[0] = 0;
+    int force_redirect = 0;   /* glibc ELF mimo ROOTFS: preskoc whitelist gate */
     size_t rl = g_shim_root ? shim_strlen(g_shim_root) : 0;
 
     /* Symlink pre-resolve: device-side symlinky (napr. $D/usr/bin/git ->
@@ -1680,9 +1725,19 @@ static int shim_execve(const char *p, char *const argv[], char *const envp[]) {
     } else if (shim_excluded(p) || shim_strncmp(p, "/system", 7) == 0 ||
         shim_strncmp(p, "/vendor", 7) == 0 || shim_strncmp(p, "/apex", 5) == 0 ||
         shim_strncmp(p, "/product", 8) == 0 || shim_strncmp(p, "/odm", 4) == 0) {
-        /* Excluded / host binaries -> real execve */
-        fp_execve f = (fp_execve)g_orig_execve;
-        return f ? f(p, argv, envp) : -1;
+        /* glibc ELF mimo ROOTFS (typicky uv managed Python pod /data/...):
+         * primy bionicky execve by selhal (chybi /lib/ld-linux-aarch64.so.1),
+         * takze ho posleme pres loader. Cesta se NEPREKLADA pod ROOTFS
+         * (binarka tam neni), preda se absolutni device cesta. Whitelist gate
+         * se pro tento pripad preskakuje (neni to guest binarka v ROOTFS). */
+        if (p[0] == '/' && is_glibc_elf(p)) {
+            shim_strcpy(resolved, sizeof(resolved), p);
+            force_redirect = 1;
+        } else {
+            /* Excluded / host binaries -> real execve */
+            fp_execve f = (fp_execve)g_orig_execve;
+            return f ? f(p, argv, envp) : -1;
+        }
     } else if (p[0] == '/') {
         /* Absolute guest path, e.g. /bin/ls or /usr/bin/gcc */
         if (g_f2_active && shim_translate(p, resolved, sizeof(resolved))) {
@@ -1778,8 +1833,9 @@ static int shim_execve(const char *p, char *const argv[], char *const envp[]) {
     }
 
     /* Whitelist gate: binarky mimo whitelist se NEredirectuji (real execve),
-     * ale zaloguji se do white.log, aby bylo videt co chybi. */
-    if (!wl_match(p)) {
+     * ale zaloguji se do white.log, aby bylo videt co chybi. glibc ELF mimo
+     * ROOTFS (force_redirect) gate obchazi - neni to guest binarka v ROOTFS. */
+    if (!force_redirect && !wl_match(p)) {
         wl_log_skip(p, "not-in-whitelist");
         fp_execve rf = (fp_execve)g_orig_execve;
         return rf ? rf(p, argv, envp) : -1;
@@ -2152,8 +2208,14 @@ static int shim_posix_spawnp(pid_t *pid, const char *p, const void *fa,
         if (shim_excluded(p) || shim_strncmp(p, "/system", 7) == 0 ||
             shim_strncmp(p, "/vendor", 7) == 0 || shim_strncmp(p, "/apex", 5) == 0 ||
             shim_strncmp(p, "/product", 8) == 0 || shim_strncmp(p, "/odm", 4) == 0) {
-            fp_posix_spawnp f = (fp_posix_spawnp)g_orig_posix_spawnp;
-            return f ? f(pid, p, fa, at, argv, envp) : -1;
+            /* glibc ELF mimo ROOTFS (uv managed Python pod /data/...): pres
+             * loader, cesta zustava absolutni device cesta (neprekladat). */
+            if (is_glibc_elf(p)) {
+                shim_strcpy(resolved, sizeof resolved, p);
+            } else {
+                fp_posix_spawnp f = (fp_posix_spawnp)g_orig_posix_spawnp;
+                return f ? f(pid, p, fa, at, argv, envp) : -1;
+            }
         } else if (!shim_translate(p, resolved, sizeof resolved)) {
             if (rl && shim_strncmp(p, g_shim_root, rl) == 0)
                 shim_strcpy(resolved, sizeof resolved, p);
