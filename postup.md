@@ -2579,3 +2579,28 @@ pod ROOTFS, oba testy zčervenají.
 jediný rozdíl byl flaky timeout `gdb` (5s limit), samostatně 3× RC=0.
 Bionické binárky pod `/system`/`/data` (`/system/bin/sh`, `rg`) stále
 raw exec. Commity `7da0f81`, `cf69881`, `8deccaa` na `origin/dev`.
+
+### Follow-up (`448ca71`): entry shebang detekce + symlink chain
+
+**Symptom:** `which` pod loaderem hlásí `[-] Not an ELF file` (např. uv
+activate skript volá `which python`).
+
+**Root cause:** `$R/usr/bin/which -> /etc/alternatives/which ->
+/usr/bin/which.debianutils` (skript `/bin/sh`). Entry shebang detekce
+v `main()` otevírala `path` **přímo** (`open(path,…)`) — jenže `path` byl
+symlink s hostovsky-absolutním cílem (`/etc/alternatives/which` na hostu
+neexistuje) → `open` selhal → `#!` se nedetekovalo → `elf_load` teprve
+resolvnul chain na skript a spadl na „Not an ELF file". U přímého
+`which.debianutils` detekce prošla (regulérní skript).
+
+**Fix:** před shebang detekcí v `main()` resolvnout symlinky pod ROOTFS
+přes `shim_resolve_symlinks()`; buffer `static` (path na něj může ukazovat
+i po bloku, když jde o symlinkovaný ELF).
+
+**Ověření:** `which ls` → `$R/usr/bin/ls` RC=0 (žádné „Not an ELF file");
+symlinkované ELF (`awk` → gawk, `egrep`, `sh` → dash) stále RC=0.
+
+**Regresní test** (`test-all.sh symlink`, i v `all`): (1) `which` chain
+na skript, (2) `awk` chain na ELF, (3) guard na absenci „Not an ELF file".
+`test-all.sh all`: PASS 128 / FAIL 33 — FAIL sada **bit-identická**
+s předchozím během (`diff` EXIT=0), žádná regrese. Na `origin/dev`.
