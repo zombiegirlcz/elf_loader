@@ -1956,11 +1956,34 @@ static void resolve_symlinks_under_root(const char *path, char *out, size_t outs
             /* uz pod ROOTFS (proot link2symlink .l2s cile jsou hostove absolutni) */
             strncpy(next, linkbuf, sizeof(next) - 1); next[sizeof(next) - 1] = 0;
         } else if (linkbuf[0] == '/') {
-            /* absolute target: prepend ROOTFS */
-            if (rl + strlen(linkbuf) + 1 < sizeof(next)) {
-                memcpy(next, root, rl);
-                strcpy(next + rl, linkbuf);
-            } else { strncpy(out, cur, outsz-1); out[outsz-1] = 0; return; }
+            /* Absolutni cil symlinku. Priorita: (1) guest cesta pod ROOTFS,
+             * (2) host cesta tak jak je. Duvod pro (2): uv managed Python
+             * (venv/bin/python -> /data/user/0/.../uv/python/.../python3.14)
+             * miri MIMO ROOTFS na device cestu, ktera realne existuje -
+             * slepe prependnuti ROOTFS by z ni udelalo $R/data/... (ENOENT)
+             * a venv by se tvaril jako rozbity. Prioritizace guest cesty
+             * zachovava spravne chovani pro /bin/sh, /usr/lib/... symlinky. */
+            struct stat gst;
+            char g[4096];
+            int used = 0;
+            if (rl + strlen(linkbuf) + 1 < sizeof(g)) {
+                memcpy(g, root, rl);
+                strcpy(g + rl, linkbuf);
+                if (lstat(g, &gst) == 0) {
+                    strncpy(next, g, sizeof(next)-1); next[sizeof(next)-1] = 0;
+                    used = 1;
+                }
+            }
+            if (!used && lstat(linkbuf, &gst) == 0) {
+                strncpy(next, linkbuf, sizeof(next)-1); next[sizeof(next)-1] = 0;
+                used = 1;
+            }
+            if (!used) {
+                if (rl + strlen(linkbuf) + 1 < sizeof(next)) {
+                    memcpy(next, root, rl);
+                    strcpy(next + rl, linkbuf);
+                } else { strncpy(out, cur, outsz-1); out[outsz-1] = 0; return; }
+            }
         } else {
             /* relative target: resolve against symlink's directory */
             strncpy(next, cur, sizeof(next)-1); next[sizeof(next)-1] = 0;
