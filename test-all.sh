@@ -648,6 +648,56 @@ category_uv() {
     fi
 }
 
+# Regresni test: symlink chain v ROOTFS s absolutnimi cily na skript/ELF.
+# Klasicky pripad: $R/usr/bin/which -> /etc/alternatives/which ->
+# /usr/bin/which.debianutils (skript /bin/sh). Entry shebang detekce v main()
+# musi nejdriv resolvnout symlinky pod ROOTFS, jinak open(path) na hostu selze
+# (broken symlink) a loader hlasi "Not an ELF file". Druhy pripad: symlink na
+# ELF (awk -> /etc/alternatives/awk -> gawk) musi porad bezet jako ELF.
+category_symlink() {
+    echo ""
+    echo "=== symlink chain (absolutni cile v ROOTFS) ==="
+    local env="ROOTFS=$R ELF_ROOTFS=$R ELF_LOADER=$L PATH=$R/usr/bin:$R/bin"
+    local rc out
+
+    # 1) symlink -> skript (/bin/sh): which pres alternatives chain
+    rc=$(ashell_rc "$env $L --ownall $R/usr/bin/which ls")
+    out=$(ashell_out "$env $L --ownall $R/usr/bin/which ls")
+    if [ "$rc" = 0 ] && printf '%s' "$out" | grep -Fq "/usr/bin/ls"; then
+        echo "PASS symlink: which -> alternatives -> skript ($out)"
+        echo "PASS: symlink - which skript" >> "$PASS_LOG"
+        ((PASS_COUNT++)) || true
+    else
+        echo "FAIL symlink: which | RC=$rc | $out"
+        echo "FAIL: symlink - which skript | RC=$rc | $out" >> "$FAIL_LOG"
+        ((FAIL_COUNT++)) || true
+    fi
+
+    # 2) symlink -> ELF: awk -> alternatives -> gawk (must not break ELF path)
+    out=$(ashell_out "$env $L --ownall $R/usr/bin/awk 'BEGIN{print 1+2}'")
+    if printf '%s' "$out" | grep -Fq "3"; then
+        echo "PASS symlink: awk -> alternatives -> gawk ELF ($out)"
+        echo "PASS: symlink - awk ELF" >> "$PASS_LOG"
+        ((PASS_COUNT++)) || true
+    else
+        echo "FAIL symlink: awk | $out"
+        echo "FAIL: symlink - awk ELF | $out" >> "$FAIL_LOG"
+        ((FAIL_COUNT++)) || true
+    fi
+
+    # 3) regrese guard: zadny 'Not an ELF file' na stderr u which
+    out=$(ashell_out "$env $L --ownall $R/usr/bin/which ls 2>&1")
+    if printf '%s' "$out" | grep -Fq "Not an ELF file"; then
+        echo "FAIL symlink: which stale hlasi 'Not an ELF file'"
+        echo "FAIL: symlink - which Not an ELF | $out" >> "$FAIL_LOG"
+        ((FAIL_COUNT++)) || true
+    else
+        echo "PASS symlink: which nehlasi 'Not an ELF file'"
+        echo "PASS: symlink - which no-Not-ELF" >> "$PASS_LOG"
+        ((PASS_COUNT++)) || true
+    fi
+}
+
 print_summary() {
     echo ""
     echo "=== SUMMARY ==="
@@ -751,6 +801,10 @@ case "${1:-all}" in
         category_uv
         print_summary
         ;;
+    symlink)
+        category_symlink
+        print_summary
+        ;;
         discovered)
             category_discovered
             print_summary
@@ -772,6 +826,7 @@ case "${1:-all}" in
         category_shell
         category_python
         category_uv
+        category_symlink
         print_summary
         ;;
 esac

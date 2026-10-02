@@ -3186,6 +3186,15 @@ static int run_ownall(const char *path, int argc, char **argv, char **envp) {
      * path/argv na [interp, (interp_arg,) script, orig_args...]. Interpret
      * pod guest ROOTFS (napr. /usr/bin/python3 -> $ROOTFS/usr/bin/python3). */
     {
+        /* Entry symlink resolv PRED shebang detekci: `which` je
+         * $R/usr/bin/which -> /etc/alternatives/which -> /usr/bin/which.debianutils
+         * (skript). Cile symlinku jsou v rootfs absolutni host cesty, takze
+         * prime open(path) na hostu selze (broken symlink) -> shebang se
+         * nedetekuje a elf_load pak hlasi "Not an ELF file". Resolvneme chain
+         * pod ROOTFS (shim_resolve_symlinks), aby se #! naslo. */
+        static char _resolved[8192];   /* static: path na nej muze ukazovat i po bloku */
+        if (shim_resolve_symlinks(path, _resolved, sizeof(_resolved)))
+            path = _resolved;
         int _fd = open(path, O_RDONLY | O_CLOEXEC);
         if (_fd >= 0) {
             char hdr[256];
