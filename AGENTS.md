@@ -150,6 +150,10 @@ Milníky:
   pod `/data/.../uv/python/…`; `is_glibc_elf` + `force_redirect` v shimu,
   `resolve_symlinks_under_root` host-cesta fallback; regresní test
   `test-all.sh uv`) — [postup.md#L2529](postup.md#L2529).
+- **Entry shebang detekce + symlink chain** (`which -> alternatives ->
+  skript` hlásil „Not an ELF file“; `shim_resolve_symlinks` před `open(path)`
+  v `main()`; regresní test `test-all.sh symlink`) —
+  [postup.md#L2570](postup.md#L2570).
 
 ## 10. Zbývá / otevřené body
 
