@@ -646,6 +646,34 @@ category_uv() {
         echo "FAIL: uv - pip install six | RC=$rc | $out" >> "$FAIL_LOG"
         ((FAIL_COUNT++)) || true
     fi
+
+    # 3) uv python find + prime spusteni managed Pythonu (glibc ELF mimo
+    #    ROOTFS). Puvodne padalo na "Failed to inspect Python interpreter"
+    #    (raw bionic exec managed Pythonu bez PT_INTERP) - fix #1 (is_glibc_elf).
+    rc=$(ashell_rc "$env $L --ownall $uv_bin python find")
+    out=$(ashell_out "$env $L --ownall $uv_bin python find")
+    if [ "$rc" = 0 ] && printf '%s' "$out" | grep -Fq "python"; then
+        echo "PASS uv: python find + managed Python ($out)"
+        echo "PASS: uv - python find" >> "$PASS_LOG"
+        ((PASS_COUNT++)) || true
+    else
+        echo "FAIL uv: python find RC=$rc out=$out"
+        echo "FAIL: uv - python find | RC=$rc | $out" >> "$FAIL_LOG"
+        ((FAIL_COUNT++)) || true
+    fi
+
+    # 4) uv run python -c (re-exec managed Pythonu pod loaderem, end-to-end)
+    rc=$(ashell_rc "$env $L --ownall $uv_bin run --no-project --python 3.15 python -c 'print(42)'")
+    out=$(ashell_out "$env $L --ownall $uv_bin run --no-project --python 3.15 python -c 'print(42)'")
+    if [ "$rc" = 0 ] && printf '%s' "$out" | grep -Fq "42"; then
+        echo "PASS uv: run managed Python -c print(42) ($out)"
+        echo "PASS: uv - run python" >> "$PASS_LOG"
+        ((PASS_COUNT++)) || true
+    else
+        echo "FAIL uv: run python RC=$rc out=$out"
+        echo "FAIL: uv - run python | RC=$rc | $out" >> "$FAIL_LOG"
+        ((FAIL_COUNT++)) || true
+    fi
 }
 
 # Regresni test: symlink chain v ROOTFS s absolutnimi cily na skript/ELF.
