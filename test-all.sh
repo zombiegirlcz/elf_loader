@@ -650,28 +650,42 @@ category_uv() {
     # 3) uv python find + prime spusteni managed Pythonu (glibc ELF mimo
     #    ROOTFS). Puvodne padalo na "Failed to inspect Python interpreter"
     #    (raw bionic exec managed Pythonu bez PT_INTERP) - fix #1 (is_glibc_elf).
+    #    Vystup (cesta k interpetu) si ulozime pro case #4 - NEhardcodovat
+    #    verzi (uv python find realne vraci 3.14.7, ne 3.15; hardcoded by
+    #    test tiše rotoval/padal pri zmene managed verze nebo bez site).
     rc=$(ashell_rc "$env $L --ownall $uv_bin python find")
     out=$(ashell_out "$env $L --ownall $uv_bin python find")
+    local py_path=""
     if [ "$rc" = 0 ] && printf '%s' "$out" | grep -Fq "python"; then
         echo "PASS uv: python find + managed Python ($out)"
         echo "PASS: uv - python find" >> "$PASS_LOG"
         ((PASS_COUNT++)) || true
+        # posledni radek vystupu bez mezer = cesta k interpetu (vnejsi cesta
+        # uz pod ROOTFS/device, takze ji uv run dostane jako --python <cesta>)
+        py_path=$(printf '%s' "$out" | tr -d '\r' | grep -F "python" | tail -1 | sed 's/^[[:space:]]*//;s/[[:space:]]*$//')
     else
         echo "FAIL uv: python find RC=$rc out=$out"
         echo "FAIL: uv - python find | RC=$rc | $out" >> "$FAIL_LOG"
         ((FAIL_COUNT++)) || true
     fi
 
-    # 4) uv run python -c (re-exec managed Pythonu pod loaderem, end-to-end)
-    rc=$(ashell_rc "$env $L --ownall $uv_bin run --no-project --python 3.15 python -c 'print(42)'")
-    out=$(ashell_out "$env $L --ownall $uv_bin run --no-project --python 3.15 python -c 'print(42)'")
-    if [ "$rc" = 0 ] && printf '%s' "$out" | grep -Fq "42"; then
-        echo "PASS uv: run managed Python -c print(42) ($out)"
-        echo "PASS: uv - run python" >> "$PASS_LOG"
-        ((PASS_COUNT++)) || true
+    # 4) uv run python -c (re-exec managed Pythonu pod loaderem, end-to-end).
+    #    Interpet odvozeny z case #3 (--python <cesta>), ne hardcoded verze.
+    if [ -n "$py_path" ]; then
+        rc=$(ashell_rc "$env $L --ownall $uv_bin run --no-project --python $py_path python -c 'print(42)'")
+        out=$(ashell_out "$env $L --ownall $uv_bin run --no-project --python $py_path python -c 'print(42)'")
+        if [ "$rc" = 0 ] && printf '%s' "$out" | grep -Fq "42"; then
+            echo "PASS uv: run managed Python -c print(42) ($out)"
+            echo "PASS: uv - run python" >> "$PASS_LOG"
+            ((PASS_COUNT++)) || true
+        else
+            echo "FAIL uv: run python RC=$rc out=$out"
+            echo "FAIL: uv - run python | RC=$rc | $out" >> "$FAIL_LOG"
+            ((FAIL_COUNT++)) || true
+        fi
     else
-        echo "FAIL uv: run python RC=$rc out=$out"
-        echo "FAIL: uv - run python | RC=$rc | $out" >> "$FAIL_LOG"
+        echo "FAIL uv: run python | interpet neznamy (python find selhal)"
+        echo "FAIL: uv - run python | interpreter from python find unavailable" >> "$FAIL_LOG"
         ((FAIL_COUNT++)) || true
     fi
 }
