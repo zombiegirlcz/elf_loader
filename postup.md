@@ -2526,3 +2526,56 @@ načten na konci (`ZSH_AUTOSUGGEST_STRATEGY`, barvy `ZSH_HIGHLIGHT_STYLES`).
 **Poznámka k údržbě:** soubor není verzovaný (žije jen na zařízení) – tahle
 sekce je jediný zdroj pravdy mimo samotné zařízení. Při další úpravě
 `.zshrc` aktualizovat i tenhle zápis.
+
+---
+
+## 2026-10-02: uv/venv — absolutní symlink a glibc ELF mimo ROOTFS
+
+**Symptom:** `uv venv` hlásí `Creating virtual environment... VENV_RC=0`
+a adresářovou strukturu vytvoří, ale `venv/bin/python` je mrtvý symlink →
+venv nefunkční; `uv pip install --python …` selže na „Failed to inspect
+Python interpreter". Druhotně `uv python find` / `uv run` hlásí
+„Python interpreter not found".
+
+**Root cause #1 (re-exec):** `uv` spouští *managed Python* (glibc binárku)
+pod `/data/user/0/com.linux_core/files/.local/share/uv/python/…`, tedy
+**mimo ROOTFS**. `shim_execve()` i `shim_posix_spawnp()` mají `/data`
+v `shim_excluded()` → cíl šel na raw bionický exec → host nemá
+`/lib/ld-linux-aarch64.so.1` → ENOENT → uv to hlásí jako chybějící
+interpreter.
+
+**Root cause #2 (symlink):** `uv venv` vytvoří `bin/python` jako symlink
+s **absolutním cílem** mimo ROOTFS. `resolve_symlinks_under_root()`
+(`src/elf_loader.c`) u absolutního cíle **vždy prependoval ROOTFS** →
+`$R/data/user/0/…/python3.14` → ENOENT. Venv vypadal jako rozbitý.
+
+**Fix #1** (`7da0f81`, `src/main.c`): helper `is_glibc_elf(path)` — raw
+syscally přečte ELF hlavičku a `PT_INTERP`; pokud obsahuje `ld-linux`,
+binárka se i mimo ROOTFS pošle přes loader (cesta se NEPŘEKLÁDÁ pod
+ROOTFS, whitelist gate se přes `force_redirect` obchází). Symetricky
+v `shim_execve` i `shim_posix_spawnp`. Bionické binárky (`linker64`)
+vracejí 0 → raw exec beze změny.
+
+**Fix #2** (`cf69881`, `src/elf_loader.c`): absolutní cíl symlinku se
+zkouší (1) jako guest cesta `$ROOTFS + target`, (2) jako host cesta
+`target` tak jak je, (3) fallback prepend ROOTFS. Priorita guest cesty
+zachovává `/bin/sh`, `/usr/lib/...`; host cesta pokrývá uv managed Python.
+
+**Ověření (ashell -c, device):**
+```
+$ uv venv vtest                          VENV_RC=0
+$ venv/bin/python --version              Python 3.14.7
+$ uv pip install --python …/python six   + six==1.17.0
+$ python -c "import six; print(…)"       six 1.17.0
+$ uv run --no-project --python 3.15 python -c 'print(42)'   42   RC=0
+```
+
+**Regresní test** (`8deccaa`, `test-all.sh`): kategorie `uv` — (1)
+`uv venv` + spuštění `venv/bin/python`, (2) `uv pip install --python … six`
++ import. Spouští se i v `all`. Pokud se symlink začne tiše prependovat
+pod ROOTFS, oba testy zčervenají.
+
+**Regrese ostatních binárek:** `test-all.sh all` PASS 122–123 / FAIL 33–34;
+jediný rozdíl byl flaky timeout `gdb` (5s limit), samostatně 3× RC=0.
+Bionické binárky pod `/system`/`/data` (`/system/bin/sh`, `rg`) stále
+raw exec. Commity `7da0f81`, `cf69881`, `8deccaa` na `origin/dev`.

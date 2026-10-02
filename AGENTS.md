@@ -146,6 +146,10 @@ Milníky:
 - **Helper knihovny (`ELF_LOADER_HELPER`), náhodný SIGSEGV ~5 %
   (heap fix), Node ≤22 teardown `free(): invalid pointer` (EXIT=134)** —
   [postup.md#L2337](postup.md#L2337).
+- **uv/venv — glibc ELF a absolutní symlink mimo ROOTFS** (managed Python
+  pod `/data/.../uv/python/…`; `is_glibc_elf` + `force_redirect` v shimu,
+  `resolve_symlinks_under_root` host-cesta fallback; regresní test
+  `test-all.sh uv`) — [postup.md#L2529](postup.md#L2529).
 
 ## 10. Zbývá / otevřené body
 
