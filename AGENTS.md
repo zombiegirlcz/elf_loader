@@ -158,10 +158,10 @@ Milníky:
   — EFAULT („Bad address“) u `stat` s `dir_fd` (Python `os.stat(dir_fd=)`,
   `shutil.rmtree`, PEP517 build wheel); regresní test `test-all.sh fstat` —
   [postup.md#L2606](postup.md#L2606).
-- **Test runner přes guest `bash -s` + `renameat2` path-translace** —
+- **Test runner přes guest `bash -s` + `renameat`/`unlinkat` path-translace** —
   `run_test` posílal `&&`/`|`/`>` jako argv loaderu (~27 falešných FAILů);
-  `mv` ENOENT kvůli chybějícímu `renameat`/`renameat2` shimu. PASS 131→158,
-  FAIL 33→6.
+  `mv`/`rm`/`rmdir` ENOENT kvůli chybějícím `renameat2`/`unlinkat`/`rmdirat`
+  shimům. PASS 131→156, FAIL 33→8.
 
 ## 10. Zbývá / otevřené body
 

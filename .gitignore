@@ -30,3 +30,9 @@ magisk-module/*.zip
 *.log
 files
 *.txt
+
+# Test artifacts (stray, generovane test-all.sh)
+echo
+echo.*
+xx0*
+test/echo

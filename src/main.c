@@ -346,7 +346,8 @@ static void *g_orig_access = NULL, *g_orig_euidaccess = NULL, *g_orig_faccessat 
 static void *g_orig_statx = NULL, *g_orig_fstatat = NULL, *g_orig_newfstatat = NULL;
 static void *g_orig_symlink = NULL, *g_orig_symlinkat = NULL, *g_orig_link = NULL,
             *g_orig_rename = NULL, *g_orig_renameat = NULL, *g_orig_renameat2 = NULL,
-            *g_orig_unlink = NULL, *g_orig_mkdir = NULL,
+            *g_orig_unlink = NULL, *g_orig_unlinkat = NULL, *g_orig_rmdirat = NULL,
+            *g_orig_mkdir = NULL,
             *g_orig_mkdirat = NULL, *g_orig_rmdir = NULL;
 static void *g_orig_execve = NULL, *g_orig_execv = NULL, *g_orig_execvp = NULL,
             *g_orig_execvpe = NULL, *g_orig_execveat = NULL,
@@ -1239,6 +1240,21 @@ typedef int (*fp_unlink)(const char *);
 static int shim_unlink(const char *p) {
     char b[8192]; const char *path = p; if (shim_translate(p, b, sizeof b)) path = b;
     fp_unlink f = (fp_unlink)g_orig_unlink; return f ? f(path) : -1;
+}
+/* GNU coreutils rm/rmdir volaji unlinkat/rmdirat (NE unlink/rmdir). Bez techto
+ * shimu zustala cesta netranslatovana -> rm hledal /tmp/x na HOSTU misto
+ * $ROOTFS/tmp/x -> ENOENT ("cannot remove ... No such file or directory"). */
+typedef int (*fp_unlinkat)(int, const char *, int);
+static int shim_unlinkat(int dfd, const char *p, int flags) {
+    char b[8192]; const char *path = p;
+    if (dfd == -100 && p && p[0] == '/') { if (shim_translate(p, b, sizeof b)) path = b; }
+    fp_unlinkat f = (fp_unlinkat)g_orig_unlinkat; return f ? f(dfd, path, flags) : -1;
+}
+typedef int (*fp_rmdirat)(int, const char *);
+static int shim_rmdirat(int dfd, const char *p) {
+    char b[8192]; const char *path = p;
+    if (dfd == -100 && p && p[0] == '/') { if (shim_translate(p, b, sizeof b)) path = b; }
+    fp_rmdirat f = (fp_rmdirat)g_orig_rmdirat; return f ? f(dfd, path) : -1;
 }
 typedef int (*fp_mkdir)(const char *, unsigned int);
 static int shim_mkdir(const char *p, unsigned int m) {
@@ -2823,7 +2839,8 @@ static f2_hook_t g_f2_hooks[] = {
     {"symlink",(void*)shim_symlink,&g_orig_symlink},{"symlinkat",(void*)shim_symlinkat,&g_orig_symlinkat},
     {"link",(void*)shim_link,&g_orig_link},{"rename",(void*)shim_rename,&g_orig_rename},
     {"renameat",(void*)shim_renameat,&g_orig_renameat},{"renameat2",(void*)shim_renameat2,&g_orig_renameat2},
-    {"unlink",(void*)shim_unlink,&g_orig_unlink},{"mkdir",(void*)shim_mkdir,&g_orig_mkdir},
+    {"unlink",(void*)shim_unlink,&g_orig_unlink},{"unlinkat",(void*)shim_unlinkat,&g_orig_unlinkat},
+    {"rmdirat",(void*)shim_rmdirat,&g_orig_rmdirat},{"mkdir",(void*)shim_mkdir,&g_orig_mkdir},
     {"mkdirat",(void*)shim_mkdirat,&g_orig_mkdirat},{"rmdir",(void*)shim_rmdir,&g_orig_rmdir},
     {"execve",(void*)shim_execve,&g_orig_execve},{"execv",(void*)shim_execv,&g_orig_execv},
     {"execvp",(void*)shim_execvp,&g_orig_execvp},{"execvpe",(void*)shim_execvpe,&g_orig_execvpe},

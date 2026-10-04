@@ -2666,7 +2666,13 @@ ne `rename`. Override tabulka mela jen `rename` -> `/tmp/x` netranslatovana ->
 mv hledal /tmp/x na HOSTU misto $ROOTFS/tmp/x -> ENOENT.
 
 **Fix #2:** `shim_renameat` / `shim_renameat2` + registrace v `g_f2_hooks`.
+Stejna trida chyby: GNU `rm`/`rmdir` volaji `unlinkat`/`rmdirat` (NE `unlink`),
+takze i ty dostaly shim (`shim_unlinkat`/`shim_rmdirat`).
 
-**Vysledek:** PASS **131 -> 158**, FAIL **33 -> 6**, **0 ubylych PASS**.
-Zbylych 6: ping/ping6 (ICMP), uptime (utmp), pslog (PID), clear (TTY), unzip
-(flaky). **Overeni mv izolovane:** `MV_OK RC=0`. Commit `8392010`.
+**Vysledek:** PASS **131 -> 156**, FAIL **33 -> 8**, **0 ubylych PASS**.
+Zbylych 8 FAILu je environmentalnich / spatne test-casy: ping/ping6 (ICMP),
+uptime (utmp), pslog (PID), timeout x2 (chybi prikaz), shred (/dev/urandom),
+mkdir (leftover /tmp/test_mkdir). Reálná čísla z čistého běhu
+`results/pass_20261004_211255.txt` (156/8) proti loaderu md5
+`1e63e8b7d00ead4cc96910c642db891d` (renameat2 + unlinkat + rmdirat).
+(Pozn.: dřívější zápis 158/6 byl proti loaderu bez *at shimů.)
