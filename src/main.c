@@ -345,7 +345,8 @@ static void *g_orig_lstat64 = NULL, *g_orig_fstat64 = NULL, *g_orig_fstatat64 = 
 static void *g_orig_access = NULL, *g_orig_euidaccess = NULL, *g_orig_faccessat = NULL;
 static void *g_orig_statx = NULL, *g_orig_fstatat = NULL, *g_orig_newfstatat = NULL;
 static void *g_orig_symlink = NULL, *g_orig_symlinkat = NULL, *g_orig_link = NULL,
-            *g_orig_rename = NULL, *g_orig_unlink = NULL, *g_orig_mkdir = NULL,
+            *g_orig_rename = NULL, *g_orig_renameat = NULL, *g_orig_renameat2 = NULL,
+            *g_orig_unlink = NULL, *g_orig_mkdir = NULL,
             *g_orig_mkdirat = NULL, *g_orig_rmdir = NULL;
 static void *g_orig_execve = NULL, *g_orig_execv = NULL, *g_orig_execvp = NULL,
             *g_orig_execvpe = NULL, *g_orig_execveat = NULL,
@@ -1216,6 +1217,23 @@ static int shim_rename(const char *o, const char *n) {
     if (shim_translate(o, b1, sizeof b1)) oldp = b1;
     if (shim_translate(n, b2, sizeof b2)) newp = b2;
     fp_rename f = (fp_rename)g_orig_rename; return f ? f(oldp, newp) : -1;
+}
+/* GNU coreutils mv (a dalsi) volaji renameat2/renameat, NE rename. Bez techto
+ * shimu zustala cesta netranslatovana -> mv hledal /tmp/x na HOSTU misto
+ * $ROOTFS/tmp/x -> ENOENT ("cannot move ... No such file or directory"). */
+typedef int (*fp_renameat)(int, const char *, int, const char *);
+static int shim_renameat(int odfd, const char *o, int ndfd, const char *n) {
+    char b1[8192], b2[8192]; const char *oldp = o, *newp = n;
+    if (odfd == -100 && o && o[0] == '/') { if (shim_translate(o, b1, sizeof b1)) oldp = b1; }
+    if (ndfd == -100 && n && n[0] == '/') { if (shim_translate(n, b2, sizeof b2)) newp = b2; }
+    fp_renameat f = (fp_renameat)g_orig_renameat; return f ? f(odfd, oldp, ndfd, newp) : -1;
+}
+typedef int (*fp_renameat2)(int, const char *, int, const char *, unsigned int);
+static int shim_renameat2(int odfd, const char *o, int ndfd, const char *n, unsigned int flags) {
+    char b1[8192], b2[8192]; const char *oldp = o, *newp = n;
+    if (odfd == -100 && o && o[0] == '/') { if (shim_translate(o, b1, sizeof b1)) oldp = b1; }
+    if (ndfd == -100 && n && n[0] == '/') { if (shim_translate(n, b2, sizeof b2)) newp = b2; }
+    fp_renameat2 f = (fp_renameat2)g_orig_renameat2; return f ? f(odfd, oldp, ndfd, newp, flags) : -1;
 }
 typedef int (*fp_unlink)(const char *);
 static int shim_unlink(const char *p) {
@@ -2804,6 +2822,7 @@ static f2_hook_t g_f2_hooks[] = {
     {"newfstatat",(void*)shim_newfstatat,&g_orig_newfstatat},{"__fxstatat",(void*)shim___fxstatat,&g_orig___fxstatat},
     {"symlink",(void*)shim_symlink,&g_orig_symlink},{"symlinkat",(void*)shim_symlinkat,&g_orig_symlinkat},
     {"link",(void*)shim_link,&g_orig_link},{"rename",(void*)shim_rename,&g_orig_rename},
+    {"renameat",(void*)shim_renameat,&g_orig_renameat},{"renameat2",(void*)shim_renameat2,&g_orig_renameat2},
     {"unlink",(void*)shim_unlink,&g_orig_unlink},{"mkdir",(void*)shim_mkdir,&g_orig_mkdir},
     {"mkdirat",(void*)shim_mkdirat,&g_orig_mkdirat},{"rmdir",(void*)shim_rmdir,&g_orig_rmdir},
     {"execve",(void*)shim_execve,&g_orig_execve},{"execv",(void*)shim_execv,&g_orig_execv},

@@ -97,20 +97,36 @@ should_skip() {
     esac
 }
 
+# Spusti guest skript pres `bash -s` v guestu (base64 pipe), aby se
+# vyhodnotily shell operatory (| && > <). Prime predani loaderu bere cmd jako
+# argv -> operatory se neinterpretuji (odtud ~30 falesnych FAILu). Base64 pipe
+# obchazi quoting i ashell limit.
+_guest_devcmd() {
+    local script="$1"
+    local b64
+    b64=$(printf '%s' "$script" | base64 | tr -d '\n')
+    printf 'printf %%s %s | /system/bin/base64 -d | ROOTFS=%s ELF_ROOTFS=%s ELF_LOADER=%s PATH=%s/bin:%s/usr/bin:%s/sbin:%s/usr/sbin %s --ownall %s/bin/bash -s' \
+        "$b64" "$R" "$R" "$L" "$R" "$R" "$R" "$R" "$L" "$R"
+}
+
+# Prevede guest cmd na skript pro bash -s. Pokud cmd obsahuje shell operator,
+# spusti se cely cmd jako skript; jinak se predradi jmeno binarky (PATH).
+# TEST_CASES jsou KOMPLETNI prikazy ('wc -c ...', 'false || true',
+# 'echo x > f && mv ...'). NEODEBIRAT ani NEPREDRAZOVAT bin_name - cmd jde do
+# guest 'bash -s' tak jak je. (Starsi runner odebiral leading bin_name kvuli
+# tomu, ze bin sel loaderu zvlast; s bash -s to neplati a predrazeni rozbilo
+# mv/rm/cmp: 'mv echo test ...'.)
+_guest_script() {
+    local bin_name="$1" cmd="$2"
+    if [ -z "$cmd" ]; then printf '%s' "$bin_name"; else printf '%s' "$cmd"; fi
+}
+
 run_test() {
     local bin="$1"
     local cmd="$2"
     local desc="$3"
     local bin_name
     bin_name=$(basename "$bin")
-
-    # TEST_CASES hodnoty zacinaji nazvem programu (napr. "wc -c /etc/hostname"),
-    # ale run_test uz binarku predava zvlast -> odstran vedouci nazev, aby guest
-    # dostal jen argumenty (jinak wc hleda soubor "wc").
-    case "$cmd" in
-        "$bin_name "*) cmd="${cmd#"$bin_name "}" ;;
-        "$bin_name") cmd="" ;;
-    esac
 
     if should_skip "$bin_name"; then
         echo "SKIP $bin_name: $desc"
@@ -123,10 +139,12 @@ run_test() {
     local pids_before pids_after
     pids_before=$(pgrep -x elf_loader 2>/dev/null | tr '\n' ',' || echo "")
 
-    local rc out
-    rc=$(ashell_rc "$L --ownall $bin $cmd") || true
+    local script devcmd rc out
+    script=$(_guest_script "$bin_name" "$cmd")
+    devcmd=$(_guest_devcmd "$script")
+    rc=$(ashell_rc "$devcmd") || true
     rc=${rc:-0}
-    out=$(ashell_out "$L --ownall $bin $cmd") || true
+    out=$(ashell_out "$devcmd") || true
 
     pids_after=$(pgrep -x elf_loader 2>/dev/null | tr '\n' ',' || echo "")
     # Zaznamenej případný nárůst sirotků po tomto testu
@@ -184,9 +202,10 @@ run_test_output() {
     local pids_before pids_after
     pids_before=$(pgrep -x elf_loader 2>/dev/null | tr '\n' ',' || echo "")
 
-    local out rc
-    out=$(ashell_out "$L --ownall $bin $cmd") || true
-    rc=$(ashell_rc "$L --ownall $bin $cmd") || true
+    local devcmd out rc
+    devcmd=$(_guest_devcmd "$cmd")
+    out=$(ashell_out "$devcmd") || true
+    rc=$(ashell_rc "$devcmd") || true
     rc=${rc:-0}
     pids_after=$(pgrep -x elf_loader 2>/dev/null | tr '\n' ',' || echo "")
     # Zaznamenej případný nárůst sirotků po tomto testu
