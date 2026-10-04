@@ -740,6 +740,42 @@ category_symlink() {
     fi
 }
 
+# Regresni test: stat s dir_fd (stary ABI __fxstatat64: ver, fd, path, buf, flags).
+# Drivejsi shim mel 4 argy -> glibc volani interpretovalo 'fd' (cislo) jako
+# ukazatel na cestu -> EFAULT ("Bad address") u Python os.stat(dir_fd=...),
+# shutil.rmtree a PEP517 buildu wheel (pad python-nmap). Tento test to hlida.
+category_fstat() {
+    echo ""
+    echo "=== fstatat dir_fd (__fxstatat64 ABI) ==="
+    local py_bin
+    py_bin=$(find "$R/bin" "$R/usr/bin" -name 'python3*' -type f 2>/dev/null | head -1 || true)
+    if [ -z "${py_bin:-}" ] || [ ! -f "$py_bin" ]; then
+        echo "SKIP fstat: python3 not found"
+        echo "SKIP: fstat - no python3" >> "$SKIP_LOG"
+        ((SKIP_COUNT++)) || true
+        return 0
+    fi
+    local env="ROOTFS=$R ELF_ROOTFS=$R ELF_LOADER=$L"
+    local code='import os,sys;fd=os.open(sys.argv[1],os.O_RDONLY);st=os.stat(sys.argv[2],dir_fd=fd,follow_symlinks=False);print(chr(70)+chr(83)+chr(84)+chr(79)+chr(75),st.st_size)'
+    local rc out
+    rc=$(ashell_rc "$env $L --ownall $py_bin -c '$code' $R/etc passwd")
+    out=$(ashell_out "$env $L --ownall $py_bin -c '$code' $R/etc passwd")
+    if [ "$rc" = 0 ] && printf '%s' "$out" | grep -Fq "FSTOK"; then
+        echo "PASS fstat: os.stat(dir_fd) bez EFAULT ($out)"
+        echo "PASS: fstat - os.stat dir_fd" >> "$PASS_LOG"
+        ((PASS_COUNT++)) || true
+    else
+        echo "FAIL fstat: os.stat(dir_fd) RC=$rc out=$out"
+        echo "FAIL: fstat - os.stat dir_fd | RC=$rc | $out" >> "$FAIL_LOG"
+        ((FAIL_COUNT++)) || true
+    fi
+    if printf '%s' "$out" | grep -Fq "Bad address"; then
+        echo "FAIL fstat: EFAULT 'Bad address' stale"
+        echo "FAIL: fstat - Bad address | $out" >> "$FAIL_LOG"
+        ((FAIL_COUNT++)) || true
+    fi
+}
+
 print_summary() {
     echo ""
     echo "=== SUMMARY ==="
@@ -847,6 +883,10 @@ case "${1:-all}" in
         category_symlink
         print_summary
         ;;
+    fstat)
+        category_fstat
+        print_summary
+        ;;
         discovered)
             category_discovered
             print_summary
@@ -869,6 +909,7 @@ case "${1:-all}" in
         category_python
         category_uv
         category_symlink
+        category_fstat
         print_summary
         ;;
 esac
