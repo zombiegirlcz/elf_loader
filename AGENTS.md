@@ -168,7 +168,7 @@ Milníky:
   (timeout/pslog/ping6) a ping/uptime/shred do `should_skip` (host limit).
   **Regresní test** `test-all.sh nss` (`getprotobyname("icmp") == 1` přes
   Python, bez setuid/raw-socket závislosti; v `all`).
-  Finálně PASS **160 / FAIL 0**, [postup.md#L2720](postup.md#L2720).
+  Finálně PASS **160 / FAIL 0**, [postup.md#L2715](postup.md#L2715).
 
 ## 10. Zbývá / otevřené body
 
