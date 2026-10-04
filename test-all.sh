@@ -808,6 +808,39 @@ category_fstat() {
     fi
 }
 
+# Regresni test: NSS /etc/protocols pod loaderem. shim_open64_nocancel musi
+# mit /etc/protocols (+ /etc/services) v whitelistu, jinak glibc NSS files
+# backend cte host /etc/protocols (neexistuje) -> ENOENT -> ping hlasi
+# "unknown protocol icmp". Test zamerne NEPOUZIVA ping (ten je setuid-root /
+# raw ICMP socket = host limit -> should_skip), ale getprotobyname() pres
+# Python, ktery na techto privilegiich nezavisi.
+category_nss() {
+    echo ""
+    echo "=== nss /etc/protocols (getprotobyname) ==="
+    local py_bin
+    py_bin=$(find "$R/bin" "$R/usr/bin" -name 'python3*' -type f 2>/dev/null | head -1 || true)
+    if [ -z "${py_bin:-}" ] || [ ! -f "$py_bin" ]; then
+        echo "SKIP nss: python3 not found"
+        echo "SKIP: nss - no python3" >> "$SKIP_LOG"
+        ((SKIP_COUNT++)) || true
+        return 0
+    fi
+    local env="ROOTFS=$R ELF_ROOTFS=$R ELF_LOADER=$L"
+    local code='import socket;print(chr(80)+chr(82)+chr(79)+chr(84)+chr(79),socket.getprotobyname(chr(105)+chr(99)+chr(109)+chr(112)))'
+    local rc out
+    rc=$(ashell_rc "$env $L --ownall $py_bin -c '$code'")
+    out=$(ashell_out "$env $L --ownall $py_bin -c '$code'")
+    if [ "$rc" = 0 ] && printf '%s' "$out" | grep -Fq "PROTO 1"; then
+        echo "PASS nss: getprotobyname(icmp) = 1 ($out)"
+        echo "PASS: nss - getprotobyname icmp" >> "$PASS_LOG"
+        ((PASS_COUNT++)) || true
+    else
+        echo "FAIL nss: getprotobyname(icmp) RC=$rc out=$out"
+        echo "FAIL: nss - getprotobyname icmp | RC=$rc | $out" >> "$FAIL_LOG"
+        ((FAIL_COUNT++)) || true
+    fi
+}
+
 print_summary() {
     echo ""
     echo "=== SUMMARY ==="
@@ -919,6 +952,10 @@ case "${1:-all}" in
         category_fstat
         print_summary
         ;;
+    nss)
+        category_nss
+        print_summary
+        ;;
         discovered)
             category_discovered
             print_summary
@@ -942,6 +979,7 @@ case "${1:-all}" in
         category_uv
         category_symlink
         category_fstat
+        category_nss
         print_summary
         ;;
 esac
