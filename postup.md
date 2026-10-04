@@ -2604,3 +2604,43 @@ symlinkované ELF (`awk` → gawk, `egrep`, `sh` → dash) stále RC=0.
 na skript, (2) `awk` chain na ELF, (3) guard na absenci „Not an ELF file".
 `test-all.sh all`: PASS 128 / FAIL 33 — FAIL sada **bit-identická**
 s předchozím během (`diff` EXIT=0), žádná regrese. Na `origin/dev`.
+
+---
+
+## 2026-10-04: `__fxstatat64`/`__fxstatat` starý ABI — EFAULT u `stat` s `dir_fd`
+
+**Symptom:** `uv pip install --reinstall python-nmap` (sdist → PEP517 wheel) padá na
+`error: [Errno 14] Bad address: 'build/bdist.linux-aarch64/wheel/python_nmap-0.7.1.dist-info'`.
+Mimo build i minimální repro: `python -c "os.stat('x', dir_fd=fd, follow_symlinks=False)"` → EFAULT.
+
+**Root cause:** override tabulka měla `__fxstatat64` se **4-arg** signaturou
+`(int dfd, const char *p, void *st, int flags)`, ale glibc **starý `*stat` ABI je 5-arg
+s verzí jako PRVNÍM argumentem**:
+```c
+int __fxstatat64(int ver, int fd, const char *file, struct stat64 *buf, int flag);
+int __fxstatat  (int ver, int fd, const char *file, struct stat  *buf, int flag);
+```
+Glibc `fstatat64()` → `__fxstatat64(_STAT_VER, fd, path, buf, flags)`. Náš shim tedy
+interpretoval `fd` (číslo) jako `char *path` → **EFAULT („Bad address“)** u každého
+`fstatat` s `dir_fd`. Rozbíjelo to: Python `os.stat(dir_fd=...)`, `shutil.rmtree`,
+a PEP517 build wheel (`bdist_wheel` kopíruje `*.dist-info` přes `DirEntry.stat`).
+Stejně chybně byl registrovaný i `__fxstatat` (mapován na 4-arg `shim_fstatat`).
+(Pozn.: `__xstat64`/`__lxstat64` už `ver`-first měly správně — jen `__fxstatat*`
+zapomněl `fd`.)
+
+**Fix** (`2ad0a22`, `src/main.c`): `shim___fxstatat64` / `shim___fxstatat` přepsány na
+5-arg `(ver, fd, path, buf, flags)`, doplněn `g_orig___fxstatat` a opravena registrace
+`__fxstatat`. Path-translace zůstává jen pro `dfd == AT_FDCWD` a absolutní cesty.
+
+**Ověření (ashell -c, čerstvý bionic build 436320 B):**
+```
+os.stat('passwd', dir_fd=fd, follow_symlinks=False)   -> FSTOK (st_size)
+uv pip install --reinstall python-nmap               -> RC=0, Built python-nmap==0.7.1
+uv sync --reinstall (27 balíčků) + uv build (wheel)  -> RC=0
+uv run wifi-scanner                                   -> TUI se spustí
+```
+
+**Regresní test** (`ddbc058`, `test-all.sh fstat`, součást `all`): Python
+`os.stat('passwd', dir_fd=fd, follow_symlinks=False)` + guard na „Bad address“.
+`test-all.sh all`: PASS 131 / FAIL 33, FAIL sada **bit-identická** (`diff` EXIT=0).
+Oba commity na `origin/dev`.

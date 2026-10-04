@@ -154,6 +154,10 @@ Milníky:
   skript` hlásil „Not an ELF file“; `shim_resolve_symlinks` před `open(path)`
   v `main()`; regresní test `test-all.sh symlink`) —
   [postup.md#L2570](postup.md#L2570).
+- **`__fxstatat64`/`__fxstatat` 5-arg starý ABI** `(ver, fd, path, buf, flags)`
+  — EFAULT („Bad address“) u `stat` s `dir_fd` (Python `os.stat(dir_fd=)`,
+  `shutil.rmtree`, PEP517 build wheel); regresní test `test-all.sh fstat` —
+  [postup.md#L2606](postup.md#L2606).
 
 ## 10. Zbývá / otevřené body
 
