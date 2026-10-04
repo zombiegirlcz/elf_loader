@@ -351,7 +351,8 @@ static void *g_orig_execve = NULL, *g_orig_execv = NULL, *g_orig_execvp = NULL,
             *g_orig_execvpe = NULL, *g_orig_execveat = NULL,
             *g_orig_execl = NULL, *g_orig_execlp = NULL, *g_orig_execle = NULL;
 static void *g_orig_fopen = NULL, *g_orig_fopen64 = NULL,
-            *g_orig___xstat64 = NULL, *g_orig___lxstat64 = NULL, *g_orig___fxstatat64 = NULL,
+            *g_orig___xstat64 = NULL, *g_orig___lxstat64 = NULL,
+            *g_orig___fxstatat = NULL, *g_orig___fxstatat64 = NULL,
             *g_orig_faccessat2 = NULL,
             *g_orig_getrlimit = NULL, *g_orig_prlimit64 = NULL;
 static void *g_orig_fileno_unlocked = NULL;
@@ -2304,10 +2305,27 @@ static int shim___lxstat64(int v, const char *p, void *st) {
     char b[8192]; const char *path = p; if (shim_translate(p, b, sizeof b)) path = b;
     fp_lxstat f = (fp_lxstat)g_orig___lxstat64; return f ? f(v, path, st) : -1;
 }
-static int shim___fxstatat64(int dfd, const char *p, void *st, int flags) {
+/* __fxstatat64 / __fxstatat: STARY ABI s verzi jako PRVNIM argumentem:
+ *   int __fxstatat64(int ver, int fd, const char *file, struct stat64 *buf, int flag);
+ *   int __fxstatat  (int ver, int fd, const char *file, struct stat  *buf, int flag);
+ * Glibc fstatat64() -> __fxstatat64(_STAT_VER, fd, path, buf, flags). Puvodni
+ * 4-arg shim (dfd, p, st, flags) interpretoval 'fd' (cislo) jako ukazatel na
+ * cestu -> EFAULT ("Bad address") u KAZDEHO statu s dir_fd: Python
+ * os.stat(dir_fd=...), shutil.rmtree, PEP517 build wheel (bdist_wheel
+ * kopiruje *.dist-info pres DirEntry.stat) -> pad buildu python-nmap apod.
+ * (Zavazne: 'ver' musi byt prvni, 'fd' druhy.) */
+typedef int (*fp_fxstatat)(int, int, const char *, void *, int);
+static int shim___fxstatat64(int ver, int dfd, const char *p, void *st, int flags) {
     char b[8192]; const char *path = p;
     if (dfd == -100 && p && p[0] == '/') { if (shim_translate(p, b, sizeof b)) path = b; }
-    fp_fstatat f = (fp_fstatat)g_orig___fxstatat64; return f ? f(dfd, path, st, flags) : -1;
+    fp_fxstatat f = (fp_fxstatat)g_orig___fxstatat64;
+    return f ? f(ver, dfd, path, st, flags) : -1;
+}
+static int shim___fxstatat(int ver, int dfd, const char *p, void *st, int flags) {
+    char b[8192]; const char *path = p;
+    if (dfd == -100 && p && p[0] == '/') { if (shim_translate(p, b, sizeof b)) path = b; }
+    fp_fxstatat f = (fp_fxstatat)g_orig___fxstatat;
+    return f ? f(ver, dfd, path, st, flags) : -1;
 }
 static int shim_faccessat2(int dfd, const char *p, int m, int ff) {
     char b[8192]; const char *path = p;
@@ -2783,7 +2801,7 @@ static f2_hook_t g_f2_hooks[] = {
     {"statvfs64",(void*)shim_statvfs64,&g_orig_statvfs64},
     {"access",(void*)shim_access,&g_orig_access},{"euidaccess",(void*)shim_euidaccess,&g_orig_euidaccess},{"faccessat",(void*)shim_faccessat,&g_orig_faccessat},
     {"statx",(void*)shim_statx,&g_orig_statx},{"fstatat",(void*)shim_fstatat,&g_orig_fstatat},
-    {"newfstatat",(void*)shim_newfstatat,&g_orig_newfstatat},{"__fxstatat",(void*)shim_fstatat,&g_orig_fstatat},
+    {"newfstatat",(void*)shim_newfstatat,&g_orig_newfstatat},{"__fxstatat",(void*)shim___fxstatat,&g_orig___fxstatat},
     {"symlink",(void*)shim_symlink,&g_orig_symlink},{"symlinkat",(void*)shim_symlinkat,&g_orig_symlinkat},
     {"link",(void*)shim_link,&g_orig_link},{"rename",(void*)shim_rename,&g_orig_rename},
     {"unlink",(void*)shim_unlink,&g_orig_unlink},{"mkdir",(void*)shim_mkdir,&g_orig_mkdir},
