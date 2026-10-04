@@ -2669,10 +2669,11 @@ mv hledal /tmp/x na HOSTU misto $ROOTFS/tmp/x -> ENOENT.
 Stejna trida chyby: GNU `rm`/`rmdir` volaji `unlinkat`/`rmdirat` (NE `unlink`),
 takze i ty dostaly shim (`shim_unlinkat`/`shim_rmdirat`).
 
-**Vysledek:** PASS **131 -> 156**, FAIL **33 -> 8**, **0 ubylych PASS**.
-Zbylych 8 FAILu je environmentalnich / spatne test-casy: ping/ping6 (ICMP),
-uptime (utmp), pslog (PID), timeout x2 (chybi prikaz), shred (/dev/urandom),
-mkdir (leftover /tmp/test_mkdir). Reálná čísla z čistého běhu
-`results/pass_20261004_211255.txt` (156/8) proti loaderu md5
+**Vysledek:** PASS **131 -> 157**, FAIL **33 -> 7**, **0 ubylych PASS**.
+Zbylych 7 FAILu je environmentalnich / spatne test-casy: ping/ping6 (ICMP),
+uptime (utmp), pslog (PID), timeout x2 (chybi prikaz), shred (/dev/urandom).
+Reálná čísla z čistého běhu po úklidu `$ROOTFS/tmp/test_mkdir`:
+`results/pass_20261004_211854.txt` (157/7) proti loaderu md5
 `1e63e8b7d00ead4cc96910c642db891d` (renameat2 + unlinkat + rmdirat).
-(Pozn.: dřívější zápis 158/6 byl proti loaderu bez *at shimů.)
+(Pozn.: dřívější zápis 158/6 byl proti loaderu bez *at shimů; 156/8 byl
+s leftover /tmp/test_mkdir.)

@@ -161,7 +161,7 @@ Milníky:
 - **Test runner přes guest `bash -s` + `renameat`/`unlinkat` path-translace** —
   `run_test` posílal `&&`/`|`/`>` jako argv loaderu (~27 falešných FAILů);
   `mv`/`rm`/`rmdir` ENOENT kvůli chybějícím `renameat2`/`unlinkat`/`rmdirat`
-  shimům. PASS 131→156, FAIL 33→8.
+  shimům. PASS 131→157, FAIL 33→7.
 
 ## 10. Zbývá / otevřené body
 
