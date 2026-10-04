@@ -2644,3 +2644,29 @@ uv run wifi-scanner                                   -> TUI se spustí
 `os.stat('passwd', dir_fd=fd, follow_symlinks=False)` + guard na „Bad address“.
 `test-all.sh all`: PASS 131 / FAIL 33, FAIL sada **bit-identická** (`diff` EXIT=0).
 Oba commity na `origin/dev`.
+
+
+---
+
+## 2026-10-04 (2): test runner guest `bash -s` + `renameat2` path-translace
+
+**Root cause #1 (test runner):** `run_test` skladalo `$L --ownall $bin $cmd`,
+ale `$cmd` mel shell operatory (`cp x /tmp/y && cat`, `echo t | xz`). Ty se
+predavaly loaderu jako argv, ne shellu -> neinterpretovaly se -> ~27 falesnych
+FAILu (column, fold, jq, xz/unxz, zip/unzip, tar, tee, comm, sdiff, split,
+csplit, patch, cmp, mkdir, cp ...).
+
+**Fix #1:** `run_test`/`run_test_output` spousti guest prikaz pres `bash -s`
+(base64 pipe). `_guest_script` posila `cmd` jak je; NEODEBIRAT leading bin_name
+(stary runner to delal kvuli $bin jako argv; s `bash -s` to rozbiji
+`false || true` -> `|| true`).
+
+**Root cause #2 (`mv` ENOENT):** GNU `mv` vola `renameat2` (RENAME_NOREPLACE),
+ne `rename`. Override tabulka mela jen `rename` -> `/tmp/x` netranslatovana ->
+mv hledal /tmp/x na HOSTU misto $ROOTFS/tmp/x -> ENOENT.
+
+**Fix #2:** `shim_renameat` / `shim_renameat2` + registrace v `g_f2_hooks`.
+
+**Vysledek:** PASS **131 -> 158**, FAIL **33 -> 6**, **0 ubylych PASS**.
+Zbylych 6: ping/ping6 (ICMP), uptime (utmp), pslog (PID), clear (TTY), unzip
+(flaky). **Overeni mv izolovane:** `MV_OK RC=0`. Commit `8392010`.
