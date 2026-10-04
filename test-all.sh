@@ -79,6 +79,15 @@ should_skip() {
         *apt*|*dpkg*|*dpkg-deb*|*aptitude*) return 0 ;;
         # Mount / power
         *mount*|*umount*|*chroot*|*pivot_root*|*reboot*|*halt*|*poweroff*|*shutdown*|*init*) return 0 ;;
+        # Host limits (Android app uid): /proc/uptime Permission denied,
+        # shred /dev/urandom, pslog cte /proc/<pid> jineho procesu.
+        # Overeno nativne bez loaderu: selze stejne -> neni bug loaderu.
+        uptime|shred|pslog) return 0 ;;
+        # ping/ping6: parrot binarky jsou setuid-root / raw ICMP socket, coz
+        # Android app uid (10323) neumi -> "setuid: Function not implemented" /
+        # "raw socket: Operation not permitted". Host limit, ne bug loaderu
+        # (NSS cast je opravena: getprotobyname(icmp)=1 pod loaderem).
+        ping|ping6) return 0 ;;
         # Destructive
         killall*|kill*|pkill*|dd|mkfs*|fdisk*|parted*|mkswap*|swapon*|swapoff*) return 0 ;;
         # Síťové démona / nástroje
@@ -288,6 +297,8 @@ TEST_CASES[du]="du -sh /etc"
 TEST_CASES[date]="date"
 TEST_CASES[cal]="cal 2024 | head -3"
 TEST_CASES[sleep]="sleep 0.1 && echo ok"
+# timeout bez prikazu -> usage RC=125; spravny smoke test je spustit neco kratkeho.
+TEST_CASES[timeout]="timeout 1 true"
 TEST_CASES[hostid]="hostid"
 TEST_CASES[man]="man --help 2>&1 | head -1"
 TEST_CASES[less]="less --help 2>&1 | head -1"
@@ -297,7 +308,8 @@ TEST_CASES[lesspipe]="lesspipe --help 2>&1 | head -1"
 TEST_CASES[manpath]="manpath"
 TEST_CASES[mandb]="mandb --help 2>&1 | head -1"
 TEST_CASES[man-recode]="man-recode --help 2>&1 | head -1"
-TEST_CASES[pslog]="pslog"
+# pslog bez PID -> usage RC=255; s PID se testuje smoke cesta.
+TEST_CASES[pslog]="pslog 1"
 TEST_CASES[pstree]="pstree -h 2>&1 | head -1"
 TEST_CASES[zipinfo]="echo test > /tmp/test.txt && zip /tmp/test.zip /tmp/test.txt && zipinfo /tmp/test.zip | head -5"
 
@@ -344,7 +356,8 @@ TEST_CASES[strace]="strace --help 2>&1 | head -1"
 TEST_CASES[ltrace]="ltrace --help 2>&1 | head -1"
 TEST_CASES[perf]="perf --help 2>&1 | head -1"
 TEST_CASES[numactl]="numactl --help 2>&1 | head -1"
-TEST_CASES[ping6]="ping6 -c 1 -W 1 127.0.0.1"
+# ping6 nezna -W (GNU ping flag) -> RC=64; pouzij jen -c na ::1.
+TEST_CASES[ping6]="ping6 -c 1 ::1"
 TEST_CASES[zipinfo]="zipinfo /tmp/test.zip 2>/dev/null | head -3"
 TEST_CASES[column]="printf 'a:b\nc:d\n' | column -t -s:"
 TEST_CASES[expand]="printf 'a\tb\n' | expand"

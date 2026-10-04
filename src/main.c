@@ -2921,7 +2921,13 @@ static int shim_open64_nocancel(const char *p, int flags, ...) {
      * (DNS prestal fungovat, dl_iterate_phdr NULL deref). */
     static const char *etc_files[] = {
         "/etc/resolv.conf", "/etc/passwd", "/etc/group",
-        "/etc/nsswitch.conf", "/etc/hosts", NULL
+        "/etc/nsswitch.conf", "/etc/hosts",
+        /* /etc/protocols + /etc/services: NSS files backend je cte internim
+         * nocancel volanim pri getprotobyname/getservbyname (ping/ping6).
+         * Bez prekladu cte host /etc/protocols (neexistuje) -> ENOENT ->
+         * "ping: unknown protocol icmp". Overeno: nativne ping RC=0,
+         * pod loaderem RC=1; strace ukazal openat("/etc/protocols")=ENOENT. */
+        "/etc/protocols", "/etc/services", NULL
     };
     const char *path = p;
     char buf[8192];
