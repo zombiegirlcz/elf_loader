@@ -166,7 +166,9 @@ Milníky:
   `unknown protocol icmp` (NSS files backend čte `/etc/protocols` interním
   nocancel voláním; doplněno + `/etc/services`). Opraveny i chybné test-casy
   (timeout/pslog/ping6) a ping/uptime/shred do `should_skip` (host limit).
-  Finálně PASS **159 / FAIL 0**, [postup.md#L2720](postup.md#L2720).
+  **Regresní test** `test-all.sh nss` (`getprotobyname("icmp") == 1` přes
+  Python, bez setuid/raw-socket závislosti; v `all`).
+  Finálně PASS **160 / FAIL 0**, [postup.md#L2720](postup.md#L2720).
 
 ## 10. Zbývá / otevřené body
 

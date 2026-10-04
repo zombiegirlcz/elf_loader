@@ -2707,6 +2707,12 @@ stejne): uptime (/proc/uptime Permission denied), shred (/dev/urandom),
 pslog (/proc/<pid>), ping/ping6 (parrot binarky setuid-root / raw ICMP
 socket, Android app uid neumi).
 
+**Regresni test (commit 83302d5):** `category_nss` v `test-all.sh` (soucast
+`all`) testuje `socket.getprotobyname("icmp") == 1` pres Python - NSS files
+backend cte `/etc/protocols` internim nocancel volanim, takze fix hlida bez
+zavislosti na ping (ten je setuid-root / raw ICMP = host limit -> should_skip).
+
 **Finalni cisla (cisty beh po uklidu /tmp):** test-all.sh all =
-PASS 159 / FAIL 0 / SKIP 35. Loader md5 0c1a411ea7b3cb87ba76dbde4360a027
-(/etc/protocols fix). Commit cf7e909 na origin/dev.
+PASS 160 / FAIL 0 / SKIP 35 (vc. kategorie `nss`). Loader md5
+0c1a411ea7b3cb87ba76dbde4360a027 (/etc/protocols fix). Commity cf7e909
+(NSS fix), 83302d5 (regresni test `nss`) na origin/dev.
