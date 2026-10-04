@@ -162,6 +162,11 @@ Milníky:
   `run_test` posílal `&&`/`|`/`>` jako argv loaderu (~27 falešných FAILů);
   `mv`/`rm`/`rmdir` ENOENT kvůli chybějícím `renameat2`/`unlinkat`/`rmdirat`
   shimům. PASS 131→157, FAIL 33→7.
+- **NSS `/etc/protocols` chyběl v `open64_nocancel` whitelistu** — `ping`
+  `unknown protocol icmp` (NSS files backend čte `/etc/protocols` interním
+  nocancel voláním; doplněno + `/etc/services`). Opraveny i chybné test-casy
+  (timeout/pslog/ping6) a ping/uptime/shred do `should_skip` (host limit).
+  Finálně PASS **159 / FAIL 0**, [postup.md#L2720](postup.md#L2720).
 
 ## 10. Zbývá / otevřené body
 

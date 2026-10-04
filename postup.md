@@ -2677,3 +2677,36 @@ Reálná čísla z čistého běhu po úklidu `$ROOTFS/tmp/test_mkdir`:
 `1e63e8b7d00ead4cc96910c642db891d` (renameat2 + unlinkat + rmdirat).
 (Pozn.: dřívější zápis 158/6 byl proti loaderu bez *at shimů; 156/8 byl
 s leftover /tmp/test_mkdir.)
+
+
+---
+
+## 2026-10-04 (3): NSS /etc/protocols chybel v open64_nocancel whitelistu
+
+**Symptom:** ping/ping6 pod loaderem: unknown protocol icmp (nativne bez
+loaderu ping RC=0).
+
+**Root cause:** shim_open64_nocancel ma hardcoded whitelist /etc/ souboru,
+ ktere glibc NSS files backend (libnss_files) cte internim __open64_nocancel
+volanim (obchazi PLT override): resolv.conf, passwd, group, nsswitch.conf, hosts.
+Chybel /etc/protocols (a /etc/services). getprotobyname("icmp") proto
+cetl host /etc/protocols (neexistuje) -> ENOENT -> unknown protocol icmp.
+Strace: openat(AT_FDCWD, "/etc/protocols") = -1 ENOENT.
+
+**Fix:** doplnit /etc/protocols + /etc/services do whitelistu
+(cf7e909, src/main.c). Po fixu strace: openat(".../parrot/etc/protocols") = 3
+a socket.getprotobyname("icmp") -> 1 RC=0 pod loaderem.
+
+**Test-casy opraveny** (byly chybne zadane, ne bug loaderu):
+- timeout -> timeout 1 true (puvodne bez prikazu = usage RC=125)
+- pslog -> pslog 1 (bez PID = usage RC=255)
+- ping6 -> ping6 -c 1 ::1 (nezna GNU -W)
+
+**Do should_skip presunuto** (host limit, overeno nativne bez loaderu selze
+stejne): uptime (/proc/uptime Permission denied), shred (/dev/urandom),
+pslog (/proc/<pid>), ping/ping6 (parrot binarky setuid-root / raw ICMP
+socket, Android app uid neumi).
+
+**Finalni cisla (cisty beh po uklidu /tmp):** test-all.sh all =
+PASS 159 / FAIL 0 / SKIP 35. Loader md5 0c1a411ea7b3cb87ba76dbde4360a027
+(/etc/protocols fix). Commit cf7e909 na origin/dev.
