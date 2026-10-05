@@ -5020,7 +5020,32 @@ NOSP static void sigsys_handler(int sig, siginfo_t *si, void *uc) {
     /* rt_sigaction(134) se SIGSYS: cizi pokus prepsat nas handler ->
      * predstirej uspech, NAS handler zustava aktivni. */
     if (nr == 134) {
-        long _old = (long)ctx->uc_mcontext.regs[2];
+        long _sig   = (long)ctx->uc_mcontext.regs[0];
+        long _act   = (long)ctx->uc_mcontext.regs[1];
+        long _old   = (long)ctx->uc_mcontext.regs[2];
+        long _ssz   = (long)ctx->uc_mcontext.regs[3];
+        /* Guest (V8/node) si pres RAW rt_sigaction instaluje vlastni fatalni
+         * handler - obejde tim glibc wrap (diag_wrapped_sigaction) v main.c,
+         * takze elf_set_guest_fatal by ho nezachytil a nas fault_handler by
+         * ho nemel na co chainovat. Ulozime ho tady (raw 152B guest layout)
+         * a vratime uspech, takze NAS fault_handler zustava aktivni a pri
+         * faultu dochainuje ulozeny guest handler. */
+        if (_act)
+            elf_set_guest_fatal((int)_sig, (const struct sigaction *)_act);
+        { int _fd = (int)raw_syscall6(56, (long)0xFFFFFFFFFFFFFF9CL, (long)(unsigned long)diag_path(), 0x441L, 0644L, 0, (long)F2_SENTINEL);
+          if (_fd >= 0) { char b[160]; int i = 0;
+            const char *q = "SIGACTION sig="; while (*q) b[i++] = *q++;
+            static const char hxd[] = "0123456789abcdef";
+            for (int sh = 28; sh >= 0; sh -= 4) b[i++] = hxd[((unsigned long)_sig >> sh) & 0xf];
+            q = " act="; while (*q) b[i++] = *q++;
+            for (int sh = 60; sh >= 0; sh -= 4) b[i++] = hxd[((unsigned long)_act >> sh) & 0xf];
+            q = " old="; while (*q) b[i++] = *q++;
+            for (int sh = 60; sh >= 0; sh -= 4) b[i++] = hxd[((unsigned long)_old >> sh) & 0xf];
+            q = " ssz="; while (*q) b[i++] = *q++;
+            for (int sh = 28; sh >= 0; sh -= 4) b[i++] = hxd[((unsigned long)_ssz >> sh) & 0xf];
+            b[i++] = '\n';
+            raw_syscall6(64, _fd, (long)(unsigned long)b, i, 0, 0, (long)F2_SENTINEL);
+            raw_syscall6(57, _fd, 0, 0, 0, 0, (long)F2_SENTINEL); } }
         if (_old)
             raw_syscall6(134, 31L, 0L, _old, 8L, 0L, (long)F2_SENTINEL);
         ctx->uc_mcontext.regs[0] = 0;
@@ -5223,6 +5248,51 @@ static void elf_install_debug_sigaction_block(void) {
       *p++ = '\n'; sys_write(2, b, (size_t)(p - b)); }
 }
 
+/* PRODUKCNI (pi+starship TTY SIGSEGV): zachyti guestovo (V8/node) RAW
+ * rt_sigaction pro fatalni signaly pres SECCOMP_RET_TRAP. Nas fault_handler
+ * se dosud ztratil, protoze si V8 pres raw syscall (obchazi glibc wrap
+ * diag_wrapped_sigaction) instaloval vlastni SIGSEGV handler. S trapem se
+ * kazda instalace dostane do naseho sigsys_handleru (nr==134), ktery ji
+ * zaloguje a vrati uspech, takze NAS fault_handler zustava aktivni.
+ * Vypnuti: ELF_LOADER_ALLOW_GUEST_FATAL=1. */
+static void elf_install_fatal_sigaction_trap(void) {
+    static const int fatal[] = { 11, 7, 4, 6, 8, 5 };
+    struct sock_filter prog[64];
+    size_t n = 0;
+    prog[n++] = (struct sock_filter)BPF_STMT(BPF_LD | BPF_W | BPF_ABS,
+                                            offsetof(struct seccomp_data, nr));
+    prog[n++] = (struct sock_filter)BPF_JUMP(BPF_JMP | BPF_JEQ | BPF_K, 134, 0, 0);
+    size_t j_nr = n - 1;
+    /* args[1] (act) == NULL -> jen cteni -> ALLOW (node ResetSignalHandlers) */
+    prog[n++] = (struct sock_filter)BPF_STMT(BPF_LD | BPF_W | BPF_ABS,
+                                            offsetof(struct seccomp_data, args[1]));
+    prog[n++] = (struct sock_filter)BPF_JUMP(BPF_JMP | BPF_JEQ | BPF_K, 0, 0, 0);
+    size_t j_act = n - 1;
+    prog[n++] = (struct sock_filter)BPF_STMT(BPF_LD | BPF_W | BPF_ABS,
+                                            offsetof(struct seccomp_data, args[0]));
+    for (size_t i = 0; i < sizeof fatal / sizeof fatal[0]; i++) {
+        prog[n++] = (struct sock_filter)BPF_JUMP(BPF_JMP | BPF_JEQ | BPF_K,
+                                                 (unsigned int)fatal[i], 0, 1);
+        prog[n++] = (struct sock_filter)BPF_STMT(BPF_RET | BPF_K, SECCOMP_RET_TRAP);
+    }
+    size_t idx_allow = n;
+    prog[n++] = (struct sock_filter)BPF_STMT(BPF_RET | BPF_K, SECCOMP_RET_ALLOW);
+    prog[j_nr].jf = (unsigned char)(idx_allow - j_nr - 1);
+    prog[j_act].jt = (unsigned char)(idx_allow - j_act - 1);
+    struct sock_fprog fprog = { .len = (unsigned short)n, .filter = prog };
+    prctl(PR_SET_NO_NEW_PRIVS, 1, 0, 0, 0);
+    long r = syscall((long)277, 1UL, 0UL, &fprog);
+    { int _fd = (int)raw_syscall6(56, (long)0xFFFFFFFFFFFFFF9CL, (long)(unsigned long)diag_path(), 0x441L, 0644L, 0, (long)F2_SENTINEL);
+      if (_fd >= 0) { char b[48]; char *p = b; const char *q = "FATAL-TRAP ret=";
+        for (; *q; q++) *p++ = *q;
+        long v = r; if (v < 0) { *p++ = '-'; v = -v; }
+        static const char hx[] = "0123456789abcdef";
+        for (int s = 28; s >= 0; s -= 4) *p++ = hx[(v >> s) & 0xf];
+        *p++ = '\n';
+        raw_syscall6(64, _fd, (long)(unsigned long)b, (long)(p - b), 0, 0, (long)F2_SENTINEL);
+        raw_syscall6(57, _fd, 0, 0, 0, 0, (long)F2_SENTINEL); } }
+}
+
 /* Otestuje hypotezu "handler je prepsan": zablokuje rt_sigaction(SIGSYS)
  * na urovni jadra (EPERM), takze nam SIGSYS handler NIKDO nemuze prepsat.
  * Kdyz starship i potom spadne na SIGSYS, je to SECCOMP KILL/TRAP z app
@@ -5406,19 +5476,18 @@ static __attribute__((noreturn)) void elf_run_final(void *sp, void *entry,
             (void *)g_tls_new_tp, sp, entry, g_pending_count);
     if (getenv("ELF_LOADER_KEEP_HANDLERS"))
         elf_install_fault_handlers();
-    /* PRODUKCNI FIX (pi+starship TTY SIGSEGV): guest (V8/node) si pres RAW
-     * rt_sigaction syscall instaluje vlastni SIGSEGV handler pro guard-page
-     * trapy. Ten obejde nas diag_wrapped_sigaction (glibc wrap) a PREPISE nas
-     * fault_handler. Pri realnem faultu (guest V8 JIT cte __thread na
-     * TP-0x618) pak V8 handler crash nezvladne (neni jeho guard-page trap)
-     * -> tichy "Segmentation fault" bez naseho dumpu. Blokace instalace
-     * (EPERM pres seccomp) nechava nas handler aktivni; V8 bez nej funguje
-     * normalne (guard-page trap nastava jen vyjimecne). Vypnutelne pres
-     * ELF_LOADER_ALLOW_GUEST_FATAL=1 pro ladeni. */
-    if (!getenv("ELF_LOADER_ALLOW_GUEST_FATAL"))
+    if (getenv("ELF_LOADER_DEBUG_PC"))
         elf_install_debug_sigaction_block();
-    else if (getenv("ELF_LOADER_DEBUG_PC"))
-        elf_install_debug_sigaction_block();
+    /* POZOR (overeno A/B na zarizeni 2026-10-05): defaultne guestovi
+     * NEZASahujeme do instalace fatalnich handleru. V8/node potrebuje vlastni
+     * SIGSEGV handler pro guard-page trapy; kdyz mu ho zachytime/blokneme
+     * (SECCOMP_RET_TRAP -> sigsys_handler), TUI se nevykresli (0/10 render,
+     * 10/10 pád). S pruchodem guest handleru pi+starship v TTY funguje
+     * (10/10 render, 0 pád). Trap je proto jen OPT-IN diagnostika pres
+     * ELF_LOADER_FATAL_TRAP=1 (uklada guest handlery pro chainovani a loguje
+     * kdo je instaluje). */
+    if (getenv("ELF_LOADER_FATAL_TRAP"))
+        elf_install_fatal_sigaction_trap();
     if (getenv("ELF_LOADER_SIGSYS_LOCK"))
         elf_install_sigsys_lock();
     fflush(stderr);
