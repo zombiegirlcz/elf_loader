@@ -3618,6 +3618,29 @@ elf_tls_ctx_t elf_setup_own_tls(elf_object_t *exe, elf_scope_t *scope) {
     g_tls_old_tp = host_tp;
     ctx.region = region;
     ctx.size = size;
+    {
+        /* Diagnostika: kdo/nahlasene TP. Pod bionickym TP zde (getenv funguje). */
+        static const char hx[] = "0123456789abcdef";
+        char b[160]; int i = 0;
+        long tid = raw_syscall6(178, 0,0,0,0,0, (long)F2_SENTINEL);
+        long pid = raw_syscall6(172, 0,0,0,0,0, (long)F2_SENTINEL);
+        const char *p = "SETUP pid="; while (*p) b[i++] = *p++;
+        for (int sh = 28; sh >= 0; sh -= 4) b[i++] = hx[((unsigned long)pid >> sh) & 0xf];
+        p = " tid="; while (*p) b[i++] = *p++;
+        for (int sh = 28; sh >= 0; sh -= 4) b[i++] = hx[((unsigned long)tid >> sh) & 0xf];
+        p = " host_tp=0x"; while (*p) b[i++] = *p++;
+        for (int sh = 60; sh >= 0; sh -= 4) b[i++] = hx[(host_tp >> sh) & 0xf];
+        p = " new_tp=0x"; while (*p) b[i++] = *p++;
+        for (int sh = 60; sh >= 0; sh -= 4) b[i++] = hx[(new_tp >> sh) & 0xf];
+        b[i++] = '\n';
+        int fd = (int)raw_syscall6(56, (long)-100L,
+            (long)(unsigned long)"/data/user/0/com.linux_core/files/usr/diag.txt",
+            0x441L, 0644L, 0, (long)F2_SENTINEL);
+        if (fd >= 0) {
+            raw_syscall6(64, fd, (long)(unsigned long)b, i, 0, 0, (long)F2_SENTINEL);
+            raw_syscall6(57, fd, 0, 0, 0, 0, (long)F2_SENTINEL);
+        }
+    }
     /* POZOR: tady NESMÍ být msr tpidr_el0! Host bionic malloc (scudo) čte
      * per-thread cache z TLS pres TPIDR_EL0 - po switchi by kazdy loaderuv
      * malloc/free dereferencoval nulovy cache v parrot regionu -> SIGSEGV.
@@ -4429,6 +4452,34 @@ static long raw_syscall6(long nr, long a0, long a1, long a2, long a3, long a4, l
                      : "memory","cc");
     return x0;
 }
+
+/* Diagnostika TLS/TP identity threadu. Volano z entry.S (elf_final_jump) pred
+ * skokem do guest entry a po initech. Pouziva jen raw syscally + mrs tpidr,
+ * takze je bezpecne pod jakymkoliv TP. Log do diag.txt. */
+static void diag_tp_line(const char *tag) {
+    uintptr_t tp; __asm__ volatile("mrs %0, tpidr_el0" : "=r"(tp));
+    long tid = raw_syscall6(178 /*gettid*/, 0,0,0,0,0, (long)F2_SENTINEL);
+    long pid = raw_syscall6(172 /*getpid*/, 0,0,0,0,0, (long)F2_SENTINEL);
+    static const char hx[] = "0123456789abcdef";
+    char b[160]; int i = 0;
+    for (const char *p = tag; *p && i < 32; p++) b[i++] = *p;
+    const char *k1 = " pid="; while (*k1) b[i++] = *k1++;
+    for (int sh = 28; sh >= 0; sh -= 4) b[i++] = hx[((unsigned long)pid >> sh) & 0xf];
+    const char *k2 = " tid="; while (*k2) b[i++] = *k2++;
+    for (int sh = 28; sh >= 0; sh -= 4) b[i++] = hx[((unsigned long)tid >> sh) & 0xf];
+    const char *k3 = " tp=0x"; while (*k3) b[i++] = *k3++;
+    for (int sh = 60; sh >= 0; sh -= 4) b[i++] = hx[(tp >> sh) & 0xf];
+    b[i++] = '\n';
+    int fd = (int)raw_syscall6(56, (long)-100L,
+        (long)(unsigned long)"/data/user/0/com.linux_core/files/usr/diag.txt",
+        0x441L, 0644L, 0, (long)F2_SENTINEL);
+    if (fd >= 0) {
+        raw_syscall6(64, fd, (long)(unsigned long)b, i, 0, 0, (long)F2_SENTINEL);
+        raw_syscall6(57, fd, 0, 0, 0, 0, (long)F2_SENTINEL);
+    }
+}
+void elf_diag_post_msr(void)  { diag_tp_line("POSTMSR"); }
+void elf_diag_pre_entry(void) { diag_tp_line("PREENTRY"); }
 
 /* Kernel struct stat (aarch64) pro newfstatat - st_mode je na ofsetu 16.
  * _u je velka rezerva, aby kernel (i s 64-bit casy) nepresahl buffer. */

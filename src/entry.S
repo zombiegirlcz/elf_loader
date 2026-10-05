@@ -40,7 +40,15 @@ elf_final_jump:
     cbz x2, .Lfj_ns
     msr tpidr_el0, x2
 .Lfj_ns:
+    /* DIAG: zaloguj realne tpidr_el0 hned po msr (pred inity). */
+    stp x6, x30, [sp, #-16]!
+    bl elf_diag_post_msr
+    ldp x6, x30, [sp], #16
     blr x6              /* elf_run_pending_inits() - C loop, malloc-free */
+    /* DIAG: zaloguj realne tpidr_el0 tesne pred skokem do guest entry. */
+    stp x6, x30, [sp, #-16]!
+    bl elf_diag_pre_entry
+    ldp x6, x30, [sp], #16
     mov x0, #0
     mov x1, #0
     mov x2, #0
