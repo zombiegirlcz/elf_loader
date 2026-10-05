@@ -16,7 +16,7 @@ static void print_help(const char *prog) {
         "  %s [--lazy] --own <elf> <shared.so> [args..]\n"
         "  %s [--lazy] --ownall <elf> [args..]\n"
         "  %s [--lazy] --shim <elf> [args..]\n"
-        "  %s init zsh\n"
+        "  %s init zsh|bash\n"
         "  %s <elf>                        (introspect)\n"
         "\n"
         "Modes:\n"
@@ -24,7 +24,7 @@ static void print_help(const char *prog) {
         "  --own         own-load one shared module into a private scope\n"
         "  --ownall      own-load all distro deps + guest binary (parrot glibc)\n"
         "  --shim        F2 path-translation shim for chroot-less guest paths\n"
-        "  init zsh      print `eval`-able zsh env defaults (LOCPATH/LC_ALL) for ROOTFS\n"
+        "  init zsh|bash print `eval`-able env defaults (LOCPATH/LC_ALL) + helpers\n"
         "  <elf>         introspect base/entry/symbols without execution\n"
         "\n"
         "Options:\n"
@@ -3979,6 +3979,65 @@ static const char LX_HELPERS_ZSH[] =
     "}\n"
     "alias lxhelp=help\n";
 
+/* Bash varianta pomocniku (stejna jmena jako zsh blok, prepsana do bash
+ * syntaxe). Pouziva se v .bashrc pres `eval "$($L init bash)"`. */
+static const char LX_HELPERS_BASH[] =
+    "# ───────────────────────── elf_loader pomocníci (bash) ─────────────────────────\n"
+    "lxwhich() {\n"
+    "  local c=$1 d\n"
+    "  if [[ $c == */* ]]; then\n"
+    "    [[ $c == /* && $c != $R/* && $c != $D/* ]] && c=$R$c\n"
+    "    [[ -e $c ]] && { printf '%s\\n' \"$c\"; return 0; }\n"
+    "    return 1\n"
+    "  fi\n"
+    "  for d in $LX_PATH; do\n"
+    "    [[ -x $d/$c && ! -d $d/$c ]] && { printf '%s\\n' \"$d/$c\"; return 0; }\n"
+    "  done\n"
+    "  return 1\n"
+    "}\n"
+    "\n"
+    "lx() {\n"
+    "  (( $# )) || { printf 'použití: lx <příkaz> [args]\\n' >&2; return 2; }\n"
+    "  local bin\n"
+    "  bin=$(lxwhich \"$1\") || { printf \"lx: '%s' není v rootfs\\n\" \"$1\" >&2; return 127; }\n"
+    "  shift\n"
+    "  env LC_ALL=${LC_ALL:-C.UTF-8} SHELL=${LX_SHELL:-$R/bin/bash} ${LX_ENV} \\\n"
+    "      \"$L\" --ownall \"$bin\" \"$@\"\n"
+    "}\n"
+    "\n"
+    "lxq() { lx \"$@\" 2> >(grep -v '^\\[MMAP\\]' >&2); }\n"
+    "\n"
+    "lxlog() {\n"
+    "  local f=$LX_LOG/${1##*/}-$(date +%H%M%S).log\n"
+    "  lx \"$@\" > \"$f\" 2>&1\n"
+    "  local st=$?\n"
+    "  grep -v '^\\[MMAP\\]' \"$f\" | tail -20\n"
+    "  printf -- '── exit=%s  log: %s\\n' \"$st\" \"$f\"\n"
+    "  return $st\n"
+    "}\n"
+    "\n"
+    "lxinfo() {\n"
+    "  printf 'loader : %s\\n' \"$L\"\n"
+    "  [ -x \"$L\" ] && ls -l \"$L\" | awk '{print \"         \" $5 \" B, \" $6 \" \" $7}' || printf '         CHYBÍ\\n'\n"
+    "  printf 'rootfs : %s\\n' \"$R\"\n"
+    "  printf 'locale : LOCPATH=%s\\n' \"$LOCPATH\"\n"
+    "}\n"
+    "\n"
+    "lxfault() {\n"
+    "  lx \"$@\" 2>&1 | grep -E 'FAULT#|pc in:|SIGSYS|panic|Segmentation|Aborted|\\[-\\]' | head -20\n"
+    "}\n"
+    "\n"
+    "command_not_found_handle() {\n"
+    "  local bin\n"
+    "  if bin=$(lxwhich \"$1\" 2>/dev/null); then\n"
+    "    [[ $1 == starship || $1 == zoxide ]] || printf '[lx] %s → %s\\n' \"$1\" \"${bin#$R}\" >&2\n"
+    "    lx \"$@\"\n"
+    "    return $?\n"
+    "  fi\n"
+    "  printf 'bash: %s: příkaz nenalezen\\n' \"$1\" >&2\n"
+    "  return 127\n"
+    "}\n";
+
 /* `elf_loader init zsh` — stejny shell-integrace vzor jako `starship init zsh`/
  * `zoxide init zsh` (uz pouzivany v host .zshrc): vypise na stdout radky pro
  * `eval`, misto aby menil vlastni prostredi (setenv v tomto procesu by na
@@ -3988,18 +4047,42 @@ static const char LX_HELPERS_ZSH[] =
  * tady jen jako text k eval misto primeho setenv. SHELL zamerne vynechano -
  * host .zshrc ma vlastni, odlisny fallback (bionic zsh, ne rootfs bash).
  * Zaroven vypise cely LX_HELPERS_ZSH blok (lx/lxwhich/lxtest/help/...). */
+/* Preamble sdileny pro zsh/bash: vsechny cesty se odvozuji z $ROOTFS/$HOME,
+ * zadna absolutni cesta neni zadratovana. ROOTFS lze prebit; default je
+ * $HOME/nh/distro/parrot (konvence app files diru). LOCPATH se nastavi jen
+ * kdyz adresar v rootfs existuje (jinak by si glibc stezoval). */
+static void elf_print_init_env(void) {
+    fputs(
+        "export D=${D:-$HOME}\n"
+        "export ROOTFS=${ROOTFS:-$D/nh/distro/parrot}\n"
+        "export R=${R:-$ROOTFS}\n"
+        "export L=${L:-$D/usr/bin/elf_loader}\n"
+        "export LX_LOG=${LX_LOG:-$HOME/.cache/lx}\n"
+        "[ -d \"$ROOTFS/usr/lib/locale\" ] && export LOCPATH=\"$ROOTFS/usr/lib/locale\"\n"
+        "export LC_ALL=${LC_ALL:-C.UTF-8}\n",
+        stdout);
+}
+
 static void elf_print_init_zsh(void) {
-    const char *root = getenv("ROOTFS");
-    if (!root || !root[0]) {
-        fprintf(stderr, "elf_loader: init zsh: ROOTFS neni nastaven, preskakuji\n");
-        return;
-    }
-    char locpath[1024];
-    int n = snprintf(locpath, sizeof locpath, "%s/usr/lib/locale", root);
-    if (n > 0 && (size_t)n < sizeof locpath && access(locpath, F_OK) == 0)
-        printf("export LOCPATH=%s\n", locpath);
-    printf("export LC_ALL=${LC_ALL:-C.UTF-8}\n");
+    elf_print_init_env();
+    fputs(
+        "typeset -ga LX_PATH=(\n"
+        "  $R/usr/local/sbin $R/usr/local/bin $R/usr/sbin $R/usr/bin $R/sbin $R/bin\n"
+        "  $R/root/.nvm/versions/node/*/bin(N/On) $R/root/.local/bin\n"
+        ")\n",
+        stdout);
     fputs(LX_HELPERS_ZSH, stdout);
+}
+
+static void elf_print_init_bash(void) {
+    elf_print_init_env();
+    fputs(
+        "LX_PATH=\"$R/usr/local/sbin $R/usr/local/bin $R/usr/sbin $R/usr/bin $R/sbin $R/bin\"\n"
+        "for _nvm in $R/root/.nvm/versions/node/*/bin; do [ -d \"$_nvm\" ] && LX_PATH=\"$LX_PATH $_nvm\"; done\n"
+        "[ -d \"$R/root/.local/bin\" ] && LX_PATH=\"$LX_PATH $R/root/.local/bin\"\n"
+        "unset _nvm\n",
+        stdout);
+    fputs(LX_HELPERS_BASH, stdout);
 }
 
 int main(int argc, char **argv, char **envp) {
@@ -4068,12 +4151,16 @@ int main(int argc, char **argv, char **envp) {
 
     if (strcmp(argv[ai], "init") == 0) {
         const char *shell = (ai + 1 < argc) ? argv[ai + 1] : "zsh";
-        if (strcmp(shell, "zsh") != 0) {
-            fprintf(stderr, "elf_loader: init: nepodporovany shell '%s' (jen 'zsh')\n", shell);
-            return 1;
+        if (strcmp(shell, "zsh") == 0) {
+            elf_print_init_zsh();
+            return 0;
         }
-        elf_print_init_zsh();
-        return 0;
+        if (strcmp(shell, "bash") == 0) {
+            elf_print_init_bash();
+            return 0;
+        }
+        fprintf(stderr, "elf_loader: init: nepodporovany shell '%s' (zsh|bash)\n", shell);
+        return 1;
     }
 
     if (strcmp(argv[ai], "--check") == 0) {
