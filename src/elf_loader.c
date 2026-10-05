@@ -5406,7 +5406,18 @@ static __attribute__((noreturn)) void elf_run_final(void *sp, void *entry,
             (void *)g_tls_new_tp, sp, entry, g_pending_count);
     if (getenv("ELF_LOADER_KEEP_HANDLERS"))
         elf_install_fault_handlers();
-    if (getenv("ELF_LOADER_DEBUG_PC"))
+    /* PRODUKCNI FIX (pi+starship TTY SIGSEGV): guest (V8/node) si pres RAW
+     * rt_sigaction syscall instaluje vlastni SIGSEGV handler pro guard-page
+     * trapy. Ten obejde nas diag_wrapped_sigaction (glibc wrap) a PREPISE nas
+     * fault_handler. Pri realnem faultu (guest V8 JIT cte __thread na
+     * TP-0x618) pak V8 handler crash nezvladne (neni jeho guard-page trap)
+     * -> tichy "Segmentation fault" bez naseho dumpu. Blokace instalace
+     * (EPERM pres seccomp) nechava nas handler aktivni; V8 bez nej funguje
+     * normalne (guard-page trap nastava jen vyjimecne). Vypnutelne pres
+     * ELF_LOADER_ALLOW_GUEST_FATAL=1 pro ladeni. */
+    if (!getenv("ELF_LOADER_ALLOW_GUEST_FATAL"))
+        elf_install_debug_sigaction_block();
+    else if (getenv("ELF_LOADER_DEBUG_PC"))
         elf_install_debug_sigaction_block();
     if (getenv("ELF_LOADER_SIGSYS_LOCK"))
         elf_install_sigsys_lock();
