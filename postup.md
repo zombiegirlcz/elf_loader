@@ -2716,3 +2716,54 @@ zavislosti na ping (ten je setuid-root / raw ICMP = host limit -> should_skip).
 PASS 160 / FAIL 0 / SKIP 35 (vc. kategorie `nss`). Loader md5
 0c1a411ea7b3cb87ba76dbde4360a027 (/etc/protocols fix). Commity cf7e909
 (NSS fix), 83302d5 (regresni test `nss`) na origin/dev.
+
+---
+
+## 2026-10-05 — pi + pi-starship v TTY: SIGSEGV v guest V8 JIT (TLS/TP bug)
+
+**Symptom:** `pi` (0.87.1) s rozsirenim `@narumitw/pi-starship` spadne
+v interaktivnim TTY na SIGSEGV (RC=139) hned po vykresleni terminalovych
+query (kitty `\e[>7u`, DA1 `\e[c`). Bez TTY (`-p`) funguje; `pi -ne`
+(bez extensions) v TTY funguje -> pad je v TTY-specificke ceste s extension.
+
+**Lokalizace (core dump `$R/root/core`, gdb v chrootu):**
+- Faultujici instrukce v guest V8 JIT kodu:
+  ```
+  mrs  x19, tpidr_el0
+  sub  x19, x19, #0x618      ; cteni __thread na TP-0x618 (initial-exec TLS)
+  => ldr  w6, [x19]          ; SIGSEGV
+  ```
+- `$_siginfo`: `si_signo=11`, **`si_code=2` (SEGV_ACCERR)**, `si_addr = TP - 0x618`.
+- Stranka `0x7c9b2be000-0x7c9b2bf000` je v core **PROT_NONE** (guard),
+  `0x7c9b2bf000-0x7c9b2c2000` RW.
+- Thread 1 (main, LWP 21029): `tpidr = 0x7c9b2bf010`.
+  Workery (LWP 21184+): `[TP]` ve vlastnim regionu = spravne guest TP.
+
+**Klicovy zaver:** kdyby thread bezel na loaderem nastavenem guest TP
+(`region+0x720`; `region` i TP v jedne 4K strance, `0x720 < 0x1000`),
+`TP-0x618` by lezelo uvnitr RW regionu -> zadny fault. Fault do PROT_NONE
+stranky dokazuje, ze **crashujici thread nebezi na loaderem nastavenem
+guest TP** (chova se jako bionicke TLS: TP na `base+0x10`, guard stranka
+pod nim). Rizene neni, ktery thread to je a kdo mu TP nastavil.
+
+**Co NEfunguje / co je hotove:**
+- Re-assert guest TP v `elf_final_jump` (`src/entry.S`, necommitnuto) pad
+  **neresi** - crash je za behu, dlouho po entry (pri TUI renderu), ne
+  pri skoku do entry. Diagnostika `TLS-REG`/`JUMP-TP` do `diag.txt` se
+  v pracovnim stromu neudrzela.
+- Overene: `--stack-size=8000` nepomaha (neni stack overflow);
+  crash nezavisly na `TERM`; `ioctl(TIOCGWINSZ)` je OK.
+
+**Nevyresena otazka:** ktery thread a proc ma jine TP. Kandidati:
+(a) crashujici LWP je bionic-vytvoreny thread (script/PTY vrstva), ne
+node main; (b) node/V8 si TP prepsie; (c) vnozeny loader (`script` +
+`node`) a sdileny `diag.txt` micha zaznamy.
+
+**Dalsi krok (jeden beh, dve cisla):** do `elf_setup_own_tls` zapsat
+poradove cislo volani + PID + TID + region/new_tp; do `elf_final_jump`
+(pred `br x19`) skutecne `tpidr_el0`; `fault_handler` uz loguje `tpidr=`
+i `tid=`. Srovnanim TID poznat, zda pada main thread (loader TP), nebo
+jiny thread (bionic TP).
+
+**Obejiti:** `settings.json` -> vypnout `@narumitw/pi-starship`
+(`"extensions": ["-dist/index.ts"]`).

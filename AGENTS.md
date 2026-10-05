@@ -137,6 +137,11 @@ Milníky:
   [postup.md#L2164](postup.md#L2164).
 - v26.8.2 stále padá — dokumentovaný JSDispatchTable bug —
   [postup.md#L2256](postup.md#L2256).
+- **pi + `@narumitw/pi-starship` v TTY SIGSEGV (RC=139)** — guest V8 JIT
+  čte `__thread` na `TP−0x618` do PROT_NONE stránky; crashující thread
+  neběží na loaderem nastaveném guest TP. Core dump + analýza, re-assert
+  TP v `elf_final_jump` pád neřeší (crash je za běhu) —
+  [postup.md#L2742](postup.md#L2742).
 
 ## 9. Ostatní binárky a poslední fixy
 
