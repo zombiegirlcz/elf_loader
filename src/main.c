@@ -179,6 +179,29 @@ static elf_scope_t *g_shim_scope = NULL;  /* platny scope behem F2 behu */
  * so we can detect if starship/glibc resets our handler. */
 #define ELF_SENTINEL 0x1234567890ABCDEFULL
 static void raw_wr2(const char *b, int n);
+
+/* Per-PID diag cesta (stejne jako v elf_loader.c) - vnorene loadery
+ * nesmi michat jeden sdileny diag.txt. */
+static char g_diag_path_main[160];
+static const char *diag_path_main(void) {
+    if (g_diag_path_main[0])
+        return g_diag_path_main;
+    register long x8 __asm__("x8") = 172; /* getpid */
+    register long x0 __asm__("x0") = 0;
+    __asm__ volatile("svc #0" : "+r"(x0) : "r"(x8) : "memory", "cc");
+    long pid = x0;
+    const char *pre = "/data/user/0/com.linux_core/files/usr/diag.";
+    int i = 0;
+    while (pre[i]) { g_diag_path_main[i] = pre[i]; i++; }
+    char t[24]; int ti = 0;
+    if (pid <= 0) pid = 1;
+    while (pid > 0) { t[ti++] = (char)('0' + (pid % 10)); pid /= 10; }
+    while (ti > 0) g_diag_path_main[i++] = t[--ti];
+    const char *suf = ".txt";
+    for (int k = 0; suf[k]; k++) g_diag_path_main[i++] = suf[k];
+    g_diag_path_main[i] = 0;
+    return g_diag_path_main;
+}
 static long my_raw_syscall6(long n, long a0, long a1, long a2, long a3, long a4, long a5) {
     register long x8 __asm__("x8") = n;
     register long x0 __asm__("x0") = a0;
@@ -217,7 +240,7 @@ static int diag_wrapped_sigaction(int signum, const struct sigaction *act,
     }
     if (signum == SIGSYS && getenv("ELF_LOADER_SIGTRACE")) {
         long fd = my_raw_syscall6(56, -100,
-                              (long)(unsigned long)"/data/user/0/com.linux_core/files/usr/diag.txt",
+                              (long)(unsigned long)diag_path_main(),
                               0x441L, 0644L, 0, ELF_SENTINEL);
         if (fd >= 0) {
             const char msg[] = "SIGACTION-SIGSYS\n";

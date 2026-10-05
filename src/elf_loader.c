@@ -2440,6 +2440,26 @@ extern uintptr_t g_tls_old_tp;
  * diag.txt writes in early init/handler. */
 static long raw_syscall6(long nr, long a0, long a1, long a2, long a3, long a4, long a5);
 
+/* Per-PID diag cesta: vnorene loadery (script -> pi) jinak michaji/truncate
+ * jeden sdileny diag.txt. Cache jednou vybudovanou cestu. */
+static char g_diag_path[160];
+static const char *diag_path(void) {
+    if (g_diag_path[0])
+        return g_diag_path;
+    long pid = raw_syscall6(172 /*getpid*/, 0,0,0,0,0, (long)F2_SENTINEL);
+    const char *pre = "/data/user/0/com.linux_core/files/usr/diag.";
+    int i = 0;
+    while (pre[i]) { g_diag_path[i] = pre[i]; i++; }
+    char t[24]; int ti = 0;
+    if (pid <= 0) pid = 1;
+    while (pid > 0) { t[ti++] = (char)('0' + (pid % 10)); pid /= 10; }
+    while (ti > 0) g_diag_path[i++] = t[--ti];
+    g_diag_path[i++] = '.'; g_diag_path[i++] = 't';
+    g_diag_path[i++] = 'x'; g_diag_path[i++] = 't';
+    g_diag_path[i] = 0;
+    return g_diag_path;
+}
+
 /* Volá se z asm (elf_final_jump) pod parrot TP. Žádný bionic kód/malloc. */
 static void install_sigsys_handler_now(void);
 static int g_f2_filter_active = 0;
@@ -2451,7 +2471,7 @@ static int g_skip_locale = 0;
 static int g_keep_handlers = 0;
 
 void elf_run_pending_inits(void) {
-    { int _fd = raw_syscall6(56, (long)0xFFFFFFFFFFFFFF9CL, (long)(unsigned long)"/data/user/0/com.linux_core/files/usr/diag.txt", 0x441L, 0644L, 0, (long)F2_SENTINEL); if (_fd >= 0) { const char _m[] = "INITS-START\n"; raw_syscall6(64, _fd, (long)(unsigned long)_m, sizeof(_m) - 1, 0, 0, (long)F2_SENTINEL); raw_syscall6(57, _fd, 0, 0, 0, 0, (long)F2_SENTINEL); } }
+    { int _fd = raw_syscall6(56, (long)0xFFFFFFFFFFFFFF9CL, (long)(unsigned long)diag_path(), 0x441L, 0644L, 0, (long)F2_SENTINEL); if (_fd >= 0) { const char _m[] = "INITS-START\n"; raw_syscall6(64, _fd, (long)(unsigned long)_m, sizeof(_m) - 1, 0, 0, (long)F2_SENTINEL); raw_syscall6(57, _fd, 0, 0, 0, 0, (long)F2_SENTINEL); } }
     if (g_tls_new_tp) {
         if (!g_skip_locale) {
             if (g_libc_uselocale)
@@ -2468,7 +2488,7 @@ void elf_run_pending_inits(void) {
         while (_n > 0) { _t[_ti++] = (char)('0' + (_n % 10)); _n /= 10; }
         while (_ti > 0) _b[_i++] = _t[--_ti];
         _b[_i++] = '\n';
-        int _fd = (int)raw_syscall6(56, (long)0xFFFFFFFFFFFFFF9CL, (long)(unsigned long)"/data/user/0/com.linux_core/files/usr/diag.txt", 0x441L, 0644L, 0, (long)F2_SENTINEL);
+        int _fd = (int)raw_syscall6(56, (long)0xFFFFFFFFFFFFFF9CL, (long)(unsigned long)diag_path(), 0x441L, 0644L, 0, (long)F2_SENTINEL);
         if (_fd >= 0) { raw_syscall6(64, _fd, (long)(unsigned long)_b, _i, 0, 0, (long)F2_SENTINEL); raw_syscall6(57, _fd, 0, 0, 0, 0, (long)F2_SENTINEL); }
     }
     if (!g_skip_inits)
@@ -2494,7 +2514,7 @@ void elf_run_pending_inits(void) {
             install_sigsys_handler_now();
         }
     }
-    { int _fd = raw_syscall6(56, (long)0xFFFFFFFFFFFFFF9CL, (long)(unsigned long)"/data/user/0/com.linux_core/files/usr/diag.txt", 0x441L, 0644L, 0, (long)F2_SENTINEL); if (_fd >= 0) { const char _m[] = "INITS-DONE\n"; raw_syscall6(64, _fd, (long)(unsigned long)_m, sizeof(_m) - 1, 0, 0, (long)F2_SENTINEL); raw_syscall6(57, _fd, 0, 0, 0, 0, (long)F2_SENTINEL); } }
+    { int _fd = raw_syscall6(56, (long)0xFFFFFFFFFFFFFF9CL, (long)(unsigned long)diag_path(), 0x441L, 0644L, 0, (long)F2_SENTINEL); if (_fd >= 0) { const char _m[] = "INITS-DONE\n"; raw_syscall6(64, _fd, (long)(unsigned long)_m, sizeof(_m) - 1, 0, 0, (long)F2_SENTINEL); raw_syscall6(57, _fd, 0, 0, 0, 0, (long)F2_SENTINEL); } }
 }
 
 static __attribute__((noreturn)) void elf_run_final(void *sp, void *entry, elf_object_t *obj);
@@ -3520,7 +3540,7 @@ elf_tls_ctx_t elf_setup_own_tls(elf_object_t *exe, elf_scope_t *scope) {
         while (*_p2) _b[_i++] = *_p2++;
         _b[_i++] = (char)('0' + g_skip_locale);
         _b[_i++] = '\n';
-        int _fd = (int)raw_syscall6(56, (long)0xFFFFFFFFFFFFFF9CL, (long)(unsigned long)"/data/user/0/com.linux_core/files/usr/diag.txt", 0x441L, 0644L, 0, (long)F2_SENTINEL);
+        int _fd = (int)raw_syscall6(56, (long)0xFFFFFFFFFFFFFF9CL, (long)(unsigned long)diag_path(), 0x441L, 0644L, 0, (long)F2_SENTINEL);
         if (_fd >= 0) { raw_syscall6(64, _fd, (long)(unsigned long)_b, _i, 0, 0, (long)F2_SENTINEL); raw_syscall6(57, _fd, 0, 0, 0, 0, (long)F2_SENTINEL); }
     }
 
@@ -3634,7 +3654,7 @@ elf_tls_ctx_t elf_setup_own_tls(elf_object_t *exe, elf_scope_t *scope) {
         for (int sh = 60; sh >= 0; sh -= 4) b[i++] = hx[(new_tp >> sh) & 0xf];
         b[i++] = '\n';
         int fd = (int)raw_syscall6(56, (long)-100L,
-            (long)(unsigned long)"/data/user/0/com.linux_core/files/usr/diag.txt",
+            (long)(unsigned long)diag_path(),
             0x441L, 0644L, 0, (long)F2_SENTINEL);
         if (fd >= 0) {
             raw_syscall6(64, fd, (long)(unsigned long)b, i, 0, 0, (long)F2_SENTINEL);
@@ -4471,7 +4491,7 @@ static void diag_tp_line(const char *tag) {
     for (int sh = 60; sh >= 0; sh -= 4) b[i++] = hx[(tp >> sh) & 0xf];
     b[i++] = '\n';
     int fd = (int)raw_syscall6(56, (long)-100L,
-        (long)(unsigned long)"/data/user/0/com.linux_core/files/usr/diag.txt",
+        (long)(unsigned long)diag_path(),
         0x441L, 0644L, 0, (long)F2_SENTINEL);
     if (fd >= 0) {
         raw_syscall6(64, fd, (long)(unsigned long)b, i, 0, 0, (long)F2_SENTINEL);
@@ -4585,7 +4605,7 @@ static void install_f2_path_filter_impl(void) {
     /* diag: zapsat navratove kody (raw, TP-independent) */
     {
         int fd = (int)raw_syscall6(56, -100L,
-            (long)(unsigned long)"/data/user/0/com.linux_core/files/usr/diag.txt",
+            (long)(unsigned long)diag_path(),
             0x441L, 0644L, 0, (long)F2_SENTINEL);
         if (fd >= 0) {
             char b[96]; int i = 0;
@@ -4903,13 +4923,13 @@ NOSP static void sigsys_handler(int sig, siginfo_t *si, void *uc) {
         if (gpc >= g_go_lo && gpc < g_go_hi && go_handle(si->si_syscall, gctx))
             return;
     }
-    if (g_tls_trace) { static const char _m[] = "HANDLER-ENTER\n"; int _fd = raw_syscall6(56, (long)0xFFFFFFFFFFFFFF9CL, (long)(unsigned long)"/data/user/0/com.linux_core/files/usr/diag.txt", 0x441L, 0644L, 0, (long)F2_SENTINEL); if (_fd >= 0) { raw_syscall6(64, _fd, (long)(unsigned long)_m, sizeof(_m) - 1, 0, 0, (long)F2_SENTINEL); raw_syscall6(57, _fd, 0, 0, 0, 0, (long)F2_SENTINEL); } }
+    if (g_tls_trace) { static const char _m[] = "HANDLER-ENTER\n"; int _fd = raw_syscall6(56, (long)0xFFFFFFFFFFFFFF9CL, (long)(unsigned long)diag_path(), 0x441L, 0644L, 0, (long)F2_SENTINEL); if (_fd >= 0) { raw_syscall6(64, _fd, (long)(unsigned long)_m, sizeof(_m) - 1, 0, 0, (long)F2_SENTINEL); raw_syscall6(57, _fd, 0, 0, 0, 0, (long)F2_SENTINEL); } }
     if (g_tls_trace) {
         static const char _m[] = "[SIGSYS] handler entered\n";
         raw_syscall6(64, 2, (long)(unsigned long)_m, sizeof(_m) - 1, 0, 0,
                      (long)F2_SENTINEL);
     }
-    if (g_tls_trace) { static const char _m[] = "ENTER\n"; int _fd = raw_syscall6(56, (long)0xFFFFFFFFFFFFFF9CL, (long)(unsigned long)"/data/user/0/com.linux_core/files/usr/diag.txt", 0x241L, 0644L, 0, (long)F2_SENTINEL); if (_fd >= 0) { raw_syscall6(64, _fd, (long)(unsigned long)_m, 6, 0, 0, (long)F2_SENTINEL); raw_syscall6(57, _fd, 0, 0, 0, 0, (long)F2_SENTINEL); } }
+    if (g_tls_trace) { static const char _m[] = "ENTER\n"; int _fd = raw_syscall6(56, (long)0xFFFFFFFFFFFFFF9CL, (long)(unsigned long)diag_path(), 0x441L, 0644L, 0, (long)F2_SENTINEL); if (_fd >= 0) { raw_syscall6(64, _fd, (long)(unsigned long)_m, 6, 0, 0, (long)F2_SENTINEL); raw_syscall6(57, _fd, 0, 0, 0, 0, (long)F2_SENTINEL); } }
     ucontext_t *ctx = (ucontext_t *)uc;
     f2_reinstall_sigsys();   /* drz nas handler i kdyz ho guest resetuje */
     long nr = si->si_syscall;
@@ -4920,7 +4940,7 @@ NOSP static void sigsys_handler(int sig, siginfo_t *si, void *uc) {
       while (_n > 0) { _t[_ti++] = (char)('0' + (_n % 10)); _n /= 10; }
       while (_ti > 0) _b[_i++] = _t[--_ti];
       _b[_i++] = '\n';
-      int _fd = (int)raw_syscall6(56, (long)0xFFFFFFFFFFFFFF9CL, (long)(unsigned long)"/data/user/0/com.linux_core/files/usr/diag.txt", 0x441L, 0644L, 0, (long)F2_SENTINEL);
+      int _fd = (int)raw_syscall6(56, (long)0xFFFFFFFFFFFFFF9CL, (long)(unsigned long)diag_path(), 0x441L, 0644L, 0, (long)F2_SENTINEL);
       if (_fd >= 0) { raw_syscall6(64, _fd, (long)(unsigned long)_b, _i, 0, 0, (long)F2_SENTINEL); raw_syscall6(57, _fd, 0, 0, 0, 0, (long)F2_SENTINEL); } }
     /* F2 seccomp path-translation: prelozime cestu (x1) a zemulujeme syscall
      * raw svc s SENTINEL v x5 (filtr ho pusti). Chyti i glibc-interni open. */
@@ -5039,7 +5059,7 @@ NOSP static void sigsys_handler(int sig, siginfo_t *si, void *uc) {
         while (ti > 0) *p++ = tmp[--ti];
         *p++ = '\n';
         int _fd = (int)raw_syscall6(56, -100L,
-            (long)(unsigned long)"/data/user/0/com.linux_core/files/usr/diag.txt",
+            (long)(unsigned long)diag_path(),
             0x441L, 0644L, 0, (long)F2_SENTINEL);
         if (_fd >= 0) {
             raw_syscall6(64, _fd, (long)(unsigned long)buf, (size_t)(p - buf),
@@ -5086,7 +5106,7 @@ void elf_install_fault_handlers(void) {
     struct sigaction sc;
     memset(&sc, 0, sizeof(sc));
     /* DEBUG: potvrdit, ze handler byl nainstalovan - zapis do souboru */
-    { int _fd = raw_syscall6(56, (long)0xFFFFFFFFFFFFFF9CL, (long)(unsigned long)"/data/user/0/com.linux_core/files/usr/diag.txt", 0x241L, 0644L, 0, (long)F2_SENTINEL); if (_fd >= 0) { const char _m[] = "INSTALLED\n"; raw_syscall6(64, _fd, (long)(unsigned long)_m, 10, 0, 0, (long)F2_SENTINEL); raw_syscall6(57, _fd, 0, 0, 0, 0, (long)F2_SENTINEL); } }
+    { int _fd = raw_syscall6(56, (long)0xFFFFFFFFFFFFFF9CL, (long)(unsigned long)diag_path(), 0x441L, 0644L, 0, (long)F2_SENTINEL); if (_fd >= 0) { const char _m[] = "INSTALLED\n"; raw_syscall6(64, _fd, (long)(unsigned long)_m, 10, 0, 0, (long)F2_SENTINEL); raw_syscall6(57, _fd, 0, 0, 0, 0, (long)F2_SENTINEL); } }
     sc.sa_sigaction = sigsys_handler;
     sc.sa_flags = SA_SIGINFO;
     f2_reinstall_sigsys();
@@ -5184,7 +5204,7 @@ static void elf_install_sigsys_lock(void) {
     prog[n++] = (struct sock_filter)BPF_STMT(BPF_RET | BPF_K, SECCOMP_RET_ALLOW);
     struct sock_fprog fprog = { .len = (unsigned short)n, .filter = prog };
     long r = syscall((long)277, 1UL, 0UL, &fprog);
-    { int _fd = raw_syscall6(56, (long)0xFFFFFFFFFFFFFF9CL, (long)(unsigned long)"/data/user/0/com.linux_core/files/usr/diag.txt", 0x441L, 0644L, 0, (long)F2_SENTINEL); if (_fd >= 0) { const char _m[] = "SIGSYS-LOCK\n"; raw_syscall6(64, _fd, (long)(unsigned long)_m, sizeof(_m)-1, 0, 0, (long)F2_SENTINEL); raw_syscall6(57, _fd, 0, 0, 0, 0, (long)F2_SENTINEL); } }
+    { int _fd = raw_syscall6(56, (long)0xFFFFFFFFFFFFFF9CL, (long)(unsigned long)diag_path(), 0x441L, 0644L, 0, (long)F2_SENTINEL); if (_fd >= 0) { const char _m[] = "SIGSYS-LOCK\n"; raw_syscall6(64, _fd, (long)(unsigned long)_m, sizeof(_m)-1, 0, 0, (long)F2_SENTINEL); raw_syscall6(57, _fd, 0, 0, 0, 0, (long)F2_SENTINEL); } }
     (void)r;
 }
 
@@ -5353,7 +5373,7 @@ static __attribute__((noreturn)) void elf_run_final(void *sp, void *entry,
     if (getenv("ELF_LOADER_SIGSYS_LOCK"))
         elf_install_sigsys_lock();
     fflush(stderr);
-    { int _fd = raw_syscall6(56, (long)0xFFFFFFFFFFFFFF9CL, (long)(unsigned long)"/data/user/0/com.linux_core/files/usr/diag.txt", 0x441L /*O_WRONLY|O_CREAT|O_APPEND*/, 0644L, 0, (long)F2_SENTINEL); if (_fd >= 0) { const char _m[] = "JUMP\n"; raw_syscall6(64, _fd, (long)(unsigned long)_m, 5, 0, 0, (long)F2_SENTINEL); raw_syscall6(57, _fd, 0, 0, 0, 0, (long)F2_SENTINEL); } }
+    { int _fd = raw_syscall6(56, (long)0xFFFFFFFFFFFFFF9CL, (long)(unsigned long)diag_path(), 0x441L /*O_WRONLY|O_CREAT|O_APPEND*/, 0644L, 0, (long)F2_SENTINEL); if (_fd >= 0) { const char _m[] = "JUMP\n"; raw_syscall6(64, _fd, (long)(unsigned long)_m, 5, 0, 0, (long)F2_SENTINEL); raw_syscall6(57, _fd, 0, 0, 0, 0, (long)F2_SENTINEL); } }
     extern void elf_final_jump(void *, void *, uintptr_t, void (*)(void));
     elf_final_jump(sp, entry, g_tls_new_tp, elf_run_pending_inits);
     __builtin_unreachable();
