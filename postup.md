@@ -2746,24 +2746,45 @@ stranky dokazuje, ze **crashujici thread nebezi na loaderem nastavenem
 guest TP** (chova se jako bionicke TLS: TP na `base+0x10`, guard stranka
 pod nim). Rizene neni, ktery thread to je a kdo mu TP nastavil.
 
-**Co NEfunguje / co je hotove:**
-- Re-assert guest TP v `elf_final_jump` (`src/entry.S`, necommitnuto) pad
-  **neresi** - crash je za behu, dlouho po entry (pri TUI renderu), ne
-  pri skoku do entry. Diagnostika `TLS-REG`/`JUMP-TP` do `diag.txt` se
-  v pracovnim stromu neudrzela.
-- Overene: `--stack-size=8000` nepomaha (neni stack overflow);
-  crash nezavisly na `TERM`; `ioctl(TIOCGWINSZ)` je OK.
+**Skutecna pricina (nalezeno 2026-10-05) — SIGSEGV se vubec nedostal do
+naseho `fault_handler`u, ktery byl instalovan POD GUEST (parrot) TP:**
 
-**Nevyresena otazka:** ktery thread a proc ma jine TP. Kandidati:
-(a) crashujici LWP je bionic-vytvoreny thread (script/PTY vrstva), ne
-node main; (b) node/V8 si TP prepsie; (c) vnozeny loader (`script` +
-`node`) a sdileny `diag.txt` micha zaznamy.
+`elf_run_pending_inits()` (src/elf_loader.c) volal:
+```c
+if (g_keep_handlers)
+    elf_install_fault_handlers();   // BUG
+```
+`elf_install_fault_handlers()` vola **bionicke** `sigaltstack()` +
+`sigaction()` - ty ctou bionickou TLS pres `TPIDR_EL0`. V tomto bode vsak
+loader bezi pod **guest (parrot) TP** (`g_tls_new_tp`), takze instalace
+handleru selhala / prepsala ho nesmyslem. O par radku niz uz kod stejny
+problem resil pro SIGSYS (prepne na `g_tls_old_tp` a zpet) - u fault
+handleru to bylo zapomenute. Dusledek: pri SIGSEGV se nas handler nikdy
+nespustil (`FAULT#` se nezapsal) a proces umrel na default action ->
+„Segmentation fault“.
 
-**Dalsi krok (jeden beh, dve cisla):** do `elf_setup_own_tls` zapsat
-poradove cislo volani + PID + TID + region/new_tp; do `elf_final_jump`
-(pred `br x19`) skutecne `tpidr_el0`; `fault_handler` uz loguje `tpidr=`
-i `tid=`. Srovnanim TID poznat, zda pada main thread (loader TP), nebo
-jiny thread (bionic TP).
+**Diagnostika, ktera to odhalila:**
+- Per-PID diag (`diag.<pid>.txt`) - vnorene loadery (`script` -> `pi`)
+  jinak michaly/truncovaly jeden `diag.txt`.
+- `SETUP`/`POSTMSR`/`PREENTRY` logy do `elf_setup_own_tls` + `entry.S`:
+  main thread ma guest TP (`...720`) spravne az do entry - pád tedy NENI
+  v entry ceste.
+- `FAULT-ENTER tp=... tid=...` jako UPLNE PRVNI instrukce `fault_handler`u.
+- Deterministicky spoustec: `ELF_LOADER_DEBUG_PC=1` (seccomp blok
+  guestiho `rt_sigaction`) delal pad 10/10; bez nej flaky.
 
-**Obejiti:** `settings.json` -> vypnout `@narumitw/pi-starship`
-(`"extensions": ["-dist/index.ts"]`).
+**Fix (commit git-agent `4602b18`, +40 radku v src/elf_loader.c):**
+`elf_install_fault_handlers()` se v `elf_run_pending_inits` volá pod
+bionickym TP (stejny `mrs/msr tpidr_el0` dance jako SIGSYS reinstall).
+
+**A/B dukaz (DEBUG_PC, 6 behu kazdy, device):**
+- STARY loader: RENDERED=0/6, 6x `Segmentation fault` (0x `FAULT-ENTER`).
+- NOVY loader: RENDERED=6/6 (plne TUI starship prompt), 0 padu.
+
+**Regrese:** `test-all.sh all` = PASS **160 / FAIL 0 / SKIP 35** proti
+nasazenemu loaderu (md5 `5b0ce4fde82db1969aef6910ad2be416`).
+
+**Pozn. k `mrs tpidr_el0`:** crashujici instrukce je guest V8 JIT - zadna
+pomocna `.so` ji nemuze zachytit (je to instrukce, ne volani). Problem
+nebyl v TP threadu za behu, ale v tom, ze se nas handler vubec
+nenainstaloval.

@@ -137,10 +137,13 @@ Milníky:
   [postup.md#L2164](postup.md#L2164).
 - v26.8.2 stále padá — dokumentovaný JSDispatchTable bug —
   [postup.md#L2256](postup.md#L2256).
-- **pi + `@narumitw/pi-starship` v TTY SIGSEGV (RC=139)** — guest V8 JIT
-  čte `__thread` na `TP−0x618` do PROT_NONE stránky; crashující thread
-  neběží na loaderem nastaveném guest TP. Core dump + analýza, re-assert
-  TP v `elf_final_jump` pád neřeší (crash je za běhu) —
+- **pi + `@narumitw/pi-starship` v TTY SIGSEGV (RC=139) — VYŘEŠENO**
+  (commit `4602b18`): `elf_run_pending_inits` instaloval fault handler
+  `elf_install_fault_handlers()` pod **guest (parrot) TP**, ale
+  `sigaltstack`/`sigaction` jsou bionické → handler se nenainstaloval a
+  SIGSEGV šel na default action. Fix: instalace pod bionickým TP
+  (`mrs/msr tpidr_el0` dance). A/B (DEBUG_PC, 6 běhů): starý 0/6 render +
+  6× SIGSEGV, nový 6/6 render. test-all 160/0 —
   [postup.md#L2742](postup.md#L2742).
 
 ## 9. Ostatní binárky a poslední fixy
