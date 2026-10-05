@@ -2497,9 +2497,24 @@ void elf_run_pending_inits(void) {
         fn(elf_init_argc, elf_init_argv, elf_init_envp);
     }
     /* po initech: libc/program může mít přepsán SIGSEGV handler (procps
-     * ps/top) → reinstalovat náš fault dump handler pro diagnostiku */
-    if (g_keep_handlers)
+     * ps/top) → reinstalovat náš fault dump handler pro diagnostiku.
+     * POZOR: sigaltstack/sigaction jsou BIONICKE - ctou bionickou TLS pres
+     * TPIDR_EL0. Tady ale bezime pod guest (parrot) TP -> musime na dobu
+     * reinstalu prepsat TP na bionicky a pak zpet (stejny vzor jako SIGSYS
+     * reinstall nize). Bez toho se nas fault_handler neinstaluje/neprepise
+     * nesmyslem a FAULT# se pri pade vubec nezapise. */
+    if (g_keep_handlers && g_tls_old_tp) {
+        uintptr_t _s; __asm__ volatile("mrs %0, tpidr_el0" : "=r"(_s));
+        if (_s != g_tls_old_tp) {
+            __asm__ volatile("msr tpidr_el0, %0" : : "r"(g_tls_old_tp));
+            elf_install_fault_handlers();
+            __asm__ volatile("msr tpidr_el0, %0" : : "r"(_s));
+        } else {
+            elf_install_fault_handlers();
+        }
+    } else if (g_keep_handlers) {
         elf_install_fault_handlers();
+    }
     /* Guest glibc při inicializaci přepíše SIGSYS handler na default ->
      * F2 path-translation (seccomp TRAP na openat) by zabila proces.
      * Reinstalujeme náš handler. sigaction je bionický (čte bionic TLS),
@@ -4046,6 +4061,29 @@ static void fault_obj_dump(const char *label, unsigned long tagged, int nq)
 }
 static void fault_handler(int sig, siginfo_t *si, void *ctx) {
     ucontext_t *uc = (ucontext_t *)ctx;
+
+    /* UPLNE PRVNI zapis: potvrdi, ze handler se vubec zavolal, a zaloguje
+     * TID + realne tpidr_el0 crashujiciho threadu - klicove pro rozhodnuti,
+     * zda crash je na main threadu (loader guest TP), nebo na jinem threadu
+     * s bionickym TP. sys_write i raw gettid jsou TP-independent. */
+    {
+        uintptr_t _tp; __asm__ volatile("mrs %0, tpidr_el0" : "=r"(_tp));
+        long _tid = raw_syscall6(178, 0,0,0,0,0, (long)F2_SENTINEL);
+        static const char _hxd[] = "0123456789abcdef";
+        char _b[96]; int _i = 0;
+        const char *_q = "FAULT-ENTER tp=0x"; while (*_q) _b[_i++] = *_q++;
+        for (int _sh = 60; _sh >= 0; _sh -= 4) _b[_i++] = _hxd[(_tp >> _sh) & 0xf];
+        _q = " tid="; while (*_q) _b[_i++] = *_q++;
+        for (int _sh = 28; _sh >= 0; _sh -= 4) _b[_i++] = _hxd[((unsigned long)_tid >> _sh) & 0xf];
+        _b[_i++] = '\n';
+        sys_write(2, _b, (size_t)_i);
+        int _fd = (int)raw_syscall6(56, (long)-100L,
+            (long)(unsigned long)diag_path(), 0x441L, 0644L, 0, (long)F2_SENTINEL);
+        if (_fd >= 0) {
+            raw_syscall6(64, _fd, (long)(unsigned long)_b, _i, 0, 0, (long)F2_SENTINEL);
+            raw_syscall6(57, _fd, 0, 0, 0, 0, (long)F2_SENTINEL);
+        }
+    }
 
     /* Diagnostika dvojitych faultu: kazde vstoupeni ocislujeme a zalogujeme
      * si_addr I adresu, kterou by faultovala instrukce na pc (pro
