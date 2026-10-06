@@ -1788,12 +1788,30 @@ static int shim_execve(const char *p, char *const argv[], char *const envp[]) {
         unsigned char emag[4] = {0, 0, 0, 0};
         int efd = raw_open(p, O_RDONLY);
         int eopened = (efd >= 0);
-        ssize_t ern = -1;
-        if (efd >= 0) { ern = raw_read(efd, emag, 4); raw_close(efd); }
+        if (efd >= 0) { raw_read(efd, emag, 4); raw_close(efd); }
         int eglibc = is_glibc_elf(p);
-        if (getenv("RFDBG"))
-            fprintf(stderr, "[rootfs-exec-dbg] p=%s opened=%d rn=%zd magic=%02x%02x%02x%02x glibc=%d\n",
-                    p, eopened, ern, emag[0], emag[1], emag[2], emag[3], eglibc);
+        {
+            /* TP-nezavisly raw diag (docasne, pro RCA) - stejny vzor jako
+             * trace_call_logger: fprintf/getenv v teto vetvi cestou shim_execve
+             * umi bezet pod spatnym TP a spadnout, proto jen raw syscally. */
+            char b[400]; char *i = b;
+            const char *s0 = "[rfdbg] p="; while (*s0) *i++ = *s0++;
+            const char *q = p; while (*q && i < b + 300) *i++ = *q++;
+            s0 = " opened="; while (*s0) *i++ = *s0++;
+            *i++ = (char)('0' + (eopened ? 1 : 0));
+            s0 = " magic="; while (*s0) *i++ = *s0++;
+            shim_hex(&i, (unsigned long)((emag[0]<<24)|(emag[1]<<16)|(emag[2]<<8)|emag[3]), 8);
+            s0 = " glibc="; while (*s0) *i++ = *s0++;
+            *i++ = (char)('0' + (eglibc ? 1 : 0));
+            *i++ = '\n';
+            long fd = shim_raw_syscall6(56, (long)0xFFFFFFFFFFFFFF9CL,
+                (long)(unsigned long)"/data/user/0/com.linux_core/files/usr/rfdbg.txt",
+                0x441L, 0644L, 0, 0);
+            if (fd >= 0) {
+                shim_raw_syscall6(64, fd, (long)b, (long)(i - b), 0, 0, 0);
+                shim_raw_syscall6(57, fd, 0, 0, 0, 0, 0);
+            }
+        }
         if (emag[0] == 0x7f && emag[1] == 'E' && emag[2] == 'L' && emag[3] == 'F' &&
             !eglibc) {
             fp_execve f = (fp_execve)g_orig_execve;
