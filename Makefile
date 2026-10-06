@@ -57,3 +57,4 @@ clean:
 	rm -rf test/mods
 
 .PHONY: all clean test
+// test
