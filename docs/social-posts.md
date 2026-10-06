@@ -8,6 +8,15 @@ published blog post, and `<REPO>` with
 
 ## Hacker News — Show HN
 
+> **HN is a tough room.** It is skeptical, allergic to marketing, and will
+> find the weakest claim in three minutes. Do NOT oversell. Lead with the
+> technical reality and the parts that don't work. The people who can actually
+> help (and the ones who file good bugs) are exactly the ones who respect a
+> project that admits its bugs. Expect, and welcome, hard questions:
+> "why not proot?", "why not just use Termux/QEMU?", "what's the perf
+> overhead?", "is this just `dlopen` with extra steps?". Have short, honest,
+> numbers-or-code answers ready. Never argue; if someone is right, say so.
+
 **Title:**
 ```
 Show HN: Run glibc Linux binaries on Android without root, proot or chroot
