@@ -852,12 +852,21 @@ category_nss() {
 category_venv() {
     echo ""
     echo "=== lx respektuje aktivni \$VIRTUAL_ENV (uv venv) ==="
+    # Skript pises do souboru (ne inline retezec) - vyhne se peklu vnoreneho
+    # uvozovani pres 3 vrstvy shellu (ashell -c "..." -> bash -c "..." -> eval).
     local ve="$D/coredir/venvtest.$$"
-    local script
-    script="mkdir -p '$ve/bin'; printf '#!/bin/sh\necho VENVTOOL_OK\n' > '$ve/bin/venvtool'; chmod +x '$ve/bin/venvtool'; export VIRTUAL_ENV='$ve'; eval \"\$($L init bash)\"; lxwhich venvtool && lx venvtool; rm -rf '$ve'"
+    local runner="$D/coredir/venvtest_run.$$.sh"
+    mkdir -p "$ve/bin"
+    printf '#!/bin/sh\necho VENVTOOL_OK\n' > "$ve/bin/venvtool"
+    chmod +x "$ve/bin/venvtool"
+    {
+        echo "export VIRTUAL_ENV='$ve'"
+        echo "eval \"\$($L init bash)\""
+        echo "lxwhich venvtool && lx venvtool"
+    } > "$runner"
     local env="ROOTFS=$R ELF_ROOTFS=$R HOME=$D D=$D L=$L"
     local out
-    out=$(ashell_out "$env $L --ownall $R/bin/bash -c \"$script\"")
+    out=$(ashell_out "$env $L --ownall $R/bin/bash $runner")
     if printf '%s' "$out" | grep -Fq "VENVTOOL_OK"; then
         echo "PASS venv: lx najde \$VIRTUAL_ENV/bin konzolovy skript"
         echo "PASS: venv - VIRTUAL_ENV lx" >> "$PASS_LOG"
@@ -867,6 +876,7 @@ category_venv() {
         echo "FAIL: venv - VIRTUAL_ENV lx | $out" >> "$FAIL_LOG"
         ((FAIL_COUNT++)) || true
     fi
+    rm -rf "$ve" "$runner"
 }
 
 # Regresni test: sitove nastroje overene REALNYM pouzitim, ne jen "-V"/"--help"
