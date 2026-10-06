@@ -229,9 +229,12 @@ Milníky:
   `shim_posix_spawnp`'s „uz pod ROOTFS" větev nekontrolovala
   `is_glibc_elf()`. **Vyřešeno** (commity `b840530`, `1737add`): obě větve
   teď ověří ELF magic + `is_glibc_elf()` před zabalením do `--ownall`.
-  Otevřený okrajový bod: `env`/`timeout` (own-loadovany guest) spouštějící
-  `ashell` přes DALŠÍ úroveň vnořeného own-loadingu stále padá (možná
-  stacked seccomp filtr) — [postup.md](postup.md) 2026-10-06 (8).
+  Otevřený okrajový bod: `env`/`timeout` (own-loadovany guest) interně
+  spouštějící `ashell` (bionic) obchází `shim_execve`/`shim_posix_spawnp`
+  úplně (žádný hook se nezavolá, potvrzeno TP-safe diag logem) —
+  stacked seccomp filtr vyvrácen. Dopad: `test-all.sh`'s `ashell_rc`/
+  `ashell_out` (`timeout N ashell -c ...`) proto nelze spustit z vnořené
+  guest session — [postup.md](postup.md) 2026-10-06 (8).
 
 ## 10. Zbývá / otevřené body
 
@@ -246,9 +249,9 @@ Milníky:
 - Síťové binárky — starship, fzf, curl, wget, python `getaddrinfo`+HTTPS,
   getent, ssh **ověřeny OK** (2026-10-06, nativně přes `ashell`, 3×).
   Zbývá jen `nmap` (není v rootfs nainstalovaný) — [postup.md#L680](postup.md#L680).
-- `env`/`timeout` own-loadovany guest spouštějící bionic ELF (`ashell`) přes
-  další úroveň vnořeného own-loadingu padá i po opravě sekce 9 — nedovyšetřeno
-  (podezření na stacked seccomp filtr), [postup.md](postup.md) 2026-10-06 (8).
+- `env`/`timeout` spouštějící `ashell` interně obchází exec-hooky úplně
+  (ne stacked seccomp, vyvráceno) — nedovyšetřeno, blokuje spuštění
+  `test-all.sh` z vnořené guest session, [postup.md](postup.md) 2026-10-06 (8).
 
 Průběžný stav otevřených bugů — viz i auto-paměť
 `[[elf-loader-open-bugs]]`.

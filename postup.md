@@ -3343,12 +3343,41 @@ bash test-all.sh all`, jeden skok) dal `test-all.sh all` **PASS 160 /
 FAIL 1 / SKIP 35** — jediný FAIL (`csplit - extra`) byl kvůli starým
 `xx00/xx01/xx02` v cwd z dřívějšího běhu (5. 10.), ne regrese.
 
-Zbyla neprobádaná hlubší hypotéza: `env`/`timeout` (own-loadovaný glibc
-guest) spouštějící `ashell` (real execve na bionic cíl) PŘES DALŠÍ úroveň
-vnořeného own-loadingu stále padá stejným způsobem i s opravou — možná
-interakce se stacked seccomp filtrem (`elf_install_compat()` se
-instaluje znovu při každé reinicializaci a filtry se nedaji odstranit,
-jen přidat). V běžném použití (test-all.sh spuštěný z opravdového
-bionického host shellu, ne zevnitř vnořeného guestu) by `timeout`/`ashell`
-byly host binárky mimo loader úplně, takže by se tahle cesta nemusela
-spustit vůbec — needokázáno, otevřený bod.
+**Doplněno po dalším vyšetřování:** hypotéza se stacked seccomp filtrem
+byla vyvrácena (`ELF_LOADER_NO_COMPAT=1` na vnější bash crash neovlivnil).
+TP-bezpečný raw-syscall diag (přímo do souboru, bez `fprintf`/`getenv` —
+ty v tomhle bodě `shim_execve` samy o sobě spadly, i na hloubce 1, patrně
+běží pod špatným TP) ukázal přesně, kde se to láme: když `bash` (own-
+loadovaný glibc guest, hloubka 1) exec'uje `env` (glibc, správně
+rozpoznáno a wrapnuto do `--ownall`), a `env` pak INTERNĚ spustí svůj
+cíl `ashell` (bionic ELF pod `$ROOTFS`), **shim_execve ani
+shim_posix_spawnp se pro tenhle druhý exec nezavolají ani jednou** — v
+logu je jen jeden řádek (pro `env` samotný), žádný pro `ashell`. Hook
+instalace (`shim_install_hooks()`) tedy pro `env`'s vlastní re-exec
+svého argumentu buď neběží, nebo `env`/`timeout` volá svůj cíl cestou,
+která PLT/GOT override úplně obchází (typicky interní glibc symbol bez
+veřejné viditelnosti, mimo náš override mechanismus). Netýká se to
+`execl`/`execlp`/`execvp`/`execvpe` wrapperů v `main.c` — ty všechny
+delegují na (opravený) `shim_execve`, ověřeno čtením zdroje.
+
+**Dopad na testování:** `ashell_rc`/`ashell_out` (pomocné funkce
+`test-all.sh`) obalují KAŽDÉ volání do `timeout N ashell -c "$cmd"` —
+`timeout` je přesně ten own-loadovaný glibc guest, co interně spustí
+`ashell` (bionic), takže **test-all.sh nelze z vnořené guest session
+(jako je tahle) spustit beze zbytku** — úplně VŠECHNY testy spadnou na
+tenhle samý bug, bez ohledu na to, co skutečně testují. V reálném
+použití (test-all.sh spuštěný z opravdového bionického host shellu) by
+`timeout`/`ashell` byly host binárky mimo loader úplně, takže by se
+tahle cesta nemusela spustit vůbec — v tomhle prostředí se to neověřilo,
+protože tahle Claude Code session SAMA běží jako guest proces loaderu
+(`ps` ukazuje `elf_loader` jako parenta), takže genuinní hloubka 0 tu
+není dostupná.
+
+Pro regresní ověření po této opravě byla proto použita dočasná kopie
+`test-all.sh` bez `timeout` prefixu (jen pro ověření na místě,
+nekomitnuto) — `all`: **PASS 167 / FAIL 1 / SKIP 36**, jediný FAIL
+(`csplit - extra`) nesouvisí s opravou (předchozí běh, stejná chyba).
+Zbývá otevřený bod: proč `env`/`timeout` svůj cíl spouští mimo
+hookovanou cestu — vyžaduje další vyšetřování (např. čtení coreutils
+`env`/`timeout` zdroje, kontrola jestli jde o `vfork`+přímý syscall,
+nebo o interní glibc alias).
