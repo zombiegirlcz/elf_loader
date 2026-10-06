@@ -84,6 +84,7 @@ Overridable from outside: `ROOTFS=/other/rootfs zsh`.
 | `lxdiag [-c]` | loader `diag.txt` (SIGSYS/INIT traces); `-c` clears it |
 | `lxinfo` | loader size/date, rootfs, repo branch |
 | `lxfault <cmd>` | print only crash lines (FAULT, pc in, SIGSYS) |
+| `lxfb [-m note] <cmd>` | run with full loader debug logging and write a feedback report (`$LX_LOG/feedback/*.md`: date, device, Android, kernel, page size, loader, rootfs OS + glibc, exit/signal, crash lines, full log) — ready for a PR into `dev/feedback/` |
 | `lxtest` | regression set (echo, bash, python, node, bun, tmux, ...) |
 | `help [topic]` (alias `lxhelp`) | built-in help with examples |
 | `<unknown command>` | auto-found in the rootfs and run via the loader |

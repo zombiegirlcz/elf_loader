@@ -12,6 +12,23 @@ anything outside `feedback/` waits for a manual review.
    `feedback/pixel8-2026-10-06.md`). Use plain Markdown, no symlinks.
 3. Open a pull request against **`dev`** (not `master`).
 
+## Generate the report automatically
+
+With the shell helpers loaded (`eval "$(elf_loader init zsh)"` or `init bash`):
+
+```sh
+lxfb -m "crashes right after start" claude
+# ── exit=139 (SIGSEGV)  report: ~/.cache/lx/feedback/<device>-<date>-claude-<time>.md
+```
+
+`lxfb` runs the command with full loader debug logging and writes a ready
+Markdown report: date, device / SoC, Android version, kernel, page size,
+loader version, rootfs OS + glibc version, the command, exit code / signal,
+crash lines, the full log and the loader's `diag.<pid>.txt`. **Read it before
+sending** (it contains paths and the command's arguments), then copy the `.md`
+into `feedback/` in your fork. For a working binary, a short manual report
+using the template below is enough.
+
 ## Template
 
 ```markdown

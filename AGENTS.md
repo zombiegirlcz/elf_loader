@@ -103,6 +103,13 @@ rychlejší alternativa jen s rootem.
   `lxtest` regresní sada, `command_not_found_handler`, `help`, starship/
   zoxide integrace (cache + `/proc/self/exe` rewrite) — soubor žije jen
   na zařízení, není v gitu — [postup.md#L2425](postup.md#L2425).
+- **`lxfb [-m pozn.] <cmd>`** (v `init zsh|bash`, jedno tělo pro oba shelly):
+  běh s `ELF_DEBUG`/`ELF_LOADER_DIAG`/`ELF_LOADER_SIGTRACE`, `tee` do logu,
+  report `$LX_LOG/feedback/<model>-<datum>-<cmd>-<čas>.md` (datum, zařízení/SoC,
+  Android+SDK, kernel, page size, loader verze+md5, rootfs OS + glibc z
+  `libc.so.6`, exit/signál, crash řádky, log ≤ `LXFB_MAX`=4000 ř., nové
+  `diag.<pid>.txt`) → PR do `dev` / `feedback/` (auto-merge). Ověřeno na zařízení
+  pod bzsh i guest bash.
 
 ## 6. Seccomp compat filtr + fork veneer
 
