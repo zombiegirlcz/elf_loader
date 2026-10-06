@@ -59,6 +59,12 @@ rychlejší alternativa jen s rootem.
   [postup.md#L605](postup.md#L605).
 - Finální architektura spouštění (tabulka) — [postup.md#L598](postup.md#L598),
   [postup.md#L731](postup.md#L731).
+- **`bzsh` — bundled bionic-native zsh (host shell)**: zsh 5.9.2 (NDK build,
+  linkuje jen `libc/libm/libdl`), trimnuté terminfo (~80K), generický `zshrc`
+  bez `com.linux_core` hardcode; instaluje se do `/data/adb/` stejně jako
+  `linuxsh`/`gbsh` (Magisk mount není vidět v app namespace). `zshrc` evaluje
+  `elf_loader init zsh`, pokud je rootfs nastaven — jeden shell pro bionic
+  host i glibc guest.
 - Kompat parity `linuxsh` vs proot (22/23 identických) —
   [postup.md#L716](postup.md#L716).
 

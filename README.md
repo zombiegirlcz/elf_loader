@@ -187,7 +187,7 @@ The result is a bionic binary with `PT_INTERP /system/bin/linker64`.
 | `gbsh/gbsh.c` | native bionic interactive shell |
 | `tools/elroot.sh` | proot-like launcher over elf_loader + gbsh |
 | `tools/demo-env.zsh` | scripted demo (env -i → glibc guest) |
-| `magisk-module/` | Magisk module (universal rootfs detection) |
+| `magisk-module/` | Magisk module (universal rootfs detection, bundles a bionic-native zsh host shell — `bzsh`) |
 | `docs/` | English docs |
 | `postup.md` | full development diary (Czech) |
 
