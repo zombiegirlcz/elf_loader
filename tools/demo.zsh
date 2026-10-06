@@ -40,7 +40,7 @@ ok "stejné jádro, ale uživatelský prostor z rootfs"
 
 title "Reálný nástroj: zkompiluj a spusť C program uvnitř guestu"
 run "mkdir -p \$R/tmp/demo"
-run "printf '%s\\n' '#include <stdio.h>' 'int main(void){printf(\"hello z glibc, %d\\\\n\",6*7);}' > \$R/tmp/demo/h.c"
+run "printf '%s\\n' '#include <stdio.h>' 'int main(void){printf(\"hello z glibc, %d\\n\",6*7);}' > \$R/tmp/demo/h.c"
 run "lx gcc \$R/tmp/demo/h.c -o \$R/tmp/demo/h && echo '  zkompilováno guest gcc 14.2 (Debian)'"
 run "lx \$R/tmp/demo/h 2>&1 | tail -1"
 
