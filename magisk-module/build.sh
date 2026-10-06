@@ -18,6 +18,14 @@ echo "[1/4] using prebuilt bionic elf_loader..."
 # Use prebuilt bionic binary (built via modal NDK cross-compile)
 cp "$HERE/system/bin/elf_loader" "$OUT/system/bin/elf_loader"
 
+echo "[1b/4] staging bundled bionic zsh (host shell)..."
+if [ -f "$HERE/system/bin/zsh" ]; then
+    mkdir -p "$OUT/system/etc"
+    cp "$HERE/system/bin/zsh" "$HERE/system/bin/bzsh" "$OUT/system/bin/"
+    cp -r "$HERE/system/etc/zsh-bionic" "$OUT/system/etc/zsh-bionic"
+    chmod +x "$OUT/system/bin/zsh" "$OUT/system/bin/bzsh"
+fi
+
 echo "[2/4] cross-building static interpreter bridge..."
 aarch64-linux-gnu-gcc -nostdlib -static -O2 -s -fno-builtin \
     -o "$OUT/system/lib/ld-linux-aarch64.so.1" \

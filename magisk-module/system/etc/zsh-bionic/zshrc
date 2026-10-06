@@ -1,0 +1,17 @@
+# Bionic host zsh (NDK build) — minimal rc, no Termux/com.linux_core
+# path assumptions. Everything is driven by env vars the `bzsh` launcher
+# sets ($ZSH_SUPPORT, $PREFIX), same pattern as `elf_loader init zsh`.
+
+[[ "$PS1" == '%m%# ' ]] && PS1='%# '
+
+: ${ZSH_SUPPORT:=/data/adb/zsh-bionic}
+if [ -f "$ZSH_SUPPORT/zsh-plugins.zshrc" ]; then
+    source "$ZSH_SUPPORT/zsh-plugins.zshrc"
+fi
+
+# elf_loader guest env, if a rootfs is configured (see elf_loader init zsh)
+if [ -x /system/bin/elf_loader ] && [ -f /data/adb/parrot_root ]; then
+    eval "$(/system/bin/elf_loader init zsh 2>/dev/null)"
+fi
+
+# vim: set noet ft=zsh tw=4 sw=4 ff=unix

@@ -1,0 +1,20 @@
+#!/system/bin/sh
+# bzsh - launcher for the bundled bionic-native zsh (NDK build, 5.9.2).
+# Runs directly on the bionic host (no glibc, no elf_loader) - this is the
+# *host* shell, distinct from a glibc guest shell run via `lx`/`linuxsh`.
+#
+# Support files (terminfo, zshrc, zsh-plugins.zshrc) are not visible via the
+# Magisk mount inside app/isolated namespaces, so service.sh/customize.sh
+# copy them to /data/adb/zsh-bionic the same way linuxsh/gbsh are copied.
+
+SUPPORT=/data/adb/zsh-bionic
+[ -d "$SUPPORT" ] || SUPPORT=/system/etc/zsh-bionic
+
+export ZSH_SUPPORT="$SUPPORT"
+export TERMINFO="$SUPPORT/terminfo"
+export ZDOTDIR="$SUPPORT"
+
+ZSH_BIN=/data/adb/zsh
+[ -x "$ZSH_BIN" ] || ZSH_BIN=/system/bin/zsh
+
+exec "$ZSH_BIN" "$@"

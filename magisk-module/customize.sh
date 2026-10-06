@@ -43,4 +43,15 @@ if [ -f "$MODDIR/system/bin/gbsh" ]; then
     chmod 755 /data/adb/gbsh 2>/dev/null
 fi
 
+# bzsh: bionic-native zsh (host shell) + its terminfo/zshrc support files -
+# same reasoning as linuxsh/gbsh above, support files need to be outside
+# the Magisk mount too (ZDOTDIR/TERMINFO point at /data/adb/zsh-bionic).
+if [ -f "$MODDIR/system/bin/zsh" ]; then
+    cp "$MODDIR/system/bin/zsh"  /data/adb/zsh  2>/dev/null
+    cp "$MODDIR/system/bin/bzsh" /data/adb/bzsh 2>/dev/null
+    chmod 755 /data/adb/zsh /data/adb/bzsh 2>/dev/null
+    rm -rf /data/adb/zsh-bionic 2>/dev/null
+    cp -r "$MODDIR/system/etc/zsh-bionic" /data/adb/zsh-bionic 2>/dev/null
+fi
+
 exit 0

@@ -19,6 +19,8 @@ dependencies are loaded and relocated by the bundled own-loading glibc loader
 | `/system/bin/patchelf_interp` | PT_INTERP rewrite tool used by the above |
 | `/lib/ld-linux-aarch64.so.1` | experimental interpreter bridge (bind-mount) so `fork/exec` of parrot binaries from inside a parrot shell also works |
 | `/data/adb/parrot_root` | config: path to the parrot rootfs |
+| `/system/bin/zsh` + `bzsh` | bundled bionic-native zsh 5.9.2 (NDK build) — a **host** shell, not a guest glibc shell |
+| `/system/etc/zsh-bionic/` | its terminfo (xterm/screen/tmux/linux/vt100) + zshrc/plugins |
 
 ## Usage
 
@@ -28,6 +30,7 @@ su
 parrot ls -la /etc
 parrot sed -n 2p /etc/passwd
 parrot-sh            # interactive bash from the rootfs
+bzsh                  # interactive bionic-native zsh (no rootfs needed)
 ```
 
 ## Rootfs
@@ -92,6 +95,27 @@ a plain Linux chroot.
 
 Without `parrot-fix-exec`, use `parrot <cmd>` to launch each program directly
 (no `/lib` bridge needed).
+
+## Bundled bionic zsh (`bzsh`)
+
+`zsh` here is a plain NDK (bionic) build — it links only `libc.so`/`libm.so`/
+`libdl.so` (Android system libs already present on the device), nothing from
+a glibc rootfs. It runs directly on the bionic host, independent of
+`elf_loader` and of any rootfs being configured.
+
+`bzsh` is a thin wrapper that points `ZDOTDIR`/`TERMINFO` at
+`/data/adb/zsh-bionic` (copied there by `customize.sh`/`service.sh`, same
+reasoning as `linuxsh`/`gbsh`: Magisk's `/system` mount isn't visible inside
+app/isolated namespaces, so the binary and support files are also kept under
+`/data/adb`). If an `elf_loader` rootfs is configured
+(`/data/adb/parrot_root`), the bundled `zshrc` also evals
+`elf_loader init zsh`, giving you the full `lx`/`lxwhich`/… guest-shell
+toolkit inside the bionic shell — one shell, both userspaces.
+
+```
+bzsh
+lx python3 --version   # only if a rootfs is configured
+```
 
 ## Building
 

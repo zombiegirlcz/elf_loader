@@ -1,6 +1,6 @@
 id=parrot_elf_loader
 name=Parrot Linux ELF Loader
-version=v1.2
-versionCode=3
+version=v1.3
+versionCode=4
 author=elf_loader project
-description=Spouští parrot/Linux aarch64 binárky na Androidu přes vlastní own-loading glibc loader (bez proot/qemu). Příkazy: parrot <cmd>, elf <bin>, linuxsh (chroot shell), gbsh [--dw|--chroot] [-c <cmd>] (--help = nápověda).
+description=Spouští parrot/Linux aarch64 binárky na Androidu přes vlastní own-loading glibc loader (bez proot/qemu). Příkazy: parrot <cmd>, elf <bin>, linuxsh (chroot shell), gbsh [--dw|--chroot] [-c <cmd>], bzsh (bundled bionic-native zsh host shell) (--help = nápověda).
