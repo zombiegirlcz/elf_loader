@@ -481,18 +481,44 @@ static inline uintptr_t dl_tp_get(void) {
 static inline void dl_tp_set(uintptr_t t) {
     __asm__ volatile("msr tpidr_el0, %0" : : "r"(t));
 }
-/* Vstoupí do loader (bionic) scope. Vrací 1 = na konci obnovit TP. */
-static inline int dl_enter_host(uintptr_t *saved) {
+static long raw_syscall6(long nr, long a0, long a1, long a2, long a3, long a4, long a5);
+
+/* Async signal behem host scope (TP = bionic) by kernel dorucil primo do
+ * guest handleru (node/libuv) -> ten pod bionickym TP sahne na glibc
+ * THREAD_SELF (TP-0x720+..., napr. cancelhandling v read/write wrapperu) ->
+ * SIGSEGV. Proto po dobu host scope blokujeme vse krome synchronnich
+ * signalu; cekajici signal se doruci az po navratu guest TP. */
+#define DL_SYNC_SIGS ((1UL << (SIGSEGV - 1)) | (1UL << (SIGBUS - 1)) | \
+                      (1UL << (SIGILL - 1)) | (1UL << (SIGFPE - 1)) | \
+                      (1UL << (SIGTRAP - 1)) | (1UL << (SIGSYS - 1)) | \
+                      (1UL << (SIGABRT - 1)))
+static inline void dl_block_async(unsigned long *old) {
+    unsigned long set = ~DL_SYNC_SIGS;
+    raw_syscall6(135 /* rt_sigprocmask */, SIG_BLOCK, (long)&set, (long)old,
+                 8, 0, (long)F2_SENTINEL);
+}
+static inline void dl_restore_mask(const unsigned long *old) {
+    raw_syscall6(135, SIG_SETMASK, (long)old, 0, 8, 0, (long)F2_SENTINEL);
+}
+
+typedef struct { uintptr_t tp; unsigned long mask; } dl_host_t;
+
+/* Vstoupí do loader (bionic) scope. Vrací 1 = na konci obnovit TP + masku. */
+static inline int dl_enter_host(dl_host_t *h) {
     uintptr_t cur = dl_tp_get();
-    *saved = cur;
+    h->tp = cur;
     if (g_tls_old_tp && cur != g_tls_old_tp) {
+        dl_block_async(&h->mask);
         dl_tp_set(g_tls_old_tp);
         return 1;
     }
     return 0;
 }
-static inline void dl_leave_host(int sw, uintptr_t saved) {
-    if (sw) dl_tp_set(saved);
+static inline void dl_leave_host(int sw, const dl_host_t *h) {
+    if (sw) {
+        dl_tp_set(h->tp);
+        dl_restore_mask(&h->mask);
+    }
 }
 
 /* glibc 2.35+ _dl_find_object(pc, struct dl_find_object *): 0 = nalezeno,
@@ -525,9 +551,9 @@ static int ldso_find_object_impl(uintptr_t pc, void *result) {
 /* Wrapper: guest glibc vola _dl_find_object pod parrot TP, ale telo shimu
  * pouziva loaderuv bionicky kod -> prepni na bionic TP. */
 static int ldso_find_object(uintptr_t pc, void *result) {
-    uintptr_t _s; int _sw = dl_enter_host(&_s);
+    dl_host_t _s; int _sw = dl_enter_host(&_s);
     int _r = ldso_find_object_impl(pc, result);
-    dl_leave_host(_sw, _s);
+    dl_leave_host(_sw, &_s);
     return _r;
 }
 
@@ -641,22 +667,22 @@ static void *ldso_lookup_symbol_x(const char *name, void *undef_map,
                                   const void **ref, void **scope,
                                   const void *version, int type_class,
                                   int flags, void *skip_map) {
-    uintptr_t _s; int _sw = dl_enter_host(&_s);
+    dl_host_t _s; int _sw = dl_enter_host(&_s);
     void *_r = ldso_lookup_symbol_x_impl(name, undef_map, ref, scope,
                                          version, type_class, flags, skip_map);
-    dl_leave_host(_sw, _s);
+    dl_leave_host(_sw, &_s);
     return _r;
 }
 
 /* _rtld_global_ro function-table shims (glibc calls these instead of going
  * through the PLT).  Offsets follow the real glibc 2.41 layout. */
 static void ldso_debug_printf(const char *fmt, ...) {
-    uintptr_t _s; int _sw = dl_enter_host(&_s);
+    dl_host_t _s; int _sw = dl_enter_host(&_s);
     va_list ap;
     va_start(ap, fmt);
     vfprintf(stderr, fmt, ap);
     va_end(ap);
-    dl_leave_host(_sw, _s);
+    dl_leave_host(_sw, &_s);
 }
 
 static void ldso_mcount(uintptr_t frompc, uintptr_t selfpc) {
@@ -678,9 +704,9 @@ static int ldso_catch_error(const char **objname, const char **errstring,
 }
 
 static void ldso_error_free(void *p) {
-    uintptr_t _s; int _sw = dl_enter_host(&_s);
+    dl_host_t _s; int _sw = dl_enter_host(&_s);
     free(p);
-    dl_leave_host(_sw, _s);
+    dl_leave_host(_sw, &_s);
 }
 
 static void ldso_libc_freeres(void) {
@@ -771,9 +797,9 @@ static void *ldso_dl_open_impl(const char *file, int mode, const void *caller,
  * (malloc/memset/stat/getenv). Guest glibc sem vstupuje pod parrot TP. */
 static void *ldso_dl_open(const char *file, int mode, const void *caller,
                           long nsid, int argc, char *argv[], char *env[]) {
-    uintptr_t _s; int _sw = dl_enter_host(&_s);
+    dl_host_t _s; int _sw = dl_enter_host(&_s);
     void *_r = ldso_dl_open_impl(file, mode, caller, nsid, argc, argv, env);
-    dl_leave_host(_sw, _s);
+    dl_leave_host(_sw, &_s);
     return _r;
 }
 
@@ -1159,9 +1185,8 @@ static elf_object_t *dl_find_loaded(const char *file) {
 
 void *ldso_dlopen(const char *file, int mode) {
     (void)mode;
-    uintptr_t saved = dl_tp_get();
-    int sw = (g_tls_old_tp && saved != g_tls_old_tp);
-    if (sw) dl_tp_set(g_tls_old_tp);
+    dl_host_t saved;
+    int sw = dl_enter_host(&saved);
     void *ret = NULL;
     if (!file) {                 /* dlopen(NULL) = handle hlavniho programu */
         g_dl_err_valid = 0;
@@ -1182,7 +1207,7 @@ void *ldso_dlopen(const char *file, int mode) {
             }
         }
     }
-    if (sw) dl_tp_set(saved);
+    dl_leave_host(sw, &saved);
     return ret;
 }
 
@@ -1224,9 +1249,8 @@ static void *mod_lookup_name(elf_object_t *m, const char *name) {
 
 void *ldso_dlsym(void *handle, const char *name) {
     if (!name) { dl_set_err("invalid symbol name"); return NULL; }
-    uintptr_t saved = dl_tp_get();
-    int sw = (g_tls_old_tp && saved != g_tls_old_tp);
-    if (sw) dl_tp_set(g_tls_old_tp);
+    dl_host_t saved;
+    int sw = dl_enter_host(&saved);
     void *ret = NULL;
     if (!handle) {                                  /* RTLD_DEFAULT */
         /* OVERRIDE prvni! Jinak by elf_scope_lookup nasel guest glibc
@@ -1283,7 +1307,7 @@ void *ldso_dlsym(void *handle, const char *name) {
             dl_set_err(name);
         }
     }
-    if (sw) dl_tp_set(saved);
+    dl_leave_host(sw, &saved);
     return ret;
 }
 
