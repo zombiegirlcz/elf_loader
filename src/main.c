@@ -1791,7 +1791,7 @@ static int shim_execve(const char *p, char *const argv[], char *const envp[]) {
         ssize_t ern = -1;
         if (efd >= 0) { ern = raw_read(efd, emag, 4); raw_close(efd); }
         int eglibc = is_glibc_elf(p);
-        if (getenv("ELF_LOADER_DIAG"))
+        if (getenv("RFDBG"))
             fprintf(stderr, "[rootfs-exec-dbg] p=%s opened=%d rn=%zd magic=%02x%02x%02x%02x glibc=%d\n",
                     p, eopened, ern, emag[0], emag[1], emag[2], emag[3], eglibc);
         if (emag[0] == 0x7f && emag[1] == 'E' && emag[2] == 'L' && emag[3] == 'F' &&
