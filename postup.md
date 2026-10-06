@@ -3047,3 +3047,24 @@ To elegantně vysvětluje VŠECHNA předchozí pozorování:
 3. `objdump`/V8 zdroj (Builtins, `macro-assembler-arm64.cc`) na offset
    `0x618` a `kRootRegister`-adjacent TLS mechanismus pro přesnou
    identifikaci, co tam V8 ukládá.
+
+### Doplnění: kandidát na zdroj TLS proměnné — nativní addon `pi-tui`
+`pi-starship`/`pi-tui` (terminal capability detekce, TUI render) má
+nativní N-API addon `node_modules/@earendil-works/pi-tui/native/linux/
+prebuilds/linux-arm64/linux-platform-x11.node` — `dlopen`-ovaný za běhu
+PO startu hlavního `node` binárky. Immediate-constant offset (`#0x618`,
+ne GOT-loaded) v disassembly z minulého pokračování odpovídá spíš
+**local-exec TLS modelu** (platný jen pro TLS bloky, co loader zná PŘI
+startu), ale je potřeba ověřit, jestli:
+(a) jde o `thread_local` proměnnou v samotném `node` binary (pak je to
+    čistě loaderův static-TLS layout bug, nesouvisí s dlopen), nebo
+(b) o proměnnou z pozdě-`dlopen`ovaného `.node` addonu (initial-exec
+    model s pevným offsetem, který loaderův `--own`/`dlopen` shim
+    nemusí korektně alokovat do "surplus" static TLS rezervy, na rozdíl
+    od glibc, co `dl_tls_static_surplus` řeší přesně pro tento případ).
+Rozlišit (a) vs (b) vyžaduje srovnání offsetu `0x618` s TLS segmenty
+`node` binárky (`readelf -l` PT_TLS p_memsz) vs. `linux-platform-x11.node`
+PT_TLS — pokud `0x618` padá uvnitř `node`'s vlastního PT_TLS rozsahu, je
+to (a); pokud je větší než `node`'s PT_TLS `p_memsz`, jde o (b) a viníkem
+je `dlopen` dynamic-TLS rezerva v loaderu. Nedokončeno — příští krok pro
+pokračovatele.
