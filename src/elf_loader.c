@@ -3650,7 +3650,19 @@ elf_tls_ctx_t elf_setup_own_tls(elf_object_t *exe, elf_scope_t *scope) {
     *(uintptr_t *)new_tp = (uintptr_t)&dtv[1]; /* tcbhead.dtv -> generation slot */
 
     g_tls_new_tp = new_tp;
-    g_tls_old_tp = host_tp;
+    /* g_tls_old_tp MUSI zustat pripnuty na PRVNI (nejvnejsi) host_tp —
+     * skutecny bionicky TP. Pri vnorenem --ownall (napr. `script`
+     * own-loaded, a UVNITR nej znovu `elf_loader --ownall node ...`) by
+     * druhe volani elf_setup_own_tls jinak prepsalo g_tls_old_tp na
+     * host_tp PRVNIHO stage == GUEST TP prvniho stage, ne realny bionicky
+     * TP. Vsechny dl_enter_host/fault-handler-reinstall/dladdr diagnosticke
+     * cesty (viz komentare u techto mist) pak "obnovi" TP na tuto
+     * zastaralou hodnotu misto spravneho bionickeho TP -> bionicke funkce
+     * (malloc/dladdr/fprintf/sigaction) ctou cizi (guest) TLS jako svoji ->
+     * SIGSEGV. Prave timto zpusobem padal pi+pi-starship pod `script`
+     * wrapperem (dve vnorene --ownall stage) - viz postup.md 2026-10-06. */
+    if (!g_tls_old_tp)
+        g_tls_old_tp = host_tp;
     ctx.region = region;
     ctx.size = size;
     {
