@@ -74,18 +74,18 @@ run "lx node -v </dev/null"
 run "lx node -e 'console.log(\"  node spočítal 6*7 =\", 6*7)' </dev/null"
 ok "Node (glibc) i V8 JIT fungují pod loaderem"
 
-# ── 8) pi — interaktivní (Node TUI) ────────────────────────────────────
-title "A nakonec interaktivní pi (Node TUI) — celé pod loaderem"
+# ── 8) pi (Node TUI) — jen ověření verze ──────────────────────────────
+title "A pi (Node TUI) jako glibc Node aplikace pod loaderem"
 # pi potřebuje PI_CODING_AGENT_DIR (= $R/root/.pi/agent), NE install.
 # Bez něj launcher zkusí npm install, což funguje jen pod prootem.
 run "export PI_CODING_AGENT_DIR=\$R/root/.pi/agent"
 run "lx pi --version </dev/null 2>&1"
-ok "pi (Node TUI) nabíhá pod loaderem z rootfs"
-pause 60
-print "${GY}  (spouští se interaktivní `lx pi`; ukonči Ctrl+C nebo /exit)${N}"
-pause 80
-lx pi
+ok "pi nabíhá pod loaderem z rootfs (interaktivně si ho pustíš sám)"
 
-print
-print "${G}${B}  Hotovo — jedna binárka elf_loader, celý glibc userspace.${N}"
-print
+# ── 9) Předání interaktivnímu zsh se starship promptem ─────────────────
+title "Předávám řízení interaktivnímu zsh — naběhne starship prompt"
+unset PREFIX   # nvm jinak varuje ("not compatible with PREFIX")
+print "${GY}  zsh načte ~/.zshrc → starship prompt (glibc binárka pod loaderem)${N}"
+print "${GY}  pi si spusť ručně:   lx pi${N}"
+pause 120
+exec ${SHELL:-$D/usr/bin/zsh} -i
