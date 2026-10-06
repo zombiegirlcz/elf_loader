@@ -1642,7 +1642,7 @@ uintptr_t elf_read_tp(void) { return read_tp(); }
 
 extern void tlsdesc_return(void);
 
-static void *map_elf_segments(void *file_map, Elf64_Ehdr *ehdr, size_t *out_total,
+static void *map_elf_segments(int fd, void *file_map, Elf64_Ehdr *ehdr, size_t *out_total,
                               size_t *out_min_vaddr) {
     Elf64_Phdr *fp = (Elf64_Phdr *)((char *)file_map + ehdr->e_phoff);
     size_t min_vaddr = SIZE_MAX;
@@ -1675,9 +1675,25 @@ static void *map_elf_segments(void *file_map, Elf64_Ehdr *ehdr, size_t *out_tota
     }
 
     for (int i = 0; i < ehdr->e_phnum; i++) {
-        if (fp[i].p_type == PT_LOAD) {
-            memcpy((char *)base + (fp[i].p_vaddr - mbv),
-                   (char *)file_map + fp[i].p_offset, fp[i].p_filesz);
+        if (fp[i].p_type != PT_LOAD)
+            continue;
+        char *dst = (char *)base + (fp[i].p_vaddr - mbv);
+        const char *src = (char *)file_map + fp[i].p_offset;
+        size_t len = fp[i].p_filesz;
+        /* Cele stranky uvnitr p_filesz mapujeme ze souboru (MAP_PRIVATE), ne
+         * anonymne + memcpy: guest muze na sva data volat madvise(MADV_DONTNEED)
+         * (Bun to dela s .bun sekci = embedovany JS) a u anonymni pameti by
+         * stranky vratily nuly misto obsahu souboru -> "Invalid character '\0'".
+         * Okrajove (sdilene) stranky zustavaji pres memcpy. */
+        size_t lo = ALIGN_UP((uintptr_t)dst, PAGE_SIZE) - (uintptr_t)dst;
+        size_t hi = len >= lo ? ALIGN_DOWN(len - lo, PAGE_SIZE) : 0;
+        if (fd >= 0 && hi && ((fp[i].p_offset + lo) % PAGE_SIZE) == 0 &&
+            mmap(dst + lo, hi, PROT_READ | PROT_WRITE, MAP_PRIVATE | MAP_FIXED,
+                 fd, (off_t)(fp[i].p_offset + lo)) != MAP_FAILED) {
+            memcpy(dst, src, lo);
+            memcpy(dst + lo + hi, src + lo + hi, len - lo - hi);
+        } else {
+            memcpy(dst, src, len);
         }
     }
     if (out_total)
@@ -2072,7 +2088,7 @@ elf_object_t *elf_load(const char *path) {
     Elf64_Phdr *file_phdr = (Elf64_Phdr *)((char *)file_map + ehdr->e_phoff);
 
     size_t total_size = 0, map_base_vaddr_ = 0;
-    void *base = map_elf_segments(file_map, ehdr, &total_size, &map_base_vaddr_);
+    void *base = map_elf_segments(fd, file_map, ehdr, &total_size, &map_base_vaddr_);
     if (!base) {
         fprintf(stderr, "[-] No LOAD segments\n");
         goto cleanup;
@@ -2810,7 +2826,7 @@ elf_object_t *elf_load_shared(const char *path, elf_scope_t *scope) {
     }
 
     size_t total_size = 0, mbv = 0;
-    void *base = map_elf_segments(file_map, ehdr, &total_size, &mbv);
+    void *base = map_elf_segments(fd, file_map, ehdr, &total_size, &mbv);
     loader_phase = "loading";
     if (!base) {
         fprintf(stderr, "[-] %s: no LOAD segments\n", path);
