@@ -36,3 +36,7 @@ echo
 echo.*
 xx0*
 test/echo
+
+# Session / tool debug cruft
+.playwright-mcp/
+results/
