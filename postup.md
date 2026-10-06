@@ -3138,3 +3138,47 @@ worker) ZŮSTÁVÁ platný a dobře podložený. Spojnice s konkrétní
 zjištění, KTERÉ `new_tp`/vlákno ve skutečnosti padlo (přidat do
 `ldso_tls.c`/`elf_setup_own_tls` log TID u KAŽDÉHO setupu, ne jen
 PID, a korelovat s LWP z core dumpu příště).
+
+## 2026-10-06 (5): Fix `g_tls_old_tp` guard NEZABRAL — skutečný problém je execve, ne multi-call
+
+### Co se stalo
+Nasazena oprava (`if (!g_tls_old_tp) g_tls_old_tp = host_tp;`, commit
+`df03782`) přes `tools/gh_build_deploy.sh` (CI build, bind-mount deploy).
+Zopakován STEJNÝ core-dump repro test → **crash framework identický**
+(stejný `pc` offset `...e5f87c` v mapovaném V8 JIT blobu, stejná instrukce).
+Diag log (`diag.5959.txt`, PID 5959) znovu ukázal: `tpidr` zachycený při
+pádu (`0x77013e8010`) se shoduje s DRUHOU `SETUP ... host_tp=` hodnotou —
+přesně stejný vzorec jako před opravou.
+
+### Proč oprava nezabrala — špatný model nesting
+Předpokládal jsem, že `elf_setup_own_tls` se volá víckrát VE STEJNÉM
+procesu (proto guard "jen při prvním volání"). **Skutečnost: každý vnořený
+`--ownall` stage je SAMOSTATNÝ `execve()`** (ne function call) — `script`
+own-loaded, a UVNITŘ něj text/data/bss `elf_loader` binárky se execve-em
+NAHRADÍ úplně novým obrazem (stejné PID, ale čerstvě nulované statické
+proměnné). `g_tls_old_tp = 0` (statická inicializace, `src/elf_loader.c:3523`)
+se tedy i PO mé opravě při KAŽDÉM execve resetuje — guard `if
+(!g_tls_old_tp)` je v nové inkarnaci vždy pravdivý, takže se znovu
+"poprvé" nastaví na `host_tp` zachycený PRÁVĚ TEĎ — což je ALE skutečná
+hodnota TP aktivní v okamžiku execve = **guest TP první (vnější) stage**,
+mylně interpretovaná jako "host"/bionický TP.
+
+### Skutečný problém (opraveno zacílení)
+`elf_setup_own_tls` předpokládá "TP aktivní při mém vstupu = pravý
+bionický host TP" — platí to jen pro NEJVNĚJŠÍ (jedinou) invokaci.
+Při execve-chainu (`elf_loader --ownall script -c "... elf_loader
+--ownall node ..."`) tento předpoklad neplatí pro VNITŘNÍ invokaci.
+Oprava vyžaduje, aby si vnitřní `elf_loader` invokace **pamatovala
+skutečný bionický TP z VNĖJŠÍHO stage přes execve hranici** — např.
+environment proměnnou nastavenou nejvnějším stage (`ELF_LOADER_TRUE_HOST_TP=
+<hex>`, nebo lépe PID+timestamp token, co nelze zfalšovat/zastarávat),
+kterou `elf_setup_own_tls` zkontroluje PŘED tím, než defaultně předpokládá
+"current TP = host". Pokud env proměnná existuje, použít JI (předanou od
+nejvnějšího stage) jako `g_tls_old_tp`, ne nove-namereny `read_tp()`.
+
+### Status
+Moje oprava (`df03782`) je NEŠKODNÁ (guard proti multi-call ve stejném
+procesu je legitimní, jen neřeší TOTO), ale **nerozhodla crash** — NEVER
+revertovat (je to korektní hardening), ale potřeba DOPLNIT skutečnou
+opravu propagace TP přes execve hranici. Nedokončeno — jasný další krok
+pro pokračovatele popsán výše.
