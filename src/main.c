@@ -1700,7 +1700,7 @@ static const char *shim_derive_root_from_path(const char *file) {
 static char **shim_child_envp(char *const envp[], const char *child_file) {
     const char *root = (g_shim_root && g_shim_root[0])
                            ? g_shim_root : shim_derive_root_from_path(child_file);
-    if (!root || !root[0]) return envp;
+    if (!root || !root[0]) return (char **)envp;
 
     /* NEPRIDAVAT LD_LIBRARY_PATH: ditetem je znovu spusteny elf_loader
      * (bionicky dynamicky), jehoz vnejsi bionicky linker by pres
@@ -1744,7 +1744,7 @@ static int shim_execve(const char *p, char *const argv[], char *const envp[]) {
     size_t rl = g_shim_root ? shim_strlen(g_shim_root) : 0;
 
     /* Symlink pre-resolve: device-side symlinky (napr. $D/usr/bin/git ->
-     * $R/usr/bin/git) padaji jinak do shim_excluded() (/data/*), coz je poslalo
+     * $R/usr/bin/git) padaji jinak do shim_excluded() (cesty pod /data), coz je poslalo
      * na raw execve a bionic je nespusti (chybi PT_INTERP). Kdyz cil symlinku
      * lezi pod ROOTFS, pouzij ho jako 'p'.
      *

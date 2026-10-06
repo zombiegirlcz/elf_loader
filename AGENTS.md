@@ -194,7 +194,9 @@ Milníky:
 
 - Kosmetika: `src/main.c:149` sign-compare, `\]` escape.
 - Test na reálném 16K Android 15+ zařízení (Task 3).
-- Bionic dlerror/errno test (Task 4).
+- ~~Bionic dlerror/errno test (Task 4).~~ **Vyřešeno** — `ldso_dlerror()` +
+  guest `dlopen/dlsym/dlerror/dlclose/dladdr` nad `_rtld_global` ověřeno
+  (`src/elf_loader.c:1295`, `src/main.c:3185`).
 - Node 23+/v26.8.2 JSDispatchTable — otevřeno; viz pokračování 12–14
   [postup.md#L1883](postup.md#L1883)+.
 - Síťové binárky (nmap, starship, fzf) — SIGSEGV pod bionic hostem
