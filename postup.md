@@ -3106,3 +3106,35 @@ pravděpodobně kořenová příčina — ne V8-specifická věc, ale obecná me
 v loaderově static-TLS emulaci, která se projeví jen u binárek s
 dostatečně velkým vlastním TLS (node ano, `node -e` samo o sobě možná
 míň zatěžuje offsety v této zóně).
+
+### Komplikace: `TP-0x618` leží UVNITŘ `TLS_PRE_TCB_SIZE` rezervy — puzzle, ne uzavřeno
+`TLS_PRE_TCB_SIZE = 0x720` (`src/elf_loader.c:3529`) — loader VŽDY alokuje
+0x720 B vynulované, zamapované paměti POD `new_tp` (`elf_setup_own_tls`).
+`TP-0x618` (1560 B) je MENŠÍ než `0x720` (1824 B) → leží uvnitř této
+rezervy, která by měla být validní mapovaná nulová paměť — teoreticky by
+tedy `ldr w6,[x19]` na `TP-0x618` NEMĚL spadnout vůbec.
+
+**Dodatečné zjištění z `diag.4844.txt` (log z PŘESNĚ toho běhu, co
+vygeneroval analyzovaný core):** `elf_setup_own_tls` proběhl v tomto
+procesu **TŘIKRÁT** (tři různé `new_tp` — `0x7361065720`, `0x7bffc43720`,
+`0x72d30e2720` — odpovídá třem vnořeným `--ownall` re-exec krokům/stages).
+**Žádná z nich se neshoduje** s `tpidr=0x7bcf637010` zachyceným v
+registrech při pádu (core dump). To znamená buď:
+(a) crash je v JINÉM vlákně/procesu, než které tento konkrétní diag
+    zaznamenal (více LWP, log možná jen z jednoho), nebo
+(b) mezi posledním zalogovaným `new_tp` a skutečným pádem proběhl JEŠTĚ
+    jeden TP-setup, co se do diagu nezapsal (např. V8 worker thread
+    spawn přes `ldso_tls.c`, ne `elf_setup_own_tls`), nebo
+(c) `tpidr` v core dumpu NENÍ to, co bylo aktivní přesně v okamžiku
+    SIGSEGV (nepravděpodobné — potvrzeno, že `FAULT-ENTER` se v diagu
+    NEobjevilo, takže náš handler neběžel a kernel capturoval čistý
+    original fault state — ale stojí za ověření, zda existuje JINÝ
+    mechanismus přepisu `tpidr` mezi fault a core-dump generací).
+
+**Status: OTEVŘENO, přesně vymezený puzzle pro pokračovatele.** Předchozí
+core-dump nález (V8 JIT kód čte `tpidr_el0` přímo, hlavní vlákno, ne
+worker) ZŮSTÁVÁ platný a dobře podložený. Spojnice s konkrétní
+`TLS_PRE_TCB_SIZE`/`dl_tls_static_surplus` teorií vyžaduje přesné
+zjištění, KTERÉ `new_tp`/vlákno ve skutečnosti padlo (přidat do
+`ldso_tls.c`/`elf_setup_own_tls` log TID u KAŽDÉHO setupu, ne jen
+PID, a korelovat s LWP z core dumpu příště).
