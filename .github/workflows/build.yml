@@ -12,8 +12,12 @@ name: build-elf-loader
 on:
   push:
     branches: ["**"]
+    tags: ["v*"]
   pull_request:
   workflow_dispatch:
+
+permissions:
+  contents: write  # needed by softprops/action-gh-release on tag pushes
 
 jobs:
   build:
@@ -63,10 +67,25 @@ jobs:
             /tmp/elf_loader_ndk_staticpie
           if-no-files-found: error
 
+      - name: Build Magisk module zip (tag release only)
+        if: startsWith(github.ref, 'refs/tags/v')
+        run: |
+          set -eux
+          sudo apt-get update -y
+          sudo apt-get install -y gcc-aarch64-linux-gnu zip
+          cp /tmp/elf_loader_ndk magisk-module/system/bin/elf_loader
+          chmod +x magisk-module/system/bin/elf_loader
+          (cd magisk-module && ./build.sh)
+          TAG="${GITHUB_REF_NAME}"
+          cp magisk-module/parrot_elf_loader.zip "/tmp/parrot_elf_loader_${TAG}.zip"
+          cp /tmp/elf_loader_ndk "/tmp/elf_loader_${TAG}_ndk"
+          cp /tmp/elf_loader_ndk_staticpie "/tmp/elf_loader_${TAG}_staticpie"
+
       - name: Attach to release
         if: startsWith(github.ref, 'refs/tags/v')
         uses: softprops/action-gh-release@v2
         with:
           files: |
-            /tmp/elf_loader_ndk
-            /tmp/elf_loader_ndk_staticpie
+            /tmp/elf_loader_${{ github.ref_name }}_ndk
+            /tmp/elf_loader_${{ github.ref_name }}_staticpie
+            /tmp/parrot_elf_loader_${{ github.ref_name }}.zip
