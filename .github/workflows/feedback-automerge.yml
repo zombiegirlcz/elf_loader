@@ -1,0 +1,76 @@
+name: feedback-automerge
+
+# Auto-merge PRs into `dev` that ONLY add/change files under `feedback/`
+# (device reports, "it works" reports). Anything touching other paths waits
+# for a manual review.
+#
+# Security: pull_request_target runs with a write token, so this workflow
+# NEVER checks out or executes PR code. It only inspects the file list and
+# the git tree of the PR head through the API.
+
+on:
+  pull_request_target:
+    types: [opened, synchronize, reopened, ready_for_review]
+    branches: [dev]
+
+permissions:
+  contents: write
+  pull-requests: write
+
+concurrency:
+  group: feedback-automerge-${{ github.event.pull_request.number }}
+  cancel-in-progress: true
+
+jobs:
+  automerge:
+    if: ${{ !github.event.pull_request.draft }}
+    runs-on: ubuntu-latest
+    steps:
+      - name: Check that the PR only touches feedback/
+        id: check
+        env:
+          GH_TOKEN: ${{ github.token }}
+          REPO: ${{ github.repository }}
+          PR: ${{ github.event.pull_request.number }}
+          HEAD_SHA: ${{ github.event.pull_request.head.sha }}
+        run: |
+          set -euo pipefail
+          files=$(gh api --paginate "repos/$REPO/pulls/$PR/files" \
+                  --jq '.[] | .filename, (.previous_filename // empty)')
+          if [ -z "$files" ]; then
+            echo "ok=false" >> "$GITHUB_OUTPUT"; echo "no files"; exit 0
+          fi
+          bad=$(printf '%s\n' "$files" | grep -v -E '^feedback/[^[:cntrl:]]+$' || true)
+          if [ -n "$bad" ]; then
+            echo "ok=false" >> "$GITHUB_OUTPUT"
+            echo "PR touches paths outside feedback/ -> manual review:"
+            printf '%s\n' "$bad"
+            exit 0
+          fi
+          # No symlinks / submodules inside feedback/ (mode must be a regular file).
+          tree=$(gh api "repos/$REPO/git/trees/$HEAD_SHA?recursive=1")
+          if [ "$(printf '%s' "$tree" | jq -r .truncated)" != false ]; then
+            echo "ok=false" >> "$GITHUB_OUTPUT"; echo "tree truncated -> manual review"; exit 0
+          fi
+          modes=$(printf '%s' "$tree" | jq -r \
+                  '.tree[] | select(.path | startswith("feedback/")) | select(.type != "tree") | .mode' \
+                  | sort -u)
+          if printf '%s\n' "$modes" | grep -v -q -E '^100(644|755)$'; then
+            echo "ok=false" >> "$GITHUB_OUTPUT"
+            echo "feedback/ contains a non-regular file (symlink/submodule) -> manual review"
+            exit 0
+          fi
+          echo "ok=true" >> "$GITHUB_OUTPUT"
+          echo "feedback-only PR:"; printf '%s\n' "$files"
+
+      - name: Merge
+        if: steps.check.outputs.ok == 'true'
+        env:
+          GH_TOKEN: ${{ github.token }}
+          REPO: ${{ github.repository }}
+          PR: ${{ github.event.pull_request.number }}
+          HEAD_SHA: ${{ github.event.pull_request.head.sha }}
+        run: |
+          set -euo pipefail
+          gh pr merge "$PR" --repo "$REPO" --squash --match-head-commit "$HEAD_SHA" \
+            --subject "feedback: merge #$PR"
