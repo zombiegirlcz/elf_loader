@@ -1,0 +1,82 @@
+name: Bug report
+description: Something crashed, hung, or produced wrong output under elf_loader
+title: "[bug] "
+labels: ["bug"]
+body:
+  - type: markdown
+    attributes:
+      value: |
+        Thanks for testing elf_loader! The more detail, the faster it can be
+        fixed. **Please fill in every field** — this project is developed
+        without wide hardware access, so your report is the main way bugs get
+        found.
+  - type: input
+    id: loader-md5
+    attributes:
+      label: Loader MD5
+      description: "`md5sum $L` on the loader binary you used"
+      placeholder: "7a4f05f0783702888d8abb5731fed71a"
+    validations:
+      required: true
+  - type: input
+    id: rootfs
+    attributes:
+      label: Rootfs / distro
+      description: Which rootfs (Parrot / Debian / Ubuntu / other) and version
+      placeholder: "Parrot Security 7.4, glibc 2.41"
+    validations:
+      required: true
+  - type: input
+    id: device
+    attributes:
+      label: Device, Android version, kernel
+      placeholder: "Xiaomi ..., Android 13, kernel 4.14.190, aarch64"
+    validations:
+      required: true
+  - type: dropdown
+    id: mode
+    attributes:
+      label: Loader mode
+      options:
+        - "--ownall"
+        - "--own"
+        - "--shim"
+        - "--run"
+        - "elroot"
+        - "other / unknown"
+    validations:
+      required: true
+  - type: input
+    id: command
+    attributes:
+      label: Exact command
+      placeholder: "ROOTFS=/... elf_loader --ownall $ROOTFS/usr/bin/foo --bar"
+    validations:
+      required: true
+  - type: textarea
+    id: expected
+    attributes:
+      label: Expected vs. actual
+      description: What you expected and what happened instead
+    validations:
+      required: true
+  - type: textarea
+    id: output
+    attributes:
+      label: Output / crash log
+      description: |
+        Paste stdout+stderr. If it crashes, the loader prints a `FAULT#` line
+        with the PC — include it. `ELF_LOADER_DIAG=1` and `ELF_DEBUG=1` give
+        more.
+      render: shell
+    validations:
+      required: true
+  - type: textarea
+    id: diagnosis
+    attributes:
+      label: Your diagnosis (optional)
+      description: |
+        If you have a guess — e.g. "the guest binary calls syscall X directly,
+        bypassing the PLT hook" — write it. Even a rough hypothesis helps.
+    validations:
+      required: false

@@ -1,255 +1,192 @@
-# elf_loader + gbsh + elroot
+# elf_loader — run glibc Linux binaries on Android without root
 
-Spouštěč glibc/parrot binárek na Androidu (aarch64) **bez prootu a bez qemu** —
-vlastní „own-loading" loader + nativní bionic shell (`gbsh`) + PRoot-like
-launcher (`elroot`). Kompatibilní s jakoukoli aplikací a jakýmkoli rootfs:
-**vše se bere z proměnných prostředí, žádné hardcoded cesty.**
+**One loader, two userspaces.** elf_loader runs glibc binaries (Parrot / Debian
+/ Ubuntu rootfs) directly on Android (bionic), in the same process — **without
+proot, without chroot, without QEMU**. It maps the guest `libc.so.6` and its
+dependencies into a private scope, applies relocations, and jumps to the guest
+entry point.
 
-> Podrobné vývojové poznámky (certifikace, seccomp emulace, historie) jsou v
-> [`postup.md`](postup.md) — ten soubor záměrně zůstává jako deník.
+Same kernel (Android), two userspaces: the bionic host and a glibc guest from a
+rootfs.
 
-## Co je v repo
-| soubor | účel |
-|---|---|
-| `src/elf_loader.c`, `src/main.c`, `src/entry.S`, `include/elf_loader.h` | vlastní loader (načte/relokuje/spustí ELF64) |
-| `gbsh/gbsh.c` | nativní interaktivní shell (bionic) s vlastním line editorem |
-| `tools/elroot.sh` | PRoot-like launcher nad elf_loader + gbsh |
-| `elf_loader`, `gbsh` | předpřipravené binárky |
-| `finale_loader_build.py`, `gbsh_combined_static_build.py`, `Makefile` | build přes Modal (NDK) |
-| `magisk-module/` | Magisk modul (univerzální detekce rootfs) |
-
-## Spuštění (univerzální — přes ENV)
-
-Všechny cesty se předávají přes prostředí, takže to může použít kdokoliv,
-kdekoliv. Minimální nastavení pro launcher (tvoje „custom launcher" / .rc):
-
-```sh
-export ROOTFS=/cesta/k/distro        # např. /data/.../nh/distro/parrot
-export ELF_LOADER="$ROOTFS/../usr/bin/elf_loader"   # volitelné, má výchozí
-export GBSH="$ROOTFS/../usr/bin/gbsh"               # volitelné, má výchozí
-export SU="${SU:-/product/bin/su}"                  # volitelné
+```console
+$ uname -srm
+Linux 4.14.190-perf aarch64          # Android kernel, bionic host
+$ cat /etc/os-release
+cat: /etc/os-release: No such file or directory
+$ lx cat /etc/os-release
+PRETTY_NAME="Parrot Security 7.4 (echo)"
+$ lx gcc hello.c -o hello && lx ./hello
+hello from glibc, 42
 ```
 
-Pak:
+> _A 15-second screen recording (env -i → starship → python → uv → node →
+> interactive zsh) will be linked here. See `tools/demo-env.zsh`._
+
+## Highlights
+
+- **No root, no proot, no chroot** — plain non-root own-loading.
+- **Works where proot struggles** — a seccomp compat filter emulates syscalls
+  that Android's app profile (kernel 4.14) kills, so glibc's legacy fallbacks
+  work.
+- **Real toolchains** — `gcc` (with `ld`/`as` via a guest `PATH`), `python3`,
+  `uv`, `git`, `gh`, `fzf`, Node.js, `tmux`, and a full interactive zsh with a
+  starship prompt.
+- **Any rootfs, any app** — everything is driven by environment variables, no
+  hard-coded paths.
+
+## Quick start
+
 ```sh
-elroot <prikaz> [args]               # AUTO: je-li su dostupné (ROOT), spustí přes chroot (ROOT);
-                                     #        jinak elf_loader --ownall (NON-ROOT)
-elroot --chroot <prikaz>             # vynutit root chroot (plný fs, žádný seccomp)
-elroot --ownall <prikaz>             # vynutit non-root (elf_loader --ownall)
-elroot zsh                            # ROOT (auto) -> plny interaktivni zsh 5.9 (ZLE/completion/barvy)
-elroot --chroot zsh                  # ROOT -> zsh v chrootu (plny zsh)
-elroot --ownall zsh                   # POZOR: non-root -> zsh nenajde moduly (ZLE nefunguje),
-                                     #         pro non-root shell spust gbsh PRIMO (je nativni)
-# gbsh se spousti PRIMO (bionicky non-root shell, deploynuty vedle rootfs):
-#   ROOTFS=/cesta/k/distro $ROOTFS/../usr/bin/gbsh      # interaktivni non-root shell
+export D=$HOME                          # app files dir (= HOME)
+export ROOTFS=$D/nh/distro/parrot       # guest rootfs
+export R=$ROOTFS
+export L=$D/usr/bin/elf_loader          # the loader binary
+
+# one eval gives you the whole `lx` environment (lx, lxwhich, help, ...)
+eval "$($L init zsh)"                   # or: eval "$($L init bash)"
+
+lx cat /etc/os-release                  # runs the guest cat
+lx python3 -c 'import sys; print(sys.version)'
+lx gcc hello.c -o hello && lx ./hello   # compile + run inside the guest
 ```
 
-Přímo přes loader (bez elrootu):
-```sh
-export ROOTFS=/cesta/k/distro
-elf_loader --ownall "$ROOTFS/bin/ls" -l     # spustí parrot ls
-gbsh                                     # interaktivní shell (vyžaduje ROOTFS)
-```
+`init zsh|bash` follows the same shell-integration pattern as
+`starship init zsh` / `zoxide init zsh`. It derives everything from
+`$HOME`/`$ROOTFS`:
 
-### Proměnné prostředí
-| proměnná | význam | výchozí |
+| variable | meaning | default |
 |---|---|---|
-| `ROOTFS` | cesta k distro rootfs (povinná pro gbsh) | — (gbsh skončí s chybou, pokud není) |
-| `ELF_LOADER` | cesta k elf_loader binárce | `$ROOTFS/../usr/bin/elf_loader`, pak `/system/bin/elf_loader` |
-| `GBSH` | cesta k gbsh | `$ROOTFS/../usr/bin/gbsh`, pak `/system/bin/gbsh` |
-| `SU` | cesta k `su` (root detekce) | `/product/bin/su` |
-| `TERMINFO` | terminfo DB (pro barvy v terminálu) | elroot nastaví na `$ROOTFS/usr/share/terminfo` |
-| `GBSHRC` | gbsh config (místo `~/.gbshrc`) | — |
-| `GBSH_PROMPT` / `GBSH_PROMPT_MODE` | vzhled/prompt gbsh | výchozí |
+| `D` | app files dir | `$HOME` |
+| `ROOTFS` | guest rootfs | `$D/nh/distro/parrot` |
+| `R` | alias for `ROOTFS` | `$ROOTFS` |
+| `L` | loader binary | `$D/usr/bin/elf_loader` |
+| `LX_LOG` | log directory | `$HOME/.cache/lx` |
+| `LOCPATH` | guest locale dir (only if it exists) | `$ROOTFS/usr/lib/locale` |
+| `LC_ALL` | locale | `C.UTF-8` |
 
-## gbsh (interaktivní shell)
-Vlastní line editor (nezávislý na zsh/bash):
-- zalamování dlouhých řádků bez duplicit (save/restore kurzoru + smazání oblasti),
-- detekce šířky terminálu přes `TIOCGWINSZ` (fallback `$COLUMNS`/80),
-- bracketed paste (`\x1b[200~`/`201~`) — víceřádkový vklad,
-- Ctrl-A/E (začátek/konec), Ctrl-K (smazat do konce), Ctrl-W (slovo),
-- barvy: `ls`/`grep`/`diff` `--color=auto`, syntax highlighting vstupu,
-- dual-world navigace (`cd ..` z `/` překlopí na host), `--chroot` režim.
+Overridable from outside: `ROOTFS=/other/rootfs zsh`.
 
-Pro **plný zsh zážitek** stačí `elroot zsh` (parrot zsh 5.9 běží pod loaderem).
+### Shell helpers
+
+| command | description |
+|---|---|
+| `lx <cmd> [args]` | run a guest binary under the loader (searches `LX_PATH`) |
+| `lxwhich <cmd>` | show the full path of a guest binary |
+| `lxq <cmd>` | like `lx`, but filters `[MMAP]` noise on stderr |
+| `lxdbg VAR=1 <cmd>` | run with a loader debug variable |
+| `lxhelper <.so> <cmd>` | run with a custom glibc helper library |
+| `lxlog <cmd>` | run with output to a log, show the tail and exit code |
+| `lxdiag [-c]` | loader `diag.txt` (SIGSYS/INIT traces); `-c` clears it |
+| `lxinfo` | loader size/date, rootfs, repo branch |
+| `lxfault <cmd>` | print only crash lines (FAULT, pc in, SIGSYS) |
+| `lxtest` | regression set (echo, bash, python, node, bun, tmux, ...) |
+| `help [topic]` (alias `lxhelp`) | built-in help with examples |
+| `<unknown command>` | auto-found in the rootfs and run via the loader |
+
+`lx` passes a guest `PATH` (paths inside the rootfs), so tools that spawn
+helpers by name (e.g. `gcc` looking for `ld`/`as`) work.
+
+## CLI
+
+```
+elf_loader --help | -h
+elf_loader --version | -V
+elf_loader --check <file>
+elf_loader [--lazy] --run   <elf> [args..]     host-loader mode (host libc)
+elf_loader [--lazy] --own   <elf> <shared.so>  own-load one shared module
+elf_loader [--lazy] --ownall <elf> [args..]    own-load all deps (guest glibc)
+elf_loader [--lazy] --shim  <elf> [args..]     F2 path-translation shim
+elf_loader init zsh|bash                        print eval-able shell env
+elf_loader <elf>                                introspect (no execution)
+```
+
+## How it works
+
+Five mechanisms make same-process glibc-on-bionic possible: own-loading (no
+`dlopen`), IFUNC/IRELATIVE resolution, a private heap arena to keep the two
+`malloc`s off each other's `brk`, static TLS with a guest thread pointer, and a
+seccomp compat filter. Full write-up: [`docs/how-it-works.md`](docs/how-it-works.md).
+
+## Verified
+
+| binary / stack | status |
+|---|---|
+| coreutils, `grep`, `sed`, `awk`, `find`, … | ✅ |
+| `python3` (glibc 2.41), `uv` | ✅ |
+| `gcc` 14 (compiles + runs C in the guest) | ✅ |
+| `git`, `gh`, `glab`, `git-lfs`, `fzf` (Go/cgo mode) | ✅ |
+| Node.js ≤ 22 (LTS) | ✅ |
+| Node.js 26 | ✅ (recently fixed — see [Known issues](#known-issues--help-wanted)) |
+| `tmux` (guest glibc, bionic zsh shell) | ✅ |
+| Bun (`claude.exe`) | ✅ |
+
+Regression suite: `test-all.sh` — see [Testing](#testing).
+
+## Known issues / help wanted
+
+This project is developed against a small number of devices, so **bug reports
+from other hardware are the main way it improves**. If something misbehaves,
+please open an issue — there are templates for bug reports and "it works"
+reports.
+
+Open / under investigation:
+
+- **Node.js ≥ 23 / v26** — a `JSDispatchTable` bootstrap nondeterminism in V8
+  caused intermittent SIGSEGV. Node 22 is rock-solid; Node 26 now starts but
+  is still being shaken out. Needs testing across Node 23/24/25/26 and V8
+  versions.
+- **Network binaries** (`nmap`, `starship`-adjacent tools) — occasional SIGSEGV
+  under the bionic host.
+- **16 KB page size** (Android 15+) — needs a real device to verify.
+- Intermittent ~5 % SIGSEGV in helper libraries (heap fix in progress).
+
+Help especially wanted with: **testing on different devices / Android versions
+/ kernels**, reproducing crashes, and reports of which guest binaries work.
+
+## Testing
+
+```sh
+./test-all.sh all            # every category
+./test-all.sh python         # python smoke tests
+./test-all.sh uv symlink fstat nss   # individual regressions
+```
+
+Runs through an `ashell`-style device shell; `PASS` / `FLAKY` / `FAIL` / `SKIP`
+per case. Latest full run: **PASS 160 / FAIL 0**.
 
 ## Build
-Přes Modal (NDK r28):
-```sh
-modal run finale_loader_build.py     # -> /tmp/elf_loader (bionic dynamic, PT_INTERP linker64)
-modal run gbsh_combined_static_build.py  # -> /root/elf_loader/files/usr/bin/gbsh
-# (statický combined binary: elf_loader + gbsh v jednom, ET_EXEC ~2.3 MB)
-```
 
-Build artefakty:
-- `elf_loader` — dynamický bionic (PT_INTERP `/system/bin/linker64`)
-- `gbsh` — statický combined binary (ET_EXEC, ~2.3 MB, zero NEEDED) obsahující
-  jak elf_loader, tak gbsh shell; dispatcher automaticky přepíná režimy
-  (loader flagy → elf_loader, shell/`-c` → gbsh)
-
-> Pozn.: static-pie (`-fPIE -static-pie`) **nefunguje na tomto zařízení** (kernel
-> 4.14, RC=139 i u triviálních testů). Proto se používá `-static` (non-PIE),
-> což na tomto zařízení běží stabilně.
-
-Nasazení na zařízení:
-```sh
-cp /tmp/elf_loader /root/elf_loader/files/usr/bin/elf_loader && chmod 755 /root/elf_loader/files/usr/bin/elf_loader
-# gbsh je už po buildu v files/usr/bin/gbsh
-```
-
-## Node.js pod loaderem
-
-**Funguje spolehlivě jen Node.js ≤ 22 (LTS).** Node 23+ používá V8 verzi
-s `JSDispatchTable` (indirekce pro tiering kódu, nesouvisí s `V8 Sandbox` —
-ten Node.js oficiálně vypíná natvrdo, viz `configure.py`), kde `Isolate::Init`
-bootstrap loop pod loaderem nedeterministicky zapíše jiný builtin do dispatch
-tabulky než nativně → SIGSEGV v `InterpreterEntryTrampoline`, obvykle ještě
-před vykonáním uživatelského kódu. Node 22 (a starší) tenhle mechanismus
-vůbec nemá — spouští se **100% spolehlivě**, včetně reálných npm balíčků
-(ověřeno na `cowsay`). Node 23 je nedeterministicky flaky (občas projde,
-občas spadne se stejným crashem jako 26); Node 26 (LTS default) padá vždy.
-Plná diagnostika (28položková bootstrap smyčka, `Builtins::code()` lookup,
-GDB watchpointy na dispatch entry) je v [`postup.md`](postup.md).
-
-Instalace a spuštění (na zařízení, `$ROOTFS` = Parrot rootfs):
-```sh
-# instalace přes nvm (v rootfs, jednou):
-nvm install 22            # nebo stáhnout oficiální tarball z nodejs.org/dist
-
-# spuštění pod loaderem:
-export ROOTFS=/cesta/k/distro
-elf_loader --ownall "$ROOTFS/root/.nvm/versions/node/v22.11.0/bin/node" skript.js
-# nebo npm balíček:
-elf_loader --ownall "$ROOTFS/.../node" "$ROOTFS/.../node_modules/<balik>/cli.js" [args]
-```
-
-Zdroj Node.js: oficiální prebuilt tarbally z
-[nodejs.org/dist](https://nodejs.org/dist/) (žádný custom build nebyl
-potřeba — Node.js build už `v8_enable_sandbox=0` nastavuje sám, vlastní
-kompilace by nic nezměnila, protože `js_dispatch_table_` v `isolate-data.h`
-není za žádným build flagem, je povinná součást V8 bez ohledu na sandbox).
-
-Proces po úspěšném vykonání skriptu skončí s `EXIT=134` (=128+SIGABRT) kvůli
-samostatnému, loaderem nezpůsobenému `double free` bugu v glibc teardownu
-oficiálních Node.js buildů — to je **očekávané a neškodné**, výstup skriptu
-je před tím vždy kompletní a správný.
-
-**Fix, díky kterému tohle vůbec funguje:** větev `fix-guest-sigaction`
-(commity `e93e08d`, `8e48207`, `2bcf9a4`) — chybějící `SIGABRT` handler
-způsoboval, že i tenhle neškodný `double free` skončil sekundárním SIGSEGV
-místo čistého ukončení procesu. Detaily v `postup.md`, sekce
-"SKUTEČNÝ FIX — SIGABRT handler bug".
-
-**Bun funguje** (ověřeno na `claude` CLI z `@anthropic-ai/claude-code`,
-samostatná binárka Bun 1.4.3). `claude.exe --version` i `--help` proběhnou
-s kódem 0 (větev `dev`, commit `3001dd8`). Příčinou pádu byl špatný
-`l_addr` ve falešném `link_map`: loader hlásil adresu mapování místo load
-biasu, takže `dl_iterate_phdr` vracel u ET_EXEC nenulový `dlpi_addr`.
-Bun si tím posouval adresu sekce `.bun` s přibaleným JS a četl nesmysly.
+Cross-compiled with the Android NDK via GitHub Actions (workflow
+`build-elf-loader`):
 
 ```sh
-elf_loader --ownall "$ROOTFS/root/claudetest/claude.exe" --version
+tools/gh_build_deploy.sh          # build HEAD, download, deploy to device
+tools/gh_build_deploy.sh --push   # push first
 ```
 
-Binárka musí ležet uvnitř Parrot rootfs, jinak loader nenajde `librt.so.1`.
-
-## tmux pod loaderem
-
-Funguje (větev `dev`). Guest glibc potřebuje cestu k locale a tmux potřebuje `SHELL`:
+Or locally with the NDK:
 
 ```sh
-D=/data/user/0/com.linux_core/files; R=$D/nh/distro/parrot
-export LOCPATH=$R/usr/lib/locale LC_ALL=C.UTF-8 SHELL=$R/bin/bash
-$D/usr/bin/elf_loader --ownall $R/usr/bin/tmux
+TC=/opt/android-ndk-r28/toolchains/llvm/prebuilt/linux-x86_64/bin
+$TC/aarch64-linux-android24-clang -Wall -Wextra -g -O0 -std=c11 \
+    src/main.c src/elf_loader.c src/ldso_tls.c src/entry.S -ldl -o elf_loader_ndk
 ```
 
-Jako shell jde i bionic zsh (`SHELL=$D/usr/bin/zsh`). Detaily v `postup.md`, pokračování 17.
+The result is a bionic binary with `PT_INTERP /system/bin/linker64`.
 
-## Go binárky pod loaderem (Go mód)
+## Repo layout
 
-Go runtime volá syscally přímo (`svc` v Go kódu), takže PLT overridy loaderu
-nevidí jeho `openat("/etc/resolv.conf")`, `stat("/usr/bin/git")` ani `execve`.
-Loader proto Go binárku pozná (PT_NOTE `Go`, typ 4) a nainstaluje seccomp
-filtr, který TRAPuje path syscally **jen z text segmentu Go binárky**
-(`seccomp_data.instruction_pointer`). cgo/glibc kód dál jede přes PLT overridy.
+| path | purpose |
+|---|---|
+| `src/elf_loader.c`, `src/main.c`, `src/entry.S`, `include/elf_loader.h` | the loader |
+| `gbsh/gbsh.c` | native bionic interactive shell |
+| `tools/elroot.sh` | proot-like launcher over elf_loader + gbsh |
+| `tools/demo-env.zsh` | scripted demo (env -i → glibc guest) |
+| `magisk-module/` | Magisk module (universal rootfs detection) |
+| `docs/` | English docs |
+| `postup.md` | full development diary (Czech) |
 
-- cesta `/X` → `$ROOTFS/X`, když tam existuje ona nebo její rodič; jinak host
-  (`/data`, `/sdcard`, `/storage`, `/proc`, `/dev`... vždy host),
-- `execve` glibc ELF / skriptu → re-exec `elf_loader --ownall`,
-- `rt_sigaction(SIGSYS)` z Go se předstírá; `rt_sigprocmask` i `sa_mask`
-  nikdy neblokují SIGSYS (kernel 4.14 při blokovaném SIGSYS resetuje handler
-  na SIG_DFL → TRAP zabije proces i vfork rodiče, exit 159).
+## License
 
-Ověřeno: `gh`, `glab`, `git-lfs`, `fzf` (cgo) a statický `render` — DNS, TLS,
-HTTP, goroutiny, signály, `os/exec` (git-lfs → git, git → git-lfs).
-Vypnutí: `ELF_LOADER_GOMODE=0`, diagnostika: `ELF_LOADER_DIAG=1`.
-
-Souvisí: glibc 2.41 má v `open64`/`openat64` PAC prolog, takže klasické inline
-hooky se nenainstalovaly a `fopen()` četl host cesty (git: „error processing
-config file(s)“). Teď se hookují PAC-safe trampolínou (`F2_NO_OPEN_HOOK=1` vypne).
-
-## Helper knihovny (ELF_LOADER_HELPER)
-
-Vlastní `.so` zkompilované proti glibc se načtou do guesta před všechny ostatní
-moduly a přebijí funkce volané přes PLT. Kód helperu běží v glibc světě, takže
-může normálně používat `printf`, `malloc` nebo `getenv`. Reálnou funkci najde přes
-`dlsym(RTLD_NEXT, ...)`.
-
-```sh
-gcc -shared -fPIC -O2 -o muj_helper.so muj_helper.c -ldl     # v Parrotu
-ELF_LOADER_HELPER=$ROOTFS/cesta/muj_helper.so elf_loader --ownall $ROOTFS/usr/bin/uname -r
-```
-
-Více knihoven se odděluje dvojtečkou a proměnná se dědí do spuštěných dětí.
-Omezení: funkce, které přebíjí loader sám (open, stat, exec...), mají přednost
-a volání uvnitř glibc mimo PLT helper nezachytí. Příklady jsou v `helper/`.
-
-## Magisk modul
-`magisk-module/` se instaluje do `/data/adb/modules/…`. Rootfs detekuje
-**univerzálně** (skenuje `/data/user/0/*/files`, `/data/data/*/files`,
-`/data/adb/*/files` po `nh/distro/parrot`) — žádné jméno aplikace není
-natvrdo. Cestu uloží do `/data/adb/parrot_root`.
-
-## Co umí loader (stručně)
-Načte ELF64 PT_LOAD, vyřeší DT_NEEDED přes vlastní scope, aplikuje relokace
-(vč. `R_AARCH64_IRELATIVE`/ifunc), sestaví stack + auxv, skočí na entry.
-Vlastní module loader (`--own`) pro glibc .so bez `dlopen`. Signály blokované
-seccompem (non-root) se emulují v SIGSYS handleru (setfsuid/setpriority/NUMA/
-keyring/syslog/IPC/futex_waitv výjimkou). Viz `postup.md`.
-
-## F2 — path-translation shim (`--shim`)
-Alternativa k chrootu pro běh glibc binárek **non-root** bez namespaců:
-loader načte host binárku (bionic) i guest glibc rootfs, při JUMP_SLOT /
-import resolvenutí dává F2 override (vlastní `open`/`open64`/`openat`/
-`openat64`/`statx`/`fstatat`/`symlink`/`rename`/`unlink`/`mkdir`/`rmdir` shimy)
-přednost před host symbolem. Shimy překládají absolutní `/…` cesty na
-`$ROOTFS/…` a volají původní glibc funkci přes `g_orig_*`.
-
-**Seccomp proot-lite (syscall-level path translation):** kromě PLT/GOT override
-instaluje F2 před `elf_load` seccomp filtr, který pro path-syscally
-(`openat=56`, `statx=291`, `newfstatat=79`, `readlinkat=78`, `faccessat=48`)
-vrací `SECCOMP_RET_TRAP`. SIGSYS handler přeloží cestu (x1) na `$ROOTFS/…` a
-**vyřeší symlinkové řetězy** (proot-lite `f2_realpath`: `newfstatat`+
-`readlinkat` smyčka, absolutní cíle přeložené na `$ROOTFS`), pak zemuluje
-syscall raw `svc #0` s `F2_SENTINEL` v `x5` (filtr jej pustí → zabrání
-zacyklení). To chytí i glibc IFUNC-resolved `open64`/`__openat64`, jejichž
-GOT je předplněný při loadu a PLT-override je nechytí (viz historie níže).
-Handler běží v parrot TLS → používá jen ruční `sys_write`/`raw_syscall6`.
-
-**Status (testováno na device, 23+ příkazů, `maps-begin=0` = žádný pád):**
-- ✅ Funguje: `cat head wc ls stat find realpath dirname basename
-  sed sort awk mawk grep cut tr uniq python3 --version apt apt-get ldconfig`.
-- ✅ Symlinkové řetězy se řeší: `awk` je `/usr/bin/awk → /etc/alternatives/
-  awk → /usr/bin/gawk`; `ls -l` správně ukazuje `→` šipky.
-- ✅ `ldconfig`/`dpkg` symlink/rename hooky (žádné `Can't link`).
-- ⚠️ `statx` má `AT_SYMLINK_NOFOLLOW` v `x2` (ne `x3`) → handler čte flagy dle
-  syscallu (openat/statx=`a2`, newfstatat/faccessat=`a3`), jinak by `lstat`
-  nechtěně vyřešil symlink.
-- ⚠️ Exclude list (host fs, který se NEPŘEKLÁDÁ) je `/proc /sys /dev /system
-  /apex /vendor /product /odm /mnt /metadata` — **`/data` tam není**, protože
-  `$ROOTFS` žije pod `/data/…`; kdyby v exclude byl, ROOTFS cesta by se
-  shodovala s `/data`+`/` a `f2_realpath` by ji vyloučil → symlinky pod
-  ROOTFS by se nerozvinuly (ENOENT, např. právě `awk`).
-- Build: `modal run finale_loader_build.py` (flagy `-O0 -g`, bez `-Werror`).
-
-Spuštění přes `elroot --shim <cmd>` (viz `tools/elroot.sh`).
+See the repository. Contributions and bug reports welcome.

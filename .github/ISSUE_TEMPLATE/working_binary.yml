@@ -1,0 +1,39 @@
+name: "It works! (binary report)"
+description: Tell us a guest binary that runs fine under elf_loader
+title: "[works] <binary> <version>"
+labels: ["works"]
+body:
+  - type: markdown
+    attributes:
+      value: |
+        Positive reports are just as useful as bug reports — they map what
+        already works and let the docs say "verified on X". Please add one
+        per binary.
+  - type: input
+    id: binary
+    attributes:
+      label: Binary + version
+      placeholder: "git 2.47.0, node v22.11.0, gh 2.x"
+    validations:
+      required: true
+  - type: input
+    id: command
+    attributes:
+      label: Command you ran
+      placeholder: "lx git --version"
+    validations:
+      required: true
+  - type: input
+    id: env
+    attributes:
+      label: Rootfs + device + loader MD5
+      placeholder: "Parrot 7.4 glibc 2.41, Android 13 kernel 4.14, loader 7a4f05f0…"
+    validations:
+      required: true
+  - type: input
+    id: output
+    attributes:
+      label: Output (first line)
+      placeholder: "git version 2.47.0"
+    validations:
+      required: false
