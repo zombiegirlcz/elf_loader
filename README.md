@@ -20,8 +20,12 @@ $ lx gcc hello.c -o hello && lx ./hello
 hello from glibc, 42
 ```
 
-> _A 15-second screen recording (env -i → starship → python → uv → node →
-> interactive zsh) will be linked here. See `tools/demo-env.zsh`._
+![elf_loader demo — env -i to a glibc guest](docs/media/demo-env.gif)
+
+**[▶ Watch the full 94-second demo](https://cdn.jsdelivr.net/gh/zombiegirlcz/elf_loader@master/docs/media/demo-env.mp4)**
+— starts in an empty environment (`env -i`), sets up the paths, then runs
+starship, python, uv, node and an interactive zsh. Reproduce it with
+[`tools/demo-env.zsh`](tools/demo-env.zsh).
 
 ## Highlights
 

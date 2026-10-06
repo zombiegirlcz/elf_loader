@@ -1,7 +1,7 @@
 # Social / launch posts (drafts)
 
-Replace `<VIDEO_URL>` with the screen recording link, `<BLOG_URL>` with the
-published blog post, and `<REPO>` with
+Replace `https://cdn.jsdelivr.net/gh/zombiegirlcz/elf_loader@master/docs/media/demo-env.mp4` with the screen recording link, `https://github.com/zombiegirlcz/elf_loader` with the
+published blog post, and `https://github.com/zombiegirlcz/elf_loader` with
 `https://github.com/zombiegirlcz/elf_loader` where needed.
 
 ---
@@ -22,7 +22,7 @@ published blog post, and `<REPO>` with
 Show HN: Run glibc Linux binaries on Android without root, proot or chroot
 ```
 
-**URL:** `<BLOG_URL>` (the blog post) — or `<REPO>` if you post the repo
+**URL:** `https://github.com/zombiegirlcz/elf_loader` (the blog post) — or `https://github.com/zombiegirlcz/elf_loader` if you post the repo
 directly. Show HN prefers a page you can read; the blog post works best.
 
 **First comment (post it yourself, right after submitting):**
@@ -64,7 +64,7 @@ TL;DR: I wrote an own-loading ELF loader that maps a guest glibc rootfs
 (Parrot/Debian) into the same process as Android's bionic libc and jumps into
 it. No root, no proot, no namespaces, no ptrace.
 
-Demo (screen recording): <VIDEO_URL>
+Demo (screen recording): https://cdn.jsdelivr.net/gh/zombiegirlcz/elf_loader@master/docs/media/demo-env.mp4
 
 On a stock Android 13 phone (kernel 4.14):
   $ lx cat /etc/os-release
@@ -88,7 +88,7 @@ with starship.
 What doesn't (yet): Node ≥23 had a V8 JSDispatchTable issue (fixing), some
 network binaries crash intermittently, 16KB pages (Android 15+) untested.
 
-Repo: <REPO>
+Repo: https://github.com/zombiegirlcz/elf_loader
 
 I'd really appreciate crash reports and "this worked on my device" reports —
 I can only test a couple of devices. There are issue templates for both.
@@ -121,10 +121,10 @@ Not a desktop rice, but close enough: an interactive zsh 5.9 with a starship
 prompt, running a real Debian/Parrot glibc userspace on a stock Android phone,
 no root, no proot.
 
-Video: <VIDEO_URL>
+Video: https://cdn.jsdelivr.net/gh/zombiegirlcz/elf_loader@master/docs/media/demo-env.mp4
 
 It's my own ELF loader (own-loads the guest glibc into the bionic process) +
-my shell config. Details and repo: <REPO>
+my shell config. Details and repo: https://github.com/zombiegirlcz/elf_loader
 ```
 
 ---
@@ -140,7 +140,7 @@ my shell config. Details and repo: <REPO>
    PRETTY_NAME="Parrot Security 7.4 (echo)"
    $ lx gcc hello.c -o hello && lx ./hello
    hello from glibc, 42
-   Real Debian gcc 14 compiling inside the guest. Video: <VIDEO_URL>
+   Real Debian gcc 14 compiling inside the guest. Video: https://cdn.jsdelivr.net/gh/zombiegirlcz/elf_loader@master/docs/media/demo-env.mp4
 
 3/ Why not proot? proot ptrace-intercepts every syscall. Own-loading runs the
    guest natively. Trade-off: you implement the dynamic linking yourself —
@@ -152,7 +152,7 @@ my shell config. Details and repo: <REPO>
 
 5/ I can only test a couple of devices — please run something on yours and
    file what happens (crash or clean run). Issue templates for both.
-   Repo: <REPO>
+   Repo: https://github.com/zombiegirlcz/elf_loader
 ```
 
 ---
