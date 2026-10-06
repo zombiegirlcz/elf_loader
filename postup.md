@@ -2960,3 +2960,90 @@ Nepoužívat externí ptrace tracer. Místo toho buď:
    bez jakéhokoliv ptrace — to by ukázalo, jestli nějaký worker thread
    vznikl s TP, který loader nestihl přepsat na guest hodnotu, přesně v
    okně mezi `clone()` a první guest TLS instrukcí.
+
+## 2026-10-06 (4): PRŮLOM — core dump (bez ptrace) odhalil V8 kód čtoucí přímo TPIDR_EL0
+
+### Metodika (bez observer efektu)
+Namísto živého tracingu: `ulimit -c unlimited` + `core_pattern=core` (default),
+spuštěn `pi` přes `script` BEZ jakéhokoliv tracera (stejný repro vzorec jako
+dřív), proces spadl přirozeně (core 1.8 GB v `coredir/`). Analýza
+POST-MORTEM: core zkopírován do `$R/tmp/pi.core`, `elf_loader` binárka do
+`$R/tmp/elf_loader_bin`, `chroot $R /usr/bin/gdb -batch -ex "core-file
+/tmp/pi.core" ... /tmp/elf_loader_bin` (žádný `attach`, žádné narušení
+časování — gdb jen čte statický obraz paměti po smrti).
+
+### Nález #1 — padá HLAVNÍ vlákno, ne worker
+`info threads` ukázal 11 LWP. **Thread 1 (LWP 18420) je ten, co dostal
+SIGSEGV** (`Program terminated with signal SIGSEGV` + `Current thread is 1`).
+Zbylých 10 vláken je zaparkovaných na IDENTICKÉ adrese `0x7b4ce6c228`/`c22c`
+(futex/worker-pool spánek v libuv thread poolu) — nejsou to oběti, jsou
+jen nečinné. **Hypotéza "worker thread bez guest TP" z minula je tedy
+vyvrácena** — jde o hlavní vlákno, které by mělo mít TP správně nastavený.
+
+### Nález #2 — SKUTEČNÁ příčina: V8 JIT kód čte `TPIDR_EL0` NAPŘÍMO
+Disassembly v místě pádu (`pc=0x7b4ce5f87c`, V8 JIT heap, ne loader/libc):
+```asm
+0x7b4ce5f864:  stp  x29, x30, [sp, #-32]!
+0x7b4ce5f86c:  mov  x29, sp
+0x7b4ce5f870:  str  x19, [sp, #16]
+0x7b4ce5f874:  mrs  x19, tpidr_el0        ; <-- V8 čte CPU TP registr přímo
+0x7b4ce5f878:  sub  x19, x19, #0x618      ; offset do "neco" relativne k TP
+=> 0x7b4ce5f87c:  ldr  w6, [x19]          ; <-- FAULT ZDE
+0x7b4ce5f880:  adrp x7, 0x7b4cf94000
+0x7b4ce5f884:  ldrb w7, [x7, #1432]
+0x7b4ce5f888:  cbnz w7, 0x7b4ce5f8d8
+0x7b4ce5f88c:  tbnz w6, #0, 0x7b4ce5f8d8
+```
+Tvar (čti flag na `TP-konst`, pak test bitu → podmíněný skok) je typický
+**entry-prolog check** generovaného V8 builtinu (stack-limit/interrupt
+check na vstupu do JS funkce) — ale namísto klasického V8 "root register"
+mechanismu čte hodnotu **přímo přes hardwarový TLS registr `tpidr_el0`**.
+
+Zajímavé: paměť na vypočtené adrese (`tpidr-0x618` = `0x7bcf6369f8`, dle
+`info registers` v okamžiku pádu) je v core dumpu **čitelná a nulová**
+(`x/4xg 0x7bcf6369f8` → `0x0 0x0`), ne "unmapped". To znamená, že v
+okamžiku SKUTEČNÉHO pádu tam byla jiná (neplatná/odlišná) hodnota TP, než
+jakou core dump ukazuje post-mortem (`tpidr` v `info registers` je hodnota
+PO signálu, kterou kernel/coredump zachytil) — **TP se mezi zápisem a
+čtením této V8 cache hodnoty změnil**, přesně jak by se stalo při TP-swap
+okně v loaderu.
+
+### Interpretace (silná, dobře podložená hypotéza)
+Novější V8 (korelující s JSDispatchTable/sandbox hardening v Node 23+)
+**převzalo přímé vlastnictví `TPIDR_EL0`** jako rychlou per-thread cache
+(pravděpodobně ukazatel na Isolate/sandbox base nebo stack-limit cache) —
+standardní na nativním Linuxu, kde TP po nastavení v `_start`/pthread
+runtime UŽ NIKDY NIKDO nemění. **Náš loader ale TP aktivně a opakovaně
+přepíná** (host↔guest TP swap kolem syscallů/fault handlerů/initů — celý
+mechanismus, na kterém je projekt postavený). Pokud V8 zapíše svou cache
+hodnotu relativně k TP v jednom okamžiku a přečte ji relativně k TP v
+jiném okamžiku, KDY byl TP dočasně jiný (byť na pár instrukcí), vypočtená
+adresa `TP-0x618` se posune na jinou (neplatnou nebo nesmyslnou) stránku
+→ SIGSEGV nebo tichá chyba.
+
+To elegantně vysvětluje VŠECHNA předchozí pozorování:
+- `node -e` (bez TUI, méně vláken/signálů) — málo příležitostí k TP-swapu
+  uprostřed V8 JIT kódu → 5/5 čistě.
+- `pi`+`pi-starship` (TUI, MCP sockety, timery, resize) — výrazně víc
+  signálů/syscallů → víc příležitostí zasáhnout TP-swap okno → spolehlivý
+  pád do 16–25s.
+- GDB/strace **maskovaly** pád (viz předchozí pokračování) — ptrace
+  stop/continue latence posune časování natolik, že okno zřídka/nikdy
+  nezasáhne → proto živé tracování na tohle nefungovalo, zatímco bez
+  tracera + core dump to zachytilo přirozeně.
+
+### Další krok (nedokončeno)
+1. Zjistit, KDE přesně V8 tuto `TP-0x618` cache hodnotu PÍŠE (najít
+   odpovídající `msr`/`str` instrukci relativně k `tpidr_el0` při
+   inicializaci Isolate/vlákna — pravděpodobně `Isolate::Init` nebo
+   per-thread setup).
+2. Ověřit, zda jde o fixní offset (konstantu per V8 build) — pak lze
+   loader opravit buď (a) garantováním, že TP se NIKDY nezmění během
+   okna, kdy by V8 JIT kód mohl tuto cache číst/psát (přísnější
+   signal-masking kolem TP-swapu), nebo (b) udržováním DVOU kopií této
+   V8 cache hodnoty (jedné pro host TP, jedné pro guest TP) a
+   přepisováním při každém swapu — podobně jako se dnes přepisuje celý
+   TP samotný.
+3. `objdump`/V8 zdroj (Builtins, `macro-assembler-arm64.cc`) na offset
+   `0x618` a `kRootRegister`-adjacent TLS mechanismus pro přesnou
+   identifikaci, co tam V8 ukládá.
