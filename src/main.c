@@ -1778,7 +1778,21 @@ static int shim_execve(const char *p, char *const argv[], char *const envp[]) {
      * ordering, guest binaries referenced by device-absolute path would be
      * passed to the raw execve and die on missing PT_INTERP. */
     if (rl && shim_strncmp(p, g_shim_root, rl) == 0 && (p[rl] == '/' || p[rl] == 0)) {
-        /* Already prefixed with $ROOTFS */
+        /* Already prefixed with $ROOTFS. Vetsina obsahu ROOTFS je glibc a
+         * potrebuje own-loading, ale rootfs muze obsahovat i bionic-staticky
+         * nastroj (napr. testovaci "ashell" v usr/local/bin). Takovy ELF se
+         * MA spustit primo real execve - jinak ho loader zkousi own-loadovat
+         * jako glibc a spadne hned na vstupu (FAULT-ENTER, tp=0, chybi
+         * PT_INTERP/TLS layout). Skripty (#!) nejsou ELF, projdou beze zmeny
+         * na shebang-handling nize. */
+        unsigned char emag[4] = {0, 0, 0, 0};
+        int efd = raw_open(p, O_RDONLY);
+        if (efd >= 0) { raw_read(efd, emag, 4); raw_close(efd); }
+        if (emag[0] == 0x7f && emag[1] == 'E' && emag[2] == 'L' && emag[3] == 'F' &&
+            !is_glibc_elf(p)) {
+            fp_execve f = (fp_execve)g_orig_execve;
+            return f ? f(p, argv, envp) : -1;
+        }
         shim_strcpy(resolved, sizeof(resolved), p);
     } else if (shim_excluded(p) || shim_strncmp(p, "/system", 7) == 0 ||
         shim_strncmp(p, "/vendor", 7) == 0 || shim_strncmp(p, "/apex", 5) == 0 ||
