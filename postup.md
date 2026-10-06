@@ -3068,3 +3068,41 @@ PT_TLS — pokud `0x618` padá uvnitř `node`'s vlastního PT_TLS rozsahu, je
 to (a); pokud je větší než `node`'s PT_TLS `p_memsz`, jde o (b) a viníkem
 je `dlopen` dynamic-TLS rezerva v loaderu. Nedokončeno — příští krok pro
 pokračovatele.
+
+### Korekce doplnění: `pi-tui` addon NEMÁ TLS — pravým kandidátem je `dl_tls_static_surplus`
+Změřeno (`readelf -l` přes chroot): `linux-platform-x11.node` (pi-tui native
+addon) **nemá PT_TLS segment vůbec** — dlopen-addon hypotéza z minulého
+zápisu je tedy slabá/nepravděpodobná pro TENTO konkrétní addon.
+
+Součet `p_memsz` všech staticky linkovaných TLS blokŭ v `node` procesu:
+- `node` (exe) samo: `0x2a0` = 672 B
+- `libc.so.6`: `0x98` = 152 B
+- `libstdc++.so.6`: `0x20` = 32 B
+- `libgcc_s.so.1`: `0x8` = 8 B
+- `libpthread.so.0`, `libm.so.6`, `libatomic.so.1`: žádný PT_TLS (moderní
+  glibc merge)
+
+Součet = 864 B (`0x360`), ale fault byl na `TP-0x618` = 1560 B — **chybí
+696 B**, které NELZE vysvětlit žádnou známou staticky linkovanou knihovnou.
+Nejpravděpodobnější vysvětlení: glibc `dl_tls_static_surplus` — rezerva,
+kterou glibc PŘIDÁVÁ ke static TLS bloku při startu procesu (bez ohledu
+na to, zda nějaký pozdější `dlopen` TLS skutečně využije), aby pozdější
+`dlopen()` s TLS proměnnými mohl dostat statický (ne DTV-dynamický) slot
+bez nutnosti realokovat celý TP blok. **Pokud náš loaderův static-TLS
+výpočet (`elf_setup_own_tls`, `min_off`/`span`) tuto rezervu nezohledňuje
+stejně jako glibc**, pak i KDYBY žádný modul v TOMTO běhu TLS surplus
+nevyužil, offset `0x618` (ležící uvnitř glibc-očekávané surplus zóny) by
+v NAŠEM bloku mohl ukazovat na stránku, kterou loader nikdy nealokoval/
+nenaplnil → shoduje se s "čte nulu/neplatnou adresu" pozorováním z core
+dumpu.
+
+**Přesný další krok:** v `src/elf_loader.c` (`elf_setup_own_tls`,
+pokr. [postup.md#L303](postup.md#L303)) ověřit, zda se počítá i
+ekvivalent `dl_tls_static_surplus` (glibc default surplus, viz
+`elf/dl-tls.c` `_dl_tls_static_surplus` konstanta, typicky
+`PTHREAD_KEY_2NDLEVEL_SIZE * 32 + ...`, orientačně ~1700-2300 B v
+novějších glibc) PŘI alokaci `span` pro guest TLS blok. Pokud ne, to je
+pravděpodobně kořenová příčina — ne V8-specifická věc, ale obecná mezera
+v loaderově static-TLS emulaci, která se projeví jen u binárek s
+dostatečně velkým vlastním TLS (node ano, `node -e` samo o sobě možná
+míň zatěžuje offsety v této zóně).
