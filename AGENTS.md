@@ -157,6 +157,14 @@ Milníky:
   (`mrs/msr tpidr_el0` dance). A/B (DEBUG_PC, 6 běhů): starý 0/6 render +
   6× SIGSEGV, nový 6/6 render. test-all 160/0 —
   [postup.md#L2742](postup.md#L2742).
+- **pi + pi-starship pod `script` (Node 26) SIGSEGV — VYŘEŠENO** (commit
+  `80c3ffd`): async signál (SIGWINCH/SIGCHLD/libuv) dorazil v okně, kdy
+  `dl_enter_host` přepnul TP na bionic kvůli `_rtld_global_ro` shimu
+  (`ldso_lookup_symbol_x` → `elf_scope_find`); kernel spustil guest handler
+  pod bionickým TP → glibc `THREAD_SELF->cancelhandling` (TP-0x618) → pád.
+  Fix: `dl_enter_host` blokuje nesynchronní signály (raw `rt_sigprocmask`),
+  `dl_leave_host` vrátí TP a pak masku. A/B 5/5 pád → 0/5. Nalezeno přes
+  core dump (gdb/strace pád maskovaly) — [postup.md](postup.md) 2026-10-06 (2)–(6).
 
 ## 9. Ostatní binárky a poslední fixy
 
@@ -197,25 +205,9 @@ Milníky:
 - ~~Bionic dlerror/errno test (Task 4).~~ **Vyřešeno** — `ldso_dlerror()` +
   guest `dlopen/dlsym/dlerror/dlclose/dladdr` nad `_rtld_global` ověřeno
   (`src/elf_loader.c:1295`, `src/main.c:3185`).
-- Node 23+/v26.8.2 JSDispatchTable — **plain `node -e` repro už NEpadá**
-  na v26.10.0 (5/5 čistě, ověřeno 2026-10-06). `pi`+`pi-starship` v TTY
-  stále padá, ale root cause je **ZÚŽENA** (core-dump post-mortem analýza,
-  bez ptrace — GDB/strace živé tracování pád maskovaly, viz heisenbug
-  nález): **padá hlavní vlákno** (ne worker — ostatních 10 LWP jen spí
-  v libuv futex waitu), přesně v okamžiku, kdy **V8 JIT kód čte
-  `TPIDR_EL0` NAPŘÍMO** (`mrs x19, tpidr_el0; sub x19,x19,#0x618; ldr
-  w6,[x19]` — typický entry-prolog stack-limit/interrupt check) jako
-  rychlou per-thread cache. Novější V8 (Node 23+/sandbox hardening)
-  očividně předpokládá, že TP po startu NIKDY nikdo nezmění — náš loader
-  ho ale aktivně přepíná host↔guest. Pravděpodobná příčina: V8 zapíše
-  cache hodnotu relativně k TP v jednom okamžiku, přečte ji v jiném,
-  kdy byl TP dočasně jiný → adresa `TP-0x618` se posune na neplatnou
-  stránku. Detaily, registry, disassembly: [postup.md#L2907](postup.md#L2907)+
-  (heisenbug) a [postup.md#L2963](postup.md#L2963)+ (core-dump průlom).
-  Další krok: najít, KDE V8 tuto cache hodnotu píše (`Isolate::Init`
-  per-thread setup, offset `0x618` od TP), pak buď garantovat TP-swap
-  atomicitu kolem V8 JIT kódu, nebo udržovat tuto cache hodnotu
-  zrcadlenou pro oba TP stavy.
+- Node 23+/v26.8.2 JSDispatchTable — plain `node -e` na v26.10.0 už
+  nepadá (5/5, 2026-10-06). `pi`+`pi-starship` TTY pád **vyřešen** (viz
+  sekce 8, commit `80c3ffd`).
 - Síťové binárky (nmap, starship, fzf) — SIGSEGV pod bionic hostem
   [postup.md#L680](postup.md#L680).
 

@@ -3182,3 +3182,65 @@ procesu je legitimní, jen neřeší TOTO), ale **nerozhodla crash** — NEVER
 revertovat (je to korektní hardening), ale potřeba DOPLNIT skutečnou
 opravu propagace TP přes execve hranici. Nedokončeno — jasný další krok
 pro pokračovatele popsán výše.
+
+## 2026-10-06 (6): VYŘEŠENO — pi+pi-starship SIGSEGV = async signál v host-scope okně
+
+### Skutečná příčina (předchozí TP/TLS hypotézy byly vedlejší koleje)
+Znovu přečtené registry z core dumpu: `x8=0x3f` (syscall `read`), `x0=4` (fd),
+`TP-0x720` je začátek glibc `struct pthread` (`TLS_PRE_TCB_SIZE`), takže
+`ldr w6,[TP-0x618]` + `tbnz w6,#0` je čtení `THREAD_SELF->cancelhandling`
+v **guest glibc cancellable syscall wrapperu** (ne V8 JIT). A `tpidr`
+při pádu končí na `...010` jako všechny bionic host TP v diagu → guest
+glibc běžel pod **bionickým TP**.
+
+Frame-pointer walk z core (gdb lokálně, `info proc mappings` + ruční
+`x29` řetěz, symbolizace `addr2line` nad CI binárkou):
+```
+crash      guest libc read/write wrapper (cancelhandling @ TP-0x618)
+  <- 0x19bd2c4      node (libuv signal handler)
+  <- 0x77026d9668   sigreturn trampolína (signal frame)
+  <- elf_scope_find              src/elf_loader.c:2207
+  <- ldso_lookup_symbol_x_impl   :631
+  <- ldso_lookup_symbol_x        :645   (dl_enter_host -> bionic TP)
+  <- ldso_catch_error            :677
+  <- guest glibc (_dl_lookup / dlsym cesta)
+```
+Tj.: guest glibc zavolá `_rtld_global_ro` shim, `dl_enter_host` přepne
+`TPIDR_EL0` na bionic, **a právě v tom okně přijde asynchronní signál**
+(TUI: SIGWINCH/SIGCHLD/libuv). Kernel spustí guest handler přímo — pořád
+na bionickém TP — a ten v glibc wrapperu sáhne na `THREAD_SELF` → SIGSEGV.
+Vysvětluje i všechno ostatní: časová závislost (signál musí trefit okno),
+`node -e` nepadá (žádné signály), gdb/strace maskují (mění doručování
+signálů), `FAULT-ENTER` chybí (pád v guest handleru pod cizím TP).
+
+Pozn.: `tpidr ...010` NENÍ "stage 1 guest TP" (jak tvrdil předchozí zápis
+(5)) — execve nuluje TPIDR_EL0 a bionic linker si nastaví vlastní; `host_tp`
+ve vnitřní stage je skutečný bionic TP. Guard `if (!g_tls_old_tp)`
+(`df03782`) je tedy neškodný, ale irelevantní.
+
+### Oprava (commit `80c3ffd`)
+`dl_enter_host` před přepnutím TP zablokuje všechny nesynchronní signály
+(raw `rt_sigprocmask`, TP-nezávislé; SEGV/BUS/ILL/FPE/TRAP/SYS/ABRT zůstávají
+povolené), `dl_leave_host` nejdřív vrátí guest TP, pak masku → čekající
+signál se doručí až pod guest TP. `ldso_dlopen`/`ldso_dlsym` převedeny na
+stejný helper (`dl_host_t`).
+
+### A/B na zařízení (`abfix.sh`, pi pod `script`, 2× vnořený `--ownall`, 35 s timeout, bez tracera)
+| loader | render | SIGSEGV | core |
+|---|---|---|---|
+| baseline `df03782` | 5/5 | **5/5** | 5/5 |
+| fix `80c3ffd` | 5/5 | **0/5** | 0/5 |
+
+### Regrese
+`./test-all.sh all` s opravou: **PASS 159 / FAIL 1 / SKIP 35** — jediný FAIL
+`TIMEOUT: gdb --help` je flaky: samostatně 2–3 s s baseline i s opravou
+(4 běhy), `./test-all.sh extended` znovu → **PASS 22 / FAIL 0** včetně gdb.
+`[ORPHAN-INCREASE] gdb` hláška existuje už v bězích od 2026-10-02 (není nová).
+
+### Poučení k metodice
+- Živý ptrace (gdb/strace) tenhle typ bugu maskuje → **core dump +
+  post-mortem gdb** (`ulimit -c unlimited`, `core_pattern=core`) je správný
+  nástroj pro časově citlivé pády.
+- Kořen se ukázal až z **celého frame-pointer řetězce**, ne z instrukce
+  v místě pádu — samotné `mrs tpidr_el0; sub #0x618` vypadalo jako V8/TLS
+  layout problém a vedlo na dvě slepé koleje (dlopen TLS, nested execve).

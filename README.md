@@ -136,10 +136,9 @@ reports.
 
 Open / under investigation:
 
-- **Node.js ≥ 23 / v26** — a `JSDispatchTable` bootstrap nondeterminism in V8
-  caused intermittent SIGSEGV. Node 22 is rock-solid; Node 26 now starts but
-  is still being shaken out. Needs testing across Node 23/24/25/26 and V8
-  versions.
+- **Node.js ≥ 23 / v26** — Node 26.10 runs plain scripts and the `pi` TUI
+  agent cleanly (a signal-during-loader-shim race was fixed). Still needs
+  testing across Node 23/24/25 and other V8 versions.
 - **Network binaries** (`nmap`, `starship`-adjacent tools) — occasional SIGSEGV
   under the bionic host.
 - **16 KB page size** (Android 15+) — needs a real device to verify.
