@@ -2788,3 +2788,55 @@ nasazenemu loaderu (md5 `5b0ce4fde82db1969aef6910ad2be416`).
 pomocna `.so` ji nemuze zachytit (je to instrukce, ne volani). Problem
 nebyl v TP threadu za behu, ale v tom, ze se nas handler vubec
 nenainstaloval.
+
+---
+
+## 2026-10-06: produkční `init zsh|bash` — univerzální ROOTFS, žádný hardcode
+
+**Cíl:** připravit shell-integraci loaderu pro produkci (prezentace, cizí
+zařízení). Původní `elf_loader init zsh` hardcodoval cestu k Parrot locale
+(`$ROOTFS/usr/lib/locale`) a existoval jen pro zsh; `.zshrc`/`.bashrc`
+na zařízení si navíc vedly vlastní kopii `LX_PATH`, `lx`/`lxwhich`/…
+(duplikace, dva zdroje pravdy).
+
+**Změny (`src/main.c`):**
+- `elf_print_init_env()` — sdílený preamble pro oba shelly; vše se odvozuje
+  z `$HOME`/`$ROOTFS`, **žádná absolutní cesta není zadrátovaná**:
+  `D=${D:-$HOME}`, `ROOTFS=${ROOTFS:-$D/nh/distro/parrot}`, `R`, `L`,
+  `LX_LOG`; `LOCPATH` se nastaví **jen když** `$ROOTFS/usr/lib/locale`
+  existuje. `LC_ALL=C.UTF-8`. Přebítelné zvenčí (`ROOTFS=/jinam zsh`).
+- `elf_print_init_zsh()` navíc vygeneruje `typeset -ga LX_PATH=(…)`
+  (guest PATH vč. node z nvm) a vypíše `LX_HELPERS_ZSH`.
+- `elf_print_init_bash()` — nový `LX_HELPERS_BASH` (stejná jména,
+  bash syntaxe: `lxwhich`/`lx`/`lxq`/`lxlog`/`lxinfo`/`lxfault`/
+  `command_not_found_handle`), plus `LX_PATH` jako prostý string.
+- `init bash` větev v `main()` (dřív `fish` → chyba).
+- **`lx` (zsh i bash) předává guest `PATH`** s cestami uvnitř rootfs —
+  bez toho `lx gcc` selhal na `collect2: fatal error: cannot find ‘ld’`
+  (gcc hledá `ld`/`as` přes PATH, ne přes exec shim).
+
+**Host `.zshrc`** přepsán na jediný zdroj pravdy:
+`eval "$(${L:-$HOME/usr/bin/elf_loader} init zsh)"` na začátku; smazána
+ruční definice `D/R/L/LX_LOG/LX_PATH`. `TMPDIR`/`TERMINFO_DIRS`/prompt/
+pluginy/starship/zoxide zůstávají (jsou specifické pro zařízení).
+**`.bashrc`** nově `eval "$(… init bash)"`; `.bash_profile` sourcuje
+`.bashrc`.
+
+**Demo (screen recording / prezentace):** `tools/demo.zsh` — 5 kroků
+ukazujících „stejné jádro, dva userspace“: (1) host = Android (bionic),
+(2) `cat /etc/os-release` → No such file, (3) přímé spuštění glibc
+binárky selže (chybí `ld-linux-aarch64.so.1`), (4) `lx cat /etc/os-release`
+→ Parrot 7.4, `lx python3` → glibc 2.41, (5) `lx gcc` zkompiluje a spustí
+C program uvnitř guestu (`hello z glibc, 42`). Cesty bere z `init zsh`.
+
+**Ověření (device, md5 loaderu `da15a39a3ef1cde64886cfdf4821e27e`,
+run 37391466051):**
+- `elf_loader init zsh|bash` — zsh `-n` i bash `-n` syntax OK.
+- `eval "$(… init bash)"` v guest bashe: `type lx` → function,
+  `lxwhich python3` → `$R/usr/bin/python3`.
+- `tools/demo.zsh` celý proběhl: krok 5 `lx gcc … && lx $R/tmp/demo/h`
+  → `hello z glibc, 42`.
+
+**Commity:** `87a0046` (univerzální env + bash varianta), `fe41bd8`
+(guest PATH v `lx` + demo skript). Build přes GH Actions NDK (workflow
+`build-elf-loader`), deploy `tools/gh_build_deploy.sh`.

@@ -78,6 +78,12 @@ rychlejší alternativa jen s rootem.
 - **`elf_loader init zsh`** (shell-integrace vzor jako starship/zoxide,
   `eval`-able LOCPATH/LC_ALL pro host zsh) + build/deploy na zařízení —
   [postup.md#L2395](postup.md#L2395).
+- **`init zsh|bash` produkčně — univerzální ROOTFS, žádný hardcode**
+  (`elf_print_init_env` odvozuje D/ROOTFS/R/L/LX_LOG z `$HOME`; LOCPATH
+  jen když locale existuje; `LX_HELPERS_BASH`; `lx` předává guest PATH →
+  `lx gcc` najde `ld`). Host `.zshrc`/`.bashrc` = `eval "$(… init …)"`.
+  Demo pro prezentaci `tools/demo.zsh` (5 kroků, „stejné jádro, dva
+  userspace") — [postup.md#L2795](postup.md#L2795).
 - **Host `.zshrc` — `lx` toolkit (kompletní zápis)**: proměnné/cesty,
   prompt, `lx`/`lxq`/`lxdbg`/`lxhelper`/`lxlog`/`lxdiag`/`lxinfo`/`lxfault`,
   `lxtest` regresní sada, `command_not_found_handler`, `help`, starship/
