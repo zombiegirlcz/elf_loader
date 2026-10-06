@@ -17,6 +17,14 @@ rychlejší alternativa jen s rootem.
 - Baterie testů (`make test`, `--ownall`) — [postup.md#L15](postup.md#L15).
 - Ověřené runtime hodnoty (GOT/TLS/arena) — [postup.md#L76](postup.md#L76).
 - Aktuální stav (linka po opravách) — [postup.md#L92](postup.md#L92).
+- **Git / GitHub ochrana (2026-10-06):** ruleset `protect-master` (zákaz
+  update/force-push/smazání, bypass jen admin = vlastník → cizí PR do `master`
+  nejde mergnout), `protect-dev` (zákaz force-push/smazání). Workflow
+  `.github/workflows/feedback-automerge.yml`: PR do `dev`, který mění **jen**
+  běžné soubory ve `feedback/`, se sám squash-mergne (`pull_request_target`,
+  kód PR se nespouští); jinak čeká na ruční review. Důsledek: `dev` může mít
+  commity navíc → před synchronizací `git pull origin dev`, pak teprve
+  `master` ← `dev` (ff), ne naslepo `dev` ← `master`.
 
 ## 2. Klíčové opravy jádra loaderu
 
