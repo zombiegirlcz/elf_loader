@@ -2840,3 +2840,67 @@ run 37391466051):**
 **Commity:** `87a0046` (univerzální env + bash varianta), `fe41bd8`
 (guest PATH v `lx` + demo skript). Build přes GH Actions NDK (workflow
 `build-elf-loader`), deploy `tools/gh_build_deploy.sh`.
+
+## 2026-10-06 (2): Node 23+/JSDispatchTable bug — ověření na zařízení, nové zjištění
+
+**Cíl:** ověřit otevřený bod (AGENTS.md #10) — Node ≥23/v26 JSDispatchTable
+bootstrap nondeterminismus (viz pokračování 9-15 výše). Na zařízení je
+nainstalován Node v26.10.0 (nvm, `root/.nvm/versions/node/v26.10.0`),
+novější patch než dříve testované v26.8.2.
+
+### Test A: plain `node -e` (přímý repro z pokračování 15) — ČISTÝ BĚH, 5/5
+```
+ROOTFS=$R HOME=$R/root LOCPATH=$R/usr/lib/locale LC_ALL=C.UTF-8 \
+$L --ownall $R/root/.nvm/versions/node/v26.10.0/bin/node -e 'console.log(42)'
+```
+`42`, `RC=0` — 5x nezávisle, včetně zátěžové varianty (`fib(20)` rekurze
+přes interpreter dispatch, `JSON.stringify`). **Dřívější deterministický
+pád (v26.8.2, `EXIT=139`, `pc=0x199d444` v `InterpreterEntryTrampoline`)
+SE NEREPRODUKUJE** na v26.10.0 s aktuálním loaderem. Buď upstream V8 fix
+v novější Node patch verzi, nebo related side-effect fixu `ffc6dff`
+(fault handler pod bionic TP) — nerozlišeno, ale fakticky vyřešeno pro
+tento repro.
+
+### Test B: `pi` (0.87.1) + `pi-starship` v TTY (přes `script`, node v26.10.0) — STÁLE PADÁ
+```
+export PI_CODING_AGENT_DIR=$R/root/.arvhive/.pi/agent ELF_LOADER_KEEP_HANDLERS=1
+$L --ownall $R/usr/bin/script -qc "$L --ownall $NODE $PIBIN" /dev/null
+```
+TUI se plně vykreslí (kitty query `[>7u`, DA1 `[?u[c`, celý frame,
+starship-like status bar `~/elf_pro (dev)` + model info) — pak **holé
+`Segmentation fault`**, bez jakéhokoliv `[FAULT]`/`FAULT-ENTER` řádku,
+i přes `ELF_LOADER_KEEP_HANDLERS=1` (fix `ffc6dff` zapnutý).
+
+**Diagnostika (`diag.<pid>.txt` node procesu, pid 23197):** poslední
+zapsaný event je `DENIED nr=425` (3x) — syscall 425 = `io_uring_setup`
+(libuv `uv__iou_init`, graceful `-ENOSYS` fallback, JE OK, odpovídá
+staršímu fixu zmíněnému v komentáři `elf_loader.c:5130`). **Po těchto
+3 řádcích nic** — žádný `FAULT-ENTER`, žádný další `INITS-RUN`/`SETUP`
+pro worker thread. Náš fault handler se tedy při tomto konkrétním pádu
+**nespustil ani s `KEEP_HANDLERS=1`**, na rozdíl od pi+starship bugu
+opraveného 2026-10-05 (`ffc6dff`), kde handler už korektně instaluje a
+RENDERED 6/6 bez padu.
+
+**Hypotéza pro příště:** tohle je JINÝ pád, pravděpodobně ve V8
+background/worker threadu (Node 26 má víc interních vláken než dřívější
+verze — JSDispatchTable/sandbox housekeeping, io_uring poll thread
+atd.). `sigaction` handlery jsou process-wide (POSIX), ale `TPIDR_EL0`
+je PER-THREAD — pokud nový worker thread vznikne (po `clone3`→ENOSYS→
+`clone()` fallbacku) BEZ toho, aby loader nastavil jeho TP na guest
+hodnotu, SIGSEGV v tom vlákně spadne do našeho handleru, který čte
+bionickou TLS přes špatný (guest) TP, nebo naopak — `fault_handler`
+samotný je process-wide instalovaný, ale **assumption, že běžíme na
+hlavním threadu s nastaveným TP, nemusí platit pro nově vzniklá V8
+worker vlákna**. Potvrzeno strukturálně podobné k pokračování
+2026-10-05 (workery měly SPRÁVNÝ guest TP tehdy) — ale TEHDY šlo o
+JINÝ specifický pád (main thread, fault handler install pod špatným
+TP). Tady handler vůbec nezapsal `FAULT-ENTER` jako první instrukci
+(na rozdíl od staršího bugu, kde ENTER se zapsal, ale pak spadl znovu)
+— což ukazuje PŘED-handler pád, ne pád UVNITŘ handleru.
+
+**Další krok (nedokončeno):** GDB attach (chroot-jen-pro-gdb trik, viz
+pokračování 8) na čerstvý `script -qc "... pi"` běh, `catch signal
+SIGSEGV`, zjistit (a) které LWP/thread padá, (b) jeho `tpidr_el0` vs.
+hlavní thread, (c) jestli je to V8 JIT kód (jako dřív) nebo nějaký nový
+io_uring/worker-pool kód zavedený v Node 26. Core dump: zkontrolovat
+`ulimit -c unlimited` + `/proc/sys/kernel/core_pattern` před repro.

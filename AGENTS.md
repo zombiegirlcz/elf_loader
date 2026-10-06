@@ -197,8 +197,14 @@ Milníky:
 - ~~Bionic dlerror/errno test (Task 4).~~ **Vyřešeno** — `ldso_dlerror()` +
   guest `dlopen/dlsym/dlerror/dlclose/dladdr` nad `_rtld_global` ověřeno
   (`src/elf_loader.c:1295`, `src/main.c:3185`).
-- Node 23+/v26.8.2 JSDispatchTable — otevřeno; viz pokračování 12–14
-  [postup.md#L1883](postup.md#L1883)+.
+- Node 23+/v26.8.2 JSDispatchTable — **plain `node -e` repro už NEpadá**
+  na v26.10.0 (5/5 čistě, ověřeno 2026-10-06), ale **`pi`+`pi-starship`
+  v TTY stále padá** (jiný pád, pravděpodobně V8 worker thread bez
+  nastaveného guest TP — fault handler se nespustí ani s
+  `ELF_LOADER_KEEP_HANDLERS=1`). Viz pokračování 12–14
+  [postup.md#L1883](postup.md#L1883)+ a dnešní ověření
+  [postup.md#L2843](postup.md#L2843)+. Další krok: GDB attach na
+  worker thread při pádu.
 - Síťové binárky (nmap, starship, fzf) — SIGSEGV pod bionic hostem
   [postup.md#L680](postup.md#L680).
 
