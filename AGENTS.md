@@ -219,6 +219,19 @@ Milníky:
   **Regresní test** `test-all.sh nss` (`getprotobyname("icmp") == 1` přes
   Python, bez setuid/raw-socket závislosti; v `all`).
   Finálně PASS **160 / FAIL 0**, [postup.md#L2715](postup.md#L2715).
+- **`lx` nerespektoval aktivní Python venv** — po `source .venv/bin/activate`
+  `lx <konzolový_skript_z_venv>` hlásil „není v Parrot rootfs" (`lxwhich`
+  hledalo jen v pevném `$LX_PATH`, `lx()` navíc natvrdo přepisovalo PATH).
+  **Vyřešeno** (commit `c5b13e7`): `lxwhich`/`lx` zkouší nejdřív
+  `$VIRTUAL_ENV/bin` (s normalizací guest-relativní cesty na `$R`-prefixed).
+- **Bionic ELF uvnitř `$ROOTFS` se omylem own-loadoval jako glibc**
+  (`ashell` testovací nástroj v `usr/local/bin`) — `shim_execve`/
+  `shim_posix_spawnp`'s „uz pod ROOTFS" větev nekontrolovala
+  `is_glibc_elf()`. **Vyřešeno** (commity `b840530`, `1737add`): obě větve
+  teď ověří ELF magic + `is_glibc_elf()` před zabalením do `--ownall`.
+  Otevřený okrajový bod: `env`/`timeout` (own-loadovany guest) spouštějící
+  `ashell` přes DALŠÍ úroveň vnořeného own-loadingu stále padá (možná
+  stacked seccomp filtr) — [postup.md](postup.md) 2026-10-06 (8).
 
 ## 10. Zbývá / otevřené body
 
@@ -233,6 +246,9 @@ Milníky:
 - Síťové binárky — starship, fzf, curl, wget, python `getaddrinfo`+HTTPS,
   getent, ssh **ověřeny OK** (2026-10-06, nativně přes `ashell`, 3×).
   Zbývá jen `nmap` (není v rootfs nainstalovaný) — [postup.md#L680](postup.md#L680).
+- `env`/`timeout` own-loadovany guest spouštějící bionic ELF (`ashell`) přes
+  další úroveň vnořeného own-loadingu padá i po opravě sekce 9 — nedovyšetřeno
+  (podezření na stacked seccomp filtr), [postup.md](postup.md) 2026-10-06 (8).
 
 Průběžný stav otevřených bugů — viz i auto-paměť
 `[[elf-loader-open-bugs]]`.

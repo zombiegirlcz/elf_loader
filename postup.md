@@ -3280,3 +3280,75 @@ Bonus: velké segmenty se už nekopírují (méně RSS, rychlejší start).
 Nová kategorie `./test-all.sh madv` (`test/madv_dontneed.c`, v `all`): fix
 `PASS (MADV A)`, baseline `FAIL (MADV 0)`. `test-all.sh` nově bere `L=` z env
 (A/B proti jinému loaderu: `L=…/elf_loader.base ./test-all.sh madv`).
+
+## 2026-10-06 (8): uv venv + `lx` — `lx markitdown` nenajde nástroj po `source .venv/bin/activate`
+
+**Symptom:** po `cd <projekt>; source .venv/bin/activate` (uv venv) host `lx
+markitdown ...` hlásí `lx: 'markitdown' není v Parrot rootfs` (rc=127), i
+když `markitdown` (konzolový skript venv) existuje a funguje, když se
+spustí přímo (`$L --ownall bash -c 'source .venv/bin/activate; markitdown
+--help'` uspěje).
+
+**Root cause:** `lxwhich` (host shell helper, `init zsh|bash`) hledá jen v
+pevném `$LX_PATH` (systémové adresáře rootfs + nvm + `~/.local/bin`),
+nikdy ve `$VIRTUAL_ENV/bin`. `lx()` navíc PŘI KAŽDÉM běhu natvrdo nastaví
+`PATH=$GPATH` (stejné pevné adresáře), takže i přímá cesta by běžela se
+špatným pythonem na PATH.
+
+**Oprava (commit `c5b13e7`, `dev`):** `lxwhich` zkusí `$VIRTUAL_ENV/bin/<cmd>`
+jako první (normalizace stejná jako u přímé cesty — pokud `$VIRTUAL_ENV`
+není uvnitř `$R`/`$D`, prefixne se `$R`, protože `uv venv` aktivační skript
+často zapéká guest-relativní cestu `/root/<projekt>/.venv`, ne host-absolutní
+`$R/root/...`). `lx()` stejně prefixne `$VIRTUAL_ENV/bin` do `GPATH`. Obě
+varianty (zsh/bash).
+
+**Ověřeno na zařízení** (reálný `.venv` z `markitdown` repa, aktivační skript
+má zapečenou guest-relativní `VIRTUAL_ENV=/root/markitdown/.venv`):
+| | `lxwhich markitdown` | `lx markitdown --version` |
+|---|---|---|
+| nasazený loader | rc=1, nenajde | `lx: 'markitdown' není v Parrot rootfs` (rc=127) |
+| oprava | najde `$R/root/markitdown/.venv/bin/markitdown` | `markitdown 0.1.8` (rc=0) |
+
+### Vedlejší nález: bionic ELF uvnitř `$ROOTFS` se omylem own-loadoval jako glibc
+
+Při testování (spuštění `ashell` z vnořeného guest shellu, viz níže proč)
+spadl **přímo `ashell`** (testovací nástroj zařízení, bionic-staticky
+NDK binary, uložený v `$ROOTFS/usr/local/bin/ashell`) hned na vstupu:
+`FAULT-ENTER tp=0x0 tid=...` (SIGSEGV).
+
+**Root cause:** `shim_execve`'s větev „cesta uz je pod `$ROOTFS`" (a identická
+duplikovaná logika v `shim_posix_spawnp`) předpokládá, že VŠECHNO pod
+`$ROOTFS` je glibc guest binárka, a bez kontroly `is_glibc_elf()` ji
+vždy zabalí do `--ownall`. `ashell` je ale bionic ELF (bez `PT_INTERP`)
+uložený uvnitř rootfs stromu jako výjimka (testovací nástroj) — loader se
+ho pokusí own-loadovat jako glibc a spadne hned na vstupu (chybí
+PT_INTERP/TLS layout, které own-loading potřebuje).
+
+**Oprava (commity `b840530`, `dev`):** obě větve nejdřív ověří ELF magic +
+`is_glibc_elf()`; validní non-glibc ELF jde přímo na real execve/posix_spawn,
+skripty (bez ELF magic) beze změny propadnou na existující shebang-handling.
+
+**Ověřeno** (fresh `--ownall bash` nad opraveným loaderem):
+| | nasazený loader | oprava |
+|---|---|---|
+| `ashell -c '...'` přímo | SIGSEGV (`FAULT-ENTER`) | OK |
+
+**Metodická poznámka k testování:** tahle session běžela JAKO guest proces
+(Claude Code `claude` spuštěný přes `--ownall`), takže KAŽDÝ příkaz je
+minimálně jednou vnořený. Testování `test-all.sh` z TAKOVÉHO prostředí
+obalením přes `$L --ownall bash -c "... bash test-all.sh ..."` přidá
+DALŠÍ reálný execve-skok navíc → falešně vypadalo, že i po opravě vše
+padá (159/160 FAIL). Po odstranění zbytečné extra vrstvy (`$L --ownall
+bash test-all.sh all`, jeden skok) dal `test-all.sh all` **PASS 160 /
+FAIL 1 / SKIP 35** — jediný FAIL (`csplit - extra`) byl kvůli starým
+`xx00/xx01/xx02` v cwd z dřívějšího běhu (5. 10.), ne regrese.
+
+Zbyla neprobádaná hlubší hypotéza: `env`/`timeout` (own-loadovaný glibc
+guest) spouštějící `ashell` (real execve na bionic cíl) PŘES DALŠÍ úroveň
+vnořeného own-loadingu stále padá stejným způsobem i s opravou — možná
+interakce se stacked seccomp filtrem (`elf_install_compat()` se
+instaluje znovu při každé reinicializaci a filtry se nedaji odstranit,
+jen přidat). V běžném použití (test-all.sh spuštěný z opravdového
+bionického host shellu, ne zevnitř vnořeného guestu) by `timeout`/`ashell`
+byly host binárky mimo loader úplně, takže by se tahle cesta nemusela
+spustit vůbec — needokázáno, otevřený bod.
