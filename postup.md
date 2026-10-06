@@ -2904,3 +2904,59 @@ SIGSEGV`, zjistit (a) které LWP/thread padá, (b) jeho `tpidr_el0` vs.
 hlavní thread, (c) jestli je to V8 JIT kód (jako dřív) nebo nějaký nový
 io_uring/worker-pool kód zavedený v Node 26. Core dump: zkontrolovat
 `ulimit -c unlimited` + `/proc/sys/kernel/core_pattern` před repro.
+
+## 2026-10-06 (3): GDB/strace attach → crash se NEPROJEVÍ (heisenbug, timing-sensitive)
+
+### Postup
+Zopakován osvědčený "chroot-jen-pro-gdb" trik z 2026-09-22 (pokr. 7):
+spuštěn `pi` pod `script` (stejný repro vzorec jako sigprobe2.sh), po
+~6s dohledán PID inner node procesu (ownall elf_loader --ownall .../bin/pi),
+na něj v samostatném `unshare -m` + bind `/proc` do `$R/proc` + `chroot $R
+/usr/bin/gdb -batch -ex "handle SIGSEGV stop print nopass" -ex "attach $PID"
+-ex continue -ex "info registers" -ex "bt full" -ex "x/10i $pc"`.
+
+### Výsledek #1 — gdb attach: ŽÁDNÝ SIGSEGV po 10+ minutách
+Proces normálně doběhl do TUI renderu (log identický s předchozím repro),
+ale **zůstal živý a v klidu (STAT=S) přes 10 minut**, zatímco bez debuggeru
+padá spolehlivě do ~16–25s. Po ručně posém `SIGTERM` (abych ověřil, že gdb
+vůbec věc sleduje) gdb korektně zachytil a zastavil proces přesně na
+`epoll_pwait` (x8=0x16=22, syscall number na aarch64) uvnitř event-loopu —
+tedy gdb funguje, jen reálný SIGSEGV prostě nenastal.
+
+### Výsledek #2 — strace (lehčí ptrace, bez breakpointů): STEJNÝ výsledek
+Pro vyloučení, že je to specificky gdb-overhead (symboly, breakpointy),
+zopakováno s `strace -f -tt -e trace=signal -p <PID>` (přímo jako root,
+bez chrootu — `/system/bin/strace` existuje nativně na zařízení). I zde:
+**žádný SIGSEGV po 2+ minutách**, proces `STAT=S`, žádná další aktivita
+v logu. Po `kill -9` na strace (detach) proces **zůstal živý i nadále**
+(dalších 20s bez pádu) — tzn. nejde o to, že by trace jen ODDÁLIL pád dokud
+běží — jednou "bezpečně" proběhlé okno se znovu neotevře.
+
+### Interpretace
+Toto silně potvrzuje hypotézu "worker thread bez korektně nastaveného
+guest TP" jako **race condition s úzkým časovým oknem při startu**, ne
+jako deterministickou chybu v kódu:
+- Jakýkoliv ptrace-based tracer (gdb i strace) vnáší stop/continue latenci
+  při signal-delivery-stop a při syscall-entry/exit stops, která **posune
+  scheduling** nových vláken (V8/libuv worker thread spin-up) natolik, že
+  se nebezpečné okno (přístup k TLS/TP dřív, než loader stihne nastavit
+  guest TP pro nově vzniklé vlákno) bezpečně "přeskočí".
+- Jde o **one-shot okno při startu**, ne o opakující se riziko: jakmile
+  jednou proběhne bezpečně (ať vlivem tracovacího zpomalení nebo štěstí),
+  proces běží stabilně dál bez tracovacích nástrojů.
+- Proto tradiční `gdb attach` + `continue` + `catch signal` postup, který
+  perfektně fungoval na Node 18/22 bugu (2026-09-22, pokr. 7-8), je na
+  TOHLE konkrétní bug **nevhodný** — observer efekt maskuje přesně to, co
+  se snažíme pozorovat.
+
+### Další krok (nedokončeno, nová strategie)
+Nepoužívat externí ptrace tracer. Místo toho buď:
+1. **Core dump při pádu** (bez tracování) — `ulimit -c unlimited` +
+   zapisovatelný `core_pattern`, pak post-mortem `gdb <binary> <core>`
+   (žádný live ptrace, žádné narušení časování).
+2. Nebo vlastní in-process instrumentace (loader už má `ELF_LOADER_TRACE_*`
+   infrastrukturu) — zalogovat při KAŽDÉM vzniku nového threadu (clone()
+   return v child) jeho TID + aktuální `tpidr_el0` do `diag.<pid>.txt`,
+   bez jakéhokoliv ptrace — to by ukázalo, jestli nějaký worker thread
+   vznikl s TP, který loader nestihl přepsat na guest hodnotu, přesně v
+   okně mezi `clone()` a první guest TLS instrukcí.

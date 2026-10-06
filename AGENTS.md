@@ -201,10 +201,15 @@ Milníky:
   na v26.10.0 (5/5 čistě, ověřeno 2026-10-06), ale **`pi`+`pi-starship`
   v TTY stále padá** (jiný pád, pravděpodobně V8 worker thread bez
   nastaveného guest TP — fault handler se nespustí ani s
-  `ELF_LOADER_KEEP_HANDLERS=1`). Viz pokračování 12–14
-  [postup.md#L1883](postup.md#L1883)+ a dnešní ověření
-  [postup.md#L2843](postup.md#L2843)+. Další krok: GDB attach na
-  worker thread při pádu.
+  `ELF_LOADER_KEEP_HANDLERS=1`). **GDB/strace attach pád NEodhalí** —
+  pod jakýmkoliv ptrace-based tracerem proces 10+ minut neselhal (jinak
+  padá do ~16–25s), tzn. jde o **race condition s úzkým startovacím
+  oknem**, kterou observer efekt tracování spolehlivě maskuje. Viz
+  pokračování 12–14 [postup.md#L1883](postup.md#L1883)+, ověření
+  [postup.md#L2843](postup.md#L2843)+ a heisenbug nález
+  [postup.md#L2907](postup.md#L2907)+. Další krok: core dump (bez live
+  ptrace) nebo in-process logování TID+`tpidr_el0` při vzniku každého
+  threadu, žádný externí tracer.
 - Síťové binárky (nmap, starship, fzf) — SIGSEGV pod bionic hostem
   [postup.md#L680](postup.md#L680).
 
