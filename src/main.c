@@ -2269,7 +2269,19 @@ static int shim_posix_spawnp(pid_t *pid, const char *p, const void *fa,
         (p[rl] == '/' || p[rl] == 0)) {
         /* Uz pod ROOTFS (napr. uv spousti $ROOTFS/.../.venv/bin/python):
          * MUSI byt pred exclude testem - ROOTFS lezi pod /data, takze by
-         * jinak sel real posix_spawn bez loaderu -> exit 127. */
+         * jinak sel real posix_spawn bez loaderu -> exit 127. Rootfs ale
+         * muze obsahovat i bionic-staticky nastroj (napr. "ashell" v
+         * usr/local/bin) - ten se MA spustit primo, jinak ho loader zkousi
+         * own-loadovat jako glibc a spadne hned na vstupu (shodna oprava
+         * jako v shim_execve). */
+        unsigned char emag[4] = {0, 0, 0, 0};
+        int efd = raw_open(p, O_RDONLY);
+        if (efd >= 0) { raw_read(efd, emag, 4); raw_close(efd); }
+        if (emag[0] == 0x7f && emag[1] == 'E' && emag[2] == 'L' && emag[3] == 'F' &&
+            !is_glibc_elf(p)) {
+            fp_posix_spawnp f = (fp_posix_spawnp)g_orig_posix_spawnp;
+            return f ? f(pid, p, fa, at, argv, envp) : -1;
+        }
         shim_strcpy(resolved, sizeof resolved, p);
     } else if (p[0] == '/') {
         /* Excluded host cesty (/system, /vendor, /apex, /proc, ...) se
