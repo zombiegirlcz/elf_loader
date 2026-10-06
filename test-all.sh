@@ -115,13 +115,13 @@ should_skip() {
         # Destructive
         killall*|kill*|pkill*|dd|mkfs*|fdisk*|parted*|mkswap*|swapon*|swapoff*) return 0 ;;
         # Síťové démona / nástroje
-        *sftp*|*rsync*|*ftp*|*telnet*|*nc*|*netcat*) return 0 ;;
+        *sftp*|*rsync*|*ftp*|*telnet*|nc|*netcat*) return 0 ;;
         # X11
         *X11*|*xterm*|*xvfb*|*Xorg*|*xset*|*xrandr*|*xclock*) return 0 ;;
         # Crypto
         *gpg*|*gnupg*|*openssl*|*gpgsm*) return 0 ;;
         # Interactive editors
-        *vim*|*vi*|*nano*|emacs*|less*|more*|man*) return 0 ;;
+        *vim*|vi|*nano*|emacs*|less*|more*|man*) return 0 ;;
         # TUI
         top|htop|btop|btm) return 0 ;;
         # Shells
@@ -1016,7 +1016,10 @@ category_madv() {
     src="$(dirname "$0")/test/madv_dontneed.c"
     bin="$D/coredir/madv_dontneed"
     mkdir -p "$D/coredir"
-    if ! command -v gcc >/dev/null 2>&1 || ! gcc -O0 -o "$bin" "$src" 2>/dev/null; then
+    # gcc i ld jsou pod $R/usr/bin, ne na defaultnim PATH top-level bashe
+    # (stejna PATH-ordering past jako u timeout/bash - viz sekce 9 AGENTS.md).
+    local gcc_path="$R/usr/bin/gcc"
+    if [ ! -x "$gcc_path" ] || ! PATH="$R/usr/bin:$R/bin:$PATH" "$gcc_path" -O0 -o "$bin" "$src" 2>/dev/null; then
         echo "SKIP madv: gcc/compile failed"
         echo "SKIP: madv - no gcc" >> "$SKIP_LOG"
         ((SKIP_COUNT++)) || true
