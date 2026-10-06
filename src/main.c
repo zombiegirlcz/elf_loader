@@ -1737,6 +1737,21 @@ static char **shim_child_envp(char *const envp[], const char *child_file) {
 
 static int shim_execve(const char *p, char *const argv[], char *const envp[]) {
     if (!p || !p[0]) return -1;
+    {
+        char b[500]; char *i = b;
+        const char *s0 = "[rfdbg-top] p="; while (*s0) *i++ = *s0++;
+        const char *q = p; while (*q && i < b + 300) *i++ = *q++;
+        s0 = " root="; while (*s0) *i++ = *s0++;
+        q = g_shim_root ? g_shim_root : "(null)"; while (*q && i < b + 450) *i++ = *q++;
+        *i++ = '\n';
+        long fdlg = shim_raw_syscall6(56, (long)0xFFFFFFFFFFFFFF9CL,
+            (long)(unsigned long)"/data/user/0/com.linux_core/files/usr/rfdbg.txt",
+            0x441L, 0644L, 0, 0);
+        if (fdlg >= 0) {
+            shim_raw_syscall6(64, fdlg, (long)b, (long)(i - b), 0, 0, 0);
+            shim_raw_syscall6(57, fdlg, 0, 0, 0, 0, 0);
+        }
+    }
 
     char resolved[8192];
     resolved[0] = 0;
@@ -2286,6 +2301,21 @@ static int shim_posix_spawnp(pid_t *pid, const char *p, const void *fa,
                              const void *at, char *const argv[],
                              char *const envp[]) {
     if (!p || !p[0]) return -1;
+    {
+        char b[500]; char *i = b;
+        const char *s0 = "[rfdbg-spawn-top] p="; while (*s0) *i++ = *s0++;
+        const char *q = p; while (*q && i < b + 300) *i++ = *q++;
+        s0 = " root="; while (*s0) *i++ = *s0++;
+        q = g_shim_root ? g_shim_root : "(null)"; while (*q && i < b + 450) *i++ = *q++;
+        *i++ = '\n';
+        long fdlg = shim_raw_syscall6(56, (long)0xFFFFFFFFFFFFFF9CL,
+            (long)(unsigned long)"/data/user/0/com.linux_core/files/usr/rfdbg.txt",
+            0x441L, 0644L, 0, 0);
+        if (fdlg >= 0) {
+            shim_raw_syscall6(64, fdlg, (long)b, (long)(i - b), 0, 0, 0);
+            shim_raw_syscall6(57, fdlg, 0, 0, 0, 0, 0);
+        }
+    }
     char resolved[8192];
     resolved[0] = 0;
     size_t rl = g_shim_root ? shim_strlen(g_shim_root) : 0;
