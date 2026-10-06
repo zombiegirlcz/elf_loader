@@ -54,8 +54,7 @@ run "export STARSHIP_CONFIG=\$R/root/.config/starship.toml"
 run "export STARSHIP_CACHE=\$HOME/.cache/starship"
 run "lxwhich starship"
 run "lx starship --version </dev/null 2>&1"
-run "lx starship prompt </dev/null 2>&1"
-ok "starship běží jako glibc proces nad bionickým hostem"
+ok "starship běží jako glibc binárka nad bionickým hostem"
 
 # ── 5) Python z rootfs (glibc) ─────────────────────────────────────────
 title "Guest Python (glibc 2.41) pod loaderem"
@@ -75,10 +74,16 @@ run "lx node -v </dev/null"
 run "lx node -e 'console.log(\"  node spočítal 6*7 =\", 6*7)' </dev/null"
 ok "Node (glibc) i V8 JIT fungují pod loaderem"
 
-# ── 8) pi — interaktivní ───────────────────────────────────────────────
+# ── 8) pi — interaktivní (Node TUI) ────────────────────────────────────
 title "A nakonec interaktivní pi (Node TUI) — celé pod loaderem"
-print "${GY}  (spouští se `lx pi`; ukonči Ctrl+C nebo /exit)${N}"
-pause 100
+# pi potřebuje PI_CODING_AGENT_DIR (= $R/root/.pi/agent), NE install.
+# Bez něj launcher zkusí npm install, což funguje jen pod prootem.
+run "export PI_CODING_AGENT_DIR=\$R/root/.pi/agent"
+run "lx pi --version </dev/null 2>&1"
+ok "pi (Node TUI) nabíhá pod loaderem z rootfs"
+pause 60
+print "${GY}  (spouští se interaktivní `lx pi`; ukonči Ctrl+C nebo /exit)${N}"
+pause 80
 lx pi
 
 print
