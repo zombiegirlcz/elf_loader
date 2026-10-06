@@ -1737,21 +1737,6 @@ static char **shim_child_envp(char *const envp[], const char *child_file) {
 
 static int shim_execve(const char *p, char *const argv[], char *const envp[]) {
     if (!p || !p[0]) return -1;
-    {
-        char b[500]; char *i = b;
-        const char *s0 = "[rfdbg-top] p="; while (*s0) *i++ = *s0++;
-        const char *q = p; while (*q && i < b + 300) *i++ = *q++;
-        s0 = " root="; while (*s0) *i++ = *s0++;
-        q = g_shim_root ? g_shim_root : "(null)"; while (*q && i < b + 450) *i++ = *q++;
-        *i++ = '\n';
-        long fdlg = shim_raw_syscall6(56, (long)0xFFFFFFFFFFFFFF9CL,
-            (long)(unsigned long)"/data/user/0/com.linux_core/files/usr/rfdbg.txt",
-            0x441L, 0644L, 0, 0);
-        if (fdlg >= 0) {
-            shim_raw_syscall6(64, fdlg, (long)b, (long)(i - b), 0, 0, 0);
-            shim_raw_syscall6(57, fdlg, 0, 0, 0, 0, 0);
-        }
-    }
 
     char resolved[8192];
     resolved[0] = 0;
@@ -1802,33 +1787,9 @@ static int shim_execve(const char *p, char *const argv[], char *const envp[]) {
          * na shebang-handling nize. */
         unsigned char emag[4] = {0, 0, 0, 0};
         int efd = raw_open(p, O_RDONLY);
-        int eopened = (efd >= 0);
         if (efd >= 0) { raw_read(efd, emag, 4); raw_close(efd); }
-        int eglibc = is_glibc_elf(p);
-        {
-            /* TP-nezavisly raw diag (docasne, pro RCA) - stejny vzor jako
-             * trace_call_logger: fprintf/getenv v teto vetvi cestou shim_execve
-             * umi bezet pod spatnym TP a spadnout, proto jen raw syscally. */
-            char b[400]; char *i = b;
-            const char *s0 = "[rfdbg] p="; while (*s0) *i++ = *s0++;
-            const char *q = p; while (*q && i < b + 300) *i++ = *q++;
-            s0 = " opened="; while (*s0) *i++ = *s0++;
-            *i++ = (char)('0' + (eopened ? 1 : 0));
-            s0 = " magic="; while (*s0) *i++ = *s0++;
-            shim_hex(&i, (unsigned long)((emag[0]<<24)|(emag[1]<<16)|(emag[2]<<8)|emag[3]), 8);
-            s0 = " glibc="; while (*s0) *i++ = *s0++;
-            *i++ = (char)('0' + (eglibc ? 1 : 0));
-            *i++ = '\n';
-            long fd = shim_raw_syscall6(56, (long)0xFFFFFFFFFFFFFF9CL,
-                (long)(unsigned long)"/data/user/0/com.linux_core/files/usr/rfdbg.txt",
-                0x441L, 0644L, 0, 0);
-            if (fd >= 0) {
-                shim_raw_syscall6(64, fd, (long)b, (long)(i - b), 0, 0, 0);
-                shim_raw_syscall6(57, fd, 0, 0, 0, 0, 0);
-            }
-        }
         if (emag[0] == 0x7f && emag[1] == 'E' && emag[2] == 'L' && emag[3] == 'F' &&
-            !eglibc) {
+            !is_glibc_elf(p)) {
             fp_execve f = (fp_execve)g_orig_execve;
             return f ? f(p, argv, envp) : -1;
         }
@@ -2301,21 +2262,6 @@ static int shim_posix_spawnp(pid_t *pid, const char *p, const void *fa,
                              const void *at, char *const argv[],
                              char *const envp[]) {
     if (!p || !p[0]) return -1;
-    {
-        char b[500]; char *i = b;
-        const char *s0 = "[rfdbg-spawn-top] p="; while (*s0) *i++ = *s0++;
-        const char *q = p; while (*q && i < b + 300) *i++ = *q++;
-        s0 = " root="; while (*s0) *i++ = *s0++;
-        q = g_shim_root ? g_shim_root : "(null)"; while (*q && i < b + 450) *i++ = *q++;
-        *i++ = '\n';
-        long fdlg = shim_raw_syscall6(56, (long)0xFFFFFFFFFFFFFF9CL,
-            (long)(unsigned long)"/data/user/0/com.linux_core/files/usr/rfdbg.txt",
-            0x441L, 0644L, 0, 0);
-        if (fdlg >= 0) {
-            shim_raw_syscall6(64, fdlg, (long)b, (long)(i - b), 0, 0, 0);
-            shim_raw_syscall6(57, fdlg, 0, 0, 0, 0, 0);
-        }
-    }
     char resolved[8192];
     resolved[0] = 0;
     size_t rl = g_shim_root ? shim_strlen(g_shim_root) : 0;
@@ -2330,30 +2276,9 @@ static int shim_posix_spawnp(pid_t *pid, const char *p, const void *fa,
          * jako v shim_execve). */
         unsigned char emag[4] = {0, 0, 0, 0};
         int efd = raw_open(p, O_RDONLY);
-        int eopened = (efd >= 0);
         if (efd >= 0) { raw_read(efd, emag, 4); raw_close(efd); }
-        int eglibc = is_glibc_elf(p);
-        {
-            char b[400]; char *i = b;
-            const char *s0 = "[rfdbg-spawn] p="; while (*s0) *i++ = *s0++;
-            const char *q = p; while (*q && i < b + 300) *i++ = *q++;
-            s0 = " opened="; while (*s0) *i++ = *s0++;
-            *i++ = (char)('0' + (eopened ? 1 : 0));
-            s0 = " magic="; while (*s0) *i++ = *s0++;
-            shim_hex(&i, (unsigned long)((emag[0]<<24)|(emag[1]<<16)|(emag[2]<<8)|emag[3]), 8);
-            s0 = " glibc="; while (*s0) *i++ = *s0++;
-            *i++ = (char)('0' + (eglibc ? 1 : 0));
-            *i++ = '\n';
-            long fdlg = shim_raw_syscall6(56, (long)0xFFFFFFFFFFFFFF9CL,
-                (long)(unsigned long)"/data/user/0/com.linux_core/files/usr/rfdbg.txt",
-                0x441L, 0644L, 0, 0);
-            if (fdlg >= 0) {
-                shim_raw_syscall6(64, fdlg, (long)b, (long)(i - b), 0, 0, 0);
-                shim_raw_syscall6(57, fdlg, 0, 0, 0, 0, 0);
-            }
-        }
         if (emag[0] == 0x7f && emag[1] == 'E' && emag[2] == 'L' && emag[3] == 'F' &&
-            !eglibc) {
+            !is_glibc_elf(p)) {
             fp_posix_spawnp f = (fp_posix_spawnp)g_orig_posix_spawnp;
             return f ? f(pid, p, fa, at, argv, envp) : -1;
         }

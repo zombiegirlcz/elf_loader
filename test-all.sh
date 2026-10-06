@@ -845,6 +845,136 @@ category_nss() {
 # musi byt file-backed (MAP_PRIVATE), jinak se stranky vrati jako nuly - Bun
 # standalone (claude) pak hlasi "SyntaxError: Invalid character '\0'".
 # test/madv_dontneed.c se prelozi hostovym (proot) gcc do device adresare.
+# Regresni test: aktivni Python venv ($VIRTUAL_ENV) musi byt vidtelny pro
+# lx/lxwhich (uv venv konzolove skripty, napr. "markitdown"). Bez opravy
+# lxwhich hledalo jen v pevnem LX_PATH a 'lx <venv-tool>' hlasilo "neni v
+# Parrot rootfs" i kdyz tool v aktivovanem venv reálne existoval.
+category_venv() {
+    echo ""
+    echo "=== lx respektuje aktivni \$VIRTUAL_ENV (uv venv) ==="
+    local ve="$D/coredir/venvtest.$$"
+    local script
+    script="mkdir -p '$ve/bin'; printf '#!/bin/sh\necho VENVTOOL_OK\n' > '$ve/bin/venvtool'; chmod +x '$ve/bin/venvtool'; export VIRTUAL_ENV='$ve'; eval \"\$($L init bash)\"; lxwhich venvtool && lx venvtool; rm -rf '$ve'"
+    local env="ROOTFS=$R ELF_ROOTFS=$R HOME=$D D=$D L=$L"
+    local out
+    out=$(ashell_out "$env $L --ownall $R/bin/bash -c \"$script\"")
+    if printf '%s' "$out" | grep -Fq "VENVTOOL_OK"; then
+        echo "PASS venv: lx najde \$VIRTUAL_ENV/bin konzolovy skript"
+        echo "PASS: venv - VIRTUAL_ENV lx" >> "$PASS_LOG"
+        ((PASS_COUNT++)) || true
+    else
+        echo "FAIL venv: out=$out"
+        echo "FAIL: venv - VIRTUAL_ENV lx | $out" >> "$FAIL_LOG"
+        ((FAIL_COUNT++)) || true
+    fi
+}
+
+# Regresni test: sitove nastroje overene REALNYM pouzitim, ne jen "-V"/"--help"
+# (ty projdou skoro vzdy, i kdyz je DNS/TLS/skutecna funkce rozbita - run_test
+# kontroluje jen exit kod, ne obsah vystupu). Kazda kontrola overuje konkretni
+# OBSAH vystupu, ne pouhe rc=0.
+category_net_real() {
+    echo ""
+    echo "=== sitove nastroje - realne pouziti (ne jen -V) ==="
+    local env="ROOTFS=$R ELF_ROOTFS=$R HOME=$D D=$D"
+    local out rc
+
+    if [ -x "$R/usr/bin/curl" ]; then
+        out=$(ashell_out "$env $L --ownall $R/usr/bin/curl -sS -o /dev/null -w '%{http_code}' --max-time 10 https://example.com")
+        if [ "$out" = "200" ]; then
+            echo "PASS curl: HTTPS GET https://example.com -> 200"
+            echo "PASS: curl - real HTTPS GET" >> "$PASS_LOG"; ((PASS_COUNT++)) || true
+        else
+            echo "FAIL curl: HTTPS GET out=$out"
+            echo "FAIL: curl - real HTTPS GET | $out" >> "$FAIL_LOG"; ((FAIL_COUNT++)) || true
+        fi
+    else
+        echo "SKIP curl: chybi v rootfs"; echo "SKIP: curl - missing" >> "$SKIP_LOG"; ((SKIP_COUNT++)) || true
+    fi
+
+    if [ -x "$R/usr/bin/wget" ]; then
+        out=$(ashell_out "$env $L --ownall $R/usr/bin/wget -q --timeout=10 -O - https://example.com")
+        if printf '%s' "$out" | grep -qi '<html\|<!doctype'; then
+            echo "PASS wget: HTTPS GET https://example.com -> HTML obsah"
+            echo "PASS: wget - real HTTPS GET" >> "$PASS_LOG"; ((PASS_COUNT++)) || true
+        else
+            echo "FAIL wget: HTTPS GET out=$(printf '%s' "$out" | head -c 80)"
+            echo "FAIL: wget - real HTTPS GET | $(printf '%s' "$out" | head -c 80)" >> "$FAIL_LOG"; ((FAIL_COUNT++)) || true
+        fi
+    else
+        echo "SKIP wget: chybi v rootfs"; echo "SKIP: wget - missing" >> "$SKIP_LOG"; ((SKIP_COUNT++)) || true
+    fi
+
+    if [ -x "$R/usr/bin/getent" ]; then
+        out=$(ashell_out "$env $L --ownall $R/usr/bin/getent hosts localhost")
+        if printf '%s' "$out" | grep -Eq '^(127\.0\.0\.1|::1)[[:space:]]'; then
+            echo "PASS getent: hosts localhost -> $(printf '%s' "$out" | head -1)"
+            echo "PASS: getent - real NSS hosts lookup" >> "$PASS_LOG"; ((PASS_COUNT++)) || true
+        else
+            echo "FAIL getent: hosts localhost out=$out"
+            echo "FAIL: getent - real NSS hosts lookup | $out" >> "$FAIL_LOG"; ((FAIL_COUNT++)) || true
+        fi
+    else
+        echo "SKIP getent: chybi v rootfs"; echo "SKIP: getent - missing" >> "$SKIP_LOG"; ((SKIP_COUNT++)) || true
+    fi
+
+    if [ -x "$R/usr/bin/ssh" ]; then
+        # -G vypise rozresenou konfiguraci (crypto/config parsing), bez
+        # sitoveho spojeni - realna funkce ssh klienta, ne jen "-V" banner.
+        out=$(ashell_out "$env $L --ownall $R/usr/bin/ssh -G example.com")
+        if printf '%s' "$out" | grep -q '^user '; then
+            echo "PASS ssh: -G rozresilo konfiguraci (user, hostname, ...)"
+            echo "PASS: ssh - real config resolution" >> "$PASS_LOG"; ((PASS_COUNT++)) || true
+        else
+            echo "FAIL ssh: -G out=$(printf '%s' "$out" | head -c 80)"
+            echo "FAIL: ssh - real config resolution | $(printf '%s' "$out" | head -c 80)" >> "$FAIL_LOG"; ((FAIL_COUNT++)) || true
+        fi
+    else
+        echo "SKIP ssh: chybi v rootfs"; echo "SKIP: ssh - missing" >> "$SKIP_LOG"; ((SKIP_COUNT++)) || true
+    fi
+
+    if [ -x "$R/usr/bin/starship" ]; then
+        out=$(ashell_out "$env $L --ownall $R/usr/bin/starship prompt")
+        if [ -n "$out" ]; then
+            echo "PASS starship: prompt vykreslen (${#out} B)"
+            echo "PASS: starship - real prompt render" >> "$PASS_LOG"; ((PASS_COUNT++)) || true
+        else
+            echo "FAIL starship: prompt prazdny"
+            echo "FAIL: starship - real prompt render | prazdny vystup" >> "$FAIL_LOG"; ((FAIL_COUNT++)) || true
+        fi
+    else
+        echo "SKIP starship: chybi v rootfs"; echo "SKIP: starship - missing" >> "$SKIP_LOG"; ((SKIP_COUNT++)) || true
+    fi
+
+    if [ -x "$R/usr/bin/fzf" ]; then
+        out=$(ashell_out "printf 'ab\nxyz\nabc\n' | $env $L --ownall $R/usr/bin/fzf --filter=ab")
+        if [ "$out" = "$(printf 'ab\nabc')" ]; then
+            echo "PASS fzf: --filter=ab na 'ab/xyz/abc' -> 'ab,abc'"
+            echo "PASS: fzf - real filter" >> "$PASS_LOG"; ((PASS_COUNT++)) || true
+        else
+            echo "FAIL fzf: --filter out=$out"
+            echo "FAIL: fzf - real filter | $out" >> "$FAIL_LOG"; ((FAIL_COUNT++)) || true
+        fi
+    else
+        echo "SKIP fzf: chybi v rootfs"; echo "SKIP: fzf - missing" >> "$SKIP_LOG"; ((SKIP_COUNT++)) || true
+    fi
+
+    if [ -x "$R/usr/bin/nmap" ] || [ -x "$R/usr/sbin/nmap" ]; then
+        local nmapbin; nmapbin=$([ -x "$R/usr/bin/nmap" ] && echo "$R/usr/bin/nmap" || echo "$R/usr/sbin/nmap")
+        out=$(ashell_out "$env $L --ownall $nmapbin -sL -n example.com")
+        if printf '%s' "$out" | grep -q 'example.com'; then
+            echo "PASS nmap: -sL -n example.com -> rozresilo"
+            echo "PASS: nmap - real DNS list scan" >> "$PASS_LOG"; ((PASS_COUNT++)) || true
+        else
+            echo "FAIL nmap: -sL out=$(printf '%s' "$out" | head -c 120)"
+            echo "FAIL: nmap - real DNS list scan | $(printf '%s' "$out" | head -c 120)" >> "$FAIL_LOG"; ((FAIL_COUNT++)) || true
+        fi
+    else
+        echo "SKIP nmap: neni v rootfs nainstalovany"
+        echo "SKIP: nmap - not installed" >> "$SKIP_LOG"; ((SKIP_COUNT++)) || true
+    fi
+}
+
 category_madv() {
     echo ""
     echo "=== madv MADV_DONTNEED na data exe ==="
@@ -992,6 +1122,14 @@ case "${1:-all}" in
         category_madv
         print_summary
         ;;
+    venv)
+        category_venv
+        print_summary
+        ;;
+    net_real)
+        category_net_real
+        print_summary
+        ;;
         discovered)
             category_discovered
             print_summary
@@ -1017,6 +1155,8 @@ case "${1:-all}" in
         category_fstat
         category_nss
         category_madv
+        category_venv
+        category_net_real
         print_summary
         ;;
 esac
