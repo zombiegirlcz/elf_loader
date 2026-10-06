@@ -139,8 +139,9 @@ Open / under investigation:
 - **Node.js ≥ 23 / v26** — Node 26.10 runs plain scripts and the `pi` TUI
   agent cleanly (a signal-during-loader-shim race was fixed). Still needs
   testing across Node 23/24/25 and other V8 versions.
-- **Network binaries** (`nmap`, `starship`-adjacent tools) — occasional SIGSEGV
-  under the bionic host.
+- **`nmap`** — historically crashed during network init under the bionic host;
+  not re-verified yet (`starship`, `fzf`, `curl`, `wget`, Python HTTPS/DNS,
+  `ssh` all pass now).
 - **16 KB page size** (Android 15+) — needs a real device to verify.
 - Intermittent ~5 % SIGSEGV in helper libraries (heap fix in progress).
 

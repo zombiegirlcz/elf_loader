@@ -3244,3 +3244,39 @@ stejný helper (`dl_host_t`).
 - Kořen se ukázal až z **celého frame-pointer řetězce**, ne z instrukce
   v místě pádu — samotné `mrs tpidr_el0; sub #0x618` vypadalo jako V8/TLS
   layout problém a vedlo na dvě slepé koleje (dlopen TLS, nested execve).
+
+## 2026-10-06 (7): claude (Bun standalone) — `SyntaxError: Invalid character '\0'` hned po startu
+
+**Symptom:** `claude` (2.1.282–2.1.291, Bun v1.4.3) pod `--ownall`: `--version`
+projde, ale interaktivní start (pod `script`, TTY) skončí s
+`SyntaxError: Invalid character: '\0'` at `<parse> (/$bunfs/root/chunk-….js:12:1)`,
+EXIT=1. Nezávislé na `HOME`/konfiguraci a na verzi loaderu (i `old-presequencefix`
+ze 30. 9. padá stejně) → nebyla to regrese, ale chování nových Bun buildů.
+
+**Root cause:** Bun drží embedovaný JS (module graph) v ELF sekci `.bun`
+(~160 MB, uvnitř RW `PT_LOAD`) a JSC parsuje funkce líně — zdroj si při prvním
+volání funkce znovu čte z paměti. Bun na tu oblast volá
+`madvise(MADV_DONTNEED)` (u file-backed `MAP_PRIVATE` kernel stránky znovu
+načte ze souboru). `map_elf_segments` ale mapoval segmenty jako **anonymní**
+paměť + `memcpy` → po DONTNEED se stránky vrátily jako **nuly** → reparse chunku
+narazí na `\0`.
+
+Mikrotest (`madv.c`: inicializované pole, `madvise(DONTNEED)` na 64K, čti bajt):
+nativně `A`, starý loader `0`, nový `A`.
+
+**Oprava (commit `c3c2d68`):** `map_elf_segments(fd, …)` mapuje celé stránky
+uvnitř `p_filesz` ze souboru (`MAP_PRIVATE|MAP_FIXED`, jako kernel); okrajové
+stránky (sdílené se sousedním segmentem / `.bss`) zůstávají přes `memcpy`.
+Fallback na čisté `memcpy`, když offset a vaddr nejsou kongruentní modulo PAGE_SIZE.
+Bonus: velké segmenty se už nekopírují (méně RSS, rychlejší start).
+
+**A/B na zařízení** (`claude` 2.1.291 pod `script`, `HOME=$R/root`, 30 s):
+| loader | SyntaxError | SIGSEGV | UI vykresleno |
+|---|---|---|---|
+| baseline `9e2de36` | 3/3 | 0 | 0/3 |
+| fix `c3c2d68` | 0/3 | 0 | 3/3 |
+
+**Regrese:** `./test-all.sh all` s opravou → **PASS 160 / FAIL 0 / SKIP 35**.
+Nová kategorie `./test-all.sh madv` (`test/madv_dontneed.c`, v `all`): fix
+`PASS (MADV A)`, baseline `FAIL (MADV 0)`. `test-all.sh` nově bere `L=` z env
+(A/B proti jinému loaderu: `L=…/elf_loader.base ./test-all.sh madv`).

@@ -12,7 +12,7 @@ set -euo pipefail
 
 # ─── Device paths ───────────────────────────────────────────────────────────
 D=/data/user/0/com.linux_core/files
-L=$D/usr/bin/elf_loader
+L=${L:-$D/usr/bin/elf_loader}
 R=$D/nh/distro/parrot
 E=$D/usr/bin/elroot
 G=$D/usr/bin/gbsh
@@ -841,6 +841,38 @@ category_nss() {
     fi
 }
 
+# Regresni test: madvise(MADV_DONTNEED) na inicializovana data exe. Segmenty
+# musi byt file-backed (MAP_PRIVATE), jinak se stranky vrati jako nuly - Bun
+# standalone (claude) pak hlasi "SyntaxError: Invalid character '\0'".
+# test/madv_dontneed.c se prelozi hostovym (proot) gcc do device adresare.
+category_madv() {
+    echo ""
+    echo "=== madv MADV_DONTNEED na data exe ==="
+    local src bin
+    src="$(dirname "$0")/test/madv_dontneed.c"
+    bin="$D/coredir/madv_dontneed"
+    mkdir -p "$D/coredir"
+    if ! command -v gcc >/dev/null 2>&1 || ! gcc -O0 -o "$bin" "$src" 2>/dev/null; then
+        echo "SKIP madv: gcc/compile failed"
+        echo "SKIP: madv - no gcc" >> "$SKIP_LOG"
+        ((SKIP_COUNT++)) || true
+        return 0
+    fi
+    local env="ROOTFS=$R ELF_ROOTFS=$R ELF_LOADER=$L"
+    local rc out
+    rc=$(ashell_rc "$env $L --ownall $bin")
+    out=$(ashell_out "$env $L --ownall $bin")
+    if [ "$rc" = 0 ] && printf '%s' "$out" | grep -Fq "MADV A"; then
+        echo "PASS madv: DONTNEED keeps file contents ($out)"
+        echo "PASS: madv - DONTNEED file-backed" >> "$PASS_LOG"
+        ((PASS_COUNT++)) || true
+    else
+        echo "FAIL madv: RC=$rc out=$out"
+        echo "FAIL: madv - DONTNEED zeroed | RC=$rc | $out" >> "$FAIL_LOG"
+        ((FAIL_COUNT++)) || true
+    fi
+}
+
 print_summary() {
     echo ""
     echo "=== SUMMARY ==="
@@ -956,6 +988,10 @@ case "${1:-all}" in
         category_nss
         print_summary
         ;;
+    madv)
+        category_madv
+        print_summary
+        ;;
         discovered)
             category_discovered
             print_summary
@@ -980,6 +1016,7 @@ case "${1:-all}" in
         category_symlink
         category_fstat
         category_nss
+        category_madv
         print_summary
         ;;
 esac

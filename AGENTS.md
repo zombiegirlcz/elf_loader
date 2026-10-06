@@ -170,6 +170,13 @@ Milníky:
 
 - **Bun (`claude.exe`) — špatný `l_addr` v link_map** —
   [postup.md#L2273](postup.md#L2273).
+- **claude (Bun standalone) `SyntaxError: Invalid character '\0'` při
+  interaktivním startu — VYŘEŠENO** (commit `c3c2d68`): Bun drží embedovaný JS
+  v sekci `.bun` a volá na ni `madvise(MADV_DONTNEED)`; `map_elf_segments`
+  mapoval segmenty anonymně + `memcpy` → stránky se vrátily jako nuly. Fix:
+  celé stránky uvnitř `p_filesz` mapovat ze souboru (`MAP_PRIVATE|MAP_FIXED`).
+  A/B 3/3 SyntaxError → 0/3; regresní test `test-all.sh madv`; test-all
+  161/0 — [postup.md](postup.md) 2026-10-06 (7).
 - **tmux pod loaderem** — [postup.md#L2306](postup.md#L2306).
 - **Helper knihovny (`ELF_LOADER_HELPER`), náhodný SIGSEGV ~5 %
   (heap fix), Node ≤22 teardown `free(): invalid pointer` (EXIT=134)** —
@@ -208,8 +215,9 @@ Milníky:
 - Node 23+/v26.8.2 JSDispatchTable — plain `node -e` na v26.10.0 už
   nepadá (5/5, 2026-10-06). `pi`+`pi-starship` TTY pád **vyřešen** (viz
   sekce 8, commit `80c3ffd`).
-- Síťové binárky (nmap, starship, fzf) — SIGSEGV pod bionic hostem
-  [postup.md#L680](postup.md#L680).
+- Síťové binárky — starship, fzf, curl, wget, python `getaddrinfo`+HTTPS,
+  getent, ssh **ověřeny OK** (2026-10-06, nativně přes `ashell`, 3×).
+  Zbývá jen `nmap` (není v rootfs nainstalovaný) — [postup.md#L680](postup.md#L680).
 
 Průběžný stav otevřených bugů — viz i auto-paměť
 `[[elf-loader-open-bugs]]`.
