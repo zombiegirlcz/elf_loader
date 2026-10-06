@@ -3343,41 +3343,34 @@ bash test-all.sh all`, jeden skok) dal `test-all.sh all` **PASS 160 /
 FAIL 1 / SKIP 35** — jediný FAIL (`csplit - extra`) byl kvůli starým
 `xx00/xx01/xx02` v cwd z dřívějšího běhu (5. 10.), ne regrese.
 
-**Doplněno po dalším vyšetřování:** hypotéza se stacked seccomp filtrem
-byla vyvrácena (`ELF_LOADER_NO_COMPAT=1` na vnější bash crash neovlivnil).
-TP-bezpečný raw-syscall diag (přímo do souboru, bez `fprintf`/`getenv` —
-ty v tomhle bodě `shim_execve` samy o sobě spadly, i na hloubce 1, patrně
-běží pod špatným TP) ukázal přesně, kde se to láme: když `bash` (own-
-loadovaný glibc guest, hloubka 1) exec'uje `env` (glibc, správně
-rozpoznáno a wrapnuto do `--ownall`), a `env` pak INTERNĚ spustí svůj
-cíl `ashell` (bionic ELF pod `$ROOTFS`), **shim_execve ani
-shim_posix_spawnp se pro tenhle druhý exec nezavolají ani jednou** — v
-logu je jen jeden řádek (pro `env` samotný), žádný pro `ashell`. Hook
-instalace (`shim_install_hooks()`) tedy pro `env`'s vlastní re-exec
-svého argumentu buď neběží, nebo `env`/`timeout` volá svůj cíl cestou,
-která PLT/GOT override úplně obchází (typicky interní glibc symbol bez
-veřejné viditelnosti, mimo náš override mechanismus). Netýká se to
-`execl`/`execlp`/`execvp`/`execvpe` wrapperů v `main.c` — ty všechny
-delegují na (opravený) `shim_execve`, ověřeno čtením zdroje.
+**Doplněno po dalším vyšetřování — SKUTEČNÁ příčina nalezena, teorie o
+PLT bypassu byla MYLNÁ:** TP-bezpečný raw-syscall diag (přímo do
+souboru, bez `fprintf`/`getenv` — ty v tomhle bodě `shim_execve` sami
+o sobě spadly, patrně běží pod špatným TP) s PID tagem ukázal přesně, co
+se děje: `timeout` v `timeout 5 bash -c "$cmd"` se resolvoval na
+**`/system/bin/timeout`** (host bionic toybox!), ne na
+`$ROOTFS/usr/bin/timeout` (glibc). PATH v own-loadovaném `--ownall`
+guestu dává `/system/bin` PŘED rootfs cestami, takže bare jméno
+`timeout` (bez `/`) najde HOST binárku první. Ta samozřejmě žádné naše
+hooky nemá (není own-loadovaná vůbec), a když se pak pokusí RAW
+execve svůj cíl `bash` (glibc pod ROOTFS), dostane `EACCES` → "timeout:
+exec bash: Permission denied". **Žádný PLT/hook bypass, žádný stacked
+seccomp filtr — čistě PATH ordering.** Ověřeno: s explicitní plnou
+cestou (`$R/usr/bin/timeout $R/bin/bash -c true`) běží cely chain
+správně, oba procesy (timeout i bash) se korektně zachytí v
+`shim_execve` (PID-tagovaný log to potvrzuje pro oba).
 
 **Dopad na testování:** `ashell_rc`/`ashell_out` (pomocné funkce
-`test-all.sh`) obalují KAŽDÉ volání do `timeout N ashell -c "$cmd"` —
-`timeout` je přesně ten own-loadovaný glibc guest, co interně spustí
-`ashell` (bionic), takže **test-all.sh nelze z vnořené guest session
-(jako je tahle) spustit beze zbytku** — úplně VŠECHNY testy spadnou na
-tenhle samý bug, bez ohledu na to, co skutečně testují. V reálném
-použití (test-all.sh spuštěný z opravdového bionického host shellu) by
-`timeout`/`ashell` byly host binárky mimo loader úplně, takže by se
-tahle cesta nemusela spustit vůbec — v tomhle prostředí se to neověřilo,
-protože tahle Claude Code session SAMA běží jako guest proces loaderu
-(`ps` ukazuje `elf_loader` jako parenta), takže genuinní hloubka 0 tu
-není dostupná.
+`test-all.sh`) používaly bare `timeout`/`bash` — opraveno na plné cesty
+`$R/usr/bin/timeout`/`$R/bin/bash` (commit `a2e9...`). Zároveň (podnět
+uživatele) byl odstraněn `ashell -c` z KAŽDÉHO jednotlivého testu —
+celý skript se teď spouští JEDNOU přes `ashell -c "... $L --ownall
+$R/bin/bash test-all.sh all"`, takže běží nativně od prvního řádku, bez
+jakéhokoli vnoření. `RESULTS_DIR` byl přepsán z hardcoded `/root/...`
+na `$R/root/...` (funkční i mimo tuto dev session, kde `/root` je bind
+mount).
 
-Pro regresní ověření po této opravě byla proto použita dočasná kopie
-`test-all.sh` bez `timeout` prefixu (jen pro ověření na místě,
-nekomitnuto) — `all`: **PASS 167 / FAIL 1 / SKIP 36**, jediný FAIL
-(`csplit - extra`) nesouvisí s opravou (předchozí běh, stejná chyba).
-Zbývá otevřený bod: proč `env`/`timeout` svůj cíl spouští mimo
-hookovanou cestu — vyžaduje další vyšetřování (např. čtení coreutils
-`env`/`timeout` zdroje, kontrola jestli jde o `vfork`+přímý syscall,
-nebo o interní glibc alias).
+**Regrese po opravě** (skutečný `test-all.sh`, jediné `ashell -c`,
+žádný hack): `all` → **PASS 165 / FAIL 1 / SKIP 38**, jediný FAIL
+(`csplit - extra`) je pre-existující flaky test nesouvisející s touto
+opravou (stará, zbytkové `xx*` soubory z předchozích běhů).

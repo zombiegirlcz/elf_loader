@@ -1,10 +1,25 @@
 #!/bin/bash
-# Sjednocený testovací rámec pro elf_loader — VÝHRADNĚ přes ashell -c
+# Sjednocený testovací rámec pro elf_loader.
 # Podle skills.md: bionic interpreter check → deploy do files/ → test přes ashell -c
 #
-# Usage:
-#   ./test-all.sh all            # všechny kategorie
-#   ./test-all.sh reexec         # pouze re-exec binárky
+# DULEZITE: cely skript se spousti JEDNOU pres `ashell -c` (ne kazdy
+# jednotlivy test zvlast - drivejsi navrh). `ashell`'s vlastni shell ma
+# jen /system/bin/sh, zadny bash, takze jako jediny prikaz musi spustit
+# primo own-loadovany guest bash (plnou cestou pod $R):
+#
+#   ashell -c "ROOTFS=$R ELF_ROOTFS=$R HOME=$D L=$L $L --ownall $R/bin/bash /root/elf_loader/test-all.sh all"
+#
+# Uvnitr uz bezi vse primo (`ashell_rc`/`ashell_out` nevolaji dalsi ashell).
+# POZOR na `timeout`/`bash` v pomocnych funkcich - MUSI byt plnou cestou pod
+# $R, ne bare jmenem: PATH v own-loadovanem guestu dava /system/bin PRED
+# rootfs, takze bare "timeout" by se resolvoval na host bionic toybox (bez
+# nasich hooku), ktery by sveho cile (glibc pod ROOTFS) zkusil spustit RAW
+# -> "Permission denied". S plnou cestou se spravne own-loaduje guest
+# timeout, ktery uz hooky ma - viz postup.md 2026-10-06 (8)/(9).
+#
+# Usage (po spusteni pres ashell viz vyse):
+#   ./test-all.sh all            # vsechny kategorie
+#   ./test-all.sh reexec         # pouze re-exec binarky
 #   ./test-all.sh python         # pouze python smoke testy
 #   ./test-all.sh basic text files system datetime compression networking math diff archive extended shell python
 
@@ -18,7 +33,7 @@ E=$D/usr/bin/elroot
 G=$D/usr/bin/gbsh
 
 # ─── Results ────────────────────────────────────────────────────────────────
-RESULTS_DIR=/root/elf_loader/results
+RESULTS_DIR=$R/root/elf_loader/results
 mkdir -p "$RESULTS_DIR"
 STAMP=$(date +%Y%m%d_%H%M%S)
 PASS_LOG=$RESULTS_DIR/pass_${STAMP}.txt
@@ -47,16 +62,25 @@ check_interpreter() {
 }
 check_interpreter "$L"
 
+# Spusti prikaz PRIMO (bez dalsiho ashell -c) - cely test-all.sh uz bezi
+# uvnitr jednoho ashell -c (viz hlavicka). DULEZITE: `timeout`/`bash` tady
+# MUSI byt plnou cestou pod $R, ne bare jmenem - PATH v own-loadovanem
+# guestu dava /system/bin PRED rootfs, takze bare "timeout"/"bash" by se
+# resolvovaly na HOST bionic toybox/nic, ktery nasledny exec sveho cile
+# (glibc pod ROOTFS) spusti RAW bez loaderu -> "Permission denied".
+# S plnou cestou se spravne own-loaduje guest timeout/bash, ktery uz ma
+# nase hooky aktivni (viz postup.md 2026-10-06 (8) - zjistena skutecna
+# pricina, puvodni teorie o obchazeni PLT hooku byla chybna).
 ashell_rc() {
     local cmd="$1"
     local rc=0
-    timeout 5 ashell -c "$cmd" >/dev/null 2>&1 || rc=$?
+    "$R/usr/bin/timeout" 5 "$R/bin/bash" -c "$cmd" >/dev/null 2>&1 || rc=$?
     echo "$rc"
 }
 
 ashell_out() {
     local cmd="$1"
-    timeout 2 ashell -c "$cmd" 2>&1 | head -c 100k || true
+    "$R/usr/bin/timeout" 2 "$R/bin/bash" -c "$cmd" 2>&1 | head -c 100k || true
 }
 
 should_skip() {
@@ -654,7 +678,7 @@ category_uv() {
     local rc out
 
     # 1) vytvor venv (uv) a spust venv python pres absolutni symlink mimo ROOTFS
-    ashell -c "$env $L --ownall $uv_bin venv $vdir" >/dev/null 2>&1 || true
+    "$R/bin/bash" -c "$env $L --ownall $uv_bin venv $vdir" >/dev/null 2>&1 || true
     out=$(ashell_out "$env $L --ownall $vdir/bin/python -V")
     if printf '%s' "$out" | grep -Fq "Python 3"; then
         echo "PASS uv: venv python symlink mimo ROOTFS ($out)"
@@ -904,7 +928,7 @@ category_net_real() {
 
     if [ -x "$R/usr/bin/wget" ]; then
         out=$(ashell_out "$env $L --ownall $R/usr/bin/wget -q --timeout=10 -O - https://example.com")
-        if printf '%s' "$out" | grep -qi '<html\|<!doctype'; then
+        if printf '%s' "$out" | grep -qiE '<html|<!doctype'; then
             echo "PASS wget: HTTPS GET https://example.com -> HTML obsah"
             echo "PASS: wget - real HTTPS GET" >> "$PASS_LOG"; ((PASS_COUNT++)) || true
         else

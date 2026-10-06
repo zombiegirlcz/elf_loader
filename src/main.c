@@ -1737,21 +1737,6 @@ static char **shim_child_envp(char *const envp[], const char *child_file) {
 
 static int shim_execve(const char *p, char *const argv[], char *const envp[]) {
     if (!p || !p[0]) return -1;
-    {
-        char b[500]; char *i = b;
-        const char *s0 = "[rfdbg-top] pid="; while (*s0) *i++ = *s0++;
-        shim_hex(&i, (unsigned long)shim_raw_syscall6(172,0,0,0,0,0,0), 8);
-        s0 = " p="; while (*s0) *i++ = *s0++;
-        const char *q = p; while (*q && i < b + 380) *i++ = *q++;
-        *i++ = '\n';
-        long fdlg = shim_raw_syscall6(56, (long)0xFFFFFFFFFFFFFF9CL,
-            (long)(unsigned long)"/data/user/0/com.linux_core/files/usr/rfdbg.txt",
-            0x441L, 0644L, 0, 0);
-        if (fdlg >= 0) {
-            shim_raw_syscall6(64, fdlg, (long)b, (long)(i - b), 0, 0, 0);
-            shim_raw_syscall6(57, fdlg, 0, 0, 0, 0, 0);
-        }
-    }
 
     char resolved[8192];
     resolved[0] = 0;

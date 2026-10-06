@@ -229,12 +229,13 @@ Milníky:
   `shim_posix_spawnp`'s „uz pod ROOTFS" větev nekontrolovala
   `is_glibc_elf()`. **Vyřešeno** (commity `b840530`, `1737add`): obě větve
   teď ověří ELF magic + `is_glibc_elf()` před zabalením do `--ownall`.
-  Otevřený okrajový bod: `env`/`timeout` (own-loadovany guest) interně
-  spouštějící `ashell` (bionic) obchází `shim_execve`/`shim_posix_spawnp`
-  úplně (žádný hook se nezavolá, potvrzeno TP-safe diag logem) —
-  stacked seccomp filtr vyvrácen. Dopad: `test-all.sh`'s `ashell_rc`/
-  `ashell_out` (`timeout N ashell -c ...`) proto nelze spustit z vnořené
-  guest session — [postup.md](postup.md) 2026-10-06 (8).
+  **Vyřešeno i navazující testovací bug:** `test-all.sh`'s `ashell_rc`/
+  `ashell_out` používaly bare `timeout`/`bash`, které se v own-loadovaném
+  guestu resolvovaly na HOST `/system/bin/timeout` (PATH dává `/system/bin`
+  před rootfs) → RAW exec cíle bez hooků → "Permission denied". Oprava:
+  plné cesty `$R/usr/bin/timeout`/`$R/bin/bash`. Zároveň `test-all.sh` teď
+  běží přes jediné `ashell -c` (ne jeden na každý test) —
+  [postup.md](postup.md) 2026-10-06 (8)/(9).
 
 ## 10. Zbývá / otevřené body
 
@@ -249,9 +250,8 @@ Milníky:
 - Síťové binárky — starship, fzf, curl, wget, python `getaddrinfo`+HTTPS,
   getent, ssh **ověřeny OK** (2026-10-06, nativně přes `ashell`, 3×).
   Zbývá jen `nmap` (není v rootfs nainstalovaný) — [postup.md#L680](postup.md#L680).
-- `env`/`timeout` spouštějící `ashell` interně obchází exec-hooky úplně
-  (ne stacked seccomp, vyvráceno) — nedovyšetřeno, blokuje spuštění
-  `test-all.sh` z vnořené guest session, [postup.md](postup.md) 2026-10-06 (8).
+- ~~`env`/`timeout` spouštějící `ashell`~~ — **vyřešeno**, byl to PATH
+  ordering (bare jméno → host binárka), ne hook bypass; viz sekce 9.
 
 Průběžný stav otevřených bugů — viz i auto-paměť
 `[[elf-loader-open-bugs]]`.
