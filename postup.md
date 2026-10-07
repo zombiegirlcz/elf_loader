@@ -3502,7 +3502,59 @@ a `-DCMAKE_C_COMPILER` nastavenými) selže v `try_compile` kroku na
 `make[1]: /usr/bin/cmake: No such file or directory` — vnořený `make`
 proces se pokouší exec'nout `/usr/bin/cmake` a dostane ENOENT, což
 vypadá jako že exec translation (shim_execve → `$ROOTFS` prefix) se
-v tomhle vnořeném kontextu neuplatní. Nevyšetřeno (mimo rozsah tohoto
-fixu — původní bug byl specificky o `/proc/self/exe`, ten je potvrzeně
-opraven). Pokud bude `ctest`/`cpack` nebo plný cmake build potřeba,
-chce to samostatné debug kolo.
+v tomhle vnořeném kontextu neuplatní. Pokud bude `ctest`/`cpack` nebo plný
+cmake build potřeba, chce to samostatné debug kolo.
+
+---
+
+### 2026-10-07 (2) — vyšetřeno GNU Make `/usr/bin/cmake: No such file or
+directory` (root cause nalezen, NEOPRAVENO — vyžaduje syscall-level fix)
+
+Izolovaný repro bez cmake: `Makefile` s `all:\n\t/usr/bin/true` pod own-
+loadovaným `make` → `make: /usr/bin/true: No such file or directory`,
+Error 127, i když `/usr/bin/true` existuje pod `$ROOTFS`.
+
+**Vyšetřovací postup** (temp instrumentace, `ELF_LOADER_EXEC_TRACE=1`,
+raw-syscall `write()` — žádný `fprintf`/`getenv` v hot-path shimech,
+viz lekce z /proc/self/exe fixu výš):
+1. `objdump -T $R/usr/bin/make` → make importuje jen `posix_spawn` +
+   `execvp` (fallback) pro spouštění dětí, žádný `execve`, `vfork`, `fork`,
+   `clone` jako dynamický symbol.
+2. Relocation-time trace (`resolve_jmp_symbol`/`elf_resolve_import`,
+   dočasně) potvrdil: `execvp` i `posix_spawn` se v `make`'s GOT **správně**
+   resolvují na `via=override` (naše shimy) — patch proběhl OK.
+3. Runtime trace (raw write na vstupu `shim_posix_spawnp`/`shim_execve`):
+   - Recept **s** shell-metaznakem (`/usr/bin/true ; true`): `make` volá
+     `posix_spawn("/bin/sh", ...)` → **náš shim se spustí** (přeloží na
+     `$ROOTFS/bin/sh`), `sh` pak uvnitř volá `execve("/usr/bin/true", ...)`
+     → **i tenhle shim se spustí** → **funguje** (`make: Leaving directory`
+     bez erroru).
+   - Recept **bez** shell-metaznaku (`/usr/bin/true` samotné, GNU Make
+     "fast path" optimalizace přeskakující `/bin/sh`): **ani
+     `shim_posix_spawnp` ani `shim_execve` ani `shim_access`/
+     `shim_faccessat` se vůbec nezavolaly** (nula trace řádků) — přesto
+     `make` nahlásí ENOENT. `make` tedy v tomhle fast-path NEPOUŽÍVÁ
+     `posix_spawn`/`execvp`/`execve`/`access` z `libc.so.6` (přes GOT), ale
+     nějaký jiný mechanismus mimo dosah GOT-override (podezření: raw
+     `clone()`+inline `execve` syscall, gnulib fallback kompilovaný přímo
+     do `make`, nebo verzovaný/jinak layoutovaný `posix_spawn` interní
+     cesta v glibc, kterou `make`'s binary vůbec nevolá jako named symbol).
+4. Kontrolní test: izolovaný `vfork()+execvp()` test program (mimo make)
+   **funguje správně** pod `--ownall` (shim se spustí, `execvetrace`
+   zaloguje, status=0) — mechanismus GOT-override obecně je OK, problém
+   je specifický pro to, jak **GNU Make konkrétně** spouští děti ve "fast
+   path" (bez shellu) režimu.
+
+**Závěr:** root cause lokalizován (make's fast-path child-spawn bypassuje
+veškeré naše GOT/PLT i F2 inline hooky), ale přesný mechanismus (jaký
+syscall/jaká cesta přesně) by chtělo `strace`/`ptrace` na skutečném
+`make` procesu (na zařízení bez rootu `strace` nejde přímo spustit —
+potřeba "chroot-jen-pro-gdb" trik jako u node sagy, sekce 8 AGENTS.md,
+nebo seccomp-level `SIGSYS` trap na `execve`/`clone` syscall numbers).
+Workaround: recepty s explicitním shellem (`sh -c '...'`, nebo cokoliv
+s `;`/`&&`/jiným shell-metaznakem) FUNGUJÍ korektně. Trvalá diagnostika
+zůstala v kódu za `ELF_LOADER_EXEC_TRACE=1` (raw-syscall write, bezpečné
+pod guest TP) — `shim_execve`/`shim_posix_spawnp` (main.c) tisknou
+`[execvetrace]`/`[spawntrace]` při vstupu; `shim_access`/`shim_faccessat`
+tisknou `[accesstrace]`/`[faccessattrace]`. `test-all.sh all` s touto
+instrumentací: PASS 171/FAIL 0 (no-op když env proměnná není nastavena).
