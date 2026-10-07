@@ -910,6 +910,20 @@ PYEOF
     local hmode hsize
     hmode=$(stat -c %a "$h/f" 2>/dev/null || echo none)
     hsize=$(stat -c %s "$h/f" 2>/dev/null || echo none)
+    # libc mkdtemp (glibc interni __mkdir mimo GOT): busybox mktemp -d ji vola primo
+    if [ -x "$R/usr/bin/busybox" ]; then
+        local dt
+        dt=$(ashell_out "$env $L --ownall $R/usr/bin/busybox mktemp -d $g/dXXXXXX")
+        if [ -n "$dt" ] && [ -d "$R$dt" ]; then
+            echo "PASS pathops: mkdtemp na guest ceste ($dt)"
+            echo "PASS: pathops - mkdtemp" >> "$PASS_LOG"
+            ((PASS_COUNT++)) || true
+        else
+            echo "FAIL pathops: mkdtemp out='$dt'"
+            echo "FAIL: pathops - mkdtemp | $dt" >> "$FAIL_LOG"
+            ((FAIL_COUNT++)) || true
+        fi
+    fi
     rm -rf "$h"
     if printf '%s' "$out" | grep -Fq "PATHOPS 7" && [ "$hmode" = 640 ] && [ "$hsize" = 2 ]; then
         echo "PASS pathops: 7/7 operaci na guest ceste (host vidi mode=$hmode size=$hsize)"

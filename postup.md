@@ -3655,3 +3655,32 @@ hostový `toybox ln`) — platformní limit, ne bug překladu (z AVC je vidět,
 nástroje přes guest bash: `chmod`, `touch -d @1000000000` (host `stat`
 mtime=1000000000), `truncate -s`, `mkfifo`, `cp -p`, `install -m`,
 `tar -xp` — vše OK.
+
+### 2026-10-07 (5) — `mkdtemp` + ověření reálným projektem (cJSON)
+
+`ctest`/`cpack` (dřív „potenciálně rozbité" kvůli `/proc/self/exe`) na
+triviálním projektu: `cmake` → build → `ctest` 1/1 → `cpack` TGZ, vše OK.
+
+Reálný projekt s **guest cestami** (`git clone` cJSON do `/tmp/cjson`,
+`-B /tmp/cjson/build`) ale selhal v `try_compile`:
+`Failed to open /tmp/cjson/build/CMakeFiles/CMakeScratch/TryCompile-XXXXXX/
+CMakeLists.txt`. Dřívější cmake testy používaly hostové cesty pod `$D`
+(nepřekládají se), proto to neodhalily.
+
+Příčina: **`mkdtemp()`** — glibc ji implementuje přes interní `__mkdir`
+(mimo GOT; BTI prolog → bez inline hooku), takže guest šablona šla na host
+→ NULL/ENOENT. `mkstemp`/`mkostemp`/`mkstemps` jsou OK (interní `__open` =
+inline PAC hook `open64`). C test: `mkdtemp("/tmp/tmpt/dXXXXXX")` → `(null)`,
+ostatní OK. `mkdtemp` importují i `dpkg`, `libapt-pkg`, `tar`, `strip`/
+`objcopy`, `git`, `m4`, `gdb`, `busybox`, `libuv` — tedy i apt/dpkg a
+`strip` na guest cestách.
+
+**Fix:** `shim_mkdtemp` — original nad přeloženou šablonou, vygenerovaný
+6znakový suffix se zkopíruje zpět do guest šablony (in-place sémantika,
+vrací se původní ukazatel).
+
+**Ověření (`ashell -c`):** C test 4/4 OK; cJSON s guest cestami: configure
+OK, build `-j4` OK, **ctest 19/19 PASS**. Regresní kontrola v `test-all.sh
+pathops` (`busybox mktemp -d /tmp/.../dXXXXXX` → adresář existuje pod
+`$R`). **A/B:** release binárka v0.3 → `FAIL pathops: mkdtemp out='mktemp:
+: No such file or directory'`, nová → PASS.

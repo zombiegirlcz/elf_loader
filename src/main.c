@@ -1409,6 +1409,23 @@ static int shim_inotify_add_watch(int fd, const char *p, unsigned int mask) { SH
 #undef TP
 #undef SHIM_PATH_BUF
 
+/* mkdtemp: glibc ji implementuje pres interni __mkdir (mimo GOT, BTI prolog
+ * -> bez inline hooku), takze guest sablona /tmp/x/dXXXXXX koncila ENOENT na
+ * hostu (cmake try_compile -> "Failed to open .../TryCompile-XXXXXX/..."). mkstemp*
+ * jsou OK (interni __open = inline hook open64). Volame original nad prelozenou
+ * sablonou a vygenerovany suffix vratime do guest sablony (in-place semantika). */
+static void *g_orig_mkdtemp;
+static char *shim_mkdtemp(char *tmpl) {
+    char *(*f)(char *) = g_orig_mkdtemp;
+    char b[8192];
+    if (!f) return NULL;
+    if (!tmpl || !shim_translate(tmpl, b, sizeof b)) return f(tmpl);
+    if (!f(b)) return NULL;
+    size_t tl = shim_strlen(tmpl), bl = shim_strlen(b);
+    if (tl >= 6 && bl >= 6) shim_memcpy(tmpl + tl - 6, b + bl - 6, 6);
+    return tmpl;
+}
+
 /* AF_UNIX socket s absolutni cestou (dbus, X11, ssh-agent, Python
  * multiprocessing...): sun_path prelozit pod ROOTFS. Abstraktni sockety
  * (sun_path[0]==0) a ostatni rodiny beze zmeny. Kdyz se prelozena cesta
@@ -3127,6 +3144,7 @@ static f2_hook_t g_f2_hooks[] = {
     {"pathconf",(void*)shim_pathconf,&g_orig_pathconf},
     {"inotify_add_watch",(void*)shim_inotify_add_watch,&g_orig_inotify_add_watch},
     {"bind",(void*)shim_bind,&g_orig_bind},{"connect",(void*)shim_connect,&g_orig_connect},
+    {"mkdtemp",(void*)shim_mkdtemp,&g_orig_mkdtemp},
     /* close/flockfile/mprotect jsou diagnosticke shimy (Node ladeni) a
      * prlimit64 mel spatnou signaturu - dokud MAX_OVERRIDES=64 zahazoval vse
      * od 65. polozky, nikdy nebezely. Registrovat jen explicitne. */

@@ -285,7 +285,11 @@ Milníky:
   audit importů 1927 ELF v rootfs; doplněny shimy `chmod/chown/utime*/
   truncate/mknod/mkfifo/linkat/statfs/xattr/creat/pathconf/
   inotify_add_watch` + AF_UNIX `bind`/`connect` (překlad `sun_path`).
-  Regresní test `test-all.sh pathops` (A/B). Hardlinky (`link`) zakazuje
+  Regresní test `test-all.sh pathops` (A/B). Navíc `mkdtemp` (glibc interní
+  `__mkdir` mimo GOT; rozbíjela cmake `try_compile` na guest cestách, apt/
+  dpkg, `strip`) — ověřeno reálným projektem cJSON (clone → cmake → build →
+  ctest 19/19 s guest cestami) — [postup.md](postup.md) 2026-10-07 (5).
+  Hardlinky (`link`) zakazuje
   SELinux app domény i nativně — platformní limit. **Pravidlo:** GOT override
   je per-jméno; při přidání shimu zkontrolovat aliasy v `libc.so.6`
   (`nm -D`, stejná adresa) a importy binárek (`nm -D --undefined-only`;
