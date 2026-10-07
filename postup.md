@@ -3721,3 +3721,58 @@ kontrola v `test-all.sh pathops` (Python `ctypes` → libc `remove`/`glob`/
 
 Kosmetika: dítě z `popen`/`system` má `$0` = plná host cesta
 `$R/bin/sh` (argv[0] = přeložená cesta), ne `sh`.
+
+### 2026-10-07 (7) — scandir, tempnam, ftok, getcwd, tzset, setmntent, shm/sem
+
+C test `/tmp/tmpt/t3.c` (guest cesty pod `/tmp/tmpt/w3`) se starým loaderem
+(`ca50ae5`): 8× FAIL — `scandir` ENOENT, `tempnam` → host dir, `ftok` ENOENT,
+`getcwd`/`get_current_dir_name` vrací `$R/tmp/tmpt/w3`, `shm_open` ENOENT,
+`tzset` → `tzname "Europe"`, `setmntent("/etc/fstab")` ENOENT.
+
+Příčiny (objdump `libc.so.6` 2.41):
+- `opendir` (i interní z `scandir`) volá `bl __open64_nocancel` s
+  `O_DIRECTORY` → nocancel shim překládal jen whitelist `/etc/...`.
+- `stat`/`lstat` jsou jen `bti c; ...; b fstatat` → `ftok` (`bl stat`) a
+  `__path_search` (`bl lstat`) končí v `fstatat`, který má BTI prolog
+  (hook_install ho přeskočí).
+- `shm_open` → `__open64_nocancel("/dev/shm/...")`, `shm_unlink` → `bl
+  unlink`; `/dev` je v `shim_excluded`, `/dev/shm` na Androidu neexistuje.
+- `sem_open` → `__mktemp` + `__open` + `bl link` + `bl unlink`; hardlinky
+  SELinux app domény zakazuje (EACCES).
+- `__tzfile_read` (`fopen "rce"`) a `setmntent` → `__open_nocancel`.
+- `getcwd` vrací to, co ví kernel (`chdir` šel na `$R/...`).
+
+**Fix (`src/main.c`, `src/elf_loader.c`):**
+- `shim_open64_nocancel`: s `O_DIRECTORY` (0x4000) překládat vždy (knihovny se
+  tak neotvírají → dlopen/dl_iterate_phdr nedotčen); whitelist rozšířen o
+  `/etc/localtime`, `/usr/share/zoneinfo`, `/etc/fstab`, `/etc/mtab`,
+  `/etc/shells`, `/etc/gai.conf`, `/etc/host.conf`, `/etc/networks`, `/etc/rpc`,
+  `/etc/ethers`, `/etc/shadow`, `/etc/gshadow`, `/etc/netgroup`, `/etc/aliases`,
+  `/dev/shm`; přeložená cesta prochází `shim_resolve_symlinks`
+  (`/etc/localtime` je absolutní symlink).
+- **BTI inline hooky** (`hook_inline_prologue`) na leaf funkce `fstatat`
+  (pokrývá stat/lstat/stat64/lstat64), `unlink`, `mkdir`, `rmdir`, `link`.
+  Všechny `g_orig_*` se stejnou adresou (fstatat64 = fstatat) dostanou
+  trampolínu, jinak by fallback skočil do patchnutého kódu → rekurze.
+  Vypínač `F2_NO_BTI_HOOK=1`. (Záměrně ne plošně — jen kde je doložený
+  interní volající.)
+- `shim_translate`: `/dev/shm[/...]` → `$R/dev/shm` (výjimka z `shim_excluded`),
+  adresář 01777 vytváří `shim_register_overrides` (bionic kontext).
+- `shim_link`: obě cesty v `$R/dev/shm/` → raw `renameat2(RENAME_NOREPLACE)`
+  místo hardlinku (stejná atomicita + EEXIST; následný `unlink(tmp)` vrátí
+  ENOENT, glibc ho ignoruje).
+- GOT shimy `getcwd`/`getwd`/`get_current_dir_name` odříznou prefix `$R`
+  (`shim_strip_root`; `getcwd` s bufferem přes lokální 8K buffer, ERANGE přes
+  guest errno). Jen GOT — interní `__getcwd` (realpath) dál dostává host cestu.
+  **Výjimka Bun:** Bun (Zig) dělá `stat`/`open` raw syscally, guest cwd pro něj
+  neexistuje (`claude`: „Can't access working directory /tmp/cwdt“). Detekce
+  přes `DT_VERDEF` jméno `BUN_*` (`elf_has_verdef_prefix`) → `g_cwd_keep_host`;
+  ručně `F2_NO_CWD_STRIP=1`.
+
+**Ověření (`ashell -c`):** t3 17/17 OK (bez `TMPDIR` — `tempnam` dává POSIX
+přednost `$TMPDIR`, v ashellu `$D/cache`), A/B `elf_loader.prev` 8× FAIL.
+Python `multiprocessing` Lock + Queue + Process OK, `$R/dev/shm` po běhu
+prázdný. node 26 / python / git s cwd pod `$R` → guest cwd, relativní i
+absolutní fs operace i child `pwd` OK; claude (Bun) s cwd pod `$R` OK.
+Regresní test `test-all.sh pathops` (`l2.py`, očekává `LIBCOPS2 7`; stará
+binárka FAIL). `all`: **PASS 177 / FAIL 0 / SKIP 33**. cJSON cmake+build+ctest 19/19.

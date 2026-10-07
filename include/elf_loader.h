@@ -101,6 +101,7 @@ void f2_set_root(const char *r);          /* F2: nastav ROOTFS pro seccomp path-
 void install_f2_path_filter(void);     /* F2: stackovany RET_TRAP filtr pro openat/statx/... */
 void f2_set_loader(const char *p);      /* Go mod: cesta k loaderu pro re-exec */
 int elf_go_mode_setup(elf_object_t *m); /* Go mod: 1 = Go binarka, filtr aktivni */
+int elf_has_verdef_prefix(const elf_object_t *m, const char *pfx); /* DT_VERDEF jmeno s prefixem */
 elf_tls_ctx_t elf_setup_own_tls(elf_object_t *exe, elf_scope_t *scope);
 void elf_teardown_own_tls(elf_tls_ctx_t *ctx);
 void ldso_install_exe_linkmap(elf_object_t *exe, const char *name);

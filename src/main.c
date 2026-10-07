@@ -2686,9 +2686,14 @@ static int shim_chdir(const char *p) {
 typedef char *(*fp_getcwd)(char *, size_t);
 static void *g_orig_getcwd = NULL, *g_orig_getwd = NULL,
             *g_orig_get_current_dir_name = NULL;
+/* 1 = cwd nechat host ($R/...): Bun (Zig) dela stat/open raw syscally, guest
+ * cesta z getcwd by pro nej neexistovala ("Can't access working directory").
+ * Nastavuje run_ownall (BUN_* verdef nebo F2_NO_CWD_STRIP=1). */
+static int g_cwd_keep_host = 0;
 static char *shim_getcwd(char *buf, size_t size) {
     fp_getcwd f = (fp_getcwd)g_orig_getcwd;
     if (!f) return NULL;
+    if (g_cwd_keep_host) return f(buf, size);
     size_t rl = (g_shim_root && g_shim_root[0]) ? shim_strlen(g_shim_root) : 0;
     /* buf==NULL: glibc alokuje; rezerva na prefix $R, zkraceni probehne na miste. */
     if (!buf) return shim_strip_root(f(NULL, size ? size + rl : 0));
@@ -2704,11 +2709,13 @@ static char *shim_getcwd(char *buf, size_t size) {
 }
 static char *shim_getwd(char *buf) {
     char *(*f)(char *) = (char *(*)(char *))g_orig_getwd;
-    return shim_strip_root(f ? f(buf) : NULL);
+    char *r = f ? f(buf) : NULL;
+    return g_cwd_keep_host ? r : shim_strip_root(r);
 }
 static char *shim_get_current_dir_name(void) {
     char *(*f)(void) = (char *(*)(void))g_orig_get_current_dir_name;
-    return shim_strip_root(f ? f() : NULL);
+    char *r = f ? f() : NULL;
+    return g_cwd_keep_host ? r : shim_strip_root(r);
 }
 
 static FILE *shim_fopen(const char *p, const char *mode) {
@@ -3851,6 +3858,9 @@ static int run_ownall(const char *path, int argc, char **argv, char **envp) {
             elf_go_mode_setup(obj);
         }
     }
+    g_cwd_keep_host = getenv("F2_NO_CWD_STRIP") || elf_has_verdef_prefix(obj, "BUN_");
+    if (elf_debug() && g_cwd_keep_host)
+        fprintf(stderr, "[F2] getcwd: host cesta (Bun / F2_NO_CWD_STRIP)\n");
     shim_install_hooks();    /* patch glibc leaf funkci (F2 / re-exec) */
     shim_resolve_fallback(); /* fallback real funkci (W^X) */
     g_real_libc_start_main = elf_scope_lookup(scope, "__libc_start_main");

@@ -294,6 +294,14 @@ Milníky:
   **inline hook `posix_spawn` (BTI prolog)** → `system()`/`popen()` spouští
   guest `/bin/sh` přes loader místo host `/system/bin/sh` (vypnout
   `F2_NO_SPAWN_HOOK=1`) — [postup.md](postup.md) 2026-10-07 (6).
+  Dále (2026-10-07 (7)): BTI inline hooky `fstatat` (= stat/lstat uvnitř
+  glibc: `ftok`, `tempnam`), `unlink`, `mkdir`, `rmdir`, `link` (vypnout
+  `F2_NO_BTI_HOOK=1`); nocancel shim překládá `O_DIRECTORY` (`scandir`) +
+  whitelist zoneinfo/localtime/fstab/mtab/shadow/…; `/dev/shm` → `$R/dev/shm`
+  a `link` v shm → `renameat2(RENAME_NOREPLACE)` (`shm_open`, `sem_open`,
+  Python `multiprocessing`); `getcwd`/`getwd`/`get_current_dir_name` vrací
+  guest cestu — **kromě Bun** (raw syscally, detekce `DT_VERDEF` `BUN_*`,
+  ručně `F2_NO_CWD_STRIP=1`). Regresní test `pathops` (`LIBCOPS2 7`).
   **Obecné pravidlo:** glibc 2.41 funkce začínají `BTI c` → `hook_install`
   je nepatchuje → glibc-interní `bl` volání obchází shimy; řešit wrapperem
   na vnější funkci nebo `hook_inline_prologue`.
