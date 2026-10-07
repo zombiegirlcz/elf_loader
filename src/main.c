@@ -3106,6 +3106,13 @@ static void shim_register_overrides(void) {
     for (size_t i = 0; i < sizeof g_f2_hooks / sizeof g_f2_hooks[0]; i++)
         if (f2_only_match(g_f2_hooks[i].n))
             elf_register_override(g_f2_hooks[i].n, g_f2_hooks[i].shim);
+    /* eaccess = glibc alias euidaccess (stejna adresa), ale GOT override jde
+     * podle jmena. GNU Make 4.4 (gnulib find_in_given_path) overuje existenci
+     * programu pres eaccess() PRED posix_spawn - bez prekladu dostal ENOENT na
+     * host "/usr/bin/true" a dite vubec nespustil. Jen override, ne g_f2_hooks:
+     * druhy inline patch na adrese euidaccess by se zdvojil. */
+    if (f2_only_match("eaccess"))
+        elf_register_override("eaccess", (void *)shim_euidaccess);
 }
 static void shim_install_hooks(void) {
     if (getenv("F2_DISABLE")) return;

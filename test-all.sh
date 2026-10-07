@@ -865,6 +865,47 @@ category_nss() {
     fi
 }
 
+# /proc/self/exe musi vracet guest binarku (ne loader) a GNU Make fast path
+# (recept bez shell-metaznaku -> gnulib find_in_given_path -> eaccess() pred
+# posix_spawn) musi najit program pod ROOTFS. Viz postup.md 2026-10-07 (3).
+category_selfexe() {
+    echo ""
+    echo "=== /proc/self/exe + make fast path (eaccess) ==="
+    local env="ROOTFS=$R ELF_ROOTFS=$R ELF_LOADER=$L"
+    local out rc
+    out=$(ashell_out "$env $L --ownall $R/usr/bin/readlink /proc/self/exe")
+    if [ "$out" = "$R/usr/bin/readlink" ]; then
+        echo "PASS selfexe: readlink /proc/self/exe -> guest binarka"
+        echo "PASS: selfexe - readlink /proc/self/exe" >> "$PASS_LOG"
+        ((PASS_COUNT++)) || true
+    else
+        echo "FAIL selfexe: readlink /proc/self/exe -> '$out'"
+        echo "FAIL: selfexe - readlink /proc/self/exe | $out" >> "$FAIL_LOG"
+        ((FAIL_COUNT++)) || true
+    fi
+    if [ ! -x "$R/usr/bin/make" ]; then
+        echo "SKIP selfexe: make neni v rootfs"
+        echo "SKIP: selfexe - no make" >> "$SKIP_LOG"
+        ((SKIP_COUNT++)) || true
+        return 0
+    fi
+    local dir="$R/tmp/selfexe_mk.$$"
+    mkdir -p "$dir"
+    printf 'all:\n\t/usr/bin/echo MKFAST\n' > "$dir/Makefile"
+    rc=$(ashell_rc "$env $L --ownall $R/usr/bin/make -s -C $dir all")
+    out=$(ashell_out "$env $L --ownall $R/usr/bin/make -s -C $dir all")
+    rm -rf "$dir"
+    if [ "$rc" = 0 ] && printf '%s' "$out" | grep -Fq "MKFAST"; then
+        echo "PASS selfexe: make fast path (/usr/bin/echo bez shellu)"
+        echo "PASS: selfexe - make fast path" >> "$PASS_LOG"
+        ((PASS_COUNT++)) || true
+    else
+        echo "FAIL selfexe: make fast path RC=$rc out=$out"
+        echo "FAIL: selfexe - make fast path | RC=$rc | $out" >> "$FAIL_LOG"
+        ((FAIL_COUNT++)) || true
+    fi
+}
+
 # Regresni test: madvise(MADV_DONTNEED) na inicializovana data exe. Segmenty
 # musi byt file-backed (MAP_PRIVATE), jinak se stranky vrati jako nuly - Bun
 # standalone (claude) pak hlasi "SyntaxError: Invalid character '\0'".
@@ -1155,6 +1196,10 @@ case "${1:-all}" in
         category_nss
         print_summary
         ;;
+    selfexe)
+        category_selfexe
+        print_summary
+        ;;
     madv)
         category_madv
         print_summary
@@ -1191,6 +1236,7 @@ case "${1:-all}" in
         category_symlink
         category_fstat
         category_nss
+        category_selfexe
         category_madv
         category_venv
         category_net_real

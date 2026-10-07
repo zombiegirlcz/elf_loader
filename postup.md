@@ -3558,3 +3558,57 @@ pod guest TP) — `shim_execve`/`shim_posix_spawnp` (main.c) tisknou
 `[execvetrace]`/`[spawntrace]` při vstupu; `shim_access`/`shim_faccessat`
 tisknou `[accesstrace]`/`[faccessattrace]`. `test-all.sh all` s touto
 instrumentací: PASS 171/FAIL 0 (no-op když env proměnná není nastavena).
+
+### 2026-10-07 (3) — GNU Make fast path VYŘEŠENO: chybějící override `eaccess`
+
+**Oprava závěru z (2):** make dítě NEspouští „mimo dosah hooků" — dítě
+vůbec nespustí. Nula trace hitů v `shim_posix_spawnp` byla správně, ale
+důvod je jiný: GNU Make 4.4 v `child_execute_job` volá gnulib
+`find_in_given_path(argv[0], ...)`, která pro cestu se `/` ověří program
+přes `eaccess(path, X_OK)`. Když selže, make nastaví `errno=ENOENT`, vypíše
+`make: /usr/bin/true: No such file or directory` (Error 127) a
+`posix_spawn` nezavolá.
+
+`objdump -T $R/usr/bin/make` (pozor: `readelf` na zařízení je toybox a
+relokace/dynsym nevypisuje spolehlivě — používat `objdump`) ukazuje import
+`eaccess@GLIBC_2.17`. V naší tabulce byl jen `euidaccess`; v glibc je
+`eaccess` alias téže funkce, ale GOT override (`override_lookup`) porovnává
+jméno → slot `eaccess` v make se resolvoval přímo na glibc → `faccessat`
+syscall s nepřeloženou host cestou → ENOENT. Inline hook na `euidaccess`
+(který by alias chytil, protože jde o stejnou adresu) se přeskočí —
+glibc 2.41 začíná funkce `BTI c` (`d503245f`), `hook_install` umí jen
+B-thunky.
+
+S shell-metaznakem (`;`) se spouští `/bin/sh` — make ho najde jinou cestou
+a `sh` pak volá `execve` přes vlastní (hooknutý) GOT, proto to fungovalo.
+
+**Proč `su -c` „fungovalo":** `su` na tomto zařízení běží přes `proot`
+(`PROOT_L2S_DIR` v env, `proot warning` ve výstupu). proot překládá cesty
+na úrovni syscallů přes ptrace, takže host `/usr/bin/true` tam existuje a
+`eaccess` projde i bez našeho překladu. Zavádějící srovnání — validní je
+jen `ashell -c` (viz SKILL.md). Další pasti při ladění: `pgrep -f` matchne
+i vlastní shell s hledaným textem v heredocu (falešné „úspěšné" ptrace
+attache); AVC log (`logcat | grep avc`) neukázal žádné `denied` → SELinux
+nebyl příčina; `ELF_LOADER_NO_COMPAT=1` (bez našeho seccomp filtru) bug
+neměnil.
+
+**Fix:** `shim_register_overrides()` navíc
+`elf_register_override("eaccess", shim_euidaccess)` — jen GOT override,
+ne položka v `g_f2_hooks` (druhý inline patch na stejné adrese by se
+zdvojil; `g_orig_euidaccess` naplní položka `euidaccess`).
+
+**Ověření (`ashell -c`, bionic build):**
+- Makefile `all:\n\t/usr/bin/true\n\t/usr/bin/echo fastpath-ok` → `RC=0`.
+- Plný cmake (s `PATH=/usr/local/bin:/usr/bin:/bin:/system/bin`, aby
+  `find_program` našel `make`/`cc` — stejně jako `lx`): `cmake -S/-B`
+  CFG_RC=0, `cmake --build` BUILD_RC=0 (`Built target t`), výsledná binárka
+  běží (`--ownall` mimo `$ROOTFS` potřebuje `ELF_ROOTFS`, stávající chování).
+- Nový regresní test `test-all.sh selfexe` (readlink `/proc/self/exe` +
+  make fast path bez shellu). **A/B:** binárka bez fixu → `FAIL selfexe:
+  make fast path RC=2 out=make: /usr/bin/echo: No such file or directory`;
+  s fixem PASS 2/2.
+- `test-all.sh all`: PASS 171 / FAIL 0 (před přidáním `selfexe`).
+
+Obecné poučení: GOT override je per-jméno — glibc aliasy (`eaccess`/
+`euidaccess`, `__open`/`open`, ...) je potřeba registrovat zvlášť, pokud je
+binárka importuje pod alias jménem a inline hook neprojde (BTI/PAC prolog).
