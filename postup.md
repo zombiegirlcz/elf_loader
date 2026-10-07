@@ -3684,3 +3684,40 @@ OK, build `-j4` OK, **ctest 19/19 PASS**. Regresní kontrola v `test-all.sh
 pathops` (`busybox mktemp -d /tmp/.../dXXXXXX` → adresář existuje pod
 `$R`). **A/B:** release binárka v0.3 → `FAIL pathops: mkdtemp out='mktemp:
 : No such file or directory'`, nová → PASS.
+
+### 2026-10-07 (6) — `remove`, `nftw`/`ftw`, `glob`, `system`/`popen`
+
+C test (`/tmp/tmpt/t2.c`, guest cesty pod `/tmp/tmpt/w`) se starým
+loaderem: `remove(file)`/`remove(dir)` ENOENT, `nftw` a `glob` nic nenašly,
+`popen("echo $0; test -x /usr/bin/python3 ...")` běžel jako host `sh`
+(guest soubory neviditelné), `system()` ≠ 0. `freopen`/`tmpfile` OK.
+
+Příčina (společná): glibc 2.41 funkce začínají `BTI c` (`d503245f`), takže
+`hook_install` (patchuje jen B-thunky) je přeskočí a glibc-interní volání
+přes `bl` jdou mimo GOT override:
+- `remove` → `bl unlink` / `bl rmdir`,
+- `nftw`/`ftw`/`glob` → interní opendir/lstat,
+- `system` (`do_system`) i `popen` (`_IO_proc_open`) → `bl posix_spawn`
+  s `/bin/sh` (objdump: `48f48`, `7182c` → `d92e0 <posix_spawn>`).
+
+**Fix (`src/main.c`):**
+- `shim_remove` — přeložit cestu, zavolat original.
+- `shim_nftw`/`nftw64`/`ftw`/`ftw64` — kořen přeložen pod ROOTFS, uživatelský
+  callback obalen trampolínou, která z `fpath` odřízne prefix `$R` (jen posun
+  ukazatele) a sníží `FTW.base`. Stav callbacku je statický s uložením/
+  obnovou (vnoření), bez `__thread` (shim běží pod guest TP).
+- `shim_glob`/`glob64` — přeložen vzor, z výsledků (`gl_pathv[gl_offs+i]`,
+  glibc layout `pathc, pathv, offs`) se prefix odřízne in-place.
+- **inline hook `posix_spawn`** přes `hook_inline_prologue` (BTI instrukce se
+  zkopíruje do trampolíny) → `shim_posix_spawnp` přeloží `/bin/sh` a spustí
+  ho přes `loader --ownall`; real spawn jde přes `posix_spawnp` → `__spawni`,
+  ne přes `posix_spawn` → bez rekurze. Vypínač `F2_NO_SPAWN_HOOK=1`.
+
+**Ověření (`ashell -c`):** t2 8/8 OK (`nftw` cesty začínají guest `B`,
+`glob` → `/tmp/tmpt/w/a`), A/B se starou binárkou 5× FAIL. Regresní
+kontrola v `test-all.sh pathops` (Python `ctypes` → libc `remove`/`glob`/
+`nftw`/`system`/`popen`, očekává `LIBCOPS 5`; stará binárka `LIBCOPS 0`).
+`all`: **PASS 176 / FAIL 0**. cJSON cmake configure+build+ctest 19/19 OK.
+
+Kosmetika: dítě z `popen`/`system` má `$0` = plná host cesta
+`$R/bin/sh` (argv[0] = přeložená cesta), ne `sh`.

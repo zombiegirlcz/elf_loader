@@ -1426,6 +1426,88 @@ static char *shim_mkdtemp(char *tmpl) {
     return tmpl;
 }
 
+/* remove(): glibc vola interni unlink/rmdir primo (bl, BTI prolog -> bez
+ * inline hooku), takze remove("/tmp/x") hlasil ENOENT na hostu. */
+static void *g_orig_remove;
+static int shim_remove(const char *p) {
+    int (*f)(const char *) = g_orig_remove;
+    char b[8192];
+    if (!f) return -1;
+    return f(p && shim_translate(p, b, sizeof b) ? b : p);
+}
+
+/* nftw/ftw: interni opendir/lstat obchazeji GOT. Koren prelozime pod ROOTFS
+ * a v callbacku odrizneme prefix ROOTFS, aby guest videl sve cesty
+ * (FTW.base je offset do fpath -> posunout o delku prefixu). Stav callbacku
+ * je staticky (bez __thread - shim bezi pod guest TP), vnoreni ulozi/obnovi. */
+struct shim_ftw { int base; int level; };
+typedef int (*shim_nftw_cb)(const char *, const void *, int, struct shim_ftw *);
+typedef int (*shim_ftw_cb)(const char *, const void *, int);
+static void *g_orig_nftw, *g_orig_nftw64, *g_orig_ftw, *g_orig_ftw64;
+static void *g_ftw_user_cb;
+static size_t g_ftw_strip;
+static const char *shim_ftw_unroot(const char *p, int *base) {
+    size_t n = g_ftw_strip;
+    if (n && shim_strncmp(p, g_shim_root, n) == 0 && p[n] == '/') {
+        if (base) *base -= (int)n;
+        return p + n;
+    }
+    return p;
+}
+static int shim_nftw_tramp(const char *p, const void *sb, int fl, struct shim_ftw *ftw) {
+    struct shim_ftw f2 = *ftw;
+    const char *gp = shim_ftw_unroot(p, &f2.base);
+    return ((shim_nftw_cb)g_ftw_user_cb)(gp, sb, fl, &f2);
+}
+static int shim_ftw_tramp(const char *p, const void *sb, int fl) {
+    return ((shim_ftw_cb)g_ftw_user_cb)(shim_ftw_unroot(p, NULL), sb, fl);
+}
+static int shim_nftw_common(void *orig, const char *d, void *cb, int nfd, int fl, int is_n) {
+    char b[8192];
+    if (!orig) return -1;
+    if (!d || !cb || !shim_translate(d, b, sizeof b)) {
+        if (is_n) return ((int (*)(const char *, void *, int, int))orig)(d, cb, nfd, fl);
+        return ((int (*)(const char *, void *, int))orig)(d, cb, nfd);
+    }
+    void *save_cb = g_ftw_user_cb; size_t save_strip = g_ftw_strip;
+    g_ftw_user_cb = cb; g_ftw_strip = shim_strlen(g_shim_root);
+    int rc = is_n
+        ? ((int (*)(const char *, void *, int, int))orig)(b, (void *)shim_nftw_tramp, nfd, fl)
+        : ((int (*)(const char *, void *, int))orig)(b, (void *)shim_ftw_tramp, nfd);
+    g_ftw_user_cb = save_cb; g_ftw_strip = save_strip;
+    return rc;
+}
+static int shim_nftw(const char *d, void *cb, int nfd, int fl) { return shim_nftw_common(g_orig_nftw, d, cb, nfd, fl, 1); }
+static int shim_nftw64(const char *d, void *cb, int nfd, int fl) { return shim_nftw_common(g_orig_nftw64, d, cb, nfd, fl, 1); }
+static int shim_ftw(const char *d, void *cb, int nfd) { return shim_nftw_common(g_orig_ftw, d, cb, nfd, 0, 0); }
+static int shim_ftw64(const char *d, void *cb, int nfd) { return shim_nftw_common(g_orig_ftw64, d, cb, nfd, 0, 0); }
+
+/* glob: interni opendir/lstat obchazeji GOT -> absolutni vzor ("/etc/*.conf")
+ * hledal na hostu. Prelozime vzor a z vysledku (gl_pathv, glibc layout:
+ * pathc, pathv, offs) odrizneme prefix ROOTFS in-place. glob64 = stejny
+ * layout na LP64. */
+struct shim_glob_t { size_t gl_pathc; char **gl_pathv; size_t gl_offs; };
+static void *g_orig_glob, *g_orig_glob64;
+static int shim_glob_common(void *orig, const char *pat, int fl, void *ef, struct shim_glob_t *g) {
+    int (*f)(const char *, int, void *, struct shim_glob_t *) = orig;
+    char b[8192];
+    if (!f) return 1; /* GLOB_NOSPACE */
+    if (!pat || !g || !shim_translate(pat, b, sizeof b)) return f(pat, fl, ef, g);
+    int rc = f(b, fl, ef, g);
+    size_t rl = shim_strlen(g_shim_root);
+    if (g->gl_pathv) {
+        for (size_t i = 0; i < g->gl_pathc; i++) {
+            char *s = g->gl_pathv[g->gl_offs + i];
+            if (!s || shim_strncmp(s, g_shim_root, rl) != 0 || s[rl] != '/') continue;
+            size_t k = 0;
+            do { s[k] = s[k + rl]; } while (s[k++]);
+        }
+    }
+    return rc;
+}
+static int shim_glob(const char *p, int fl, void *ef, struct shim_glob_t *g) { return shim_glob_common(g_orig_glob, p, fl, ef, g); }
+static int shim_glob64(const char *p, int fl, void *ef, struct shim_glob_t *g) { return shim_glob_common(g_orig_glob64, p, fl, ef, g); }
+
 /* AF_UNIX socket s absolutni cestou (dbus, X11, ssh-agent, Python
  * multiprocessing...): sun_path prelozit pod ROOTFS. Abstraktni sockety
  * (sun_path[0]==0) a ostatni rodiny beze zmeny. Kdyz se prelozena cesta
@@ -3145,6 +3227,10 @@ static f2_hook_t g_f2_hooks[] = {
     {"inotify_add_watch",(void*)shim_inotify_add_watch,&g_orig_inotify_add_watch},
     {"bind",(void*)shim_bind,&g_orig_bind},{"connect",(void*)shim_connect,&g_orig_connect},
     {"mkdtemp",(void*)shim_mkdtemp,&g_orig_mkdtemp},
+    {"remove",(void*)shim_remove,&g_orig_remove},
+    {"nftw",(void*)shim_nftw,&g_orig_nftw},{"nftw64",(void*)shim_nftw64,&g_orig_nftw64},
+    {"ftw",(void*)shim_ftw,&g_orig_ftw},{"ftw64",(void*)shim_ftw64,&g_orig_ftw64},
+    {"glob",(void*)shim_glob,&g_orig_glob},{"glob64",(void*)shim_glob64,&g_orig_glob64},
     /* close/flockfile/mprotect jsou diagnosticke shimy (Node ladeni) a
      * prlimit64 mel spatnou signaturu - dokud MAX_OVERRIDES=64 zahazoval vse
      * od 65. polozky, nikdy nebezely. Registrovat jen explicitne. */
@@ -3329,6 +3415,22 @@ static void shim_install_hooks(void) {
                 if (elf_debug())
                     fprintf(stderr, "[hook] %s inline (PAC) OK\n", oh[i].n);
             }
+        }
+    }
+    /* system()/popen() volaji interni __posix_spawn("/bin/sh") primo (bl),
+     * posix_spawn ma BTI prolog -> hook_install ho preskoci a dite byl host
+     * /system/bin/sh (guest prikazy nenalezeny). Inline hook prelozi /bin/sh
+     * a spusti ho pres loader (shim_posix_spawnp -> real posix_spawnp, ktery
+     * jde do __spawni, ne do posix_spawn -> bez rekurze).
+     * Vypnout lze F2_NO_SPAWN_HOOK=1. */
+    if (g_shim_scope && !g_orig_posix_spawn && !getenv("F2_NO_SPAWN_HOOK") &&
+        f2_only_match("posix_spawn")) {
+        void *t = elf_scope_lookup(g_shim_scope, "posix_spawn");
+        void *tramp = NULL;
+        if (t && hook_inline_prologue(t, (void *)shim_posix_spawnp, &tramp) && tramp) {
+            g_orig_posix_spawn = tramp;
+            ok++;
+            if (elf_debug()) fprintf(stderr, "[hook] posix_spawn inline (BTI) OK\n");
         }
     }
     if (elf_debug())

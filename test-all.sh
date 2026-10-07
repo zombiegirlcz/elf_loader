@@ -924,6 +924,51 @@ PYEOF
             ((FAIL_COUNT++)) || true
         fi
     fi
+    # libc funkce s internimi volanimi mimo GOT (remove->unlink, glob/nftw->
+    # opendir/lstat, system/popen->__posix_spawn("/bin/sh")); vysledne cesty
+    # musi byt guest (bez prefixu ROOTFS). Viz postup.md 2026-10-07 (6).
+    mkdir -p "$h/w/sub"
+    : > "$h/w/a"; : > "$h/w/b"
+    cat > "$h/l.py" <<PYEOF
+import ctypes, ctypes.util
+c = ctypes.CDLL(None)
+B = "$g/w"
+r = []
+def t(n, ok):
+    (r.append(n) if ok else print("ERR", n))
+t("remove", c.remove((B + "/b").encode()) == 0)
+class G(ctypes.Structure):
+    _fields_ = [("pathc", ctypes.c_size_t), ("pathv", ctypes.POINTER(ctypes.c_char_p)),
+                ("offs", ctypes.c_size_t), ("pad", ctypes.c_char * 128)]
+g = G()
+gr = c.glob((B + "/*").encode(), 0, None, ctypes.byref(g))
+t("glob", gr == 0 and g.pathc == 2 and g.pathv[0] == (B + "/a").encode())
+seen = []
+CB = ctypes.CFUNCTYPE(ctypes.c_int, ctypes.c_char_p, ctypes.c_void_p, ctypes.c_int, ctypes.c_void_p)
+cb = CB(lambda p, s, f, w: seen.append(p) or 0)
+t("nftw", c.nftw(B.encode(), cb, 8, 1) == 0 and len(seen) == 3 and all(p.startswith(B.encode()) for p in seen))
+t("system", c.system(b"test -x /usr/bin/python3") == 0)
+c.popen.restype = ctypes.c_void_p
+f = c.popen(b"test -x /usr/bin/python3 && echo GUEST", b"r")
+buf = ctypes.create_string_buffer(64)
+c.fgets.argtypes = [ctypes.c_char_p, ctypes.c_int, ctypes.c_void_p]
+c.pclose.argtypes = [ctypes.c_void_p]
+got = f and c.fgets(buf, 64, f)
+if f: c.pclose(f)
+t("popen", buf.value.strip() == b"GUEST")
+print("LIBCOPS", len(r), " ".join(r))
+PYEOF
+    local lout
+    lout=$(ashell_out "$env $L --ownall $py_bin $g/l.py")
+    if printf '%s' "$lout" | grep -Fq "LIBCOPS 5"; then
+        echo "PASS pathops: libc remove/glob/nftw/system/popen na guest ceste"
+        echo "PASS: pathops - libc interni" >> "$PASS_LOG"
+        ((PASS_COUNT++)) || true
+    else
+        echo "FAIL pathops: libc interni out=$lout"
+        echo "FAIL: pathops - libc interni | $lout" >> "$FAIL_LOG"
+        ((FAIL_COUNT++)) || true
+    fi
     rm -rf "$h"
     if printf '%s' "$out" | grep -Fq "PATHOPS 7" && [ "$hmode" = 640 ] && [ "$hsize" = 2 ]; then
         echo "PASS pathops: 7/7 operaci na guest ceste (host vidi mode=$hmode size=$hsize)"

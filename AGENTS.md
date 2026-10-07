@@ -289,6 +289,14 @@ Milníky:
   `__mkdir` mimo GOT; rozbíjela cmake `try_compile` na guest cestách, apt/
   dpkg, `strip`) — ověřeno reálným projektem cJSON (clone → cmake → build →
   ctest 19/19 s guest cestami) — [postup.md](postup.md) 2026-10-07 (5).
+  Dále `remove` (interní `unlink`/`rmdir`), `nftw`/`ftw` + `glob` (kořen/vzor
+  přeložen, z callback cest a `gl_pathv` se odřízne prefix `$R`) a
+  **inline hook `posix_spawn` (BTI prolog)** → `system()`/`popen()` spouští
+  guest `/bin/sh` přes loader místo host `/system/bin/sh` (vypnout
+  `F2_NO_SPAWN_HOOK=1`) — [postup.md](postup.md) 2026-10-07 (6).
+  **Obecné pravidlo:** glibc 2.41 funkce začínají `BTI c` → `hook_install`
+  je nepatchuje → glibc-interní `bl` volání obchází shimy; řešit wrapperem
+  na vnější funkci nebo `hook_inline_prologue`.
   Hardlinky (`link`) zakazuje
   SELinux app domény i nativně — platformní limit. **Pravidlo:** GOT override
   je per-jméno; při přidání shimu zkontrolovat aliasy v `libc.so.6`
