@@ -3374,3 +3374,77 @@ mount).
 žádný hack): `all` → **PASS 165 / FAIL 1 / SKIP 38**, jediný FAIL
 (`csplit - extra`) je pre-existující flaky test nesouvisející s touto
 opravou (stará, zbytkové `xx*` soubory z předchozích běhů).
+
+---
+
+## 2026-10-06 (10) — Audit SKIP vs. skutečný FAIL + test heavy binárek/pip balíčků z `/usr/bin` + nový bug `/proc/self/exe`
+
+**Audit SKIP v `test-all.sh`:** `should_skip()` měl přehnaně široké
+substring vzory `*vi*` a `*nc*` — `*vi*` omylem zachytávalo `service`
+(obsahuje "vi"), `*nc*` zachytávalo `truncate`/`gencat`/`loginctl`
+(obsahují "nc") → tyto funkční binárky se nikdy reálně neotestovaly, jen
+se tiše skipovaly jako by šlo o `vi`/`nc`. Oprava: přesné literály
+`vi`/`nc` místo substring globů. Zároveň `category_madv` hlásila
+`SKIP: no gcc`, i když gcc v rootfs reálně funguje — `command -v gcc`
+jen neuspělo, protože top-level bash (spuštěný jedním `ashell -c`) nemá
+`$R/usr/bin` v PATH. Opraveno na explicitní `$R/usr/bin/gcc` + PATH
+export jen pro compile krok. Commit `9694076`.
+
+Zbylé SKIPy ověřeny jako legitimní (host limity Android app-uid:
+`uptime`/`pslog`/`shred`/`ping`/`ping6`; mimo-scope: toolchain,
+interpretery, editory; chybějící v rootfs: `nmap`) nebo transparentně
+zdokumentovaný známý bug (`python -m kaggle/modal/yt_dlp/huggingface_hub`
+segfaultují pod loaderem — komentář v kódu, žádné tajení).
+
+**Test heavy binárek z `/usr/bin` přes `ashell -c`, reálné použití (NE
+`--version`), plné device cesty — všechny OK:** `rg` (grep v reálném
+souboru), `eza` (listing), `zoxide` (add+query), `openssl` (SHA-256
+digest ověřen proti známé hash hodnotě), `bison` (reálná gramatika →
+`.tab.c` s `yyparse`), `gpg` (symetrický encrypt+decrypt roundtrip),
+`pandoc` (markdown→HTML), `batcat` (zobrazení souboru), `sq`
+(generování OpenPGP klíče + inspect), `gh` (čtení lokální auth
+konfigurace), `git-lfs` (`install` v git repu — potřeboval `$R` v
+PATH, jinak "Error getting Git version" stejná PATH-ordering třída
+jako u `timeout`/`bash` výše, ne nový bug).
+
+**Python balíčky (doinstalováno `pandas`/`lxml`/`Pillow`/`scipy` přes
+`pip install --break-system-packages`; `numpy`/`cryptography` už byly
+nainstalované) — reálné use-case testy, všechny OK:** pandas
+(`DataFrame.sum()`), lxml (XML parse), Pillow (PNG save+reopen
+round-trip), scipy (`linalg.det`), cryptography (`Fernet`
+encrypt/decrypt roundtrip), numpy (maticová inverze, ověřeno `A⁻¹·A = I`).
+
+**NOVÝ BUG NALEZEN — `/proc/self/exe` v own-loadovaném procesu vrací
+cestu k LOADERU, ne ke skutečné guest binárce.** Ověřeno přímo:
+```
+ashell -c "$L --ownall $R/usr/bin/python3 -c 'import os; print(os.readlink("/proc/self/exe"))'"
+→ /data/user/0/com.linux_core/files/usr/bin/elf_loader
+```
+Dopad: libovolný nástroj, který si self-introspekcí (`readlink
+/proc/self/exe`) zjišťuje VLASTNÍ absolutní cestu, dostane špatnou
+hodnotu (cestu k loaderu místo k sobě pod $ROOTFS). Konkrétně
+demonstrováno na `cmake`: `CMAKE_COMMAND` se odvodí špatně, vygenerovaný
+`Makefile` pak referencuje neexistující host cestu:
+```
+make: /usr/bin/cmake: No such file or directory
+make: *** [Makefile:93: all] Error 127
+```
+Repro: `cmake .` v projektu s `CMakeLists.txt` (project+add_executable)
+pod `$L --ownall $R/usr/bin/cmake` — `configure` i `try_compile` kroky
+samy o sobě proběhnou (`cc` funguje přímo), ale generovaný Makefile je
+nepoužitelný, protože $(CMAKE_COMMAND) uvnitř není ROOTFS-prefixed.
+Pravděpodobně postihuje i `ctest`/`cpack` (nezkoušeno dál, mimo rozsah
+tohoto kola) a potenciálně libovolný jiný self-introspekující nástroj
+(Go binárky zjišťující si vlastní cestu, balíčkovací nástroje apod).
+Fix by šel přes shim na `readlink("/proc/self/exe", ...)`/
+`readlinkat`, který by měl vracet cestu guest exe (uloženou při
+`--ownall` entry), ne cestu k loaderu — NEIMPLEMENTOVÁNO, otevřený bod.
+
+**Vedlejší nález (ne nový bug, stejná známá třída):** `python3 -m
+ensurepip` pod own-loadem padá `FileNotFoundError` na
+`/usr/share/python-wheels/pip-*.whl` — Debian-balíčkovaná pip wheel
+cesta je absolutní a mimo $ROOTFS translaci (`os.listxattr` na
+host cestu, co v non-chroot běhu neexistuje). Stejná třída jako
+již zdokumentovaný problém "absolutní symlinky/cesty mimo chroot"
+(sekce 5 AGENTS.md), ne nový mechanismus. Workaround: `pip install
+--break-system-packages` přímo, bez venv/ensurepip.

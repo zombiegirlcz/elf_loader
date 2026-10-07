@@ -236,10 +236,27 @@ Milníky:
   plné cesty `$R/usr/bin/timeout`/`$R/bin/bash`. Zároveň `test-all.sh` teď
   běží přes jediné `ashell -c` (ne jeden na každý test) —
   [postup.md](postup.md) 2026-10-06 (8)/(9).
+- **Audit SKIP vs. skutečný FAIL v `test-all.sh` + test heavy binárek a
+  pip balíčků z `/usr/bin`** — přehnaně široké substring vzory `*vi*`/`*nc*`
+  v `should_skip()` omylem skipovaly funkční `service`/`truncate`/
+  `gencat`/`loginctl`; `category_madv` hlásila `no gcc` jen kvůli
+  chybějícímu `$R/usr/bin` v PATH top-level bashe. Opraveno (commit
+  `9694076`). Dále reálně (přes `ashell -c`, ne `--version`) ověřeny OK:
+  `rg`, `eza`, `zoxide`, `openssl`, `bison`, `gpg`, `pandoc`, `batcat`,
+  `sq`, `gh`, `git-lfs`; Python `pandas`/`lxml`/`Pillow`/`scipy`/
+  `cryptography`/`numpy`. **Nový bug nalezen** (neopraveno): `/proc/self/exe`
+  v own-loadovaném procesu vrací cestu k loaderu, ne ke guest binárce —
+  rozbíjí self-introspekující nástroje (`cmake` generuje nefunkční
+  Makefile s `$(CMAKE_COMMAND)` ukazujícím na neexistující host cestu) —
+  [postup.md](postup.md) 2026-10-06 (10).
 
 ## 10. Zbývá / otevřené body
 
 - Kosmetika: `src/main.c:149` sign-compare, `\]` escape.
+- **`/proc/self/exe` v own-loadovaném procesu vrací cestu k loaderu** místo
+  ke skutečné guest binárce — rozbíjí self-introspekci (`cmake` build je
+  nefunkční, potenciálně `ctest`/`cpack` a další). Neopraveno —
+  [postup.md](postup.md) 2026-10-06 (10).
 - Test na reálném 16K Android 15+ zařízení (Task 3).
 - ~~Bionic dlerror/errno test (Task 4).~~ **Vyřešeno** — `ldso_dlerror()` +
   guest `dlopen/dlsym/dlerror/dlclose/dladdr` nad `_rtld_global` ověřeno
