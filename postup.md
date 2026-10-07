@@ -3448,3 +3448,61 @@ host cestu, co v non-chroot běhu neexistuje). Stejná třída jako
 již zdokumentovaný problém "absolutní symlinky/cesty mimo chroot"
 (sekce 5 AGENTS.md), ne nový mechanismus. Workaround: `pip install
 --break-system-packages` přímo, bez venv/ensurepip.
+
+---
+
+### 2026-10-07 — `/proc/self/exe` fix (VYŘEŠENO)
+
+Root cause (systematic-debugging): own-loadovaný proces fyzicky JE loader
+(guest binárka je jen namapovaná do jeho adresního prostoru), takže reálný
+`readlink("/proc/self/exe")` nutně vrací cestu k loaderu — kernel nemá
+důvod vracet nic jiného. Fix musí být shim na `readlink`/`readlinkat`.
+
+Implementace (`src/main.c`):
+- Nový globál `g_guest_exe_path[8192]`, naplněný v `run_ownall` těsně před
+  `elf_load(path)` — `path` je v tu chvíli finální resolvovaná host cesta
+  ke guest binárce (po `shim_resolve_symlinks` a shebang rewrite).
+- `shim_is_proc_self_exe(p)`: true pro `/proc/self/exe` NEBO `/proc/<vlastni
+  pid>/exe`.
+- `shim_readlink`/`shim_readlinkat`: pokud `shim_is_proc_self_exe()` a
+  `g_guest_exe_path` je nastavený, vrátí jeho obsah namísto volání
+  skutečného readlink. Beze změny pro vše ostatní.
+
+**Regrese při první verzi fixu** (chycena testem, ne review): `shim_is_proc_
+self_exe` použila `snprintf(buf, "/proc/%d/exe", getpid())`. `test-all.sh
+python` spadlo z PASS 4/0 na PASS 1/3 (`import os` atd. SIGSEGV v bionic
+libc, `pc` v `/apex/.../libc.so+0xceeb8`). Root cause: `shim_readlink`/
+`shim_readlinkat` jsou F2 inline-hook náhrady — patchují se PŘÍMO do
+glibc kódu (ne přes PLT), takže běží pod GUEST TP ve chvíli, kdy je
+volá guest glibc (nebo glibc-interní `realpath`/`canonicalize`). Bionic
+`snprintf`/`getpid()` jsou TLS-dependent (errno, FILE/locale interní
+stav) a čtou/píšou přes bionický TP offset — pod guest TP to zapisuje
+do náhodného místa v GUEST TLS blobu → tichá korupce, projeví se až
+později (threading v CPython). Přesně stejný důvod, proč `shim_execveat`
+o kus výš v tomtéž souboru ručně sestavuje `/proc/self/fd/<N>` bez
+`snprintf` — zavedený vzor, který jsem při prvním pokusu nedodržel.
+
+Fix fixu: `shim_is_proc_self_exe` teď getpid řeší přes
+`shim_raw_syscall6(172 /* SYS_getpid */, ...)` (raw syscall, žádná TLS) a
+číslo do stringu sestavuje ručně (stejný pattern jako `shim_execveat`).
+
+A/B ověření (`ashell -c`, bionic build, přes `elf_loader --ownall`):
+- `readlink /proc/self/exe` pod `--ownall $R/usr/bin/readlink`: teď vrací
+  `$R/usr/bin/readlink` (dřív by vrátilo cestu k `elf_loader`).
+- `test-all.sh python`: PASS 4/0 (regrese pryč).
+- `test-all.sh all`: **PASS 171 / FAIL 0** (dřív 160 — nová čísla kvůli
+  nové verzi testů v mezičase, žádná ztráta).
+- `cmake -S/-B` na triviálním `CMakeLists.txt` (`project`+`add_executable`):
+  configure fáze už nekrashuje; `CMakeCache.txt` má `CMAKE_COMMAND:INTERNAL=
+  /usr/bin/cmake` (guest-relativní, korektní — dřív by to byla cesta
+  k loaderu).
+
+**Neuzavřeno/navazující:** plný `cmake` self-build (s `-DCMAKE_MAKE_PROGRAM`
+a `-DCMAKE_C_COMPILER` nastavenými) selže v `try_compile` kroku na
+`make[1]: /usr/bin/cmake: No such file or directory` — vnořený `make`
+proces se pokouší exec'nout `/usr/bin/cmake` a dostane ENOENT, což
+vypadá jako že exec translation (shim_execve → `$ROOTFS` prefix) se
+v tomhle vnořeném kontextu neuplatní. Nevyšetřeno (mimo rozsah tohoto
+fixu — původní bug byl specificky o `/proc/self/exe`, ten je potvrzeně
+opraven). Pokud bude `ctest`/`cpack` nebo plný cmake build potřeba,
+chce to samostatné debug kolo.

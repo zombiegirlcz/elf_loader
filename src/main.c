@@ -171,6 +171,13 @@ static int f2_should_filter(void) {
  * Android fs). */
 static const char *g_shim_root = NULL;
 static const char *g_shim_loader = NULL;
+/* Resolved host path k realne spoustene guest binarce (--ownall/--shim).
+ * /proc/self/exe v own-loadovanem procesu jinak vraci cestu k LOADERU
+ * (to je skutecny obraz procesu), ne k guest binarce, kterou loader jen
+ * namapoval do pameti -> rozbije self-introspekujici nastroje (cmake
+ * generuje Makefile s $(CMAKE_COMMAND) na neexistujici cestu). shim_readlink/
+ * shim_readlinkat tohle prepisuji na g_guest_exe_path. */
+static char g_guest_exe_path[8192];
 static const char *g_exec_mode = "--ownall";
 static int g_f2_active = 0;  /* 1 = F2 rezim (--shim), povol inline-hooky */
 static elf_scope_t *g_shim_scope = NULL;  /* platny scope behem F2 behu */
@@ -2049,11 +2056,47 @@ static void *shim_opendir(const char *p) {
     char b[8192]; const char *path = p; if (shim_translate(p, b, sizeof b)) path = b;
     fp_opendir f = (fp_opendir)g_orig_opendir; return f ? f(path) : NULL;
 }
+/* /proc/self/exe (a /proc/<vlastni-pid>/exe) v own-loadovanem procesu
+ * ukazuje na LOADER (skutecny obraz procesu), ne na guest binarku, kterou
+ * loader jen namapoval do pameti -> self-introspekujici nastroje (cmake,
+ * ...) se rozbiji. Pokud mame ulozenou guest cestu, vratime tu namisto
+ * skutecneho readlink. */
+static int shim_is_proc_self_exe(const char *p) {
+    if (!p) return 0;
+    if (shim_strcmp(p, "/proc/self/exe") == 0) return 1;
+    /* Bez snprintf/getpid(): tyto shimy bezi pod GUEST TP (patchnuty primo
+     * v glibc kodu) a bionic snprintf/getpid pres TLS by guest TLS poskodily
+     * (viz shim_execveat o kus vys - rucni sestaveni cisla ze stejneho duvodu). */
+    if (shim_strncmp(p, "/proc/", 6) != 0) return 0;
+    long pid = shim_raw_syscall6(172 /* SYS_getpid */, 0, 0, 0, 0, 0, 0);
+    char buf[32]; int i = 0;
+    shim_strcpy(buf, sizeof buf, "/proc/");
+    i = (int)shim_strlen(buf);
+    if (pid == 0) { buf[i++] = '0'; }
+    else { char rev[16]; int ri = 0; long tmp = pid;
+        while (tmp > 0) { rev[ri++] = (char)('0' + tmp % 10); tmp /= 10; }
+        while (ri > 0) buf[i++] = rev[--ri]; }
+    buf[i] = 0;
+    shim_strcat(buf, sizeof buf, "/exe");
+    return shim_strcmp(p, buf) == 0;
+}
 static ssize_t shim_readlink(const char *p, char *b, size_t n) {
+    if (shim_is_proc_self_exe(p) && g_guest_exe_path[0]) {
+        size_t len = shim_strlen(g_guest_exe_path);
+        if (len > n) len = n;
+        shim_memcpy(b, g_guest_exe_path, len);
+        return (ssize_t)len;
+    }
     char x[8192]; const char *path = p; if (shim_translate(p, x, sizeof x)) path = x;
     fp_readlink f = (fp_readlink)g_orig_readlink; return f ? f(path, b, n) : -1;
 }
 static ssize_t shim_readlinkat(int d, const char *p, char *b, size_t n) {
+    if (d == -100 && shim_is_proc_self_exe(p) && g_guest_exe_path[0]) {
+        size_t len = shim_strlen(g_guest_exe_path);
+        if (len > n) len = n;
+        shim_memcpy(b, g_guest_exe_path, len);
+        return (ssize_t)len;
+    }
     char x[8192]; const char *path = p;
     if (d == -100 && p && p[0] == '/') { if (shim_translate(p, x, sizeof x)) path = x; }
     fp_readlinkat f = (fp_readlinkat)g_orig_readlinkat; return f ? f(d, path, b, n) : -1;
@@ -3385,6 +3428,7 @@ static int run_ownall(const char *path, int argc, char **argv, char **envp) {
             install_f2_path_filter();
         }
     }
+    shim_strcpy(g_guest_exe_path, sizeof(g_guest_exe_path), path);
     elf_object_t *obj = elf_load(path);
     elf_own_scope = NULL;
     elf_set_crash_scope(scope);

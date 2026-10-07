@@ -253,10 +253,22 @@ Milníky:
 ## 10. Zbývá / otevřené body
 
 - Kosmetika: `src/main.c:149` sign-compare, `\]` escape.
-- **`/proc/self/exe` v own-loadovaném procesu vrací cestu k loaderu** místo
-  ke skutečné guest binárce — rozbíjí self-introspekci (`cmake` build je
-  nefunkční, potenciálně `ctest`/`cpack` a další). Neopraveno —
-  [postup.md](postup.md) 2026-10-06 (10).
+- ~~`/proc/self/exe` v own-loadovaném procesu vrací cestu k loaderu~~ —
+  **VYŘEŠENO** (2026-10-07): `run_ownall` ukládá resolvovanou host cestu
+  ke guest binárce do `g_guest_exe_path`; `shim_readlink`/`shim_readlinkat`
+  rozpoznají `/proc/self/exe` i `/proc/<pid>/exe` a vrátí tuto cestu místo
+  volání do skutečného readlink (ten by vrátil loader). Cesta pro `<pid>`
+  je sestavena ručně (žádný `snprintf`/`getpid()`) — první verze fixu
+  použila oba a rozbila python3 (`import os` SIGSEGV): tyto shimy běží
+  patchnuté přímo v glibc kódu pod GUEST TP, takže bionic `snprintf`/`getpid`
+  (TLS-dependent) korumpovaly guest TLS. Ověřeno `readlink /proc/self/exe`
+  pod `--ownall` → vrací `$ROOTFS/.../binárka` (dřív cestu k loaderu);
+  `test-all.sh all` PASS 171/0 (dřív 160, bez regrese). cmake `-S/-B`
+  configure fázi už nekrashuje a `CMAKE_COMMAND` v cache je korektní
+  guest-relativní cesta (dřív loader); plný self-build (`make` → nested
+  `/usr/bin/cmake` link step) ještě naráží na samostatný, zřejmě nesouvisející
+  problém s exec translation v nested make procesu — nevyšetřeno, potenciálně
+  `ctest`/`cpack` dotčeny stejně.
 - Test na reálném 16K Android 15+ zařízení (Task 3).
 - ~~Bionic dlerror/errno test (Task 4).~~ **Vyřešeno** — `ldso_dlerror()` +
   guest `dlopen/dlsym/dlerror/dlclose/dladdr` nad `_rtld_global` ověřeno
