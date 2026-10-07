@@ -1474,6 +1474,11 @@ static void *resolve_jmp_symbol(elf_object_t *obj, Elf64_Rela *r) {
         if (addr && is_ifunc)
             addr = call_ifunc_resolver(addr);
         tls_trace(name, addr, via, obj->soname);
+        if (getenv("ELF_LOADER_EXEC_TRACE") &&
+            (strcmp(name, "execve") == 0 || strcmp(name, "execvp") == 0 ||
+             strcmp(name, "posix_spawn") == 0 || strcmp(name, "posix_spawnp") == 0))
+            fprintf(stderr, "[exectrace] %s via=%s addr=%p obj=%s\n",
+                    name, via, addr, obj->soname ? obj->soname : "EXE");
     }
     return addr;
 }
@@ -3065,6 +3070,11 @@ static sym_status_t lookup_table(const Elf64_Sym *symtab, const char *strtab,
 
 void *elf_resolve_import(elf_object_t *obj, const char *name) {
     void *sym = override_lookup(name);
+    if (getenv("ELF_LOADER_EXEC_TRACE") &&
+        (strcmp(name, "execve") == 0 || strcmp(name, "execvp") == 0 ||
+         strcmp(name, "posix_spawn") == 0 || strcmp(name, "posix_spawnp") == 0))
+        fprintf(stderr, "[exectrace-import] %s override=%p obj=%s\n",
+                name, sym, obj ? (obj->soname ? obj->soname : "EXE") : "?");
     /* Override ma prioritu pred host/resolvovanim: explicitne zaregistrovany
      * shim (F2 path-translation) musi prebirat i host ld.so symboly jako
      * "open". Bez toho by resolve_import_ldso vracel bionicky open a shim

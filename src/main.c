@@ -396,6 +396,7 @@ static void *g_orig_mprotect = NULL;
 /* ELF_LOADER_VMTRACE=1 -> loguj kazdy mmap/mprotect/munmap (diagnostika
  * V8 read-only heapu: kdo udelal stranku r--p pred fatalnim store). */
 static int g_vmtrace = 0;
+static int g_exec_trace = 0;  /* ELF_LOADER_EXEC_TRACE: raw-syscall trace v exec shimech (guest TP safe) */
 /* ELF_LOADER_RO_KEEP_WRITE=1 -> mprotect, ktery odebira PROT_WRITE z datove
  * stranky, necha zapis povoleny. Diagnostika/workaround pro V8 seal
  * read-only heapu: Builtins_InterpreterEntryTrampoline zapisuje age=0 do
@@ -1744,6 +1745,12 @@ static char **shim_child_envp(char *const envp[], const char *child_file) {
 
 static int shim_execve(const char *p, char *const argv[], char *const envp[]) {
     if (!p || !p[0]) return -1;
+    if (g_exec_trace) {
+        static const char m1[] = "[execvetrace] enter p=";
+        shim_raw_syscall6(64, 2, (long)(unsigned long)m1, sizeof(m1) - 1, 0, 0, 0);
+        shim_raw_syscall6(64, 2, (long)(unsigned long)p, shim_strlen(p), 0, 0, 0);
+        shim_raw_syscall6(64, 2, (long)(unsigned long)"\n", 1, 0, 0, 0);
+    }
 
     char resolved[8192];
     resolved[0] = 0;
@@ -2395,7 +2402,14 @@ static int shim_posix_spawnp(pid_t *pid, const char *p, const void *fa,
 
     fp_posix_spawnp f = (fp_posix_spawnp)g_orig_posix_spawnp;
     char **cenv = shim_child_envp(envp, resolved);
-    return f ? f(pid, loader_bin, fa, at, na, cenv) : -1;
+    if (g_exec_trace) {
+        static const char m1[] = "[spawntrace] enter resolved=";
+        shim_raw_syscall6(64, 2, (long)(unsigned long)m1, sizeof(m1) - 1, 0, 0, 0);
+        shim_raw_syscall6(64, 2, (long)(unsigned long)resolved, shim_strlen(resolved), 0, 0, 0);
+        shim_raw_syscall6(64, 2, (long)(unsigned long)"\n", 1, 0, 0, 0);
+    }
+    int rc = f ? f(pid, loader_bin, fa, at, na, cenv) : -1;
+    return rc;
 }
 
 static int shim_dladdr(const void *addr, void *info) {
@@ -3216,6 +3230,7 @@ static int run_ownall(const char *path, int argc, char **argv, char **envp) {
         }
     }
     g_tls_trace = getenv("ELF_LOADER_TLS_TRACE") != NULL;
+    g_exec_trace = getenv("ELF_LOADER_EXEC_TRACE") != NULL;
     g_vmtrace = getenv("ELF_LOADER_VMTRACE") != NULL;
     g_ro_keep_write = getenv("ELF_LOADER_RO_KEEP_WRITE") != NULL;
     elf_scope_t *scope = elf_scope_create();
