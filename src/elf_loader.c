@@ -4931,6 +4931,39 @@ static int go_is_go(const elf_object_t *m, unsigned long bias) {
     return 0;
 }
 
+/* Definuje modul verzi symbolu zacinajici pfx (DT_VERDEF)? Bun exportuje
+ * node_api_* jako BUN_1.x - pouziva se k detekci programu, ktere delaji fs
+ * operace raw syscally (Zig), a tedy potrebuji host cesty. */
+int elf_has_verdef_prefix(const elf_object_t *m, const char *pfx) {
+    unsigned long bias = (unsigned long)m->base_addr - map_base_vaddr(m);
+    const Elf64_Dyn *dyn = NULL;
+    for (int i = 0; i < m->phdr_count; i++)
+        if (m->phdr[i].p_type == PT_DYNAMIC)
+            dyn = (const Elf64_Dyn *)(bias + m->phdr[i].p_vaddr);
+    if (!dyn) return 0;
+    unsigned long vd = 0, vdn = 0, str = 0;
+    for (; dyn->d_tag != DT_NULL; dyn++) {
+        if (dyn->d_tag == DT_VERDEF) vd = dyn->d_un.d_ptr;
+        else if (dyn->d_tag == DT_VERDEFNUM) vdn = dyn->d_un.d_val;
+        else if (dyn->d_tag == DT_STRTAB) str = dyn->d_un.d_ptr;
+    }
+    if (!vd || !str) return 0;
+    /* d_ptr muze byt uz relokovany (absolutni) nebo vaddr */
+    if (vd < (unsigned long)m->base_addr) vd += bias;
+    if (str < (unsigned long)m->base_addr) str += bias;
+    size_t pl = strlen(pfx);
+    const Elf64_Verdef *d = (const Elf64_Verdef *)vd;
+    for (unsigned long k = 0; k < vdn && k < 64; k++) {
+        if (d->vd_aux) {
+            const Elf64_Verdaux *a = (const Elf64_Verdaux *)((const char *)d + d->vd_aux);
+            if (strncmp((const char *)str + a->vda_name, pfx, pl) == 0) return 1;
+        }
+        if (!d->vd_next) break;
+        d = (const Elf64_Verdef *)((const char *)d + d->vd_next);
+    }
+    return 0;
+}
+
 int elf_go_mode_setup(elf_object_t *m) {
     unsigned long bias = (unsigned long)m->base_addr - map_base_vaddr(m);
     int isgo = go_is_go(m, bias);

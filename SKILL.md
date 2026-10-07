@@ -99,6 +99,76 @@ Krok po kroku:
 - **NESAHEJ na systémové ownery/perms** (bootloop riziko); deploy jen kopírováním do `files/`
   (== `$F`).
 
+## Doplňky ze session 2026-10-07 (path-translace)
+
+- **Větve: vývoj a testy jdou do `dev`, `master` je produkční.** Opravy commituj na `dev`
+  (`git checkout dev && git pull origin dev`); `master` se posouvá jen z `dev` (ff) po
+  ověření celé sady. Necommituj přímo na `master`.
+- **Push na `master` vždy s tagem verze** (konvence `vX.Y`, poslední `v0.3`): po ff
+  `master` ← `dev` vytvoř anotovaný tag a pushni oba najednou:
+  ```sh
+  git checkout master && git merge --ff-only dev
+  git tag -a v0.4 -m "release: v0.4 — <shrnutí>"
+  git push origin master v0.4
+  ```
+  Push na `master` bez tagu nedělej.
+
+- **Repo vs. testovací kopie:** git repo je `/root/elf_pro`; `/root/elf_loader` je pracovní
+  kopie, ze které běží `test-all.sh`. Po úpravě kopíruj **jen** `test-all.sh`:
+  `cp /root/elf_pro/test-all.sh /root/elf_loader/`. NIKDY nekopíruj `src/*.c` do kořene
+  `/root/elf_loader` (git-agent je auto-commitne do `dev`).
+- **git-agent auto-commituje i `/root/elf_pro` a PUSHUJE na `origin/master`** (commit
+  „<datum> git-agent" s rozpracovaným stavem). Nenechávej rozbitý mezistav v `src/` dlouho
+  ležet; před vlastním commitem zkontroluj `git log`/`git status -sb`.
+- **`su -c` na tomto zařízení = proot** (`PROOT_L2S_DIR`) → překládá cesty na úrovni syscallů
+  a path bugy maskuje. Platí jen `ashell -c`.
+- **Deploy s A/B zálohou:**
+  ```sh
+  cp $L $D/usr/bin/elf_loader.prev; cp /tmp/elf_loader_ndk $L; chmod 755 $L
+  ```
+  Každou opravu ověř A/B: stejný test s `$D/usr/bin/elf_loader.prev` musí FAILnout,
+  s novou PASSnout (jinak test nic nedokazuje).
+- **Celá sada** (trvá > 10 min → spouštěj na pozadí, výstup do scratchpadu):
+  ```sh
+  ashell -c "ROOTFS=$R ELF_ROOTFS=$R HOME=$D L=$L $L --ownall $R/bin/bash /root/elf_loader/test-all.sh all"
+  ```
+  Jednotlivá kategorie: `... test-all.sh pathops`. A/B kategorie: nastav `L=…elf_loader.prev`.
+  Stav k 2026-10-07: **PASS 177 / FAIL 0 / SKIP 33**.
+- **C testy glibc funkcí:** zdroj dej pod `$R/tmp/...`, kompiluj guest gcc přes loader:
+  ```sh
+  ashell -c "export ROOTFS=$R ELF_ROOTFS=$R ELF_LOADER=$L PATH=/usr/bin:/bin:/system/bin; \
+    $L --ownall $R/usr/bin/gcc -o /tmp/tmpt/t3 /tmp/tmpt/t3.c && $L --ownall $R/tmp/tmpt/t3"
+  ```
+  Regresní testy do `test-all.sh` piš jako Python `ctypes` skript (`c = ctypes.CDLL(None)`)
+  s výstupem `NAZEV <počet>` — viz `category_pathops` (`LIBCOPS`, `LIBCOPS2`).
+- **Pasti v ashell prostředí:** `TMPDIR=$D/cache` (host) → `tempnam` ho podle POSIX
+  použije přednostně; v testu `unset TMPDIR`. Bare `timeout`/`bash` uvnitř guestu se
+  resolvují na host `/system/bin` → používej `$R/usr/bin/timeout`, `$R/bin/bash`.
+- **Analýza glibc lokálně** (objdump/nm jsou v prootu):
+  ```sh
+  LIBC=$R/usr/lib/aarch64-linux-gnu/libc.so.6
+  nm -D $LIBC | grep ' fstatat'            # aliasy = stejná adresa
+  objdump -d --start-address=0x... --stop-address=0x... $LIBC   # prolog: bti c / paciasp / b
+  ```
+  `d503245f` = `bti c`, `d503233f` = `paciasp` → `hook_install` je nepatchuje, jen GOT override
+  (interní `bl` ho obchází) → `hook_inline_prologue`. Po inline hooku musí všechny `g_orig_*`
+  se stejnou adresou dostat trampolínu (jinak rekurze).
+- **Shimy běží pod GUEST TP:** žádné bionic TLS funkce (`snprintf`, `getpid`, `getenv`,
+  `fprintf`, `memset`) — jen `shim_*` helpery, `shim_raw_syscall6`, `shim_guest_errno_set`.
+- **Po změně path shimů vždy otestuj i Bun (claude) s cwd pod `$R`** — Bun dělá fs raw
+  syscally, guest cesty pro něj neexistují:
+  ```sh
+  ashell -c "export ROOTFS=$R ELF_ROOTFS=$R ELF_LOADER=$L HOME=$D; cd $R/tmp/cwdt; \
+    $L --ownall $R/root/claudetest/claude.exe -p hi </dev/null"
+  ```
+  Úspěch = `Not logged in · Please run /login`; chyba = `Can't access working directory`.
+  (`BUN_BE_BUN=1` u této verze nefunguje.) Dále node (`$R/root/.nvm/versions/node/v26.10.0/bin/node`),
+  python, git a cJSON (`$R/tmp/cjson`, guest PATH `/usr/local/bin:/usr/bin:/bin:/system/bin`,
+  cmake -S/-B → build → ctest 19/19).
+- **Vypínače pro bisekci:** `F2_DISABLE`, `F2_ONLY=a,b`, `F2_NO_INTERNAL_HOOK`,
+  `F2_NO_OPEN_HOOK`, `F2_NO_SPAWN_HOOK`, `F2_NO_BTI_HOOK`, `F2_NO_CWD_STRIP`;
+  diagnostika `ELF_DEBUG=1` (`[hook] ... inline OK`), `ELF_LOADER_EXEC_TRACE=1`.
+
 ## Příklad (loader smoke test)
 
 ```sh
