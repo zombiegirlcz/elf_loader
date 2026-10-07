@@ -281,6 +281,15 @@ Milníky:
   se tam neprojeví; jediný platný test je `ashell -c`. Diagnostika
   `ELF_LOADER_EXEC_TRACE=1` (raw-syscall trace v exec/access shimech) —
   [postup.md](postup.md) 2026-10-07 (2)/(3).
+- ~~Funkce s cestou mimo override tabulku~~ — **VYŘEŠENO** (2026-10-07, (4)):
+  audit importů 1927 ELF v rootfs; doplněny shimy `chmod/chown/utime*/
+  truncate/mknod/mkfifo/linkat/statfs/xattr/creat/pathconf/
+  inotify_add_watch` + AF_UNIX `bind`/`connect` (překlad `sun_path`).
+  Regresní test `test-all.sh pathops` (A/B). Hardlinky (`link`) zakazuje
+  SELinux app domény i nativně — platformní limit. **Pravidlo:** GOT override
+  je per-jméno; při přidání shimu zkontrolovat aliasy v `libc.so.6`
+  (`nm -D`, stejná adresa) a importy binárek (`nm -D --undefined-only`;
+  toybox `readelf` relokace nevypisuje).
 - Test na reálném 16K Android 15+ zařízení (Task 3).
 - ~~Bionic dlerror/errno test (Task 4).~~ **Vyřešeno** — `ldso_dlerror()` +
   guest `dlopen/dlsym/dlerror/dlclose/dladdr` nad `_rtld_global` ověřeno

@@ -3612,3 +3612,46 @@ zdvojil; `g_orig_euidaccess` naplní položka `euidaccess`).
 Obecné poučení: GOT override je per-jméno — glibc aliasy (`eaccess`/
 `euidaccess`, `__open`/`open`, ...) je potřeba registrovat zvlášť, pokud je
 binárka importuje pod alias jménem a inline hook neprojde (BTI/PAC prolog).
+
+### 2026-10-07 (4) — audit GOT override tabulky: chybějící funkce s cestou
+
+Po `eaccess` (3) systematický audit:
+1. **Aliasy** hooknutých funkcí v guest `libc.so.6` (`nm -D --defined-only`,
+   stejná adresa): zbývají jen `_IO_fopen`, `fstat`/`__fstat64`,
+   `getrlimit64`, `__mmap`/`__mprotect`/`__munmap`, `__sigaction` — žádný
+   z nich binárky v rootfs neimportují kvůli cestám (`fstat` je fd-based).
+2. **Nehooknuté funkce s cestou** — import count přes 1927 ELF v
+   `$R/usr/{bin,sbin,lib/aarch64-linux-gnu}` (`nm -D --undefined-only`):
+   `chmod` 123, `connect` 119, `bind` 99, `chown` 58, `utime` 49,
+   `utimensat` 34, `inotify_add_watch` 30, `pathconf` 21, xattr ~100,
+   `creat` 18, `statfs` 18, `mknod` 17, `fchmodat`/`fchownat` 16, `mkfifo` 16,
+   `linkat` 15, `truncate` 7, ... Fortify `__open_2`/`__openat_2` (112/46)
+   jsou OK — interně volají `__open64` = inline PAC hook `open64`.
+3. **Empiricky (Python `os.*` na `/tmp/...`, jen pod ROOTFS):** FAIL
+   `chmod`, `chown`, `utime`, `truncate`, `mkfifo`, `link`, `listxattr`,
+   AF_UNIX `bind`/`connect` (ENOENT). OK: `open`, `access`, `statvfs`,
+   `scandir`.
+
+**Fix (`src/main.c`):** shimy + položky v `g_f2_hooks` pro `chmod lchmod
+fchmodat chown lchown fchownat utime utimes lutimes futimesat utimensat
+truncate truncate64 mknod mknodat mkfifo mkfifoat linkat statfs statfs64
+{,l}getxattr {,l}setxattr {,l}listxattr {,l}removexattr creat creat64
+pathconf inotify_add_watch bind connect`. Jednotný vzor `shim_tp()` (jen
+překlad prefixu, bez resolvu symlinků — stejně jako `unlink`/`mkdir`); u
+`*at` se absolutní cesta překládá vždy (kernel `dirfd` ignoruje).
+`bind`/`connect`: jen `AF_UNIX` s absolutní `sun_path`; abstraktní sockety
+a jiné rodiny beze změny; když se přeložená cesta nevejde do 108 B
+`sun_path`, nechá se původní. Nový `shim_memset` (volatile — guest TP,
+nesmí se z toho stát volání bionic `memset`), `#include <sys/un.h>`.
+
+**`link`/`linkat` zůstává EACCES:** SELinux `untrusted_app_27` zakazuje
+hardlinky v `app_data_file` i nativně (`avc: denied { link }` i pro
+hostový `toybox ln`) — platformní limit, ne bug překladu (z AVC je vidět,
+že `elf_loader` už sahal na správný inode v rootfs).
+
+**Ověření (`ashell -c`):** nový regresní test `test-all.sh pathops`
+(7 operací + host `stat` kontrola mode=640 size=2). **A/B:** binárka z
+`bfaaf9b` → `FAIL ... ERR chmod [Errno 2]`, nová → PASS 7/7. Reálné
+nástroje přes guest bash: `chmod`, `touch -d @1000000000` (host `stat`
+mtime=1000000000), `truncate -s`, `mkfifo`, `cp -p`, `install -m`,
+`tar -xp` — vše OK.

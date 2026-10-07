@@ -865,6 +865,63 @@ category_nss() {
     fi
 }
 
+# Path-translace pro metadata/uzly/xattr/unix socket (chmod, chown, utime,
+# truncate, mkfifo, listxattr, AF_UNIX bind/connect) na guest cestach, ktere
+# existuji JEN pod ROOTFS. Hardlink (link/linkat) zamerne ne - SELinux app
+# domeny ho zakazuje i nativne (avc denied { link }). Viz postup.md 2026-10-07 (4).
+category_pathops() {
+    echo ""
+    echo "=== path-translace: chmod/chown/utime/truncate/mkfifo/xattr/AF_UNIX ==="
+    local py_bin
+    py_bin=$(find "$R/usr/bin" -name 'python3' 2>/dev/null | head -1 || true)
+    if [ -z "${py_bin:-}" ]; then
+        echo "SKIP pathops: python3 not found"
+        echo "SKIP: pathops - no python3" >> "$SKIP_LOG"
+        ((SKIP_COUNT++)) || true
+        return 0
+    fi
+    local g="/tmp/pathops.$$" h="$R/tmp/pathops.$$"
+    mkdir -p "$h"
+    cat > "$h/t.py" <<PYEOF
+import os, socket
+B = "$g"
+open(B + "/f", "w").write("hello")
+r = []
+def t(n, fn):
+    try:
+        fn(); r.append(n)
+    except Exception as e:
+        print("ERR", n, e)
+t("chmod", lambda: os.chmod(B + "/f", 0o640))
+t("chown", lambda: os.chown(B + "/f", os.getuid(), os.getgid()))
+t("utime", lambda: os.utime(B + "/f", (1000000000, 1000000000)))
+t("truncate", lambda: os.truncate(B + "/f", 2))
+t("mkfifo", lambda: os.mkfifo(B + "/fifo"))
+t("listxattr", lambda: os.listxattr(B + "/f"))
+def u():
+    p = B + "/s"; s = socket.socket(socket.AF_UNIX); s.bind(p); s.listen(1)
+    c = socket.socket(socket.AF_UNIX); c.connect(p); c.close(); s.close()
+t("unix", u)
+print("PATHOPS", len(r), " ".join(r))
+PYEOF
+    local env="ROOTFS=$R ELF_ROOTFS=$R ELF_LOADER=$L"
+    local out
+    out=$(ashell_out "$env $L --ownall $py_bin $g/t.py")
+    local hmode hsize
+    hmode=$(stat -c %a "$h/f" 2>/dev/null || echo none)
+    hsize=$(stat -c %s "$h/f" 2>/dev/null || echo none)
+    rm -rf "$h"
+    if printf '%s' "$out" | grep -Fq "PATHOPS 7" && [ "$hmode" = 640 ] && [ "$hsize" = 2 ]; then
+        echo "PASS pathops: 7/7 operaci na guest ceste (host vidi mode=$hmode size=$hsize)"
+        echo "PASS: pathops - 7/7" >> "$PASS_LOG"
+        ((PASS_COUNT++)) || true
+    else
+        echo "FAIL pathops: out=$out host mode=$hmode size=$hsize"
+        echo "FAIL: pathops | $out | mode=$hmode size=$hsize" >> "$FAIL_LOG"
+        ((FAIL_COUNT++)) || true
+    fi
+}
+
 # /proc/self/exe musi vracet guest binarku (ne loader) a GNU Make fast path
 # (recept bez shell-metaznaku -> gnulib find_in_given_path -> eaccess() pred
 # posix_spawn) musi najit program pod ROOTFS. Viz postup.md 2026-10-07 (3).
@@ -1200,6 +1257,10 @@ case "${1:-all}" in
         category_selfexe
         print_summary
         ;;
+    pathops)
+        category_pathops
+        print_summary
+        ;;
     madv)
         category_madv
         print_summary
@@ -1237,6 +1298,7 @@ case "${1:-all}" in
         category_fstat
         category_nss
         category_selfexe
+        category_pathops
         category_madv
         category_venv
         category_net_real
