@@ -1153,6 +1153,12 @@ static int shim_statvfs64(const char *p, struct statvfs64 *st) {
 }
 
 static int shim_access(const char *p, int m) {
+    if (g_exec_trace) {
+        static const char m1[] = "[accesstrace] p=";
+        shim_raw_syscall6(64, 2, (long)(unsigned long)m1, sizeof(m1) - 1, 0, 0, 0);
+        shim_raw_syscall6(64, 2, (long)(unsigned long)p, shim_strlen(p), 0, 0, 0);
+        shim_raw_syscall6(64, 2, (long)(unsigned long)"\n", 1, 0, 0, 0);
+    }
     char b[8192]; const char *path = p; if (shim_translate(p, b, sizeof b)) path = b;
     /* Resolve symlinks under ROOTFS so kernel doesn't follow guest-absolute
      * symlink targets against the host root (e.g. awk -> /etc/alternatives/awk) */
@@ -1173,6 +1179,12 @@ static int shim_euidaccess(const char *p, int m) {
     fp_euidaccess f = (fp_euidaccess)g_orig_euidaccess; return f ? f(path, m) : -1;
 }
 static int shim_faccessat(int dfd, const char *p, int m, int ff) {
+    if (g_exec_trace) {
+        static const char m1[] = "[faccessattrace] p=";
+        shim_raw_syscall6(64, 2, (long)(unsigned long)m1, sizeof(m1) - 1, 0, 0, 0);
+        shim_raw_syscall6(64, 2, (long)(unsigned long)(p?p:"(null)"), shim_strlen(p?p:"(null)"), 0, 0, 0);
+        shim_raw_syscall6(64, 2, (long)(unsigned long)"\n", 1, 0, 0, 0);
+    }
     char b[8192]; const char *path = p;
     if (dfd == -100 && p && p[0] == '/') {
         if (shim_translate(p, b, sizeof b)) path = b;

@@ -266,9 +266,24 @@ Milníky:
   `test-all.sh all` PASS 171/0 (dřív 160, bez regrese). cmake `-S/-B`
   configure fázi už nekrashuje a `CMAKE_COMMAND` v cache je korektní
   guest-relativní cesta (dřív loader); plný self-build (`make` → nested
-  `/usr/bin/cmake` link step) ještě naráží na samostatný, zřejmě nesouvisející
-  problém s exec translation v nested make procesu — nevyšetřeno, potenciálně
-  `ctest`/`cpack` dotčeny stejně.
+  `/usr/bin/cmake` link step) ještě naráží na samostatný problém.
+- **GNU Make "fast path" (recept bez shell-metaznaku) úplně obchází
+  `posix_spawn`/`execvp`/`execve`/`access` GOT-override** — root cause
+  lokalizován (2026-10-07), NEOPRAVENO. `make` normálně importuje a
+  správně volá `posix_spawn`/`execvp` (ověřeno: recept S `;`/jiným shell
+  metaznakem funguje, `sh` i jeho `execve` se korektně přeloží). Ale bez
+  metaznaku (make spouští dítě přímo, bez `/bin/sh`) NEPROBĚHNE žádné
+  volání `posix_spawn`/`execvp`/`execve`/`access`/`faccessat` přes GOT —
+  nula trace hitů (`ELF_LOADER_EXEC_TRACE=1`, trvalá diagnostika v kódu) —
+  takže dítě se spouští syscall-level mechanismem mimo dosah GOT/PLT i F2
+  inline hooků. Izolovaný `vfork()+execvp()` test (mimo make) funguje OK,
+  takže obecný mechanismus je v pořádku — specifický je `make`'s vlastní
+  spawn cesta. Dopad: `cmake`/`ctest`/`cpack` plný build pod `--ownall`
+  nefunguje pro recepty bez shellu (naprostá většina generovaných
+  Makefile recipes ALE shell potřebuje, takže dopad může být menší než
+  se zdá — nezkoušeno na reálném projektu). Chce to `strace`/seccomp-trap
+  na `execve`/`clone` syscall numbers pro přesnou identifikaci —
+  [postup.md](postup.md) 2026-10-07 (2).
 - Test na reálném 16K Android 15+ zařízení (Task 3).
 - ~~Bionic dlerror/errno test (Task 4).~~ **Vyřešeno** — `ldso_dlerror()` +
   guest `dlopen/dlsym/dlerror/dlclose/dladdr` nad `_rtld_global` ověřeno
