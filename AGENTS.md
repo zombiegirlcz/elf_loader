@@ -8,6 +8,10 @@ Toto je hutný index k [postup.md](postup.md). Sekce jsou seřazeny tematicky
 scope a běh glibc binárek v procesu na AArch64 Androidu (bionic host).
 Preference — non-root vlastní loading (`--ownall`); chroot (`linuxsh`) je
 rychlejší alternativa jen s rootem.
+**Původní myšlenka:** postavit něco, co zrychlí / nahradí `proot` (žádný
+ptrace překlad každého syscallu). **Pro uživatele:** zjednodušuje použití
+běžných Linux nástrojů (glibc binárek z distro rootfs) přímo v jejich
+Android appce — bez nutnosti je kompilovat pro bionic/NDK.
 
 ---
 
