@@ -3374,3 +3374,135 @@ mount).
 žádný hack): `all` → **PASS 165 / FAIL 1 / SKIP 38**, jediný FAIL
 (`csplit - extra`) je pre-existující flaky test nesouvisející s touto
 opravou (stará, zbytkové `xx*` soubory z předchozích běhů).
+
+---
+
+## 2026-10-06 (10) — Audit SKIP vs. skutečný FAIL + test heavy binárek/pip balíčků z `/usr/bin` + nový bug `/proc/self/exe`
+
+**Audit SKIP v `test-all.sh`:** `should_skip()` měl přehnaně široké
+substring vzory `*vi*` a `*nc*` — `*vi*` omylem zachytávalo `service`
+(obsahuje "vi"), `*nc*` zachytávalo `truncate`/`gencat`/`loginctl`
+(obsahují "nc") → tyto funkční binárky se nikdy reálně neotestovaly, jen
+se tiše skipovaly jako by šlo o `vi`/`nc`. Oprava: přesné literály
+`vi`/`nc` místo substring globů. Zároveň `category_madv` hlásila
+`SKIP: no gcc`, i když gcc v rootfs reálně funguje — `command -v gcc`
+jen neuspělo, protože top-level bash (spuštěný jedním `ashell -c`) nemá
+`$R/usr/bin` v PATH. Opraveno na explicitní `$R/usr/bin/gcc` + PATH
+export jen pro compile krok. Commit `9694076`.
+
+Zbylé SKIPy ověřeny jako legitimní (host limity Android app-uid:
+`uptime`/`pslog`/`shred`/`ping`/`ping6`; mimo-scope: toolchain,
+interpretery, editory; chybějící v rootfs: `nmap`) nebo transparentně
+zdokumentovaný známý bug (`python -m kaggle/modal/yt_dlp/huggingface_hub`
+segfaultují pod loaderem — komentář v kódu, žádné tajení).
+
+**Test heavy binárek z `/usr/bin` přes `ashell -c`, reálné použití (NE
+`--version`), plné device cesty — všechny OK:** `rg` (grep v reálném
+souboru), `eza` (listing), `zoxide` (add+query), `openssl` (SHA-256
+digest ověřen proti známé hash hodnotě), `bison` (reálná gramatika →
+`.tab.c` s `yyparse`), `gpg` (symetrický encrypt+decrypt roundtrip),
+`pandoc` (markdown→HTML), `batcat` (zobrazení souboru), `sq`
+(generování OpenPGP klíče + inspect), `gh` (čtení lokální auth
+konfigurace), `git-lfs` (`install` v git repu — potřeboval `$R` v
+PATH, jinak "Error getting Git version" stejná PATH-ordering třída
+jako u `timeout`/`bash` výše, ne nový bug).
+
+**Python balíčky (doinstalováno `pandas`/`lxml`/`Pillow`/`scipy` přes
+`pip install --break-system-packages`; `numpy`/`cryptography` už byly
+nainstalované) — reálné use-case testy, všechny OK:** pandas
+(`DataFrame.sum()`), lxml (XML parse), Pillow (PNG save+reopen
+round-trip), scipy (`linalg.det`), cryptography (`Fernet`
+encrypt/decrypt roundtrip), numpy (maticová inverze, ověřeno `A⁻¹·A = I`).
+
+**NOVÝ BUG NALEZEN — `/proc/self/exe` v own-loadovaném procesu vrací
+cestu k LOADERU, ne ke skutečné guest binárce.** Ověřeno přímo:
+```
+ashell -c "$L --ownall $R/usr/bin/python3 -c 'import os; print(os.readlink("/proc/self/exe"))'"
+→ /data/user/0/com.linux_core/files/usr/bin/elf_loader
+```
+Dopad: libovolný nástroj, který si self-introspekcí (`readlink
+/proc/self/exe`) zjišťuje VLASTNÍ absolutní cestu, dostane špatnou
+hodnotu (cestu k loaderu místo k sobě pod $ROOTFS). Konkrétně
+demonstrováno na `cmake`: `CMAKE_COMMAND` se odvodí špatně, vygenerovaný
+`Makefile` pak referencuje neexistující host cestu:
+```
+make: /usr/bin/cmake: No such file or directory
+make: *** [Makefile:93: all] Error 127
+```
+Repro: `cmake .` v projektu s `CMakeLists.txt` (project+add_executable)
+pod `$L --ownall $R/usr/bin/cmake` — `configure` i `try_compile` kroky
+samy o sobě proběhnou (`cc` funguje přímo), ale generovaný Makefile je
+nepoužitelný, protože $(CMAKE_COMMAND) uvnitř není ROOTFS-prefixed.
+Pravděpodobně postihuje i `ctest`/`cpack` (nezkoušeno dál, mimo rozsah
+tohoto kola) a potenciálně libovolný jiný self-introspekující nástroj
+(Go binárky zjišťující si vlastní cestu, balíčkovací nástroje apod).
+Fix by šel přes shim na `readlink("/proc/self/exe", ...)`/
+`readlinkat`, který by měl vracet cestu guest exe (uloženou při
+`--ownall` entry), ne cestu k loaderu — NEIMPLEMENTOVÁNO, otevřený bod.
+
+**Vedlejší nález (ne nový bug, stejná známá třída):** `python3 -m
+ensurepip` pod own-loadem padá `FileNotFoundError` na
+`/usr/share/python-wheels/pip-*.whl` — Debian-balíčkovaná pip wheel
+cesta je absolutní a mimo $ROOTFS translaci (`os.listxattr` na
+host cestu, co v non-chroot běhu neexistuje). Stejná třída jako
+již zdokumentovaný problém "absolutní symlinky/cesty mimo chroot"
+(sekce 5 AGENTS.md), ne nový mechanismus. Workaround: `pip install
+--break-system-packages` přímo, bez venv/ensurepip.
+
+---
+
+### 2026-10-07 — `/proc/self/exe` fix (VYŘEŠENO)
+
+Root cause (systematic-debugging): own-loadovaný proces fyzicky JE loader
+(guest binárka je jen namapovaná do jeho adresního prostoru), takže reálný
+`readlink("/proc/self/exe")` nutně vrací cestu k loaderu — kernel nemá
+důvod vracet nic jiného. Fix musí být shim na `readlink`/`readlinkat`.
+
+Implementace (`src/main.c`):
+- Nový globál `g_guest_exe_path[8192]`, naplněný v `run_ownall` těsně před
+  `elf_load(path)` — `path` je v tu chvíli finální resolvovaná host cesta
+  ke guest binárce (po `shim_resolve_symlinks` a shebang rewrite).
+- `shim_is_proc_self_exe(p)`: true pro `/proc/self/exe` NEBO `/proc/<vlastni
+  pid>/exe`.
+- `shim_readlink`/`shim_readlinkat`: pokud `shim_is_proc_self_exe()` a
+  `g_guest_exe_path` je nastavený, vrátí jeho obsah namísto volání
+  skutečného readlink. Beze změny pro vše ostatní.
+
+**Regrese při první verzi fixu** (chycena testem, ne review): `shim_is_proc_
+self_exe` použila `snprintf(buf, "/proc/%d/exe", getpid())`. `test-all.sh
+python` spadlo z PASS 4/0 na PASS 1/3 (`import os` atd. SIGSEGV v bionic
+libc, `pc` v `/apex/.../libc.so+0xceeb8`). Root cause: `shim_readlink`/
+`shim_readlinkat` jsou F2 inline-hook náhrady — patchují se PŘÍMO do
+glibc kódu (ne přes PLT), takže běží pod GUEST TP ve chvíli, kdy je
+volá guest glibc (nebo glibc-interní `realpath`/`canonicalize`). Bionic
+`snprintf`/`getpid()` jsou TLS-dependent (errno, FILE/locale interní
+stav) a čtou/píšou přes bionický TP offset — pod guest TP to zapisuje
+do náhodného místa v GUEST TLS blobu → tichá korupce, projeví se až
+později (threading v CPython). Přesně stejný důvod, proč `shim_execveat`
+o kus výš v tomtéž souboru ručně sestavuje `/proc/self/fd/<N>` bez
+`snprintf` — zavedený vzor, který jsem při prvním pokusu nedodržel.
+
+Fix fixu: `shim_is_proc_self_exe` teď getpid řeší přes
+`shim_raw_syscall6(172 /* SYS_getpid */, ...)` (raw syscall, žádná TLS) a
+číslo do stringu sestavuje ručně (stejný pattern jako `shim_execveat`).
+
+A/B ověření (`ashell -c`, bionic build, přes `elf_loader --ownall`):
+- `readlink /proc/self/exe` pod `--ownall $R/usr/bin/readlink`: teď vrací
+  `$R/usr/bin/readlink` (dřív by vrátilo cestu k `elf_loader`).
+- `test-all.sh python`: PASS 4/0 (regrese pryč).
+- `test-all.sh all`: **PASS 171 / FAIL 0** (dřív 160 — nová čísla kvůli
+  nové verzi testů v mezičase, žádná ztráta).
+- `cmake -S/-B` na triviálním `CMakeLists.txt` (`project`+`add_executable`):
+  configure fáze už nekrashuje; `CMakeCache.txt` má `CMAKE_COMMAND:INTERNAL=
+  /usr/bin/cmake` (guest-relativní, korektní — dřív by to byla cesta
+  k loaderu).
+
+**Neuzavřeno/navazující:** plný `cmake` self-build (s `-DCMAKE_MAKE_PROGRAM`
+a `-DCMAKE_C_COMPILER` nastavenými) selže v `try_compile` kroku na
+`make[1]: /usr/bin/cmake: No such file or directory` — vnořený `make`
+proces se pokouší exec'nout `/usr/bin/cmake` a dostane ENOENT, což
+vypadá jako že exec translation (shim_execve → `$ROOTFS` prefix) se
+v tomhle vnořeném kontextu neuplatní. Nevyšetřeno (mimo rozsah tohoto
+fixu — původní bug byl specificky o `/proc/self/exe`, ten je potvrzeně
+opraven). Pokud bude `ctest`/`cpack` nebo plný cmake build potřeba,
+chce to samostatné debug kolo.

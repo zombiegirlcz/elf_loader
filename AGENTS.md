@@ -236,10 +236,39 @@ Milníky:
   plné cesty `$R/usr/bin/timeout`/`$R/bin/bash`. Zároveň `test-all.sh` teď
   běží přes jediné `ashell -c` (ne jeden na každý test) —
   [postup.md](postup.md) 2026-10-06 (8)/(9).
+- **Audit SKIP vs. skutečný FAIL v `test-all.sh` + test heavy binárek a
+  pip balíčků z `/usr/bin`** — přehnaně široké substring vzory `*vi*`/`*nc*`
+  v `should_skip()` omylem skipovaly funkční `service`/`truncate`/
+  `gencat`/`loginctl`; `category_madv` hlásila `no gcc` jen kvůli
+  chybějícímu `$R/usr/bin` v PATH top-level bashe. Opraveno (commit
+  `9694076`). Dále reálně (přes `ashell -c`, ne `--version`) ověřeny OK:
+  `rg`, `eza`, `zoxide`, `openssl`, `bison`, `gpg`, `pandoc`, `batcat`,
+  `sq`, `gh`, `git-lfs`; Python `pandas`/`lxml`/`Pillow`/`scipy`/
+  `cryptography`/`numpy`. **Nový bug nalezen** (neopraveno): `/proc/self/exe`
+  v own-loadovaném procesu vrací cestu k loaderu, ne ke guest binárce —
+  rozbíjí self-introspekující nástroje (`cmake` generuje nefunkční
+  Makefile s `$(CMAKE_COMMAND)` ukazujícím na neexistující host cestu) —
+  [postup.md](postup.md) 2026-10-06 (10).
 
 ## 10. Zbývá / otevřené body
 
 - Kosmetika: `src/main.c:149` sign-compare, `\]` escape.
+- ~~`/proc/self/exe` v own-loadovaném procesu vrací cestu k loaderu~~ —
+  **VYŘEŠENO** (2026-10-07): `run_ownall` ukládá resolvovanou host cestu
+  ke guest binárce do `g_guest_exe_path`; `shim_readlink`/`shim_readlinkat`
+  rozpoznají `/proc/self/exe` i `/proc/<pid>/exe` a vrátí tuto cestu místo
+  volání do skutečného readlink (ten by vrátil loader). Cesta pro `<pid>`
+  je sestavena ručně (žádný `snprintf`/`getpid()`) — první verze fixu
+  použila oba a rozbila python3 (`import os` SIGSEGV): tyto shimy běží
+  patchnuté přímo v glibc kódu pod GUEST TP, takže bionic `snprintf`/`getpid`
+  (TLS-dependent) korumpovaly guest TLS. Ověřeno `readlink /proc/self/exe`
+  pod `--ownall` → vrací `$ROOTFS/.../binárka` (dřív cestu k loaderu);
+  `test-all.sh all` PASS 171/0 (dřív 160, bez regrese). cmake `-S/-B`
+  configure fázi už nekrashuje a `CMAKE_COMMAND` v cache je korektní
+  guest-relativní cesta (dřív loader); plný self-build (`make` → nested
+  `/usr/bin/cmake` link step) ještě naráží na samostatný, zřejmě nesouvisející
+  problém s exec translation v nested make procesu — nevyšetřeno, potenciálně
+  `ctest`/`cpack` dotčeny stejně.
 - Test na reálném 16K Android 15+ zařízení (Task 3).
 - ~~Bionic dlerror/errno test (Task 4).~~ **Vyřešeno** — `ldso_dlerror()` +
   guest `dlopen/dlsym/dlerror/dlclose/dladdr` nad `_rtld_global` ověřeno
