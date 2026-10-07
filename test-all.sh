@@ -969,6 +969,47 @@ PYEOF
         echo "FAIL: pathops - libc interni | $lout" >> "$FAIL_LOG"
         ((FAIL_COUNT++)) || true
     fi
+    # Dalsi glibc-interni cesty: scandir (__opendir -> nocancel O_DIRECTORY),
+    # tempnam/ftok (stat/lstat -> fstatat, BTI inline hook), getcwd (strip $R),
+    # tzset/setmntent (nocancel whitelist), sem_open (/dev/shm + link->renameat2).
+    # Viz postup.md 2026-10-07 (7).
+    cat > "$h/l2.py" <<PYEOF
+import ctypes, os, time
+c = ctypes.CDLL(None)
+B = "$g/w"
+r = []
+def t(n, ok):
+    (r.append(n) if ok else print("ERR", n))
+nl = ctypes.c_void_p()
+t("scandir", c.scandir(B.encode(), ctypes.byref(nl), None, None) == 4)
+os.environ.pop("TMPDIR", None)
+c.tempnam.restype = ctypes.c_char_p
+tn = c.tempnam(B.encode(), b"pfx")
+t("tempnam", tn is not None and tn.startswith(B.encode() + b"/pfx"))
+t("ftok", c.ftok((B + "/a").encode(), 97) != -1)
+os.chdir(B)
+t("getcwd", os.getcwd() == B)
+os.environ["TZ"] = "Europe/Prague"; time.tzset()
+t("tzset", time.tzname[0] == "CET")
+c.setmntent.restype = ctypes.c_void_p
+m = c.setmntent(b"/etc/fstab", b"r")
+t("setmntent", bool(m))
+import multiprocessing
+l = multiprocessing.Lock(); l.acquire(); l.release()
+t("sem_open", True)
+print("LIBCOPS2", len(r), " ".join(r))
+PYEOF
+    local l2out
+    l2out=$(ashell_out "$env $L --ownall $py_bin $g/l2.py" 2>&1)
+    if printf '%s' "$l2out" | grep -Fq "LIBCOPS2 7"; then
+        echo "PASS pathops: scandir/tempnam/ftok/getcwd/tzset/setmntent/sem_open"
+        echo "PASS: pathops - libc interni 2" >> "$PASS_LOG"
+        ((PASS_COUNT++)) || true
+    else
+        echo "FAIL pathops: libc interni 2 out=$l2out"
+        echo "FAIL: pathops - libc interni 2 | $l2out" >> "$FAIL_LOG"
+        ((FAIL_COUNT++)) || true
+    fi
     rm -rf "$h"
     if printf '%s' "$out" | grep -Fq "PATHOPS 7" && [ "$hmode" = 640 ] && [ "$hsize" = 2 ]; then
         echo "PASS pathops: 7/7 operaci na guest ceste (host vidi mode=$hmode size=$hsize)"

@@ -358,7 +358,10 @@ static int shim_translate(const char *p, char *out, size_t n) {
     if (!g_shim_root || !g_shim_root[0]) return 0;
     size_t rl = shim_strlen(g_shim_root);
     if (shim_strncmp(p, g_shim_root, rl) == 0 && (p[rl] == '/' || p[rl] == 0)) return 0;
-    if (shim_excluded(p)) return 0;
+    /* /dev/shm na Androidu neexistuje (shm_open/sem_open -> ENOENT) -> guest
+     * $R/dev/shm (vytvari shim_register_overrides). Zbytek /dev zustava host. */
+    int shm = shim_strncmp(p, "/dev/shm", 8) == 0 && (p[8] == '/' || p[8] == 0);
+    if (!shm && shim_excluded(p)) return 0;
     size_t pl = shim_strlen(p);
     if (rl + pl + 1 > n) return 0;            /* out neni zkraceno -> bezpecne */
     shim_memcpy(out, g_shim_root, rl);
@@ -1039,6 +1042,7 @@ typedef int (*fp_open)(const char *, int, ...);
 static int g_loader_active = 0;        /* 1 = loaderuv vlastni kod (bionic TLS) */
 typedef int (*fp_openat)(int, const char *, int, ...);
 static int shim_resolve_symlinks(const char *path, char *out, size_t outsz);
+static void shim_guest_errno_set(int v);
 static int shim_open(const char *p, int flags, ...) {
     char buf[8192]; const char *path = p;
     if (shim_translate(p, buf, sizeof buf)) path = buf;
@@ -1259,6 +1263,20 @@ static int shim_link(const char *o, const char *n) {
     char b1[8192], b2[8192]; const char *oldp = o, *newp = n;
     if (shim_translate(o, b1, sizeof b1)) oldp = b1;
     if (shim_translate(n, b2, sizeof b2)) newp = b2;
+    /* sem_open: link(/dev/shm/sem.XXXXXX, /dev/shm/sem.NAME) + unlink(tmp).
+     * SELinux app domeny hardlinky zakazuje (EACCES) -> v shm adresari misto
+     * toho renameat2(RENAME_NOREPLACE): stejna atomicita i EEXIST semantika,
+     * nasledny unlink(tmp) jen vrati ENOENT (glibc ho ignoruje). */
+    if (g_shim_root && g_shim_root[0]) {
+        size_t rl = shim_strlen(g_shim_root);
+        if (shim_strncmp(oldp, g_shim_root, rl) == 0 && shim_strncmp(newp, g_shim_root, rl) == 0 &&
+            shim_strncmp(oldp + rl, "/dev/shm/", 9) == 0 && shim_strncmp(newp + rl, "/dev/shm/", 9) == 0) {
+            long r = shim_raw_syscall6(276 /* renameat2 */, -100, (long)oldp, -100, (long)newp,
+                                       1 /* RENAME_NOREPLACE */, 0);
+            if (r < 0) { shim_guest_errno_set((int)-r); return -1; }
+            return 0;
+        }
+    }
     fp_link f = (fp_link)g_orig_link; return f ? f(oldp, newp) : -1;
 }
 typedef int (*fp_rename)(const char *, const char *);
@@ -2661,6 +2679,37 @@ static int shim_chdir(const char *p) {
     char b[8192]; const char *path = p; if (shim_translate(p, b, sizeof b)) path = b;
     fp_chdir f = (fp_chdir)g_orig_chdir; return f ? f(path) : -1;
 }
+/* chdir("/tmp/x") jde do $R/tmp/x, takze kernel getcwd vraci $R/tmp/x. Program
+ * (cmake, git, Python os.getcwd) ma videt guest pohled jako v proot. Jen GOT
+ * override: glibc-interni __getcwd (realpath relativni cesty) musi dal dostat
+ * host cestu, kterou predava primo do syscallu. */
+typedef char *(*fp_getcwd)(char *, size_t);
+static void *g_orig_getcwd = NULL, *g_orig_getwd = NULL,
+            *g_orig_get_current_dir_name = NULL;
+static char *shim_getcwd(char *buf, size_t size) {
+    fp_getcwd f = (fp_getcwd)g_orig_getcwd;
+    if (!f) return NULL;
+    size_t rl = (g_shim_root && g_shim_root[0]) ? shim_strlen(g_shim_root) : 0;
+    /* buf==NULL: glibc alokuje; rezerva na prefix $R, zkraceni probehne na miste. */
+    if (!buf) return shim_strip_root(f(NULL, size ? size + rl : 0));
+    if (!size) return f(buf, size);            /* EINVAL od glibc */
+    char tmp[8192];
+    char *r = f(tmp, sizeof tmp);
+    if (!r) return NULL;
+    shim_strip_root(tmp);
+    size_t l = shim_strlen(tmp);
+    if (l + 1 > size) { shim_guest_errno_set(ERANGE); return NULL; }
+    shim_memcpy(buf, tmp, l + 1);
+    return buf;
+}
+static char *shim_getwd(char *buf) {
+    char *(*f)(char *) = (char *(*)(char *))g_orig_getwd;
+    return shim_strip_root(f ? f(buf) : NULL);
+}
+static char *shim_get_current_dir_name(void) {
+    char *(*f)(void) = (char *(*)(void))g_orig_get_current_dir_name;
+    return shim_strip_root(f ? f() : NULL);
+}
 
 static FILE *shim_fopen(const char *p, const char *mode) {
     char b[8192]; const char *path = p; if (shim_translate(p, b, sizeof b)) path = b;
@@ -3198,6 +3247,8 @@ static f2_hook_t g_f2_hooks[] = {
     {"readlink",(void*)shim_readlink,&g_orig_readlink},{"readlinkat",(void*)shim_readlinkat,&g_orig_readlinkat},
     {"realpath",(void*)shim_realpath,&g_orig_realpath},{"dlopen",(void*)shim_dlopen,&g_orig_dlopen},
     {"chdir",(void*)shim_chdir,&g_orig_chdir},
+    {"getcwd",(void*)shim_getcwd,&g_orig_getcwd},{"getwd",(void*)shim_getwd,&g_orig_getwd},
+    {"get_current_dir_name",(void*)shim_get_current_dir_name,&g_orig_get_current_dir_name},
     {"fopen",(void*)shim_fopen,&g_orig_fopen},{"fopen64",(void*)shim_fopen64,&g_orig_fopen64},
     {"__xstat64",(void*)shim___xstat64,&g_orig___xstat64},{"__lxstat64",(void*)shim___lxstat64,&g_orig___lxstat64},
     {"__fxstatat64",(void*)shim___fxstatat64,&g_orig___fxstatat64},{"faccessat2",(void*)shim_faccessat2,&g_orig_faccessat2},
@@ -3298,11 +3349,22 @@ static int shim_open64_nocancel(const char *p, int flags, ...) {
          * Bez prekladu cte host /etc/protocols (neexistuje) -> ENOENT ->
          * "ping: unknown protocol icmp". Overeno: nativne ping RC=0,
          * pod loaderem RC=1; strace ukazal openat("/etc/protocols")=ENOENT. */
-        "/etc/protocols", "/etc/services", NULL
+        "/etc/protocols", "/etc/services",
+        /* tzset (__tzfile_read: fopen "rce" -> nocancel), setmntent, getusershell,
+         * getaddrinfo (gai.conf), NSS files (shadow/netgroup/...), shm_open. */
+        "/etc/localtime", "/usr/share/zoneinfo", "/etc/fstab", "/etc/mtab",
+        "/etc/shells", "/etc/gai.conf", "/etc/host.conf", "/etc/networks",
+        "/etc/rpc", "/etc/ethers", "/etc/shadow", "/etc/gshadow",
+        "/etc/netgroup", "/etc/aliases", "/dev/shm", NULL
     };
     const char *path = p;
     char buf[8192];
-    if (p && p[0] == '/') {
+    /* O_DIRECTORY (0x4000 na aarch64): opendir/scandir/nftw volaji interni
+     * __opendir -> __open64_nocancel(O_DIRECTORY) mimo GOT. Knihovny/ld.so.cache
+     * se s O_DIRECTORY neotviraji, takze dlopen/dl_iterate_phdr to nerozbije. */
+    if (p && p[0] == '/' && (flags & 0x4000)) {
+        if (shim_translate(p, buf, sizeof buf)) path = buf;
+    } else if (p && p[0] == '/') {
         for (int i = 0; etc_files[i]; i++) {
             size_t fl = shim_strlen(etc_files[i]);
             if (shim_strncmp(p, etc_files[i], fl) == 0 &&
@@ -3312,6 +3374,11 @@ static int shim_open64_nocancel(const char *p, int flags, ...) {
             }
         }
     }
+    /* /etc/localtime -> /usr/share/zoneinfo/... je absolutni symlink, kernel by
+     * ho nasledoval proti host rootu. */
+    char resolved[8192];
+    if (path == buf && shim_resolve_symlinks(path, resolved, sizeof resolved))
+        path = resolved;
     va_list ap; va_start(ap, flags); mode_t mode = va_arg(ap, mode_t); va_end(ap);
     fp_open f = (fp_open)g_orig_open64_nocancel;
     return f ? f(path, flags, mode) : -1;
@@ -3356,6 +3423,13 @@ static void shim_register_overrides(void) {
     g_shim_loader = getenv("ELF_LOADER");
     if (!g_shim_loader || !g_shim_loader[0]) g_shim_loader = "/proc/self/exe";
     wl_init();   /* nacti whitelist + priprav white.log (bionicky kontext) */
+    /* shm_open/sem_open: /dev/shm -> $R/dev/shm (viz shim_translate). */
+    if (g_shim_root && g_shim_root[0]) {
+        char shm[4096];
+        if ((size_t)snprintf(shm, sizeof shm, "%s/dev/shm", g_shim_root) < sizeof shm &&
+            mkdir(shm, 01777) == 0)
+            chmod(shm, 01777);
+    }
     for (size_t i = 0; i < sizeof g_f2_hooks / sizeof g_f2_hooks[0]; i++)
         if (f2_only_match(g_f2_hooks[i].n))
             elf_register_override(g_f2_hooks[i].n, g_f2_hooks[i].shim);
@@ -3431,6 +3505,34 @@ static void shim_install_hooks(void) {
             g_orig_posix_spawn = tramp;
             ok++;
             if (elf_debug()) fprintf(stderr, "[hook] posix_spawn inline (BTI) OK\n");
+        }
+    }
+    /* glibc-interni bl volani path leaf funkci s BTI prologem obchazi GOT
+     * shimy: stat/lstat jsou jen `b fstatat` (ftok, tempnam/__path_search,
+     * ttyname...), shm_unlink/sem_unlink -> unlink, __gen_tempname -> mkdir.
+     * Hookujeme leaf (fstatat pokryje i stat/lstat/stat64/lstat64). Vsechny
+     * g_orig_* se stejnou adresou (fstatat64 = fstatat) musi dostat
+     * trampolinu, jinak by fallback ukazal na patchnuty kod -> rekurze.
+     * Vypnout lze F2_NO_BTI_HOOK=1. */
+    if (g_shim_scope && !getenv("F2_NO_BTI_HOOK")) {
+        static const struct { const char *n; void *shim; } bh[] = {
+            { "fstatat", (void *)shim_fstatat },
+            { "unlink",  (void *)shim_unlink },
+            { "mkdir",   (void *)shim_mkdir },
+            { "rmdir",   (void *)shim_rmdir },
+            { "link",    (void *)shim_link },     /* sem_open -> link() */
+        };
+        for (size_t i = 0; i < sizeof bh / sizeof bh[0]; i++) {
+            if (!f2_only_match(bh[i].n)) continue;
+            void *t = elf_scope_lookup(g_shim_scope, bh[i].n);
+            void *tramp = NULL;
+            if (!t || !hook_inline_prologue(t, bh[i].shim, &tramp) || !tramp) continue;
+            for (size_t j = 0; j < sizeof g_f2_hooks / sizeof g_f2_hooks[0]; j++)
+                if (!*g_f2_hooks[j].orig &&
+                    elf_scope_lookup(g_shim_scope, g_f2_hooks[j].n) == t)
+                    *g_f2_hooks[j].orig = tramp;
+            ok++;
+            if (elf_debug()) fprintf(stderr, "[hook] %s inline (BTI) OK\n", bh[i].n);
         }
     }
     if (elf_debug())
