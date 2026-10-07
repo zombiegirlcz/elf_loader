@@ -265,25 +265,31 @@ Milníky:
   pod `--ownall` → vrací `$ROOTFS/.../binárka` (dřív cestu k loaderu);
   `test-all.sh all` PASS 171/0 (dřív 160, bez regrese). cmake `-S/-B`
   configure fázi už nekrashuje a `CMAKE_COMMAND` v cache je korektní
-  guest-relativní cesta (dřív loader); plný self-build (`make` → nested
-  `/usr/bin/cmake` link step) ještě naráží na samostatný problém.
-- **GNU Make "fast path" (recept bez shell-metaznaku) úplně obchází
-  `posix_spawn`/`execvp`/`execve`/`access` GOT-override** — root cause
-  lokalizován (2026-10-07), NEOPRAVENO. `make` normálně importuje a
-  správně volá `posix_spawn`/`execvp` (ověřeno: recept S `;`/jiným shell
-  metaznakem funguje, `sh` i jeho `execve` se korektně přeloží). Ale bez
-  metaznaku (make spouští dítě přímo, bez `/bin/sh`) NEPROBĚHNE žádné
-  volání `posix_spawn`/`execvp`/`execve`/`access`/`faccessat` přes GOT —
-  nula trace hitů (`ELF_LOADER_EXEC_TRACE=1`, trvalá diagnostika v kódu) —
-  takže dítě se spouští syscall-level mechanismem mimo dosah GOT/PLT i F2
-  inline hooků. Izolovaný `vfork()+execvp()` test (mimo make) funguje OK,
-  takže obecný mechanismus je v pořádku — specifický je `make`'s vlastní
-  spawn cesta. Dopad: `cmake`/`ctest`/`cpack` plný build pod `--ownall`
-  nefunguje pro recepty bez shellu (naprostá většina generovaných
-  Makefile recipes ALE shell potřebuje, takže dopad může být menší než
-  se zdá — nezkoušeno na reálném projektu). Chce to `strace`/seccomp-trap
-  na `execve`/`clone` syscall numbers pro přesnou identifikaci —
-  [postup.md](postup.md) 2026-10-07 (2).
+  guest-relativní cesta (dřív loader). Regresní test `test-all.sh selfexe`.
+- ~~GNU Make "fast path" `make: /usr/bin/X: No such file or directory`~~ —
+  **VYŘEŠENO** (2026-10-07, (3)): GNU Make 4.4 (gnulib `find_in_given_path`)
+  ověřuje program přes **`eaccess()`** PŘED `posix_spawn`; `eaccess` je
+  glibc alias `euidaccess` (stejná adresa), ale GOT override jde podle
+  jména a `eaccess` v tabulce chyběl (inline hook `euidaccess` se kvůli BTI
+  prologu přeskočí) → nepřeložená host cesta → ENOENT → `posix_spawn` se
+  vůbec nezavolal. Fix: `elf_register_override("eaccess", shim_euidaccess)`
+  v `shim_register_overrides`. Ověřeno: plný `cmake -S/-B` + `cmake --build`
+  triviálního projektu pod `--ownall` projde (s guest PATH), A/B regresní
+  test `test-all.sh selfexe` (stará binárka FAIL, nová PASS), `all` PASS
+  171/0. **Pozor (ladicí past):** `su -c` na tomhle zařízení běží přes
+  `proot` (`PROOT_L2S_DIR`), který překládá cesty na úrovni syscallů — bug
+  se tam neprojeví; jediný platný test je `ashell -c`. Diagnostika
+  `ELF_LOADER_EXEC_TRACE=1` (raw-syscall trace v exec/access shimech) —
+  [postup.md](postup.md) 2026-10-07 (2)/(3).
+- ~~Funkce s cestou mimo override tabulku~~ — **VYŘEŠENO** (2026-10-07, (4)):
+  audit importů 1927 ELF v rootfs; doplněny shimy `chmod/chown/utime*/
+  truncate/mknod/mkfifo/linkat/statfs/xattr/creat/pathconf/
+  inotify_add_watch` + AF_UNIX `bind`/`connect` (překlad `sun_path`).
+  Regresní test `test-all.sh pathops` (A/B). Hardlinky (`link`) zakazuje
+  SELinux app domény i nativně — platformní limit. **Pravidlo:** GOT override
+  je per-jméno; při přidání shimu zkontrolovat aliasy v `libc.so.6`
+  (`nm -D`, stejná adresa) a importy binárek (`nm -D --undefined-only`;
+  toybox `readelf` relokace nevypisuje).
 - Test na reálném 16K Android 15+ zařízení (Task 3).
 - ~~Bionic dlerror/errno test (Task 4).~~ **Vyřešeno** — `ldso_dlerror()` +
   guest `dlopen/dlsym/dlerror/dlclose/dladdr` nad `_rtld_global` ověřeno

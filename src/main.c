@@ -65,6 +65,8 @@ static void print_help(const char *prog) {
 #include <sys/resource.h>
 #include <sys/prctl.h>
 #include <sys/syscall.h>
+#include <sys/socket.h>
+#include <sys/un.h>
 #include <linux/filter.h>
 #include <linux/seccomp.h>
 extern int elf_debug(void);
@@ -290,6 +292,10 @@ static int shim_strncmp(const char *a, const char *b, size_t n) {
 static void shim_memcpy(void *d, const void *s, size_t n) {
     char *dd = (char *)d; const char *ss = (const char *)s;
     for (size_t i = 0; i < n; i++) dd[i] = ss[i];
+}
+static void shim_memset(void *d, int c, size_t n) {
+    volatile char *dd = (volatile char *)d;   /* volatile: at z toho clang neudela volani bionic memset */
+    for (size_t i = 0; i < n; i++) dd[i] = (char)c;
 }
 static void shim_strcpy(char *dst, size_t dstsz, const char *src) {
     size_t i = 0;
@@ -1314,6 +1320,128 @@ typedef int (*fp_rmdir)(const char *);
 static int shim_rmdir(const char *p) {
     char b[8192]; const char *path = p; if (shim_translate(p, b, sizeof b)) path = b;
     fp_rmdir f = (fp_rmdir)g_orig_rmdir; return f ? f(path) : -1;
+}
+
+/* Metadata/uzly/xattr/hardlink: bez prekladu sly na host cestu (Python
+ * os.chmod/utime/truncate/mkfifo/link/listxattr na /tmp/x -> ENOENT). U *at
+ * variant se absolutni cesta preklada vzdy - kernel dirfd ignoruje. */
+static const char *shim_tp(const char *p, char *b, size_t n) {
+    return shim_translate(p, b, n) ? b : p;
+}
+#define SHIM_PATH_BUF char _tb[8192]
+#define TP(p) shim_tp((p), _tb, sizeof _tb)
+static void *g_orig_chmod, *g_orig_lchmod, *g_orig_fchmodat, *g_orig_chown, *g_orig_lchown,
+            *g_orig_fchownat, *g_orig_utime, *g_orig_utimes, *g_orig_lutimes, *g_orig_futimesat,
+            *g_orig_utimensat, *g_orig_truncate, *g_orig_truncate64, *g_orig_mknod, *g_orig_mknodat,
+            *g_orig_mkfifo, *g_orig_mkfifoat, *g_orig_linkat, *g_orig_statfs, *g_orig_statfs64,
+            *g_orig_getxattr, *g_orig_lgetxattr, *g_orig_setxattr, *g_orig_lsetxattr,
+            *g_orig_listxattr, *g_orig_llistxattr, *g_orig_removexattr, *g_orig_lremovexattr,
+            *g_orig_creat, *g_orig_creat64, *g_orig_pathconf, *g_orig_inotify_add_watch,
+            *g_orig_bind, *g_orig_connect;
+static int shim_chmod(const char *p, unsigned int m) { SHIM_PATH_BUF;
+    int (*f)(const char *, unsigned int) = g_orig_chmod; return f ? f(TP(p), m) : -1; }
+static int shim_lchmod(const char *p, unsigned int m) { SHIM_PATH_BUF;
+    int (*f)(const char *, unsigned int) = g_orig_lchmod; return f ? f(TP(p), m) : -1; }
+static int shim_fchmodat(int d, const char *p, unsigned int m, int fl) { SHIM_PATH_BUF;
+    int (*f)(int, const char *, unsigned int, int) = g_orig_fchmodat; return f ? f(d, TP(p), m, fl) : -1; }
+static int shim_chown(const char *p, unsigned int u, unsigned int g) { SHIM_PATH_BUF;
+    int (*f)(const char *, unsigned int, unsigned int) = g_orig_chown; return f ? f(TP(p), u, g) : -1; }
+static int shim_lchown(const char *p, unsigned int u, unsigned int g) { SHIM_PATH_BUF;
+    int (*f)(const char *, unsigned int, unsigned int) = g_orig_lchown; return f ? f(TP(p), u, g) : -1; }
+static int shim_fchownat(int d, const char *p, unsigned int u, unsigned int g, int fl) { SHIM_PATH_BUF;
+    int (*f)(int, const char *, unsigned int, unsigned int, int) = g_orig_fchownat;
+    return f ? f(d, TP(p), u, g, fl) : -1; }
+static int shim_utime(const char *p, const void *t) { SHIM_PATH_BUF;
+    int (*f)(const char *, const void *) = g_orig_utime; return f ? f(TP(p), t) : -1; }
+static int shim_utimes(const char *p, const void *t) { SHIM_PATH_BUF;
+    int (*f)(const char *, const void *) = g_orig_utimes; return f ? f(TP(p), t) : -1; }
+static int shim_lutimes(const char *p, const void *t) { SHIM_PATH_BUF;
+    int (*f)(const char *, const void *) = g_orig_lutimes; return f ? f(TP(p), t) : -1; }
+static int shim_futimesat(int d, const char *p, const void *t) { SHIM_PATH_BUF;
+    int (*f)(int, const char *, const void *) = g_orig_futimesat; return f ? f(d, TP(p), t) : -1; }
+/* utimensat(fd, NULL, ...) = futimens - p muze byt NULL; shim_translate to snese. */
+static int shim_utimensat(int d, const char *p, const void *t, int fl) { SHIM_PATH_BUF;
+    int (*f)(int, const char *, const void *, int) = g_orig_utimensat; return f ? f(d, TP(p), t, fl) : -1; }
+static int shim_truncate(const char *p, long l) { SHIM_PATH_BUF;
+    int (*f)(const char *, long) = g_orig_truncate; return f ? f(TP(p), l) : -1; }
+static int shim_truncate64(const char *p, long l) { SHIM_PATH_BUF;
+    int (*f)(const char *, long) = g_orig_truncate64; return f ? f(TP(p), l) : -1; }
+static int shim_mknod(const char *p, unsigned int m, unsigned long dev) { SHIM_PATH_BUF;
+    int (*f)(const char *, unsigned int, unsigned long) = g_orig_mknod; return f ? f(TP(p), m, dev) : -1; }
+static int shim_mknodat(int d, const char *p, unsigned int m, unsigned long dev) { SHIM_PATH_BUF;
+    int (*f)(int, const char *, unsigned int, unsigned long) = g_orig_mknodat; return f ? f(d, TP(p), m, dev) : -1; }
+static int shim_mkfifo(const char *p, unsigned int m) { SHIM_PATH_BUF;
+    int (*f)(const char *, unsigned int) = g_orig_mkfifo; return f ? f(TP(p), m) : -1; }
+static int shim_mkfifoat(int d, const char *p, unsigned int m) { SHIM_PATH_BUF;
+    int (*f)(int, const char *, unsigned int) = g_orig_mkfifoat; return f ? f(d, TP(p), m) : -1; }
+static int shim_linkat(int od, const char *o, int nd, const char *n, int fl) {
+    char b1[8192], b2[8192];
+    int (*f)(int, const char *, int, const char *, int) = g_orig_linkat;
+    return f ? f(od, shim_tp(o, b1, sizeof b1), nd, shim_tp(n, b2, sizeof b2), fl) : -1; }
+static int shim_statfs(const char *p, void *buf) { SHIM_PATH_BUF;
+    int (*f)(const char *, void *) = g_orig_statfs; return f ? f(TP(p), buf) : -1; }
+static int shim_statfs64(const char *p, void *buf) { SHIM_PATH_BUF;
+    int (*f)(const char *, void *) = g_orig_statfs64; return f ? f(TP(p), buf) : -1; }
+static ssize_t shim_getxattr(const char *p, const char *nm, void *v, size_t s) { SHIM_PATH_BUF;
+    ssize_t (*f)(const char *, const char *, void *, size_t) = g_orig_getxattr; return f ? f(TP(p), nm, v, s) : -1; }
+static ssize_t shim_lgetxattr(const char *p, const char *nm, void *v, size_t s) { SHIM_PATH_BUF;
+    ssize_t (*f)(const char *, const char *, void *, size_t) = g_orig_lgetxattr; return f ? f(TP(p), nm, v, s) : -1; }
+static int shim_setxattr(const char *p, const char *nm, const void *v, size_t s, int fl) { SHIM_PATH_BUF;
+    int (*f)(const char *, const char *, const void *, size_t, int) = g_orig_setxattr; return f ? f(TP(p), nm, v, s, fl) : -1; }
+static int shim_lsetxattr(const char *p, const char *nm, const void *v, size_t s, int fl) { SHIM_PATH_BUF;
+    int (*f)(const char *, const char *, const void *, size_t, int) = g_orig_lsetxattr; return f ? f(TP(p), nm, v, s, fl) : -1; }
+static ssize_t shim_listxattr(const char *p, char *l, size_t s) { SHIM_PATH_BUF;
+    ssize_t (*f)(const char *, char *, size_t) = g_orig_listxattr; return f ? f(TP(p), l, s) : -1; }
+static ssize_t shim_llistxattr(const char *p, char *l, size_t s) { SHIM_PATH_BUF;
+    ssize_t (*f)(const char *, char *, size_t) = g_orig_llistxattr; return f ? f(TP(p), l, s) : -1; }
+static int shim_removexattr(const char *p, const char *nm) { SHIM_PATH_BUF;
+    int (*f)(const char *, const char *) = g_orig_removexattr; return f ? f(TP(p), nm) : -1; }
+static int shim_lremovexattr(const char *p, const char *nm) { SHIM_PATH_BUF;
+    int (*f)(const char *, const char *) = g_orig_lremovexattr; return f ? f(TP(p), nm) : -1; }
+static int shim_creat(const char *p, unsigned int m) { SHIM_PATH_BUF;
+    int (*f)(const char *, unsigned int) = g_orig_creat; return f ? f(TP(p), m) : -1; }
+static int shim_creat64(const char *p, unsigned int m) { SHIM_PATH_BUF;
+    int (*f)(const char *, unsigned int) = g_orig_creat64; return f ? f(TP(p), m) : -1; }
+static long shim_pathconf(const char *p, int nm) { SHIM_PATH_BUF;
+    long (*f)(const char *, int) = g_orig_pathconf; return f ? f(TP(p), nm) : -1; }
+static int shim_inotify_add_watch(int fd, const char *p, unsigned int mask) { SHIM_PATH_BUF;
+    int (*f)(int, const char *, unsigned int) = g_orig_inotify_add_watch; return f ? f(fd, TP(p), mask) : -1; }
+#undef TP
+#undef SHIM_PATH_BUF
+
+/* AF_UNIX socket s absolutni cestou (dbus, X11, ssh-agent, Python
+ * multiprocessing...): sun_path prelozit pod ROOTFS. Abstraktni sockety
+ * (sun_path[0]==0) a ostatni rodiny beze zmeny. Kdyz se prelozena cesta
+ * nevejde do sun_path (108 B), necha se puvodni. */
+static const void *shim_unix_addr(const void *a, unsigned int len, struct sockaddr_un *out,
+                                  unsigned int *olen) {
+    const struct sockaddr_un *u = a;
+    if (!a || len <= sizeof(u->sun_family) || u->sun_family != AF_UNIX || u->sun_path[0] != '/')
+        return a;
+    size_t max = len - sizeof(u->sun_family);
+    if (max > sizeof u->sun_path) max = sizeof u->sun_path;
+    char p[sizeof u->sun_path + 1], b[8192];
+    size_t i = 0;
+    while (i < max && u->sun_path[i]) { p[i] = u->sun_path[i]; i++; }
+    p[i] = 0;
+    if (!shim_translate(p, b, sizeof b)) return a;
+    size_t bl = shim_strlen(b);
+    if (bl >= sizeof out->sun_path) return a;
+    shim_memset(out, 0, sizeof *out);
+    out->sun_family = AF_UNIX;
+    shim_memcpy(out->sun_path, b, bl + 1);
+    *olen = (unsigned int)(sizeof(out->sun_family) + bl + 1);
+    return out;
+}
+static int shim_bind(int fd, const void *a, unsigned int len) {
+    struct sockaddr_un su; unsigned int l = len;
+    const void *na = shim_unix_addr(a, len, &su, &l);
+    int (*f)(int, const void *, unsigned int) = g_orig_bind; return f ? f(fd, na, l) : -1;
+}
+static int shim_connect(int fd, const void *a, unsigned int len) {
+    struct sockaddr_un su; unsigned int l = len;
+    const void *na = shim_unix_addr(a, len, &su, &l);
+    int (*f)(int, const void *, unsigned int) = g_orig_connect; return f ? f(fd, na, l) : -1;
 }
 
 typedef int (*fp_execve)(const char *, char *const[], char *const[]);
@@ -2978,6 +3106,27 @@ static f2_hook_t g_f2_hooks[] = {
     {"fileno_unlocked",(void*)shim_fileno_unlocked,&g_orig_fileno_unlocked},{"fileno",(void*)shim_fileno,&g_orig_fileno},
     {"setfsuid",(void*)shim_setfsuid,&g_orig_setfsuid},
     {"setfsgid",(void*)shim_setfsgid,&g_orig_setfsgid},
+    {"chmod",(void*)shim_chmod,&g_orig_chmod},{"lchmod",(void*)shim_lchmod,&g_orig_lchmod},
+    {"fchmodat",(void*)shim_fchmodat,&g_orig_fchmodat},
+    {"chown",(void*)shim_chown,&g_orig_chown},{"lchown",(void*)shim_lchown,&g_orig_lchown},
+    {"fchownat",(void*)shim_fchownat,&g_orig_fchownat},
+    {"utime",(void*)shim_utime,&g_orig_utime},{"utimes",(void*)shim_utimes,&g_orig_utimes},
+    {"lutimes",(void*)shim_lutimes,&g_orig_lutimes},{"futimesat",(void*)shim_futimesat,&g_orig_futimesat},
+    {"utimensat",(void*)shim_utimensat,&g_orig_utimensat},
+    {"truncate",(void*)shim_truncate,&g_orig_truncate},{"truncate64",(void*)shim_truncate64,&g_orig_truncate64},
+    {"mknod",(void*)shim_mknod,&g_orig_mknod},{"mknodat",(void*)shim_mknodat,&g_orig_mknodat},
+    {"mkfifo",(void*)shim_mkfifo,&g_orig_mkfifo},{"mkfifoat",(void*)shim_mkfifoat,&g_orig_mkfifoat},
+    {"linkat",(void*)shim_linkat,&g_orig_linkat},
+    {"statfs",(void*)shim_statfs,&g_orig_statfs},{"statfs64",(void*)shim_statfs64,&g_orig_statfs64},
+    {"getxattr",(void*)shim_getxattr,&g_orig_getxattr},{"lgetxattr",(void*)shim_lgetxattr,&g_orig_lgetxattr},
+    {"setxattr",(void*)shim_setxattr,&g_orig_setxattr},{"lsetxattr",(void*)shim_lsetxattr,&g_orig_lsetxattr},
+    {"listxattr",(void*)shim_listxattr,&g_orig_listxattr},{"llistxattr",(void*)shim_llistxattr,&g_orig_llistxattr},
+    {"removexattr",(void*)shim_removexattr,&g_orig_removexattr},
+    {"lremovexattr",(void*)shim_lremovexattr,&g_orig_lremovexattr},
+    {"creat",(void*)shim_creat,&g_orig_creat},{"creat64",(void*)shim_creat64,&g_orig_creat64},
+    {"pathconf",(void*)shim_pathconf,&g_orig_pathconf},
+    {"inotify_add_watch",(void*)shim_inotify_add_watch,&g_orig_inotify_add_watch},
+    {"bind",(void*)shim_bind,&g_orig_bind},{"connect",(void*)shim_connect,&g_orig_connect},
     /* close/flockfile/mprotect jsou diagnosticke shimy (Node ladeni) a
      * prlimit64 mel spatnou signaturu - dokud MAX_OVERRIDES=64 zahazoval vse
      * od 65. polozky, nikdy nebezely. Registrovat jen explicitne. */
@@ -3106,6 +3255,13 @@ static void shim_register_overrides(void) {
     for (size_t i = 0; i < sizeof g_f2_hooks / sizeof g_f2_hooks[0]; i++)
         if (f2_only_match(g_f2_hooks[i].n))
             elf_register_override(g_f2_hooks[i].n, g_f2_hooks[i].shim);
+    /* eaccess = glibc alias euidaccess (stejna adresa), ale GOT override jde
+     * podle jmena. GNU Make 4.4 (gnulib find_in_given_path) overuje existenci
+     * programu pres eaccess() PRED posix_spawn - bez prekladu dostal ENOENT na
+     * host "/usr/bin/true" a dite vubec nespustil. Jen override, ne g_f2_hooks:
+     * druhy inline patch na adrese euidaccess by se zdvojil. */
+    if (f2_only_match("eaccess"))
+        elf_register_override("eaccess", (void *)shim_euidaccess);
 }
 static void shim_install_hooks(void) {
     if (getenv("F2_DISABLE")) return;
