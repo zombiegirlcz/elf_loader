@@ -196,6 +196,12 @@ Milníky:
   celé stránky uvnitř `p_filesz` mapovat ze souboru (`MAP_PRIVATE|MAP_FIXED`).
   A/B 3/3 SyntaxError → 0/3; regresní test `test-all.sh madv`; test-all
   161/0 — [postup.md](postup.md) 2026-10-06 (7).
+- **`lx` nepobral `|` — VYŘEŠENO** (2026-10-09): `lx` předával argumenty rovnou
+  loaderu jako argv, takže pipeline šla jen postavit na hostu a `lx -c` hlásilo
+  „'-c' není v rootfs". Nově `lx -c '<řádka>'` pošle celou řádku guest shellu
+  (`$LX_SHELL`, default `$R/bin/bash`) → fungují pipy/`&&`/redirecty v guestu,
+  včetně `lxfb -c '<řádka>'` (report se pojmenuje podle příkazu, ne podle `-c`).
+  Regresní test `test-all.sh lxc` (A/B).
 - **Dlouhý argv přetékal za guest stack — VYŘEŠENO** (2026-10-09, feedback
   `feedback/m2101k6g-2026-10-09-trans-221301.md`): `trans` → `gawk` s celým awk
   programem v argv → SIGSEGV v bionic `memcpy`. Místo pro argv/env řetězce na
