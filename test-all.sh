@@ -1025,6 +1025,31 @@ PYEOF
 # /proc/self/exe musi vracet guest binarku (ne loader) a GNU Make fast path
 # (recept bez shell-metaznaku -> gnulib find_in_given_path -> eaccess() pred
 # posix_spawn) musi najit program pod ROOTFS. Viz postup.md 2026-10-07 (3).
+# Regresni test: argv/env retezce se kopiruji na guest stack; rezerva byla
+# odhad (argc*128 + env*256), dlouhy argument (trans -> gawk s celym awk
+# programem v argv) pretekl za vrchol stacku do libc.so.6 -> SIGSEGV nebo
+# tise oriznuty argument. Viz feedback/m2101k6g-2026-10-09-trans-221301.md.
+category_bigargv() {
+    echo ""
+    echo "=== velky argv (60 KB argument pres exec) ==="
+    local env="ROOTFS=$R ELF_ROOTFS=$R ELF_LOADER=$L"
+    local dir="$R/tmp/bigargv.$$"
+    mkdir -p "$dir"
+    printf '%s\n' 'x=$(head -c 60000 /dev/zero | tr "\0" x)' '/bin/echo "$x" | wc -c' > "$dir/t.sh"
+    local out
+    out=$(ashell_out "$env $L --ownall $R/bin/bash ${dir#$R}/t.sh")
+    rm -rf "$dir"
+    if printf '%s' "$out" | grep -qx "60001"; then
+        echo "PASS bigargv: 60 KB argument predan cely"
+        echo "PASS: bigargv - 60KB argv" >> "$PASS_LOG"
+        ((PASS_COUNT++)) || true
+    else
+        echo "FAIL bigargv: ocekavano 60001, out=$out"
+        echo "FAIL: bigargv - 60KB argv | $out" >> "$FAIL_LOG"
+        ((FAIL_COUNT++)) || true
+    fi
+}
+
 category_selfexe() {
     echo ""
     echo "=== /proc/self/exe + make fast path (eaccess) ==="
@@ -1125,7 +1150,7 @@ category_net_real() {
     fi
 
     if [ -x "$R/usr/bin/wget" ]; then
-        out=$(ashell_out "$env $L --ownall $R/usr/bin/wget -q --timeout=10 -O - https://example.com")
+        out=$(ashell_out "$env $L --ownall $R/usr/bin/wget -4 -q --timeout=10 -O - https://example.com")
         if printf '%s' "$out" | grep -qiE '<html|<!doctype'; then
             echo "PASS wget: HTTPS GET https://example.com -> HTML obsah"
             echo "PASS: wget - real HTTPS GET" >> "$PASS_LOG"; ((PASS_COUNT++)) || true
@@ -1357,6 +1382,10 @@ case "${1:-all}" in
         category_selfexe
         print_summary
         ;;
+    bigargv)
+        category_bigargv
+        print_summary
+        ;;
     pathops)
         category_pathops
         print_summary
@@ -1398,6 +1427,7 @@ case "${1:-all}" in
         category_fstat
         category_nss
         category_selfexe
+        category_bigargv
         category_pathops
         category_madv
         category_venv

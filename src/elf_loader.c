@@ -5433,7 +5433,11 @@ int elf_run(elf_object_t *obj, int argc, char **argv, char **envp) {
 
     char *stack_top = stack + stack_size;
 
-    size_t str_total = 256 + argc * 128 + env_count * 256;
+    size_t str_total = 256;
+    for (int i = 0; i < argc; i++)
+        str_total += strlen(argv[i]) + 1;
+    for (size_t i = 0; i < env_count; i++)
+        str_total += strlen(envp[i]) + 1;
 
     size_t argv_off_size = (argc > 0) ? argc : 1;
     size_t envp_off_size = (env_count > 0) ? env_count : 1;
