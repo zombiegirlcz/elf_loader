@@ -8,6 +8,10 @@ Toto je hutný index k [postup.md](postup.md). Sekce jsou seřazeny tematicky
 scope a běh glibc binárek v procesu na AArch64 Androidu (bionic host).
 Preference — non-root vlastní loading (`--ownall`); chroot (`linuxsh`) je
 rychlejší alternativa jen s rootem.
+**Původní myšlenka:** postavit něco, co zrychlí / nahradí `proot` (žádný
+ptrace překlad každého syscallu). **Pro uživatele:** zjednodušuje použití
+běžných Linux nástrojů (glibc binárek z distro rootfs) přímo v jejich
+Android appce — bez nutnosti je kompilovat pro bionic/NDK.
 
 ---
 
@@ -192,6 +196,14 @@ Milníky:
   celé stránky uvnitř `p_filesz` mapovat ze souboru (`MAP_PRIVATE|MAP_FIXED`).
   A/B 3/3 SyntaxError → 0/3; regresní test `test-all.sh madv`; test-all
   161/0 — [postup.md](postup.md) 2026-10-06 (7).
+- **Dlouhý argv přetékal za guest stack — VYŘEŠENO** (2026-10-09, feedback
+  `feedback/m2101k6g-2026-10-09-trans-221301.md`): `trans` → `gawk` s celým awk
+  programem v argv → SIGSEGV v bionic `memcpy`. Místo pro argv/env řetězce na
+  guest stacku bylo odhadem `argc*128 + env*256` (`src/elf_loader.c`, stavba
+  stacku před `elf_run_final`); teď skutečný součet `strlen+1`. Stará verze
+  60 KB argument tiše uřízla nebo spadla. Regresní test `test-all.sh bigargv`
+  (A/B); `wget` v `net_real` vynucen `-4` (síť bez IPv6 trasy, wget nemá
+  fallback). `all` PASS 179/0.
 - **tmux pod loaderem** — [postup.md#L2306](postup.md#L2306).
 - **Helper knihovny (`ELF_LOADER_HELPER`), náhodný SIGSEGV ~5 %
   (heap fix), Node ≤22 teardown `free(): invalid pointer` (EXIT=134)** —
