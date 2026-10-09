@@ -1029,6 +1029,33 @@ PYEOF
 # odhad (argc*128 + env*256), dlouhy argument (trans -> gawk s celym awk
 # programem v argv) pretekl za vrchol stacku do libc.so.6 -> SIGSEGV nebo
 # tise oriznuty argument. Viz feedback/m2101k6g-2026-10-09-trans-221301.md.
+# Regresni test: lx -c '<radka>' posle celou shell radku guest bashi, takze
+# funguji pipy/&&/redirecty (driv `lx cmd | other` resp. `lx -c` hlasilo
+# "'-c' neni v rootfs" a | se nikdy nedostalo do guestu).
+category_lxc() {
+    echo ""
+    echo "=== lx -c (pipe/&& v guestu pres init bash) ==="
+    local dir="$R/tmp/lxc.$$"
+    mkdir -p "$dir"
+    cat > "$dir/t.sh" <<'EOS'
+eval "$($LB init bash)"
+lx -c 'echo ahoj svet | tr a-z A-Z'
+lx echo plain
+EOS
+    local out
+    out=$(ashell_out "D=$D R=$R LB=$L HOME=$D $L --ownall $R/bin/bash ${dir#$R}/t.sh")
+    rm -rf "$dir"
+    if printf '%s' "$out" | grep -qx "AHOJ SVET" && printf '%s' "$out" | grep -qx "plain"; then
+        echo "PASS lxc: lx -c pipe + lx <cmd> oboje funguje"
+        echo "PASS: lxc - lx -c pipe" >> "$PASS_LOG"
+        ((PASS_COUNT++)) || true
+    else
+        echo "FAIL lxc: out=$out"
+        echo "FAIL: lxc - lx -c pipe | $out" >> "$FAIL_LOG"
+        ((FAIL_COUNT++)) || true
+    fi
+}
+
 category_bigargv() {
     echo ""
     echo "=== velky argv (60 KB argument pres exec) ==="
@@ -1386,6 +1413,10 @@ case "${1:-all}" in
         category_bigargv
         print_summary
         ;;
+    lxc)
+        category_lxc
+        print_summary
+        ;;
     pathops)
         category_pathops
         print_summary
@@ -1428,6 +1459,7 @@ case "${1:-all}" in
         category_nss
         category_selfexe
         category_bigargv
+        category_lxc
         category_pathops
         category_madv
         category_venv
