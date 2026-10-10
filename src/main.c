@@ -16,7 +16,7 @@ static void print_help(const char *prog) {
         "  %s [--lazy] --own <elf> <shared.so> [args..]\n"
         "  %s [--lazy] --ownall <elf> [args..]\n"
         "  %s [--lazy] --shim <elf> [args..]\n"
-        "  %s init zsh|bash\n"
+        "  %s init zsh|bash [-dw]\n"
         "  %s <elf>                        (introspect)\n"
         "\n"
         "Modes:\n"
@@ -25,6 +25,8 @@ static void print_help(const char *prog) {
         "  --ownall      own-load all distro deps + guest binary (parrot glibc)\n"
         "  --shim        F2 path-translation shim for chroot-less guest paths\n"
         "  init zsh|bash print `eval`-able env defaults (LOCPATH/LC_ALL) + helpers\n"
+        "                -dw/--double-world: cd do $ROOTFS spusti guest shell s\n"
+        "                prekladem cest, cd .. z / zpet na host (toggle: lxdw on|off)\n"
         "  <elf>         introspect base/entry/symbols without execution\n"
         "\n"
         "Options:\n"
@@ -2989,6 +2991,38 @@ static long main_raw_syscall4(long nr, long a0, long a1, long a2, long a3);
 static int shim_setfsuid(unsigned int uid) { (void)uid; return (int)main_raw_syscall4(174, 0, 0, 0, 0); }
 static int shim_setfsgid(unsigned int gid) { (void)gid; return (int)main_raw_syscall4(176, 0, 0, 0, 0); }
 
+/* Stejne setuid/setgid rodina: app seccomp ji zabije (interaktivni zsh pri
+ * `unsetopt privileged` vola setgid(getgid()) - fzf init v rootfs .zshrc
+ * obnovuje options=(... privileged off ...) -> "Bad system call"). Id app
+ * procesu se nemeni: zmena na soucasne id (nebo -1) = uspech bez syscallu,
+ * jine id = EPERM, jako u neprivilegovaneho procesu. */
+static void *g_orig_setuid, *g_orig_setgid, *g_orig_seteuid, *g_orig_setegid;
+static void *g_orig_setreuid, *g_orig_setregid, *g_orig_setresuid, *g_orig_setresgid;
+static int shim_id_same(long nr, unsigned int v) {
+    return v == (unsigned int)-1 || v == (unsigned int)main_raw_syscall4(nr, 0, 0, 0, 0);
+}
+static int shim_setid_ret(int ok) {
+    if (ok) return 0;
+    shim_guest_errno_set(EPERM);
+    return -1;
+}
+static int shim_setuid(unsigned int u) { return shim_setid_ret(shim_id_same(174, u)); }
+static int shim_setgid(unsigned int g) { return shim_setid_ret(shim_id_same(176, g)); }
+static int shim_seteuid(unsigned int u) { return shim_setid_ret(shim_id_same(175, u)); }
+static int shim_setegid(unsigned int g) { return shim_setid_ret(shim_id_same(177, g)); }
+static int shim_setreuid(unsigned int r, unsigned int e) {
+    return shim_setid_ret(shim_id_same(174, r) && shim_id_same(175, e));
+}
+static int shim_setregid(unsigned int r, unsigned int e) {
+    return shim_setid_ret(shim_id_same(176, r) && shim_id_same(177, e));
+}
+static int shim_setresuid(unsigned int r, unsigned int e, unsigned int s) {
+    return shim_setid_ret(shim_id_same(174, r) && shim_id_same(175, e) && shim_id_same(175, s));
+}
+static int shim_setresgid(unsigned int r, unsigned int e, unsigned int s) {
+    return shim_setid_ret(shim_id_same(176, r) && shim_id_same(177, e) && shim_id_same(177, s));
+}
+
 /* ===== MAP_FIXED_NOREPLACE emulace (kernel 4.14) =====
  * Android kernel 4.14 flag MAP_FIXED_NOREPLACE (0x100000) NEZNA -> ignoruje
  * ho a chova se jako hint. V8/Node s nim rezervuje 4GB pointer-compression
@@ -3263,6 +3297,10 @@ static f2_hook_t g_f2_hooks[] = {
     {"fileno_unlocked",(void*)shim_fileno_unlocked,&g_orig_fileno_unlocked},{"fileno",(void*)shim_fileno,&g_orig_fileno},
     {"setfsuid",(void*)shim_setfsuid,&g_orig_setfsuid},
     {"setfsgid",(void*)shim_setfsgid,&g_orig_setfsgid},
+    {"setuid",(void*)shim_setuid,&g_orig_setuid},{"setgid",(void*)shim_setgid,&g_orig_setgid},
+    {"seteuid",(void*)shim_seteuid,&g_orig_seteuid},{"setegid",(void*)shim_setegid,&g_orig_setegid},
+    {"setreuid",(void*)shim_setreuid,&g_orig_setreuid},{"setregid",(void*)shim_setregid,&g_orig_setregid},
+    {"setresuid",(void*)shim_setresuid,&g_orig_setresuid},{"setresgid",(void*)shim_setresgid,&g_orig_setresgid},
     {"chmod",(void*)shim_chmod,&g_orig_chmod},{"lchmod",(void*)shim_lchmod,&g_orig_lchmod},
     {"fchmodat",(void*)shim_fchmodat,&g_orig_fchmodat},
     {"chown",(void*)shim_chown,&g_orig_chown},{"lchown",(void*)shim_lchown,&g_orig_lchown},
@@ -4553,6 +4591,7 @@ static const char LX_HELPERS_ZSH[] =
     "    _h_title \"Other\"\n"
     "    _h_cmd \"cdl / cdr\" \"go to the loader repo / the Parrot rootfs\"\n"
     "    _h_cmd \"reload\" \"reload ~/.zshrc\"\n"
+    "    _h_cmd \"lxdw on|off\" \"double world: cd into \\$R runs a guest shell (paths -> rootfs), cd .. from / returns\"\n"
     "  fi\n"
     "  unfunction _h_title _h_cmd _h_ex\n"
     "  [[ $t == (overview|all|lx|test|debug|helper|tmux|prompt|keys) ]] || { print -u2 \"unknown topic: $t\"; return 1 }\n"
@@ -4709,6 +4748,183 @@ static const char LX_HELPERS_BASH[] =
     "  return 127\n"
     "}\n";
 
+/* double-world (dw) — nahrada gbsh -dw: rootfs svet = guest shell pod
+ * loaderem (loader preklada vsechny cesty), host svet = tento shell.
+ * Vypisuje se za LX_HELPERS_* v `init zsh|bash`; aktivni jen s LX_DW=1. */
+static const char LX_DW_ZSH[] =
+    "# ─────────────── double-world (dw): $ROOTFS jako druhý svět ───────────────\n"
+    "# LX_DW=1 (`lxdw on`, nebo `init zsh -dw`): jakmile cwd vstoupí do $ROOTFS\n"
+    "# (cd $R/etc, pushd, start v rootfs), spustí se guest shell pod loaderem.\n"
+    "# Loader v něm překládá všechny cesty (/etc = $R/etc; cd, redirecty, globy,\n"
+    "# argumenty). `cd ..` z / guest ukončí a host shell skončí v rodiči $ROOTFS,\n"
+    "# cd na cestu mimo rootfs skončí tamtéž na hostu. exit/Ctrl-D = zpět, odkud\n"
+    "# jsi do rootfs vstoupil. Proměnné: LX_DW_SHELL (guest shell, cesta v rootfs),\n"
+    "# LX_DW_RC (rc guest shellu místo ~/.zshrc v rootfs).\n"
+    "_lx_dw_inside() { [[ $1 == $R || $1 == $R/* ]] }\n"
+    "\n"
+    "lxdw() {\n"
+    "  case ${1:-status} in\n"
+    "    on)  export LX_DW=1 ;;\n"
+    "    off) export LX_DW=0\n"
+    "         [[ $LX_WORLD == rootfs ]] && { : > $LX_DW_MARK.off; _lx_dw_leave $R${PWD%/} } ;;\n"
+    "    status) if [[ $LX_WORLD == rootfs ]]; then print \"dw: zapnuto, rootfs svět ($R)\"\n"
+    "            elif [[ $LX_DW == 1 ]]; then print \"dw: zapnuto, host svět\"\n"
+    "            else print \"dw: vypnuto\"; fi ;;\n"
+    "    *) print -u2 'použití: lxdw [on|off|status]'; return 2 ;;\n"
+    "  esac\n"
+    "}\n"
+    "\n"
+    "if [[ $LX_WORLD == rootfs ]]; then\n"
+    "  # ── guest strana (zsh pod loaderem, cesty už jsou virtuální) ──\n"
+    "  _lx_dw_leave() { print -r -- $1 > $LX_DW_MARK; exit 0 }\n"
+    "  # rc v rootfs může mít `alias cd=z` (zoxide): alias by přebil funkci, proto\n"
+    "  # ho zrušíme a běžné cd pošleme dál přes něj\n"
+    "  [[ -n ${aliases[cd]} ]] && _lx_dw_cd=${aliases[cd]}\n"
+    "  : ${_lx_dw_cd:=builtin cd}\n"
+    "  unalias cd 2>/dev/null\n"
+    "  function cd {\n"
+    "    if [[ $# == 1 && $1 == .. && $PWD == / ]]; then\n"
+    "      _lx_dw_leave ${R:h}\n"
+    "    elif [[ $# == 1 ]] && _lx_dw_inside $1; then\n"
+    "      builtin cd -- ${${1#$R}:-/}\n"
+    "    else\n"
+    "      ${=_lx_dw_cd} \"$@\"\n"
+    "    fi\n"
+    "  }\n"
+    "  # cwd mimo rootfs (cd $D, pushd /sdcard…) → zpět na host\n"
+    "  _lx_dw_precmd() {\n"
+    "    local st=$?\n"
+    "    if _lx_dw_inside $PWD; then builtin cd -q -- ${${PWD#$R}:-/}\n"
+    "    elif [[ ! $R$PWD -ef . ]]; then _lx_dw_leave $PWD; fi\n"
+    "    return $st\n"
+    "  }\n"
+    "  _LX_DW_TAG=\"%F{green}[${R:t}]%f \"\n"
+    "else\n"
+    "  # ── host strana ──\n"
+    "  _lx_dw_enter() {\n"
+    "    local back=$1 mark=$LX_LOG/dw/mark.$$ rc=$LX_LOG/dw/rc sh=$LX_DW_SHELL t\n"
+    "    [[ -n $sh ]] || { [[ -x $R/usr/bin/zsh ]] && sh=/usr/bin/zsh || sh=/bin/bash }\n"
+    "    mkdir -p $rc; rm -f $mark $mark.off\n"
+    "    if [[ $sh == *zsh ]]; then\n"
+    "      print -r -- \"unset ZDOTDIR; [[ -r \\${LX_DW_RC:-\\$HOME/.zshrc} ]] && source \\${LX_DW_RC:-\\$HOME/.zshrc}; eval \\\"\\$($L init zsh)\\\"\" > $rc/.zshrc\n"
+    "      set -- -i\n"
+    "    else\n"
+    "      print -r -- \"[ -r \\\"\\${LX_DW_RC:-\\$HOME/.bashrc}\\\" ] && . \\\"\\${LX_DW_RC:-\\$HOME/.bashrc}\\\"; eval \\\"\\$($L init bash)\\\"\" > $rc/bashrc\n"
+    "      set -- --rcfile $rc/bashrc -i\n"
+    "    fi\n"
+    "    env LX_WORLD=rootfs LX_DW=1 LX_DW_MARK=$mark ZDOTDIR=$rc HOME=/root SHELL=$sh PWD=${${PWD#$R}:-/} \\\n"
+    "        PATH=/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin:/system/bin \\\n"
+    "        LC_ALL=${LC_ALL:-C.UTF-8} $L --ownall $R$sh \"$@\"\n"
+    "    [[ -s $mark ]] && t=$(<$mark) || t=$back\n"
+    "    [[ -e $mark.off ]] && LX_DW=0\n"
+    "    rm -f $mark $mark.off\n"
+    "    [[ $LX_DW == 1 ]] && _lx_dw_inside $t && t=${R:h}   # pojistka proti smyčce\n"
+    "    builtin cd -q -- $t 2>/dev/null || builtin cd -q -- ${R:h}\n"
+    "  }\n"
+    "  _lx_dw_precmd() {\n"
+    "    local st=$? b\n"
+    "    if [[ $LX_DW == 1 ]] && _lx_dw_inside $PWD; then\n"
+    "      b=$OLDPWD; _lx_dw_inside $b && b=${R:h}\n"
+    "      _lx_dw_enter $b\n"
+    "    fi\n"
+    "    [[ $LX_DW == 1 ]] && _LX_DW_TAG=\"%F{yellow}[host]%f \" || _LX_DW_TAG=\n"
+    "    return $st\n"
+    "  }\n"
+    "fi\n"
+    "# značka světa před promptem (funguje i se starship, ten PROMPT nastaví jednou)\n"
+    "_lx_dw_tag() {\n"
+    "  local st=$?\n"
+    "  [[ -n $_LX_DW_OLDTAG ]] && PROMPT=${PROMPT#$_LX_DW_OLDTAG}\n"
+    "  PROMPT=$_LX_DW_TAG$PROMPT; _LX_DW_OLDTAG=$_LX_DW_TAG\n"
+    "  return $st\n"
+    "}\n"
+    "precmd_functions=(${precmd_functions:#_lx_dw_*} _lx_dw_precmd _lx_dw_tag)\n";
+
+/* bash varianta LX_DW_ZSH (PROMPT_COMMAND misto precmd_functions) */
+static const char LX_DW_BASH[] =
+    "# ─────────────── double-world (dw): $ROOTFS jako druhý svět ───────────────\n"
+    "# Stejné chování jako zsh varianta: viz `elf_loader init zsh` / lxdw.\n"
+    "_lx_dw_inside() { [[ $1 == \"$R\" || $1 == \"$R\"/* ]]; }\n"
+    "\n"
+    "lxdw() {\n"
+    "  case ${1:-status} in\n"
+    "    on)  export LX_DW=1 ;;\n"
+    "    off) export LX_DW=0\n"
+    "         [ \"$LX_WORLD\" = rootfs ] && { : > \"$LX_DW_MARK.off\"; _lx_dw_leave \"$R${PWD%/}\"; } ;;\n"
+    "    status) if [ \"$LX_WORLD\" = rootfs ]; then printf 'dw: zapnuto, rootfs svět (%s)\\n' \"$R\"\n"
+    "            elif [ \"$LX_DW\" = 1 ]; then printf 'dw: zapnuto, host svět\\n'\n"
+    "            else printf 'dw: vypnuto\\n'; fi ;;\n"
+    "    *) printf 'použití: lxdw [on|off|status]\\n' >&2; return 2 ;;\n"
+    "  esac\n"
+    "}\n"
+    "\n"
+    "if [ \"$LX_WORLD\" = rootfs ]; then\n"
+    "  _lx_dw_leave() { printf '%s\\n' \"$1\" > \"$LX_DW_MARK\"; exit 0; }\n"
+    "  # `alias cd=z` (zoxide) v rc by přebil funkci: zrušit, běžné cd přes něj\n"
+    "  [ -n \"${BASH_ALIASES[cd]}\" ] && _lx_dw_cd=${BASH_ALIASES[cd]}\n"
+    "  : \"${_lx_dw_cd:=builtin cd}\"\n"
+    "  unalias cd 2>/dev/null\n"
+    "  function cd {\n"
+    "    if [ $# = 1 ] && [ \"$1\" = .. ] && [ \"$PWD\" = / ]; then\n"
+    "      _lx_dw_leave \"${R%/*}\"\n"
+    "    elif [ $# = 1 ] && _lx_dw_inside \"$1\"; then\n"
+    "      local v=${1#\"$R\"}; builtin cd -- \"${v:-/}\"\n"
+    "    else\n"
+    "      $_lx_dw_cd \"$@\"\n"
+    "    fi\n"
+    "  }\n"
+    "  _lx_dw_precmd() {\n"
+    "    local st=$? v\n"
+    "    if _lx_dw_inside \"$PWD\"; then v=${PWD#\"$R\"}; builtin cd -- \"${v:-/}\"\n"
+    "    elif ! [ \"$R$PWD\" -ef . ]; then _lx_dw_leave \"$PWD\"; fi\n"
+    "    return $st\n"
+    "  }\n"
+    "  _LX_DW_TAG=\"\\[\\e[32m\\][${R##*/}]\\[\\e[0m\\] \"\n"
+    "else\n"
+    "  _lx_dw_enter() {\n"
+    "    local back=$1 mark=$LX_LOG/dw/mark.$$ rc=$LX_LOG/dw/rc sh=$LX_DW_SHELL t v=${PWD#\"$R\"}\n"
+    "    [ -n \"$sh\" ] || sh=/bin/bash\n"
+    "    mkdir -p \"$rc\"; rm -f \"$mark\" \"$mark.off\"\n"
+    "    local -a a\n"
+    "    if [[ $sh == *zsh ]]; then\n"
+    "      printf '%s\\n' \"unset ZDOTDIR; [[ -r \\${LX_DW_RC:-\\$HOME/.zshrc} ]] && source \\${LX_DW_RC:-\\$HOME/.zshrc}; eval \\\"\\$($L init zsh)\\\"\" > \"$rc/.zshrc\"\n"
+    "      a=(-i)\n"
+    "    else\n"
+    "      printf '%s\\n' \"[ -r \\\"\\${LX_DW_RC:-\\$HOME/.bashrc}\\\" ] && . \\\"\\${LX_DW_RC:-\\$HOME/.bashrc}\\\"; eval \\\"\\$($L init bash)\\\"\" > \"$rc/bashrc\"\n"
+    "      a=(--rcfile \"$rc/bashrc\" -i)\n"
+    "    fi\n"
+    "    env LX_WORLD=rootfs LX_DW=1 LX_DW_MARK=\"$mark\" ZDOTDIR=\"$rc\" HOME=/root SHELL=\"$sh\" PWD=\"${v:-/}\" \\\n"
+    "        PATH=/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin:/system/bin \\\n"
+    "        LC_ALL=\"${LC_ALL:-C.UTF-8}\" \"$L\" --ownall \"$R$sh\" \"${a[@]}\"\n"
+    "    if [ -s \"$mark\" ]; then t=$(<\"$mark\"); else t=$back; fi\n"
+    "    [ -e \"$mark.off\" ] && LX_DW=0\n"
+    "    rm -f \"$mark\" \"$mark.off\"\n"
+    "    [ \"$LX_DW\" = 1 ] && _lx_dw_inside \"$t\" && t=${R%/*}   # pojistka proti smyčce\n"
+    "    builtin cd -- \"$t\" 2>/dev/null || builtin cd -- \"${R%/*}\"\n"
+    "  }\n"
+    "  _lx_dw_precmd() {\n"
+    "    local st=$? b\n"
+    "    if [ \"$LX_DW\" = 1 ] && _lx_dw_inside \"$PWD\"; then\n"
+    "      b=$OLDPWD; _lx_dw_inside \"$b\" && b=${R%/*}\n"
+    "      _lx_dw_enter \"$b\"\n"
+    "    fi\n"
+    "    if [ \"$LX_DW\" = 1 ]; then _LX_DW_TAG=\"\\[\\e[33m\\][host]\\[\\e[0m\\] \"; else _LX_DW_TAG=; fi\n"
+    "    return $st\n"
+    "  }\n"
+    "fi\n"
+    "# značka světa před promptem; běží až za ostatními PROMPT_COMMAND (starship\n"
+    "# přepisuje PS1 v každém promptu, tag se přidá po něm)\n"
+    "_lx_dw_tag() {\n"
+    "  local st=$?\n"
+    "  [ -n \"$_LX_DW_OLDTAG\" ] && PS1=${PS1#\"$_LX_DW_OLDTAG\"}\n"
+    "  PS1=$_LX_DW_TAG$PS1; _LX_DW_OLDTAG=$_LX_DW_TAG\n"
+    "  return $st\n"
+    "}\n"
+    "case \";$PROMPT_COMMAND;\" in\n"
+    "  *\";_lx_dw_precmd;\"*) ;;\n"
+    "  *) PROMPT_COMMAND=\"_lx_dw_precmd${PROMPT_COMMAND:+;$PROMPT_COMMAND};_lx_dw_tag\" ;;\n"
+    "esac\n";
+
 /* `elf_loader init zsh` — stejny shell-integrace vzor jako `starship init zsh`/
  * `zoxide init zsh` (uz pouzivany v host .zshrc): vypise na stdout radky pro
  * `eval`, misto aby menil vlastni prostredi (setenv v tomto procesu by na
@@ -4722,7 +4938,8 @@ static const char LX_HELPERS_BASH[] =
  * zadna absolutni cesta neni zadratovana. ROOTFS lze prebit; default je
  * $HOME/nh/distro/parrot (konvence app files diru). LOCPATH se nastavi jen
  * kdyz adresar v rootfs existuje (jinak by si glibc stezoval). */
-static void elf_print_init_env(void) {
+static void elf_print_init_env(int dw) {
+    if (dw) fputs("export LX_DW=1\n", stdout);
     fputs(
         "export D=${D:-$HOME}\n"
         "export ROOTFS=${ROOTFS:-$D/nh/distro/parrot}\n"
@@ -4734,8 +4951,8 @@ static void elf_print_init_env(void) {
         stdout);
 }
 
-static void elf_print_init_zsh(void) {
-    elf_print_init_env();
+static void elf_print_init_zsh(int dw) {
+    elf_print_init_env(dw);
     fputs(
         "typeset -ga LX_PATH=(\n"
         "  $R/usr/local/sbin $R/usr/local/bin $R/usr/sbin $R/usr/bin $R/sbin $R/bin\n"
@@ -4743,10 +4960,11 @@ static void elf_print_init_zsh(void) {
         ")\n",
         stdout);
     fputs(LX_HELPERS_ZSH, stdout);
+    fputs(LX_DW_ZSH, stdout);
 }
 
-static void elf_print_init_bash(void) {
-    elf_print_init_env();
+static void elf_print_init_bash(int dw) {
+    elf_print_init_env(dw);
     fputs(
         "LX_PATH=\"$R/usr/local/sbin $R/usr/local/bin $R/usr/sbin $R/usr/bin $R/sbin $R/bin\"\n"
         "for _nvm in $R/root/.nvm/versions/node/*/bin; do [ -d \"$_nvm\" ] && LX_PATH=\"$LX_PATH $_nvm\"; done\n"
@@ -4754,6 +4972,7 @@ static void elf_print_init_bash(void) {
         "unset _nvm\n",
         stdout);
     fputs(LX_HELPERS_BASH, stdout);
+    fputs(LX_DW_BASH, stdout);
 }
 
 int main(int argc, char **argv, char **envp) {
@@ -4821,16 +5040,24 @@ int main(int argc, char **argv, char **envp) {
     }
 
     if (strcmp(argv[ai], "init") == 0) {
-        const char *shell = (ai + 1 < argc) ? argv[ai + 1] : "zsh";
+        /* init [zsh|bash] [-dw|--double-world] (poradi libovolne) */
+        const char *shell = "zsh";
+        int dw = 0;
+        for (int i = ai + 1; i < argc; i++) {
+            if (strcmp(argv[i], "-dw") == 0 || strcmp(argv[i], "--double-world") == 0)
+                dw = 1;
+            else
+                shell = argv[i];
+        }
         if (strcmp(shell, "zsh") == 0) {
-            elf_print_init_zsh();
+            elf_print_init_zsh(dw);
             return 0;
         }
         if (strcmp(shell, "bash") == 0) {
-            elf_print_init_bash();
+            elf_print_init_bash(dw);
             return 0;
         }
-        fprintf(stderr, "elf_loader: init: nepodporovany shell '%s' (zsh|bash)\n", shell);
+        fprintf(stderr, "elf_loader: init: nepodporovany shell '%s' (zsh|bash [-dw])\n", shell);
         return 1;
     }
 

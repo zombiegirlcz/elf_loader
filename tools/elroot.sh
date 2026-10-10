@@ -1,12 +1,12 @@
 #!/system/bin/sh
-# elroot - PRoot-like launcher pro libovolny glibc rootfs (vyuziva elf_loader + gbsh).
+# elroot - PRoot-like launcher pro libovolny glibc rootfs (vyuziva elf_loader, chroot pres linuxsh-root).
 # Spusti prikaz z rootfs:
 #   - preferovane pres ROOT chroot (plny fs + zadny seccomp) -> vse funguje
 #   - fallback na elf_loader --ownall (non-root)
 # Vse se bere z ENV (univerzalni, bez hardcoded cest k aplikaci):
 #   ROOTFS     cesta k distro rootfs (napr. /data/.../nh/distro/parrot)
 #   ELF_LOADER cesta k elf_loader binarce (vychozi: $ROOTFS/../usr/bin/elf_loader, pak /system/bin/elf_loader)
-#   GBSH       cesta k gbsh (vychozi: $ROOTFS/../usr/bin/gbsh, pak /system/bin/gbsh)
+#   LINUXSH_ROOT cesta k linuxsh-root (vychozi: /data/adb/linuxsh-root, pak /system/bin/linuxsh-root)
 #   SU         cesta k su (vychozi /product/bin/su)
 # Pouziti: elroot [--ownall|-n] [--chroot|-r] [--rootfs DIR] <prikaz> [args...]
 
@@ -33,7 +33,7 @@ Options:
 Environment:
   ROOTFS          guest rootfs path
   ELF_LOADER      loader binary path
-  GBSH            gbsh binary path
+  LINUXSH_ROOT    linuxsh-root path (chroot mode)
   SU              su binary path
 Examples:
   elroot bash
@@ -48,7 +48,6 @@ EOF
 print_version() {
     echo "elroot 1.0"
     echo "  loader: elf_loader (bionic NDK build)"
-    echo "  shell:  gbsh (native bionic shell)"
     echo "  chroot: linuxsh-root (Magisk su)"
 }
 
@@ -68,13 +67,12 @@ if [ -z "$L" ]; then
   done
 fi
 [ -x "$L" ] || L=/system/bin/elf_loader
-G="${GBSH:-}"
-if [ -z "$G" ]; then
-  for cand in "$R/../usr/bin/gbsh" "$R/../../../usr/bin/gbsh" "$R/usr/bin/gbsh" "/system/bin/gbsh"; do
-    if [ -x "$cand" ]; then G="$cand"; break; fi
+LR="${LINUXSH_ROOT:-}"
+if [ -z "$LR" ]; then
+  for cand in /data/adb/linuxsh-root /system/bin/linuxsh-root; do
+    if [ -x "$cand" ]; then LR="$cand"; break; fi
   done
 fi
-[ -x "$G" ] || G=/system/bin/gbsh
 SU="${SU:-/product/bin/su}"
 
 # cesta: pro shim/ownall preferujeme ROOTFS bin (parrot binarky), aby guest
@@ -156,8 +154,10 @@ if [ "$MODE" != "ownall" ] && [ "$MODE" != "shim" ]; then
 fi
 
 if [ "$MODE" = "chroot" ]; then
+  [ -n "$LR" ] || { echo "elroot: --chroot potřebuje linuxsh-root (Magisk modul)"; exit 1; }
+  # linuxsh-root: privatni mount NS + make-rprivate + chroot (bez leaku mountu)
   ARGS="$@"
-  exec "$SU" -c "ROOTFS=$R '$G' --chroot -c '$PBIN $ARGS'"
+  exec "$SU" -c "ROOTFS='$R' '$LR' $PBIN $ARGS"
 elif [ "$MODE" = "shim" ]; then
   # F2 seccomp path-filter se ZDE vypina: pri --shim re-execu dedi dite
   # (napr. bash spousti kazdy prikaz pres execve) zdedy filtr, ale SIGSYS

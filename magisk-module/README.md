@@ -105,7 +105,7 @@ a glibc rootfs. It runs directly on the bionic host, independent of
 
 `bzsh` is a thin wrapper that points `ZDOTDIR`/`TERMINFO` at
 `/data/adb/zsh-bionic` (copied there by `customize.sh`/`service.sh`, same
-reasoning as `linuxsh`/`gbsh`: Magisk's `/system` mount isn't visible inside
+reasoning as `linuxsh`: Magisk's `/system` mount isn't visible inside
 app/isolated namespaces, so the binary and support files are also kept under
 `/data/adb`). If an `elf_loader` rootfs is configured
 (`/data/adb/parrot_root`), the bundled `zshrc` also evals

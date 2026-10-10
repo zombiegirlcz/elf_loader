@@ -30,10 +30,6 @@ if [ -f "$MODDIR/system/bin/linuxsh" ] && [ ! -f /data/adb/linuxsh ]; then
     cp "$MODDIR/system/bin/linuxsh-root" /data/adb/linuxsh-root 2>/dev/null
     chmod 755 /data/adb/linuxsh /data/adb/linuxsh-root 2>/dev/null
 fi
-if [ -f "$MODDIR/system/bin/gbsh" ] && [ ! -f /data/adb/gbsh ]; then
-    cp "$MODDIR/system/bin/gbsh" /data/adb/gbsh 2>/dev/null
-    chmod 755 /data/adb/gbsh 2>/dev/null
-fi
 
 # bzsh: bionic-native zsh + support files (see customize.sh for why).
 if [ -f "$MODDIR/system/bin/zsh" ] && [ ! -f /data/adb/zsh ]; then

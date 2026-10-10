@@ -74,7 +74,7 @@ Android appce — bez nutnosti je kompilovat pro bionic/NDK.
 - **`bzsh` — bundled bionic-native zsh (host shell)**: zsh 5.9.2 (NDK build,
   linkuje jen `libc/libm/libdl`), trimnuté terminfo (~80K), generický `zshrc`
   bez `com.linux_core` hardcode; instaluje se do `/data/adb/` stejně jako
-  `linuxsh`/`gbsh` (Magisk mount není vidět v app namespace). `zshrc` evaluje
+  `linuxsh` (Magisk mount není vidět v app namespace). `zshrc` evaluje
   `elf_loader init zsh`, pokud je rootfs nastaven — jeden shell pro bionic
   host i glibc guest.
 - Kompat parity `linuxsh` vs proot (22/23 identických) —
@@ -107,6 +107,21 @@ Android appce — bez nutnosti je kompilovat pro bionic/NDK.
   `lxtest` regresní sada, `command_not_found_handler`, `help`, starship/
   zoxide integrace (cache + `/proc/self/exe` rewrite) — soubor žije jen
   na zařízení, není v gitu — [postup.md#L2425](postup.md#L2425).
+- **Double world (`init zsh|bash -dw`, `lxdw on|off|status`) — náhrada
+  gbsh -dw (gbsh zrušen 2026-10-10)**: s `LX_DW=1` vstup cwd do `$ROOTFS`
+  (cd/pushd/start) spustí z precmd/PROMPT_COMMAND **guest shell pod loaderem**
+  (`LX_WORLD=rootfs`, guest `PWD`/`HOME=/root`/guest PATH + `/system/bin`);
+  loader v něm překládá všechny cesty (cd, redirecty, globy, argumenty).
+  `cd ..` z `/` nebo cwd mimo rootfs (`[[ $R$PWD -ef . ]]` — rootfs má i
+  vlastní `$R/data/user/0/...`!) guest ukončí přes marker `$LX_LOG/dw/mark.<pid>`
+  a host skončí v rodiči `$ROOTFS` / v cílové cestě; `exit` = zpět, odkud
+  se vstoupilo. Guest rc = `$LX_LOG/dw/rc` (`source ${LX_DW_RC:-~/.zshrc}` +
+  `init`). Pasti: rootfs `.zshrc` má `alias cd=z` → `function cd` + `unalias`,
+  původní alias se volá dál (`_lx_dw_cd`); zděděné fyzické `PWD` → guest by se
+  hned vrátil. Navíc **setuid/setgid/setres*/setre* shimy** (zsh `unsetopt
+  privileged` → `setgid(getgid())` → app seccomp „Bad system call" v
+  interaktivním zsh s Parrot `.zshrc`): stejné id = 0, jiné = EPERM.
+  Regresní test `test-all.sh dw` (A/B) — [postup.md](postup.md) 2026-10-10.
 - **`lxfb [-m pozn.] <cmd>`** (v `init zsh|bash`, jedno tělo pro oba shelly):
   běh s `ELF_DEBUG`/`ELF_LOADER_DIAG`/`ELF_LOADER_SIGTRACE`, `tee` do logu,
   report `$LX_LOG/feedback/<model>-<datum>-<cmd>-<čas>.md` (datum, zařízení/SoC,
@@ -123,12 +138,13 @@ Android appce — bez nutnosti je kompilovat pro bionic/NDK.
 - Ověření na zařízení + externí exec limit — [postup.md#L704](postup.md#L704),
   [postup.md#L710](postup.md#L710).
 
-## 7. Konkrétní opravy — dep libc.so.6, `--own` flow, gbsh, nano
+## 7. Konkrétní opravy — dep libc.so.6, `--own` flow, gbsh (zrušen), nano
 
 - #3 libc dep hard-exit; #5 `--own` pc=0x0 — [postup.md#L743](postup.md#L743).
 - #2 `ft6` syscall probe diagnostika — [postup.md#L758](postup.md#L758).
 - **gbsh v0.4/v0.5 (dual-world flag, cd navigace, dvojitý starship
-  prompt)** — [postup.md#L772](postup.md#L772), [postup.md#L969](postup.md#L969).
+  prompt)** — gbsh **zrušen 2026-10-10**, `-dw` přeneseno do `init zsh|bash`
+  (sekce 5) — [postup.md#L772](postup.md#L772), [postup.md#L969](postup.md#L969).
 - **nano 8.4 — `derive_distro_libdirs`** — [postup.md#L795](postup.md#L795).
 - Termux proot-distro rootfs (glibc 2.28) — [postup.md#L846](postup.md#L846).
 - TUI testy (top/htop/btop/btm) — [postup.md#L870](postup.md#L870).

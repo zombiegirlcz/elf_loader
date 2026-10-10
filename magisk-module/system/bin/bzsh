@@ -5,7 +5,7 @@
 #
 # Support files (terminfo, zshrc, zsh-plugins.zshrc) are not visible via the
 # Magisk mount inside app/isolated namespaces, so service.sh/customize.sh
-# copy them to /data/adb/zsh-bionic the same way linuxsh/gbsh are copied.
+# copy them to /data/adb/zsh-bionic the same way linuxsh is copied.
 
 SUPPORT=/data/adb/zsh-bionic
 [ -d "$SUPPORT" ] || SUPPORT=/system/etc/zsh-bionic

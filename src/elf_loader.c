@@ -2043,7 +2043,7 @@ elf_object_t *elf_load(const char *path) {
     if (is_android_stub(path)) {
         fprintf(stderr,
                 "[-] %s: Android stub (symlink to /bin/true) — not a runnable binary.\n"
-                "    Use the real distro binary, or run via: gbsh --chroot <rootfs> <bin>\n",
+                "    Use the real distro binary, or run via chroot: linuxsh <bin>\n",
                 path);
         return NULL;
     }
@@ -2720,7 +2720,7 @@ void elf_queue_module_inits(elf_object_t *m) {
 /* Android stub detection: a dependency symlinked to /bin/true (or
    /system/bin/true) is an Android stub placeholder, not a real shared
    object. Loading it crashes with a cryptic SIGSYS/SEGV. Detect and
-   report clearly so the user knows to use gbsh --chroot or provide the
+   report clearly so the user knows to use linuxsh (chroot) or provide the
    real distro library. */
 static int is_android_stub(const char *path) {
     if (!path)
@@ -2742,7 +2742,7 @@ elf_object_t *elf_load_shared(const char *path, elf_scope_t *scope) {
     if (is_android_stub(path)) {
         fprintf(stderr,
                 "[-] %s: Android stub (symlink to /bin/true) — cannot own-load.\n"
-                "    Use the real distro library, or run via: gbsh --chroot <rootfs> <bin>\n",
+                "    Use the real distro library, or run via chroot: linuxsh <bin>\n",
                 path);
         return NULL;
     }

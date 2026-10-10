@@ -8,7 +8,7 @@
 #
 # Tento skript vezme vsechny [skip] cesty, prevede na basename a doplni je do
 # whitelist.txt (bez duplikatu). Tim se "naplni whitelist" z realneho provozu:
-# spustis gbsh -dw, nechas protekly provoz a pak spustis tento merge.
+# spustis guest prikazy pres loader, nechas protekly provoz a pak spustis tento merge.
 #
 # Pouziti:
 #   ROOTFS=/cesta/k/rootfs sh tools/gbsh-whitelist-merge.sh [--dry-run]

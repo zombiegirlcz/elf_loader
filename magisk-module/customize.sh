@@ -32,19 +32,17 @@ if [ ! -f /data/adb/parrot_root ]; then
 else
     echo "parrot: keeping existing /data/adb/parrot_root"
 fi
-# linuxsh + gbsh: nativni shelly - dostupne i pred rebootem
+# linuxsh: nativni chroot shell - dostupny i pred rebootem
 if [ -f "$MODDIR/system/bin/linuxsh" ]; then
     cp "$MODDIR/system/bin/linuxsh"      /data/adb/linuxsh      2>/dev/null
     cp "$MODDIR/system/bin/linuxsh-root" /data/adb/linuxsh-root 2>/dev/null
     chmod 755 /data/adb/linuxsh /data/adb/linuxsh-root 2>/dev/null
 fi
-if [ -f "$MODDIR/system/bin/gbsh" ]; then
-    cp "$MODDIR/system/bin/gbsh" /data/adb/gbsh 2>/dev/null
-    chmod 755 /data/adb/gbsh 2>/dev/null
-fi
+# gbsh byl zrusen (nahrada: `elf_loader init zsh|bash -dw`) - uklid stare kopie
+rm -f /data/adb/gbsh 2>/dev/null
 
 # bzsh: bionic-native zsh (host shell) + its terminfo/zshrc support files -
-# same reasoning as linuxsh/gbsh above, support files need to be outside
+# same reasoning as linuxsh above, support files need to be outside
 # the Magisk mount too (ZDOTDIR/TERMINFO point at /data/adb/zsh-bionic).
 if [ -f "$MODDIR/system/bin/zsh" ]; then
     cp "$MODDIR/system/bin/zsh"  /data/adb/zsh  2>/dev/null

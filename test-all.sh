@@ -30,7 +30,6 @@ D=/data/user/0/com.linux_core/files
 L=${L:-$D/usr/bin/elf_loader}
 R=$D/nh/distro/parrot
 E=$D/usr/bin/elroot
-G=$D/usr/bin/gbsh
 
 # ─── Results ────────────────────────────────────────────────────────────────
 RESULTS_DIR=$R/root/elf_loader/results
@@ -1056,6 +1055,55 @@ EOS
     fi
 }
 
+category_dw() {
+    echo ""
+    echo "=== dw: setgid shim + double-world (init zsh -dw) ==="
+    local env="ROOTFS=$R ELF_ROOTFS=$R ELF_LOADER=$L"
+    local out
+    # zsh `unsetopt privileged` vola setgid(getgid()); app seccomp ho dřív zabil
+    # (interaktivne "Bad system call", jinak "can't change option")
+    out=$(ashell_out "$env $L --ownall $R/usr/bin/zsh -f -c 'unsetopt privileged && echo SETID_OK'")
+    if printf '%s' "$out" | grep -qx "SETID_OK"; then
+        echo "PASS dw/setid: setgid na vlastni gid projde"
+        echo "PASS: dw - setid" >> "$PASS_LOG"
+        ((PASS_COUNT++)) || true
+    else
+        echo "FAIL dw/setid: out=$out"
+        echo "FAIL: dw - setid | $out" >> "$FAIL_LOG"
+        ((FAIL_COUNT++)) || true
+    fi
+    local hz=$D/usr/bin/zsh
+    if [ ! -x "$hz" ]; then
+        echo "SKIP dw/flip: host zsh $hz chybi"
+        ((SKIP_COUNT++)) || true
+        return
+    fi
+    local dir="$R/tmp/dw.$$"
+    mkdir -p "$dir"
+    # host zsh: cd do $R/etc spusti guest shell; ten zapise svuj PWD, overi
+    # preklad redirectu a dvojim `cd ..` z / se preklopi zpet na host
+    cat > "$dir/t.zsh" <<EOS
+eval "\$($L init zsh -dw)"
+export LX_DW_RC=/dev/null LX_DW_SHELL=/usr/bin/zsh
+cd $R/etc
+printf '%s\\n' 'echo "G=\$PWD" > /tmp/dw.$$/g' 'echo dwok > /tmp/dw.$$/out' 'cd ..' 'cd ..' 'echo NE > /tmp/dw.$$/ne' | _lx_dw_precmd >/dev/null 2>&1
+echo "H=\$PWD"
+EOS
+    out=$("$R/usr/bin/timeout" 120 "$R/bin/bash" -c "cd $D; HOME=$D $hz -f $dir/t.zsh" 2>&1 | grep -v MMAP)
+    out="$out $(cat "$dir/g" "$dir/out" 2>/dev/null) ne=$([ -e "$dir/ne" ] && echo 1 || echo 0)"
+    rm -rf "$dir"
+    if printf '%s' "$out" | grep -q "H=${R%/*}" && printf '%s' "$out" | grep -q "G=/etc" \
+       && printf '%s' "$out" | grep -q "dwok" && printf '%s' "$out" | grep -q "ne=0"; then
+        echo "PASS dw/flip: guest /etc, redirect pod \$R, cd .. z / zpet na host"
+        echo "PASS: dw - flip" >> "$PASS_LOG"
+        ((PASS_COUNT++)) || true
+    else
+        echo "FAIL dw/flip: out=$out"
+        echo "FAIL: dw - flip | $out" >> "$FAIL_LOG"
+        ((FAIL_COUNT++)) || true
+    fi
+}
+
 category_bigargv() {
     echo ""
     echo "=== velky argv (60 KB argument pres exec) ==="
@@ -1417,6 +1465,10 @@ case "${1:-all}" in
         category_lxc
         print_summary
         ;;
+    dw)
+        category_dw
+        print_summary
+        ;;
     pathops)
         category_pathops
         print_summary
@@ -1460,6 +1512,7 @@ case "${1:-all}" in
         category_selfexe
         category_bigargv
         category_lxc
+        category_dw
         category_pathops
         category_madv
         category_venv

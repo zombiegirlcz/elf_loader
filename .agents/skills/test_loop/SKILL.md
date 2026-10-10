@@ -75,12 +75,12 @@ Krok po kroku:
    cesty jsou absolutní:
    `/data/user/0/com.linux_core/files/usr/bin/elf_loader`.
    Loader se obvykle řídí přes `elroot`:
-   `ROOTFS=… ELF_LOADER=… GBSH=… /data/…/elroot --shim <guest-cmd>`.
+   `ROOTFS=… ELF_LOADER=… /data/…/elroot --shim <guest-cmd>`.
 
 ## ashell konfigurace
 
 - **Config**: `ashellrc=/root/elf_loader/files/ashell.conf` (na device, zrcadleno v `files/ashell.conf`).
-  Nastavuje env app shellu (PATH, ROOTFS, ELF_LOADER, GBSH, TERMINFO, …) a ukazuje ashell na
+  Nastavuje env app shellu (PATH, ROOTFS, ELF_LOADER, TERMINFO, …) a ukazuje ashell na
   správné device adresáře.
 - **`apps hell` (ashell)** = omezený shell appky; běží jako uid 10310 v SELinux doméně appky.
   Není root. Všechny testy jdou přes něj.
@@ -173,14 +173,14 @@ Krok po kroku:
 
 ```sh
 D=/data/user/0/com.linux_core/files
-R=$D/nh/distro/parrot; L=$D/usr/bin/elf_loader; E=$D/usr/bin/elroot; G=$D/usr/bin/gbsh
+R=$D/nh/distro/parrot; L=$D/usr/bin/elf_loader; E=$D/usr/bin/elroot
 
 # 2+3: compile (modal) -> /tmp/elf_loader_ndk, deploy do device
 cp -f /tmp/elf_loader_ndk /root/elf_loader/files/usr/bin/elf_loader && chmod 755 /root/elf_loader/files/usr/bin/elf_loader
 
 # 4: test pres ashell (literal device cesty, bez pipe kvuli head manglingu)
 ashell -c "$L --ownall /system/bin/true; echo RC=\$?"
-ashell -c "ROOTFS=$R ELF_LOADER=$L GBSH=$G $E --shim ls /usr/bin/awk"
+ashell -c "ROOTFS=$R ELF_LOADER=$L $E --shim ls /usr/bin/awk"
 ```
 
 Flow v jedné větě: **píšeš v prootu → `modal` zkompiluje NDK do `/tmp` → `cp` do `files/`

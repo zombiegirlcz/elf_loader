@@ -3776,3 +3776,66 @@ prázdný. node 26 / python / git s cwd pod `$R` → guest cwd, relativní i
 absolutní fs operace i child `pwd` OK; claude (Bun) s cwd pod `$R` OK.
 Regresní test `test-all.sh pathops` (`l2.py`, očekává `LIBCOPS2 7`; stará
 binárka FAIL). `all`: **PASS 177 / FAIL 0 / SKIP 33**. cJSON cmake+build+ctest 19/19.
+
+### 2026-10-10 — gbsh zrušen, double world (`-dw`) přenesen do `init zsh|bash`
+
+**Zadání:** zrušit vlastní shell loaderu (gbsh) a jeho schopnosti, hlavně
+`-dw`/`--double-world`, přenést do zsh/bash konfigurace tak, aby se v dw módu
+všechny cesty automaticky překládaly na `$ROOTFS`.
+
+**Návrh (zvolen z dvou variant):** rootfs svět = **guest shell pod loaderem**,
+ne přepis příkazové řádky v host shellu. Ověřeno předem přes `ashell -c`:
+guest bash/zsh pod `--ownall` s guest PATH přeloží `cd /etc`, `ls /etc/…`,
+`echo x > /tmp/x` (→ `$R/tmp/x`), glob `/etc/host*` i `cd ..`; host příkazy
+(`getprop`, `/system/bin/sh`) projdou. Přepis řádky (ZLE/`bind -x`) by
+globoval na hostu, měl mezní případy v parsování a ukazoval přepsaný řádek.
+
+**Implementace (`src/main.c`, `LX_DW_ZSH` / `LX_DW_BASH`, vypisuje `init`):**
+- `elf_loader init zsh|bash [-dw|--double-world]` (`-dw` → `export LX_DW=1`),
+  přepínač `lxdw on|off|status`.
+- Host: hook v `precmd_functions` / `PROMPT_COMMAND` — když je `LX_DW=1`
+  a `$PWD` leží v `$R`, spustí guest shell (`LX_WORLD=rootfs`, `HOME=/root`,
+  `PWD` virtuální, PATH rootfs + `/system/bin`, `ZDOTDIR`/`--rcfile` =
+  `$LX_LOG/dw/rc`, které sourcuje `${LX_DW_RC:-~/.zshrc}` a znovu `init`).
+  Po návratu host přečte marker `$LX_LOG/dw/mark.<pid>`: cíl flipu, jinak
+  zpět do `OLDPWD`; pojistka proti smyčce → `${R:h}`.
+- Guest: `function cd` — `cd ..` v `/` → marker `${R:h}` + exit (= obrácený
+  svět jako gbsh), `cd $R/x` → `/x`; precmd: cwd mimo rootfs → marker
+  `$PWD` + exit. Značka `[host]` / `[parrot]` před promptem.
+
+**Pasti nalezené při testu:**
+1. Guest zdědil exportované `PWD=$R/etc` → zsh ho převzal (stejný inode),
+   precmd usoudil „mimo rootfs" a hned se vrátil. Fix: předat `PWD=/etc`
+   + v guest precmd fyzický alias `$R/…` normalizovat přes `cd`.
+2. Test „mimo rootfs" přes `[[ -e $R$PWD ]]` selhal na `cd $D`: rootfs má
+   skutečný adresář `$R/data/user/0/com.linux_core/files` (pozůstatek
+   prootu). Fix: `[[ $R$PWD -ef . ]]` (inode kandidáta vs. skutečné cwd).
+3. Parrot `/root/.zshrc` má `alias cd=z` → `cd() {` se rozbalilo na `z() {`
+   → parse error a zbytek dw bloku chyběl. Fix: `function cd`, `unalias cd`,
+   původní alias se volá dál (`_lx_dw_cd`), takže zoxide funguje.
+4. **Loader bug:** interaktivní guest zsh s Parrot `.zshrc` padal na
+   `Bad system call` — fzf init obnovuje `options=(… privileged off …)`,
+   zsh volá `setgid(getgid())`, app seccomp ho zabije (neinteraktivně jen
+   ENOSYS „can't change option"). Fix: GOT shimy `setuid/setgid/seteuid/
+   setegid/setreuid/setregid/setresuid/setresgid` — změna na současné id
+   (nebo -1) = 0 bez syscallu, jiné = EPERM (stejně jako `setfsuid`).
+
+**gbsh úklid:** smazány `gbsh/`, `magisk-module/system/bin/gbsh{,_static}`,
+`tools/gbsh-shim-gen.sh`; magisk modul ho už neinstaluje a `customize.sh`
+maže starou `/data/adb/gbsh`. `elroot --chroot` volal neexistující
+`gbsh --chroot` → teď `linuxsh-root` (privátní mount NS). Hlášky Android stub
+v `src/elf_loader.c` odkazují na `linuxsh`. `tools/gbsh_shim.sh` a
+`tools/gbsh-whitelist-merge.sh` zůstaly (patří k `exec_shim.so`, ne ke gbsh).
+
+**Ověření (`ashell -c`, bionic build, A/B s `elf_loader.prev`):**
+- host zsh (`$D/usr/bin/zsh`) + `init zsh -dw` + reálný Parrot `.zshrc`:
+  `cd $R/etc` → guest `PWD=/etc`, `ls /etc/os-release` OK, redirect do
+  `$R/tmp/…`, `cd ..` ×2 → host v `…/nh/distro`; `cd $D` v guestu → host
+  `$D`; `cd $R/usr` zůstane v guestu jako `/usr`; `cd /var/log` přes `z`;
+  `exit` → zpět do `OLDPWD`; `lxdw off` v guestu → host `$R/etc`, `LX_DW=0`.
+- interaktivně přes PTY (`script -qfc 'zsh -i'`): stejný flip, prompt
+  `HOST ~/nh/distro`.
+- bash varianta (host bash simulován pod loaderem s `F2_NO_CWD_STRIP=1`,
+  guest s Parrot `.bashrc`): flip, `cd $D`, `cd $R/usr`, redirect OK.
+- `test-all.sh dw`: nová 2/2 PASS, stará 2/2 FAIL (setid i flip).
+- `test-all.sh all`: **PASS 182 / FAIL 0 / SKIP 32** (dřív 179/0, bez regrese).
