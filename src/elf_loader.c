@@ -10,6 +10,7 @@
 extern char **environ;
 #include <signal.h>
 #include <dlfcn.h>
+#include <pthread.h>
 #include <sys/mman.h>
 #include <sys/auxv.h>
 #include <sys/stat.h>
@@ -1186,32 +1187,242 @@ static elf_object_t *dl_find_loaded(const char *file) {
 /* ───────────── Bionic bridge: guest glibc dlopen() bionicke knihovny ──────
  * Bionicka .so (/system, /vendor, /apex...) se NESMI own-loadovat do guest
  * scope: tahne druhou, neinicializovanou kopii bionic libc.so -> SIGSEGV.
- * Misto toho ji nacte skutecny linker64 (bionic dlopen pod bionic TP) a guest
- * dostane jen thunky (entry.S bb_stubs): kazde volani prepne tpidr_el0 na
- * bionic TP + zablokuje async signaly, po navratu vrati guest TP.
- * Vulkan: vkGet{Instance,Device}ProcAddr vraci dalsi ukazatele -> obaleny
- * wrapperem, ktery thunkuje i vysledek.
- * Limity: callbacky bionic -> guest (VkAllocationCallbacks, debug messenger)
- * se neobaluji; vsechna vlakna sdili bionic TCB hlavniho vlakna. */
+ * Misto toho ji nacte skutecny linker64 (bionic dlopen) a guest dostane jen
+ * thunky (entry.S):
+ *   bb_stubs  guest -> bionic: blok async signalu, tpidr_el0 = bionic TP
+ *   rb_stubs  bionic -> guest (callbacky): tpidr_el0 = guest TP
+ * Parovani vlaken: kazde vlakno ma v jednom svete vlastni TCB a v druhem si
+ * PUJCI TCB zaparkovaneho "donor" vlakna (bb_pairs). Guest vlakno dostane
+ * bionic donor (spravne tid/zamky/errno v driveru), vlakno driveru dostane
+ * glibc donor (callback do guestu). Donory vyrabeji dva spawner vlakna.
+ * Vulkan: vkGet*ProcAddr thunkuje i vysledky; pAllocator (index z vk.xml,
+ * src/vk_alloc_table.h) a pfn*Callback v debug create-info se pri volani
+ * podmeni reverznimi thunky. */
+#include "vk_alloc_table.h"
 #define BB_NSTUBS 4096
-extern char bb_stubs[];
+#define RB_NSTUBS 1024
+extern char bb_stubs[], rb_stubs[];
 extern void *bb_targets[BB_NSTUBS];
-static size_t bb_nused;
-static int bb_lock;
+extern void *rb_targets[RB_NSTUBS];
+/* bb_meta: bit7 = pAllocator v x[bity 0-2]; bit8 = debug create-info v
+ * x[bity 9-11]; bit12 = x[bity 13-15] je primo guest funkce (callback). */
+static uint16_t bb_meta[BB_NSTUBS];
+static size_t bb_nused, rb_nused;
+static int bb_lock, rb_lock;
 
-static void *bb_wrap(void *fn) {
+typedef struct {
+    uint64_t stack[14];
+    uint64_t fp, lr, x19, x20;
+    uint64_t x[8];
+    uint64_t x8, idx, mask, tp;
+    __uint128_t q[8];
+    uint64_t alloc[6];          /* kopie VkAllocationCallbacks s thunky */
+    uint64_t patch[4];          /* {adresa, puvodni} x2 - in-place debug pfn */
+} bb_frame_t;
+_Static_assert(sizeof(bb_frame_t) == 448, "bb_frame_t vs entry.S BB_FRAME");
+_Static_assert(__builtin_offsetof(bb_frame_t, x) == 144, "x");
+_Static_assert(__builtin_offsetof(bb_frame_t, tp) == 232, "tp");
+_Static_assert(__builtin_offsetof(bb_frame_t, q) == 240, "q");
+
+static inline void bb_spin(int *l) {
+    while (__atomic_exchange_n(l, 1, __ATOMIC_ACQUIRE)) { }
+}
+static inline void bb_unspin(int *l) { __atomic_store_n(l, 0, __ATOMIC_RELEASE); }
+
+static int bb_stub_index(const char *base, size_t n, void *fn) {
+    uintptr_t p = (uintptr_t)fn, b = (uintptr_t)base;
+    if (p >= b && p < b + 8 * n && ((p - b) & 7) == 0) return (int)((p - b) / 8);
+    return -1;
+}
+
+static void *rb_wrap(void *fn);
+/* guest -> bionic thunk. Pure C bez bionic volani (bezi i pod guest TP). */
+static void *bb_wrap_meta(void *fn, uint16_t meta) {
     if (!fn) return NULL;
-    while (__atomic_exchange_n(&bb_lock, 1, __ATOMIC_ACQUIRE)) { }
+    int ri = bb_stub_index(rb_stubs, RB_NSTUBS, fn);
+    if (ri >= 0) return rb_targets[ri];           /* guest fce vracena zpet */
+    if (bb_stub_index(bb_stubs, BB_NSTUBS, fn) >= 0) return fn;
+    bb_spin(&bb_lock);
     void *r = NULL;
     for (size_t i = 0; i < bb_nused; i++)
-        if (bb_targets[i] == fn) { r = bb_stubs + 8 * i; break; }
+        if (bb_targets[i] == fn) { r = bb_stubs + 8 * i; bb_meta[i] |= meta; break; }
     if (!r && bb_nused < BB_NSTUBS) {
+        bb_meta[bb_nused] = meta;
         bb_targets[bb_nused] = fn;
-        r = bb_stubs + 8 * bb_nused++;
+        r = bb_stubs + 8 * bb_nused;
+        __atomic_store_n(&bb_nused, bb_nused + 1, __ATOMIC_RELEASE);
     }
-    __atomic_store_n(&bb_lock, 0, __ATOMIC_RELEASE);
-    if (!r) fprintf(stderr, "[bridge] thunk pool full\n");
+    bb_unspin(&bb_lock);
     return r;
+}
+/* bionic -> guest thunk (callback). Pure C. */
+static void *rb_wrap(void *fn) {
+    if (!fn) return NULL;
+    int bi = bb_stub_index(bb_stubs, BB_NSTUBS, fn);
+    if (bi >= 0) return bb_targets[bi];           /* bionic fce vracena zpet */
+    if (bb_stub_index(rb_stubs, RB_NSTUBS, fn) >= 0) return fn;
+    bb_spin(&rb_lock);
+    void *r = NULL;
+    for (size_t i = 0; i < rb_nused; i++)
+        if (rb_targets[i] == fn) { r = rb_stubs + 8 * i; break; }
+    if (!r && rb_nused < RB_NSTUBS) {
+        rb_targets[rb_nused] = fn;
+        r = rb_stubs + 8 * rb_nused;
+        __atomic_store_n(&rb_nused, rb_nused + 1, __ATOMIC_RELEASE);
+    }
+    bb_unspin(&rb_lock);
+    return r;
+}
+
+/* ---- parovani vlaken ---- */
+#define BB_NPAIRS 512
+static struct { uintptr_t guest, host; } bb_pairs[BB_NPAIRS];
+static int bb_npairs, bb_pairs_lock;
+static long bb_spawn_pid;
+
+static uintptr_t bb_pair_find(uintptr_t tp, int want_host) {
+    int n = __atomic_load_n(&bb_npairs, __ATOMIC_ACQUIRE);
+    for (int i = 0; i < n; i++) {
+        if (want_host && bb_pairs[i].guest == tp) return bb_pairs[i].host;
+        if (!want_host && bb_pairs[i].host == tp) return bb_pairs[i].guest;
+    }
+    return 0;
+}
+static void bb_pair_add(uintptr_t g, uintptr_t h) {
+    bb_spin(&bb_pairs_lock);
+    int n = bb_npairs;
+    if (n < BB_NPAIRS) {
+        bb_pairs[n].guest = g;
+        bb_pairs[n].host = h;
+        __atomic_store_n(&bb_npairs, n + 1, __ATOMIC_RELEASE);
+    }
+    bb_unspin(&bb_pairs_lock);
+}
+
+static inline void bb_futex_wait(int *a, int v) {
+    raw_syscall6(98 /*futex*/, (long)a, 0 /*WAIT*/, v, 0, 0, (long)F2_SENTINEL);
+}
+static inline void bb_futex_wake(int *a) {
+    raw_syscall6(98, (long)a, 1 /*WAKE*/, 0x7fffffff, 0, 0, (long)F2_SENTINEL);
+}
+
+typedef int (*bb_create_fn)(void *, const void *, void *(*)(void *), void *);
+typedef struct {
+    bb_create_fn create;        /* bionic resp. guest pthread_create */
+    const void *attr;
+    int req, resp, lock, park;
+    uintptr_t out_tp;
+} bb_spawner_t;
+static bb_spawner_t bb_host_sp, bb_guest_sp;
+
+/* Donor: zverejni svuj TP a navzdy zaparkuje (nikdy nebezi user kod). */
+static void *bb_donor(void *arg) {
+    bb_spawner_t *sp = arg;
+    uintptr_t t;
+    __asm__ volatile("mrs %0, tpidr_el0" : "=r"(t));
+    sp->out_tp = t;
+    __atomic_add_fetch(&sp->resp, 1, __ATOMIC_RELEASE);
+    bb_futex_wake(&sp->resp);
+    for (;;) bb_futex_wait(&sp->park, 0);
+    return NULL;
+}
+/* Spawner bezi ve "svem" svete (bionic resp. guest TP) a na zadost vyrobi donor. */
+static void *bb_spawner(void *arg) {
+    bb_spawner_t *sp = arg;
+    int seen = 0;
+    for (;;) {
+        int cur;
+        while ((cur = __atomic_load_n(&sp->req, __ATOMIC_ACQUIRE)) == seen)
+            bb_futex_wait(&sp->req, seen);
+        for (; seen != cur; seen++) {
+            uint64_t th[8];
+            sp->create(th, sp->attr, bb_donor, sp);
+        }
+    }
+    return NULL;
+}
+/* Pure C + raw syscally: smi bezet pod libovolnym TP. */
+static uintptr_t bb_request(bb_spawner_t *sp) {
+    if (raw_syscall6(172 /*getpid*/, 0, 0, 0, 0, 0, (long)F2_SENTINEL) != bb_spawn_pid)
+        return 0;                                 /* po forku spawnery nejsou */
+    bb_spin(&sp->lock);
+    int r = __atomic_load_n(&sp->resp, __ATOMIC_ACQUIRE);
+    __atomic_add_fetch(&sp->req, 1, __ATOMIC_RELEASE);
+    bb_futex_wake(&sp->req);
+    int c;
+    while ((c = __atomic_load_n(&sp->resp, __ATOMIC_ACQUIRE)) == r)
+        bb_futex_wait(&sp->resp, c);
+    uintptr_t t = sp->out_tp;
+    bb_unspin(&sp->lock);
+    return t;
+}
+
+/* ---- Vulkan callback fixupy (pod guest TP, pure C) ---- */
+static void bb_patch_pfn(bb_frame_t *f, uint64_t *slot) {
+    if (!*slot) return;
+    for (int k = 0; k < 4; k += 2)
+        if (!f->patch[k]) {
+            f->patch[k] = (uint64_t)slot;
+            f->patch[k + 1] = *slot;
+            *slot = (uint64_t)rb_wrap((void *)*slot);
+            return;
+        }
+}
+static void bb_fix_debug_chain(bb_frame_t *f, const void *info) {
+    for (int n = 0; info && n < 32; n++) {
+        const int32_t st = *(const int32_t *)info;
+        uint64_t *w = (uint64_t *)info;
+        if (st == 1000128004) bb_patch_pfn(f, &w[4]);      /* DebugUtilsMessenger: pfnUserCallback @32 */
+        else if (st == 1000011000) bb_patch_pfn(f, &w[3]); /* DebugReportCallback: pfnCallback @24 */
+        else if (st == 1000284002) bb_patch_pfn(f, &w[3]); /* DeviceMemoryReport: pfnUserCallback @24 */
+        info = (const void *)w[1];                         /* pNext */
+    }
+}
+
+void *bb_pre(bb_frame_t *f) {
+    uintptr_t g;
+    __asm__ volatile("mrs %0, tpidr_el0" : "=r"(g));
+    uintptr_t h = bb_pair_find(g, 1);
+    if (!h) {
+        h = bb_request(&bb_host_sp);
+        if (h) bb_pair_add(g, h);
+        else h = g_tls_old_tp;
+    }
+    f->tp = h;
+    f->patch[0] = f->patch[2] = 0;
+    uint16_t m = bb_meta[f->idx];
+    if (m & 0x80) {
+        unsigned a = m & 7;
+        const uint64_t *src = (const uint64_t *)f->x[a];
+        if (src) {
+            f->alloc[0] = src[0];                         /* pUserData */
+            for (int k = 1; k < 6; k++) f->alloc[k] = (uint64_t)rb_wrap((void *)src[k]);
+            f->x[a] = (uint64_t)f->alloc;
+        }
+    }
+    if (m & 0x100)
+        bb_fix_debug_chain(f, (const void *)f->x[(m >> 9) & 7]);
+    if (m & 0x1000) {
+        unsigned a = (m >> 13) & 7;
+        f->x[a] = (uint64_t)rb_wrap((void *)f->x[a]);
+    }
+    return bb_targets[f->idx];
+}
+void bb_post(bb_frame_t *f) {
+    for (int k = 0; k < 4; k += 2)
+        if (f->patch[k]) *(uint64_t *)f->patch[k] = f->patch[k + 1];
+}
+void *rb_pre(bb_frame_t *f) {
+    uintptr_t h;
+    __asm__ volatile("mrs %0, tpidr_el0" : "=r"(h));
+    uintptr_t g = bb_pair_find(h, 0);
+    if (!g) {
+        g = bb_request(&bb_guest_sp);
+        if (g) bb_pair_add(g, h);
+        else g = g_tls_new_tp;
+    }
+    f->tp = g;
+    return rb_targets[f->idx];
 }
 
 typedef void *(*bb_pa_fn)(void *, const char *);
@@ -1219,18 +1430,39 @@ static bb_pa_fn bb_real_gipa, bb_real_gdpa;
 static void *bb_gipa(void *inst, const char *name);
 static void *bb_gdpa(void *dev, const char *name);
 
-/* Pod bionic TP (volano pres thunk). */
+/* Bezne bionic libc API s callbackem v argumentu (index do x0-x7). */
+static const struct { const char *name; unsigned char idx; } bb_cb_table[] = {
+    {"pthread_create", 2}, {"pthread_once", 1}, {"qsort", 3}, {"bsearch", 4},
+};
+static uint16_t bb_vk_meta(const char *name) {
+    uint16_t m = 0;
+    for (size_t i = 0; i < sizeof bb_cb_table / sizeof bb_cb_table[0]; i++)
+        if (strcmp(bb_cb_table[i].name, name) == 0)
+            return 0x1000 | (uint16_t)(bb_cb_table[i].idx << 13);
+    if (name[0] != 'v' || name[1] != 'k') return 0;
+    for (size_t i = 0; i < sizeof vk_alloc_table / sizeof vk_alloc_table[0]; i++)
+        if (strcmp(vk_alloc_table[i].name, name) == 0) {
+            m |= 0x80 | vk_alloc_table[i].idx;
+            break;
+        }
+    if (strcmp(name, "vkCreateInstance") == 0) m |= 0x100 | (0 << 9);
+    else if (strcmp(name, "vkCreateDevice") == 0 ||
+             strcmp(name, "vkCreateDebugUtilsMessengerEXT") == 0 ||
+             strcmp(name, "vkCreateDebugReportCallbackEXT") == 0) m |= 0x100 | (1 << 9);
+    return m;
+}
+/* Pod bionic TP (volano z dlsym nebo pres thunk). */
 static void *bb_wrap_named(const char *name, void *real) {
-    if (!real || !name) return bb_wrap(real);
+    if (!real || !name) return bb_wrap_meta(real, 0);
     if (strcmp(name, "vkGetInstanceProcAddr") == 0) {
         if (!bb_real_gipa) bb_real_gipa = (bb_pa_fn)real;
-        return bb_wrap((void *)bb_gipa);
+        return bb_wrap_meta((void *)bb_gipa, 0);
     }
     if (strcmp(name, "vkGetDeviceProcAddr") == 0) {
         if (!bb_real_gdpa) bb_real_gdpa = (bb_pa_fn)real;
-        return bb_wrap((void *)bb_gdpa);
+        return bb_wrap_meta((void *)bb_gdpa, 0);
     }
-    return bb_wrap(real);
+    return bb_wrap_meta(real, bb_vk_meta(name));
 }
 static void *bb_gipa(void *inst, const char *name) {
     return bb_wrap_named(name, bb_real_gipa ? bb_real_gipa(inst, name) : NULL);
@@ -1259,13 +1491,48 @@ static int bb_is_bionic_path(const char *f) {
     return 0;
 }
 
-static void *bb_dlopen(const char *file, int mode) {
+/* Jednou: hlavni par + oba spawnery. Pod bionic TP; guest_tp = TP volajiciho. */
+static void bb_init(uintptr_t guest_tp) {
+    static int done;
+    if (done) return;
+    done = 1;
+    bb_spawn_pid = raw_syscall6(172, 0, 0, 0, 0, 0, (long)F2_SENTINEL);
+    if (g_tls_new_tp && g_tls_old_tp) bb_pair_add(g_tls_new_tp, g_tls_old_tp);
+
+    static pthread_attr_t donor_attr;
+    pthread_attr_init(&donor_attr);
+    pthread_attr_setstacksize(&donor_attr, 64 * 1024);
+    pthread_attr_setdetachstate(&donor_attr, PTHREAD_CREATE_DETACHED);
+    bb_host_sp.create = (bb_create_fn)pthread_create;
+    bb_host_sp.attr = &donor_attr;
+    pthread_t t;
+    if (pthread_create(&t, &donor_attr, bb_spawner, &bb_host_sp) != 0)
+        fprintf(stderr, "[bridge] host spawner failed\n");
+
+    bb_create_fn gcreate = g_crash_scope
+        ? (bb_create_fn)elf_scope_lookup(g_crash_scope, "pthread_create") : NULL;
+    if (gcreate && guest_tp) {
+        bb_guest_sp.create = gcreate;
+        bb_guest_sp.attr = NULL;
+        uint64_t gt[8];
+        uintptr_t save = dl_tp_get();
+        dl_tp_set(guest_tp);
+        int r = gcreate(gt, NULL, bb_spawner, &bb_guest_sp);
+        dl_tp_set(save);
+        if (r != 0) fprintf(stderr, "[bridge] guest spawner failed (%d)\n", r);
+    } else {
+        fprintf(stderr, "[bridge] guest pthread_create not found\n");
+    }
+}
+
+static void *bb_dlopen(const char *file, int mode, uintptr_t guest_tp) {
     void *real = dlopen(file, mode & 0x1103);  /* LAZY/NOW/GLOBAL/NODELETE: stejne hodnoty */
     if (!real) {
         const char *e = dlerror();
         dl_set_err(e ? e : "bionic dlopen failed");
         return NULL;
     }
+    bb_init(guest_tp);
     bb_handle_t *h = malloc(sizeof *h);
     if (!h) return NULL;
     h->magic = BB_MAGIC;
@@ -1285,7 +1552,7 @@ void *ldso_dlopen(const char *file, int mode) {
         ret = (void *)g_crash_scope;
     } else {
         elf_object_t *m = bb_is_bionic_path(file) ? NULL : dl_find_loaded(file);
-        if (bb_is_bionic_path(file)) ret = bb_dlopen(file, mode);
+        if (bb_is_bionic_path(file)) ret = bb_dlopen(file, mode, saved.tp);
         else if (m) { g_dl_err_valid = 0; ret = (void *)m; }
         else if (resolve_import_ldso(file)) { g_dl_err_valid = 0; ret = (void *)g_crash_scope; }
         else {
