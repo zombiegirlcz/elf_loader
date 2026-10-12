@@ -1125,6 +1125,48 @@ category_bigargv() {
     fi
 }
 
+category_bionic() {
+    echo ""
+    echo "=== bionic bridge (guest glibc dlopen bionicke .so) ==="
+    local env="ROOTFS=$R ELF_ROOTFS=$R ELF_LOADER=$L"
+    local py='import ctypes as c
+z = c.CDLL("/system/lib64/libz.so"); z.zlibVersion.restype = c.c_char_p
+print("ZLIB", z.zlibVersion().decode())
+try:
+    v = c.CDLL("/system/lib64/libvulkan.so"); n = c.c_uint(0)
+    print("VK", v.vkEnumerateInstanceVersion(c.byref(n)), n.value >> 22)
+except OSError:
+    print("VK none")'
+    local dir="$R/tmp/bionic.$$"
+    mkdir -p "$dir"
+    printf '%s\n' "$py" > "$dir/t.py"
+    local out
+    out=$(ashell_out "$env $L --ownall $R/usr/bin/python3 ${dir#$R}/t.py")
+    rm -rf "$dir"
+    if printf '%s' "$out" | grep -q "^ZLIB 1\."; then
+        echo "PASS bionic: libz.so zlibVersion pres bridge"
+        echo "PASS: bionic - libz zlibVersion" >> "$PASS_LOG"
+        ((PASS_COUNT++)) || true
+    else
+        echo "FAIL bionic: libz.so, out=$out"
+        echo "FAIL: bionic - libz zlibVersion | $out" >> "$FAIL_LOG"
+        ((FAIL_COUNT++)) || true
+    fi
+    if printf '%s' "$out" | grep -q "^VK none"; then
+        echo "SKIP bionic: libvulkan.so neni"
+        echo "SKIP: bionic - no libvulkan" >> "$SKIP_LOG"
+        ((SKIP_COUNT++)) || true
+    elif printf '%s' "$out" | grep -q "^VK 0 1$"; then
+        echo "PASS bionic: vkEnumerateInstanceVersion pres bridge"
+        echo "PASS: bionic - vkEnumerateInstanceVersion" >> "$PASS_LOG"
+        ((PASS_COUNT++)) || true
+    else
+        echo "FAIL bionic: libvulkan.so, out=$out"
+        echo "FAIL: bionic - vkEnumerateInstanceVersion | $out" >> "$FAIL_LOG"
+        ((FAIL_COUNT++)) || true
+    fi
+}
+
 category_selfexe() {
     echo ""
     echo "=== /proc/self/exe + make fast path (eaccess) ==="
@@ -1461,6 +1503,10 @@ case "${1:-all}" in
         category_bigargv
         print_summary
         ;;
+    bionic)
+        category_bionic
+        print_summary
+        ;;
     lxc)
         category_lxc
         print_summary
@@ -1511,6 +1557,7 @@ case "${1:-all}" in
         category_nss
         category_selfexe
         category_bigargv
+        category_bionic
         category_lxc
         category_dw
         category_pathops

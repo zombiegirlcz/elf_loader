@@ -226,6 +226,14 @@ Milníky:
   60 KB argument tiše uřízla nebo spadla. Regresní test `test-all.sh bigargv`
   (A/B); `wget` v `net_real` vynucen `-4` (síť bez IPv6 trasy, wget nemá
   fallback). `all` PASS 179/0.
+- **Bionic bridge — glibc guest `dlopen()` bionické `.so` — VYŘEŠENO**
+  (2026-10-12): dřív own-load tahal druhou bionic `libc.so` → SIGSEGV. Teď
+  `/system|/vendor|/apex|…` cesty → skutečný bionic `dlopen`, `dlsym` vrací asm
+  thunky (`entry.S` `bb_stubs`: přepnutí `tpidr_el0` + blok async signálů,
+  kopie stack argů), `vkGet*ProcAddr` thunkuje i výsledky. Glibc program
+  dosáhne Adreno 618 (`vkCreateDevice` OK). Limity: callbacky bionic→guest,
+  vlákna driveru. Vypnout `ELF_LOADER_NO_BIONIC_BRIDGE=1`. Regresní test
+  `test-all.sh bionic` (A/B) — [postup.md](postup.md) 2026-10-12.
 - **tmux pod loaderem** — [postup.md#L2306](postup.md#L2306).
 - **Helper knihovny (`ELF_LOADER_HELPER`), náhodný SIGSEGV ~5 %
   (heap fix), Node ≤22 teardown `free(): invalid pointer` (EXIT=134)** —

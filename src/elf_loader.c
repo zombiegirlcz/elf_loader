@@ -1183,8 +1183,100 @@ static elf_object_t *dl_find_loaded(const char *file) {
     return NULL;
 }
 
+/* ───────────── Bionic bridge: guest glibc dlopen() bionicke knihovny ──────
+ * Bionicka .so (/system, /vendor, /apex...) se NESMI own-loadovat do guest
+ * scope: tahne druhou, neinicializovanou kopii bionic libc.so -> SIGSEGV.
+ * Misto toho ji nacte skutecny linker64 (bionic dlopen pod bionic TP) a guest
+ * dostane jen thunky (entry.S bb_stubs): kazde volani prepne tpidr_el0 na
+ * bionic TP + zablokuje async signaly, po navratu vrati guest TP.
+ * Vulkan: vkGet{Instance,Device}ProcAddr vraci dalsi ukazatele -> obaleny
+ * wrapperem, ktery thunkuje i vysledek.
+ * Limity: callbacky bionic -> guest (VkAllocationCallbacks, debug messenger)
+ * se neobaluji; vsechna vlakna sdili bionic TCB hlavniho vlakna. */
+#define BB_NSTUBS 4096
+extern char bb_stubs[];
+extern void *bb_targets[BB_NSTUBS];
+static size_t bb_nused;
+static int bb_lock;
+
+static void *bb_wrap(void *fn) {
+    if (!fn) return NULL;
+    while (__atomic_exchange_n(&bb_lock, 1, __ATOMIC_ACQUIRE)) { }
+    void *r = NULL;
+    for (size_t i = 0; i < bb_nused; i++)
+        if (bb_targets[i] == fn) { r = bb_stubs + 8 * i; break; }
+    if (!r && bb_nused < BB_NSTUBS) {
+        bb_targets[bb_nused] = fn;
+        r = bb_stubs + 8 * bb_nused++;
+    }
+    __atomic_store_n(&bb_lock, 0, __ATOMIC_RELEASE);
+    if (!r) fprintf(stderr, "[bridge] thunk pool full\n");
+    return r;
+}
+
+typedef void *(*bb_pa_fn)(void *, const char *);
+static bb_pa_fn bb_real_gipa, bb_real_gdpa;
+static void *bb_gipa(void *inst, const char *name);
+static void *bb_gdpa(void *dev, const char *name);
+
+/* Pod bionic TP (volano pres thunk). */
+static void *bb_wrap_named(const char *name, void *real) {
+    if (!real || !name) return bb_wrap(real);
+    if (strcmp(name, "vkGetInstanceProcAddr") == 0) {
+        if (!bb_real_gipa) bb_real_gipa = (bb_pa_fn)real;
+        return bb_wrap((void *)bb_gipa);
+    }
+    if (strcmp(name, "vkGetDeviceProcAddr") == 0) {
+        if (!bb_real_gdpa) bb_real_gdpa = (bb_pa_fn)real;
+        return bb_wrap((void *)bb_gdpa);
+    }
+    return bb_wrap(real);
+}
+static void *bb_gipa(void *inst, const char *name) {
+    return bb_wrap_named(name, bb_real_gipa ? bb_real_gipa(inst, name) : NULL);
+}
+static void *bb_gdpa(void *dev, const char *name) {
+    return bb_wrap_named(name, bb_real_gdpa ? bb_real_gdpa(dev, name) : NULL);
+}
+
+#define BB_MAGIC 0x42494f4e49434252ULL   /* "RBCINOIB" */
+typedef struct { uint64_t magic; void *real; } bb_handle_t;
+
+static int bb_is_handle(void *h) {
+    return h && h != (void *)-1 && ((uintptr_t)h & 7) == 0 &&
+           (uintptr_t)h > 0x10000 && ((bb_handle_t *)h)->magic == BB_MAGIC;
+}
+
+/* Pod bionic TP. 1 = cesta vede na bionickou knihovnu hosta. */
+static int bb_is_bionic_path(const char *f) {
+    if (!f || f[0] != '/' || getenv("ELF_LOADER_NO_BIONIC_BRIDGE")) return 0;
+    const char *root = getenv("ROOTFS");
+    if (root && root[0] && strncmp(f, root, strlen(root)) == 0) return 0;
+    static const char *pre[] = { "/system/", "/vendor/", "/apex/", "/odm/",
+                                 "/product/", "/system_ext/", NULL };
+    for (int i = 0; pre[i]; i++)
+        if (strncmp(f, pre[i], strlen(pre[i])) == 0) return 1;
+    return 0;
+}
+
+static void *bb_dlopen(const char *file, int mode) {
+    void *real = dlopen(file, mode & 0x1103);  /* LAZY/NOW/GLOBAL/NODELETE: stejne hodnoty */
+    if (!real) {
+        const char *e = dlerror();
+        dl_set_err(e ? e : "bionic dlopen failed");
+        return NULL;
+    }
+    bb_handle_t *h = malloc(sizeof *h);
+    if (!h) return NULL;
+    h->magic = BB_MAGIC;
+    h->real = real;
+    if (getenv("ELF_DEBUG"))
+        fprintf(stderr, "[bridge] bionic dlopen %s -> %p\n", file, real);
+    g_dl_err_valid = 0;
+    return h;
+}
+
 void *ldso_dlopen(const char *file, int mode) {
-    (void)mode;
     dl_host_t saved;
     int sw = dl_enter_host(&saved);
     void *ret = NULL;
@@ -1192,8 +1284,9 @@ void *ldso_dlopen(const char *file, int mode) {
         g_dl_err_valid = 0;
         ret = (void *)g_crash_scope;
     } else {
-        elf_object_t *m = dl_find_loaded(file);
-        if (m) { g_dl_err_valid = 0; ret = (void *)m; }
+        elf_object_t *m = bb_is_bionic_path(file) ? NULL : dl_find_loaded(file);
+        if (bb_is_bionic_path(file)) ret = bb_dlopen(file, mode);
+        else if (m) { g_dl_err_valid = 0; ret = (void *)m; }
         else if (resolve_import_ldso(file)) { g_dl_err_valid = 0; ret = (void *)g_crash_scope; }
         else {
             /* Není načtený -> zkus ho own-loadnout z search paths (Python
@@ -1252,7 +1345,11 @@ void *ldso_dlsym(void *handle, const char *name) {
     dl_host_t saved;
     int sw = dl_enter_host(&saved);
     void *ret = NULL;
-    if (!handle) {                                  /* RTLD_DEFAULT */
+    if (bb_is_handle(handle)) {
+        void *p = dlsym(((bb_handle_t *)handle)->real, name);
+        if (p) { g_dl_err_valid = 0; ret = bb_wrap_named(name, p); }
+        else dl_set_err(name);
+    } else if (!handle) {                                  /* RTLD_DEFAULT */
         /* OVERRIDE prvni! Jinak by elf_scope_lookup nasel guest glibc
          * dlopen/dlsym (pracuji nad nulovym _rtld_global) a Python by si
          * pres dlsym(RTLD_DEFAULT,"dlopen") vytahl rozbitou verzi. */

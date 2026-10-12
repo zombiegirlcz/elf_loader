@@ -22,3 +22,7 @@ int dladdr(const void *addr, Dl_info *info) {
     (void)info;
     return 0;
 }
+
+char *dlerror(void) {
+    return "dlfcn not available (static build)";
+}

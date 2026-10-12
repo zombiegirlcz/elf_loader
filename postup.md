@@ -3839,3 +3839,43 @@ v `src/elf_loader.c` odkazují na `linuxsh`. `tools/gbsh_shim.sh` a
   guest s Parrot `.bashrc`): flip, `cd $D`, `cd $R/usr`, redirect OK.
 - `test-all.sh dw`: nová 2/2 PASS, stará 2/2 FAIL (setid i flip).
 - `test-all.sh all`: **PASS 182 / FAIL 0 / SKIP 32** (dřív 179/0, bez regrese).
+
+## 2026-10-12 — Bionic bridge: guest glibc `dlopen()` bionické knihovny (Vulkan/Adreno)
+
+**Podnět:** dotaz z Redditu — jak řešíme rozdílný TLS layout a jde-li z glibc
+programu ve stejném procesu sáhnout na bionickou knihovnu (Vulkan ICD).
+
+**Stav před:** guest `dlopen("/system/lib64/libvulkan.so")` → `ldso_dlopen` →
+`ldso_load_new` own-loadoval bionickou `.so` jako glibc i s DT_NEEDED →
+**druhá, neinicializovaná kopie bionic `libc.so`** v guest scope → SIGSEGV
+(RC=139), `dlopen` se ani nevrátil.
+
+**Fix (`src/elf_loader.c` „Bionic bridge", `src/entry.S` `bb_stubs`/`bb_common`):**
+- `ldso_dlopen`: cesta pod `/system/ /vendor/ /apex/ /odm/ /product/
+  /system_ext/` (a ne pod `ROOTFS`) → skutečný bionic `dlopen` (linker64,
+  už jsme pod bionic TP díky `dl_enter_host`). Guest dostane `bb_handle_t`
+  (magic + skutečný handle). Vypnout `ELF_LOADER_NO_BIONIC_BRIDGE=1`.
+- `ldso_dlsym` na bridge handle → bionic `dlsym` + **thunk**. 4096 předgenerovaných
+  stubů (`mov x16,#i; b bb_common`) + tabulka cílů `bb_targets` (dedup).
+  `bb_common`: rámec 224 B, kopie 14 slotů stack argumentů (Vulkan `vkCmd*`
+  má >8 argů), raw `rt_sigprocmask` blokuje async signály (x5 = `F2_SENTINEL`,
+  stejně jako `dl_enter_host`), `msr tpidr_el0 ← g_tls_old_tp`, `blr`, vrátí
+  guest TP a masku. x8 i v0–v7 nedotčené (float argumenty, indirect result).
+- `vkGetInstanceProcAddr`/`vkGetDeviceProcAddr` se obalí C wrapperem
+  (běží pod bionic TP), který thunkuje i **vrácené** ukazatele.
+- Static-PIE build: doplněn `dlerror` stub v `src/dlfcn_stubs.c`.
+
+**Limity (vědomé):** callbacky bionic → guest (`VkAllocationCallbacks`, debug
+messenger) se neobalují; všechna guest vlákna používají bionic TCB hlavního
+vlákna (`g_tls_old_tp`); vlákna vytvořená driverem nemají glibc TCB. Jde jen
+o explicitní `dlopen` — guest `libvulkan.so.1` (Khronos loader) přes DT_NEEDED
+na bridge nevede (Khronos loader by navíc přepsal dispatch pointer Android
+loaderu).
+
+**Ověření (`ashell -c`, bionic build, A/B s `elf_loader.prev`):**
+- `$R/tmp/bidi/vk.c` (bez hlaviček, guest gcc): `vkCreateInstance r=0`,
+  `vkEnumeratePhysicalDevices n=1`, `GPU 0: Adreno (TM) 618 api=1.1.128
+  vendor=0x5143`, `vkCreateDevice r=0`, `vkGetDeviceQueue`, `vkDeviceWaitIdle=0`,
+  destroy, `guest TP stable: yes`, RC=0. Stará binárka i opt-out: SIGSEGV 139.
+- Regresní test `test-all.sh bionic` (Python ctypes: `libz.so zlibVersion` +
+  `vkEnumerateInstanceVersion`, SKIP bez libvulkan): nová 2/2 PASS, stará 2/2 FAIL.

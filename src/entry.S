@@ -104,3 +104,110 @@ tlsdesc_return:
 .size tlsdesc_return, .-tlsdesc_return
 
 .section .note.GNU-stack, "", %progbits
+/* ---- Bionic bridge thunky (guest glibc -> bionic knihovna) ----------------
+ * Stub i: x16 = i, skok do bb_common. bb_common nacte cil z bb_targets[i],
+ * zkopiruje 14 slotu stack argumentu, zablokuje async signaly (raw
+ * rt_sigprocmask, x5 = F2_SENTINEL), prepne tpidr_el0 na bionic TP
+ * (g_tls_old_tp), zavola cil a vse vrati. x8 (indirect result) a v0-v7
+ * zustavaji nedotcene. */
+.text
+.balign 16
+.globl bb_stubs
+.type bb_stubs, %function
+bb_stubs:
+.set bb_i, 0
+.rept 4096
+    mov x16, #bb_i
+    b bb_common
+.set bb_i, bb_i + 1
+.endr
+.size bb_stubs, .-bb_stubs
+
+.type bb_common, %function
+bb_common:
+    sub sp, sp, #224
+    stp x29, x30, [sp, #112]
+    add x29, sp, #112
+    stp x19, x20, [sp, #128]
+    stp x0, x1, [sp, #144]
+    stp x2, x3, [sp, #160]
+    stp x4, x5, [sp, #176]
+    stp x6, x7, [sp, #192]
+    stp x8, x16, [sp, #208]
+    /* stack argumenty volajiciho (sp+224..) -> nove sp+0.. */
+    ldp x9, x10, [sp, #224]
+    stp x9, x10, [sp, #0]
+    ldp x9, x10, [sp, #240]
+    stp x9, x10, [sp, #16]
+    ldp x9, x10, [sp, #256]
+    stp x9, x10, [sp, #32]
+    ldp x9, x10, [sp, #272]
+    stp x9, x10, [sp, #48]
+    ldp x9, x10, [sp, #288]
+    stp x9, x10, [sp, #64]
+    ldp x9, x10, [sp, #304]
+    stp x9, x10, [sp, #80]
+    ldp x9, x10, [sp, #320]
+    stp x9, x10, [sp, #96]
+    /* rt_sigprocmask(SIG_BLOCK, &bb_async_set, &old -> [x29+8 = x30 slot? ne: sp+216]) */
+    mov x0, #0                        /* SIG_BLOCK */
+    adrp x1, bb_async_set
+    add x1, x1, :lo12:bb_async_set
+    add x2, sp, #216                  /* old mask prepise ulozeny x16 (uz nepotrebny) */
+    ldr x16, [sp, #216]
+    adrp x9, bb_targets
+    add x9, x9, :lo12:bb_targets
+    ldr x19, [x9, x16, lsl #3]        /* cil */
+    mov x3, #8
+    mov x4, #0
+    movz x5, #0xCDEF
+    movk x5, #0x90AB, lsl #16
+    movk x5, #0x5678, lsl #32
+    movk x5, #0x1234, lsl #48
+    mov x8, #135
+    svc #0
+    mrs x20, tpidr_el0                /* guest TP */
+    adrp x9, :got:g_tls_old_tp
+    ldr x9, [x9, :got_lo12:g_tls_old_tp]
+    ldr x9, [x9]
+    cbz x9, 1f
+    msr tpidr_el0, x9
+1:
+    ldp x0, x1, [sp, #144]
+    ldp x2, x3, [sp, #160]
+    ldp x4, x5, [sp, #176]
+    ldp x6, x7, [sp, #192]
+    ldr x8, [sp, #208]
+    blr x19
+    msr tpidr_el0, x20
+    /* obnov masku; navratove x0/x1 (+v0-v7, x8) zachovat */
+    stp x0, x1, [sp, #144]
+    mov x0, #2                        /* SIG_SETMASK */
+    add x1, sp, #216
+    mov x2, #0
+    mov x3, #8
+    mov x4, #0
+    movz x5, #0xCDEF
+    movk x5, #0x90AB, lsl #16
+    movk x5, #0x5678, lsl #32
+    movk x5, #0x1234, lsl #48
+    mov x8, #135
+    svc #0
+    ldp x0, x1, [sp, #144]
+    ldp x19, x20, [sp, #128]
+    ldp x29, x30, [sp, #112]
+    add sp, sp, #224
+    ret
+.size bb_common, .-bb_common
+
+.bss
+.balign 8
+.globl bb_targets
+bb_targets:
+    .zero 4096 * 8
+.data
+.balign 8
+.globl bb_async_set
+/* ~(SEGV|BUS|ILL|FPE|TRAP|SYS|ABRT): bity 10,6,3,7,4,30,5 (signo-1) */
+bb_async_set:
+    .quad ~((1 << 10) | (1 << 6) | (1 << 3) | (1 << 7) | (1 << 4) | (1 << 30) | (1 << 5))
