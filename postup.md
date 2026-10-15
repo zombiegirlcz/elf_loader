@@ -3879,3 +3879,226 @@ loaderu).
   destroy, `guest TP stable: yes`, RC=0. Stará binárka i opt-out: SIGSEGV 139.
 - Regresní test `test-all.sh bionic` (Python ctypes: `libz.so zlibVersion` +
   `vkEnumerateInstanceVersion`, SKIP bez libvulkan): nová 2/2 PASS, stará 2/2 FAIL.
+
+---
+
+## 2026-10-15 — Zátěžový test multi-runtime (Claude Code uvnitř re-exec řetězu) + 3 nové nálezy
+
+**Kontext spuštění (netriviální — vše běželo přes loader na třech úrovních):**
+
+```
+lx zsh                                    (uživatelský shell pod loaderem)
+  └─ elf_loader --ownall .../node/v22.11.0/bin/claude      (Claude Code)
+       └─ Bash tool → jednorázové `bash -c` příkazy        (testy níže)
+```
+
+Ověřeno z `/proc/$PPID/cmdline`:
+```
+/data/user/0/com.linux_core/files/usr/bin/elf_loader --ownall \
+  /data/user/0/.../root/.nvm/versions/node/v22.11.0/bin/claude
+```
+Tj. i jednorázové Bash příkazy agenta dědí loader — testy měří reálný
+produkční řetěz, ne izolovaný `elf_loader --ownall foo`.
+
+### Výsledky zátěže (vše PASS, 0 selhání)
+
+Runtimy: Python 3.13.5, Node v26.10.0, Perl 5.40.1, GCC 14.2.0, rustc 1.99.0.
+
+| test | výsledek |
+|---|---|
+| 40 proc. (8× 5 runtimes) | 2,67 s real / 14,2 s user — 0 selhání |
+| 150 proc. (30× 5 runtimes) | 8,80 s real / 38,8 s user — 0 selhání, všech 150 výstupů bitově shodných |
+| rampa 10→25→50→100 souběžných | 97 → 59 → 63 → 55 ms/proc, **lineární, bez degradace** |
+
+Kontrola korektnosti pod souběhem (30× každý, všechny výstupy identické):
+`rust sum=933333666668`, `c 26999995`, `perl 38399931`, py sha256 prefix
+`2f3bf7d3`, node `546`. Žádná křížová korupce TLS/stdout při 150 procesech.
+
+### Režie exec
+
+```
+200× $ROOTFS/bin/true   (přes loader)     9,66 s  → 48 ms/proc
+200× /system/bin/toybox true (nativní)    1,92 s  → 10 ms/proc
+200× elf_loader $ROOTFS/bin/true (přímo)  2,82 s  → 14 ms/proc
+200× shell builtin `:`                    0,05 s  →  0,2 ms/proc
+```
+
+Přímé volání loaderu je **3,5× rychlejší** než přes `bin/true`. Rozdíl ~34 ms
+jde na opakované resolvování dynamických symbolů — `bin/true` je plný PIE
+s `interpreter /lib/ld-linux-aarch64.so.1`; loader při každém startu vypisuje
+mj.:
+```
+[-] 'main' -> not found
+[+] 'printf' -> import @ 0x7d8befc518
+[+] 'puts'   -> import @ 0x7d8befc63c
+[+] '__libc_start_main' -> import @ 0x0
+```
+**Námět:** cache resolvovaných symbolů per-binárka (klíč BuildID+mtime) by
+mohla srazit exec z 48 ms k ~14 ms.
+
+### NÁLEZ 1 — vlastní `argv[0]` se zahazuje (`exec -a`, `ARGV0=`) — NEOPRAVENO
+
+Loader přepíše `argv[0]` resolvovanou absolutní cestou k binárce a vlastní
+`argv[0]` zahodí. Reprodukce (`av.c` = `for(i<argc) printf("argv[%d]=%s")`):
+
+```
+$ (exec -a FAKENAME0 ./av XXX)
+argv[0]=/data/user/0/.../root/stress/av          # očekáváno: FAKENAME0
+argv[1]=XXX
+$ ARGV0=FAKENAME1 ./av XXX
+argv[0]=/data/user/0/.../root/stress/./av        # očekáváno: FAKENAME1
+$ perl -e 'exec {"./av"} "FAKENAME2","XXX"'
+argv[0]=/data/user/0/.../root/stress/./av        # očekáváno: FAKENAME2
+```
+
+Všechny tři cesty (bash `exec -a`, zsh `ARGV0=`, perlí `exec {prog} LIST`)
+selžou stejně → chyba je v `shim_execve`, ne v shellu.
+
+**Reálný dopad — rozbíjí Claude Code běžící pod loaderem.** Claude Code má
+`grep` jako shell funkci, která re-execuje vlastní binárku pod jménem `ugrep`:
+```sh
+(exec -a ugrep "$_cc_bin" -G --ignore-files --hidden -I ... "$@")
+```
+Protože se `ugrep` nepropíše, binárka se spustí jako `claude` a `-G` nezná:
+```
+$ grep -n '^#' postup.md
+error: unknown option '-G'
+```
+Každý `grep` v agentově shellu takhle padá. Workaround: `command grep`.
+
+**Pozn.:** `python3 -c ... → sys.argv[0]=='-c'` a `perl -e ... → $0=='-e'`
+jsou NORMÁLNÍ sémantika interpretů, ne projev téhle chyby (při prvním měření
+jsem si je spletl; C test výše to vyvrací).
+
+### NÁLEZ 2 — `/proc/self/cmdline` není shimnutý (na rozdíl od `/proc/self/exe`)
+
+Fix z 2026-10-07 shimuje `readlink("/proc/self/exe")` a **drží** — ověřeno,
+vrací guest binárku ve všech testovaných adresářích. `cmdline` ale zůstal:
+
+```c
+argv[0]=/data/user/0/.../root/stress/cl          // OK (ze stacku)
+cmdline[0]=/data/user/0/.../usr/bin/elf_loader   // leak loaderu
+```
+Čtou to `ps`, `pgrep`, `setproctitle`, supervizory a leccos v CPythonu.
+Fix analogický `shim_readlink`: zachytit `open`/`read` na `/proc/self/cmdline`
+a `/proc/<vlastní pid>/cmdline`, podstrčit `g_guest_exe_path` + guest argv.
+Pozor na stejnou TLS past jako u `shim_is_proc_self_exe` — žádné `snprintf`
+ani `getpid()` z bionic, jen raw syscall + ruční sestavení čísla.
+
+### NÁLEZ 3 — rustc hlásí `sysroot` = guest(dirname(cwd)) — ROOT CAUSE NEIZOLOVÁN
+
+Každý rust build padá:
+```
+error[E0463]: can't find crate for `std`
+  = note: the `aarch64-unknown-linux-gnu` target may not be installed
+```
+Přitom target **nainstalovaný je** (`.../rustlib/aarch64-unknown-linux-gnu/lib/`
+obsahuje `libaddr2line-*.rlib` atd.). Sysroot se počítá z `cwd`, ne z binárky:
+
+```
+cwd=/                        sysroot=(prázdný)
+cwd=/tmp                     sysroot=/
+cwd=$R/root                  sysroot=/
+cwd=$R/root/stress           sysroot=/root
+cwd=$R/root/.rustup/toolchains/stable-aarch64-unknown-linux-gnu/bin
+                             sysroot=/root/.rustup/toolchains/stable-aarch64-unknown-linux-gnu
+cwd=/usr                     sysroot=/
+```
+Platí přesně `sysroot == guest_path(dirname(cwd))`.
+
+Vyloučeno měřením (tj. root cause je jinde):
+- **není to rustup shim** — `~/.cargo/bin/rustc -> rustup`, ale i reálný
+  `$T/bin/rustc` dělá totéž; `RUSTUP_TOOLCHAIN=...` nepomůže.
+- **není to rozbitý `argv[0]`** — sonda (`cl_probe`) zkopírovaná do `$T/bin`
+  a volaná stejně jako rustc dostane `argv[0]` = plnou správnou cestu.
+- **není to rozbitý `/proc/self/exe`** — `rl_probe` v `$T/bin` vrací
+  `.../toolchains/stable-.../bin/rl_probe`, správně.
+- rustc je dynamicky linkovaný PIE (shimy se tedy aplikují).
+
+Zbývající hypotéza: `std::env::current_exe()` uvnitř rustc nedostane absolutní
+cestu (vrátí relativní/bare jméno), Rust ji spojí s `cwd` a `dirname²` pak dá
+`dirname(cwd)`; host→guest překlad cesty proběhne až někde v shimu. Chce to
+samostatné kolo s instrumentací `readlink`/`getcwd`/`realpath` volání z rustc.
+
+**Workaround (funguje, ověřeno):**
+```sh
+rustc --sysroot $HOME/.rustup/toolchains/stable-aarch64-unknown-linux-gnu -O a.rs -o a_bin
+./a_bin        # -> rust sum=933333666668
+```
+
+### NÁLEZ 4 — nelze spustit binárku ležící mimo `$ROOTFS` (souvisí s 2026-10-07 (2))
+
+Kompilace do adresáře mimo rootfs projde, spuštění ne — `shim_execve` nalepí
+`$ROOTFS` prefix i na cestu, která už je absolutní host cesta mimo rootfs:
+
+```
+$ gcc -O2 d.c -o /data/user/0/com.linux_core/files/tmp/.../scratchpad/stress/d_bin   # OK
+$ /data/user/0/com.linux_core/files/tmp/.../scratchpad/stress/d_bin
+[-] open(/data/user/0/com.linux_core/files/nh/distro/parrot/data/user/0/com.linux_core/files/tmp/.../scratchpad/stress/d_bin): No such file or directory
+          ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^ $ROOTFS prefix nalepen navíc
+```
+Interpretované runtimy tím netrpí (jen `open()`, žádný `exec`). Je to nejspíš
+tatáž vrstva jako neuzavřený nález *2026-10-07 (2)* (vnořený `make` →
+`/usr/bin/cmake: No such file or directory`), jen z opačné strany: tam prefix
+**chybí**, tady **přebývá**. Stojí za to řešit obě najednou.
+
+Workaround: kompilovat a spouštět uvnitř rootfs (`$R/root/stress`).
+
+### 2026-10-15 (2) — Zátěž threading + mmap (vše PASS, 0 nálezů)
+
+Navazuje na předchozí sekci, stejný re-exec řetěz (`lx zsh → claude → bash`).
+Cíl: ověřit TLS pod vlákny a VM vrstvu — historicky nejcitlivější místa
+(viz regrese TLS v *2026-10-07 `/proc/self/exe` fix*).
+
+**pthreads + TLS canary** (`th.c`, per-thread `__thread long`, kontrola po
+výpočtu, `acc` pod mutexem):
+```
+threads=2   acc=3599988     tls=OK
+threads=8   acc=14399952    tls=OK
+threads=32  acc=57599808    tls=OK
+threads=128 acc=230399232   tls=OK
+threads=256 acc=460798464   tls=OK
+```
+`acc` sedí přesně na `1799994 × n` u všech běhů → žádná ztracená ani
+dvakrát započítaná iterace, žádná záměna TLS slotů.
+
+**VM vrstva** (`mm.c`):
+```
+pagesize=4096
+anon 64M rw       OK        (dotek po stránkách + verifikace vzoru)
+mprotect RO/RW    OK
+mremap 64M->128M  OK        (MREMAP_MAYMOVE, data po přesunu ověřena)
+file mmap 8M MAP_SHARED + msync -> OK   (zpětné čtení přes pread)
+4096 malých map   -> vytvořeno 4096     (bez limitu)
+MAP_FIXED overlay OK
+```
+
+**Kombinovaná tortura** (`tm.c`):
+```
+64 vláken × 200 cyklů mmap/memset/verify/mprotect×2/munmap: chyb=0
+   (per-vlákno unikátní výplňový bajt, kontrola na cross-thread korupci)
+fork COW 16M: dítě rc=0, rodič netknut OK
+MAP_SHARED anon mezi procesy: 77 OK
+dlopen libz.so.1: OK   dlsym zlibVersion -> 1.3.1
+```
+
+**Runtime úroveň:**
+```
+py threads: 32 unikátních hashů: 32        (threading + hashlib)
+py mmap anon 8M: HELLO len 8388608
+py mmap file 4M: size()=4194304, WORLD     (flush + zpětné čtení)
+py multiprocessing Pool(8) × 16 úloh: součet 9600024
+node worker_threads: 16 workerů, SharedArrayBuffer součet = 120 OK
+   (Atomics.store z workerů, ověřeno proti N*(N-1)/2)
+```
+
+**Falešný poplach (nehonit znovu):** `mmap.mmap(-1, N).size()` hodí
+`OSError: [Errno 9] Bad file descriptor`. Není to chyba loaderu —
+CPython implementuje `size()` jako `fstat(self.fd)` a u anonymní mapy je
+`fd == -1`; `os.fstat(-1)` dá stejné EBADF i nativně. Pro anonymní mapu
+se používá `len(m)`.
+
+**Závěr:** threading, TLS, mmap/mremap/mprotect/msync, COW, MAP_SHARED
+napříč procesy i `dlopen` jsou pod loaderem v pořádku. Všechny čtyři nálezy
+z předchozí sekce jsou v cestách **exec/argv/path-resolution**, ne v jádru
+loaderu (VM + TLS).

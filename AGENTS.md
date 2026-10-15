@@ -130,6 +130,11 @@ Android appce — bez nutnosti je kompilovat pro bionic/NDK.
   `diag.<pid>.txt`) → PR do `dev` / `feedback/` (auto-merge). Ověřeno na zařízení
   pod bzsh i guest bash.
 
+- **rustc/cargo: `sysroot` se odvodí z `cwd`, ne z binárky** → `E0463:
+  can't find crate for std` u každého buildu. Otevřené, root cause
+  neizolován; workaround `--sysroot <toolchain>`. Detail a vyloučené
+  hypotézy v sekci 10 — [postup.md#L3988](postup.md#L3988).
+
 ## 6. Seccomp compat filtr + fork veneer
 
 - **App seccomp (kernel 4.14) — `clone3` SIGSYS, `close_range` atd.**;
@@ -364,6 +369,40 @@ Milníky:
   Zbývá jen `nmap` (není v rootfs nainstalovaný) — [postup.md#L680](postup.md#L680).
 - ~~`env`/`timeout` spouštějící `ashell`~~ — **vyřešeno**, byl to PATH
   ordering (bare jméno → host binárka), ne hook bypass; viz sekce 9.
+
+- **Zátěžový test multi-runtime + threading/mmap (2026-10-15)** — spuštěno
+  uvnitř reálného re-exec řetězu `lx zsh → elf_loader --ownall claude →
+  agentí bash -c` (ne izolovaný `--ownall`). Jádro loaderu čisté: pthreads
+  do 256 vláken s TLS canary, mmap/mremap/mprotect/msync/MAP_FIXED, 64 vláken
+  × 200 mmap cyklů, fork COW, MAP_SHARED mezi procesy, `dlopen`, python
+  threading/`multiprocessing`, node `worker_threads`+SharedArrayBuffer —
+  vše PASS. 150 souběžných procesů (python/node/perl/rust/C) 0 selhání,
+  rampa 10→100 lineární. Režie exec: 48 ms přes `$ROOTFS/bin/true` vs 14 ms
+  přímým voláním loaderu vs 10 ms nativní toybox → **námět: cache
+  resolvovaných symbolů per-binárka (BuildID+mtime)**.
+  [postup.md#L3885](postup.md#L3885), threading/mmap
+  [postup.md#L4047](postup.md#L4047).
+  Čtyři nové otevřené nálezy, všechny v cestách exec/argv/path-resolution:
+  - **Vlastní `argv[0]` se při exec zahazuje** (`exec -a`, zsh `ARGV0=`,
+    perlí `exec {} LIST` → přepsáno resolvovanou cestou). Rozbíjí mj.
+    Claude Code `grep`, který se re-execuje jako `ugrep`
+    (`error: unknown option '-G'`); workaround `command grep`.
+    Pozn.: `python3 -c` → `sys.argv[0]=='-c'` je normální sémantika
+    interpretu, ne tento bug — [postup.md#L3939](postup.md#L3939).
+  - **`/proc/self/cmdline` není shimnutý** a leakuje cestu k loaderu
+    (`/proc/self/exe` shimnutý JE a drží). Fix analogický `shim_readlink`
+    — pozor na tutéž TLS past (žádný bionic `snprintf`/`getpid()`, jen raw
+    syscall) — [postup.md#L3973](postup.md#L3973).
+  - **rustc `sysroot == guest(dirname(cwd))`** → každý build `E0463: can't
+    find crate for std`. Root cause NEIZOLOVÁN; měřením vyloučeno: rustup
+    shim, `argv[0]`, `/proc/self/exe`, statické linkování. Workaround
+    `rustc --sysroot $R/root/.rustup/toolchains/stable-aarch64-unknown-linux-gnu`
+    — [postup.md#L3988](postup.md#L3988).
+  - **Binárku mimo `$ROOTFS` nelze spustit** — `shim_execve` nalepí `$ROOTFS`
+    prefix i na už absolutní host cestu mimo rootfs. Nejspíš tatáž vrstva
+    jako neuzavřený nález 2026-10-07 (2) (vnořený `make`), jen z opačné
+    strany (tam prefix chybí, tady přebývá) — řešit najednou.
+    [postup.md#L4029](postup.md#L4029).
 
 Průběžný stav otevřených bugů — viz i auto-paměť
 `[[elf-loader-open-bugs]]`.
