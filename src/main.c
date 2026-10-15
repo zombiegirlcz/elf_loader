@@ -1669,6 +1669,23 @@ static int is_glibc_elf(const char *path) {
     return found;
 }
 
+/* 1 = jde o ELF, ktery NESMI jit pres own-loading (bionic nebo staticka glibc
+ * binarka bez PT_INTERP, napr. "ashell" nebo Magisk "su_wrapper"). Own-load
+ * takove binarky spadne hned na vstupu (FAULT-ENTER, chybi PT_INTERP/TLS
+ * layout). Skripty (#!) nejsou ELF -> 0, projdou na shebang-handling.
+ * TLS-safe: jen raw_* syscally. */
+static int elf_needs_real_exec(const char *path) {
+    if (!path || !path[0]) return 0;
+    unsigned char emag[4] = {0, 0, 0, 0};
+    int fd = raw_open(path, O_RDONLY);
+    if (fd < 0) return 0;
+    raw_read(fd, emag, 4);
+    raw_close(fd);
+    if (!(emag[0] == 0x7f && emag[1] == 'E' && emag[2] == 'L' && emag[3] == 'F'))
+        return 0;
+    return !is_glibc_elf(path);
+}
+
 /* TLS-safe symlink resolver for paths under ROOTFS. Resolves symlink chains
  * where targets are guest-absolute (e.g. /etc/alternatives/awk -> /usr/bin/mawk)
  * by prepending ROOTFS to absolute targets. Returns 1 if resolved, 0 if not a
@@ -2058,11 +2075,7 @@ static int shim_execve(const char *p, char *const argv[], char *const envp[]) {
          * jako glibc a spadne hned na vstupu (FAULT-ENTER, tp=0, chybi
          * PT_INTERP/TLS layout). Skripty (#!) nejsou ELF, projdou beze zmeny
          * na shebang-handling nize. */
-        unsigned char emag[4] = {0, 0, 0, 0};
-        int efd = raw_open(p, O_RDONLY);
-        if (efd >= 0) { raw_read(efd, emag, 4); raw_close(efd); }
-        if (emag[0] == 0x7f && emag[1] == 'E' && emag[2] == 'L' && emag[3] == 'F' &&
-            !is_glibc_elf(p)) {
+        if (elf_needs_real_exec(p)) {
             fp_execve f = (fp_execve)g_orig_execve;
             return f ? f(p, argv, envp) : -1;
         }
@@ -2123,6 +2136,17 @@ static int shim_execve(const char *p, char *const argv[], char *const envp[]) {
                 shim_strcpy(resolved, sizeof(resolved), p);
             }
         }
+    }
+
+    /* Bionic / staticka glibc binarka (zadny PT_INTERP) se NESMI own-loadovat.
+     * Vetev "uz pod ROOTFS" to resi vys; tady to pokryva guest-absolutni
+     * (/usr/local/bin/x), relativni i bare-name cesty - bez toho napr.
+     * "/usr/local/bin/su_wrapper" spadl na SIGSEGV, zatimco tataz binarka
+     * zadana jako "$ROOTFS/usr/local/bin/su_wrapper" bezela. force_redirect
+     * znaci glibc ELF mimo ROOTFS, ktery uz is_glibc_elf() prosel. */
+    if (!force_redirect && resolved[0] && elf_needs_real_exec(resolved)) {
+        fp_execve fr = (fp_execve)g_orig_execve;
+        return fr ? fr(resolved, argv, envp) : -1;
     }
 
     /* Check for Shebang (#!) in resolved file */
@@ -2583,11 +2607,7 @@ static int shim_posix_spawnp(pid_t *pid, const char *p, const void *fa,
          * usr/local/bin) - ten se MA spustit primo, jinak ho loader zkousi
          * own-loadovat jako glibc a spadne hned na vstupu (shodna oprava
          * jako v shim_execve). */
-        unsigned char emag[4] = {0, 0, 0, 0};
-        int efd = raw_open(p, O_RDONLY);
-        if (efd >= 0) { raw_read(efd, emag, 4); raw_close(efd); }
-        if (emag[0] == 0x7f && emag[1] == 'E' && emag[2] == 'L' && emag[3] == 'F' &&
-            !is_glibc_elf(p)) {
+        if (elf_needs_real_exec(p)) {
             fp_posix_spawnp f = (fp_posix_spawnp)g_orig_posix_spawnp;
             return f ? f(pid, p, fa, at, argv, envp) : -1;
         }
@@ -2647,6 +2667,15 @@ static int shim_posix_spawnp(pid_t *pid, const char *p, const void *fa,
         }
     }
     if (!resolved[0]) return -1;
+
+    /* Stejna pojistka jako v shim_execve: bionic / staticka glibc binarka
+     * (zadny PT_INTERP) se NESMI own-loadovat. Vetev "uz pod ROOTFS" vys to
+     * uz resi, tady to dopada na guest-absolutni, relativni a bare-name
+     * cesty. */
+    if (elf_needs_real_exec(resolved)) {
+        fp_posix_spawnp fr = (fp_posix_spawnp)g_orig_posix_spawnp;
+        return fr ? fr(pid, resolved, fa, at, argv, envp) : -1;
+    }
 
     const char *loader_bin = g_shim_loader && g_shim_loader[0]
                                  ? g_shim_loader : "/proc/self/exe";

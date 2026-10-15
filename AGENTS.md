@@ -102,6 +102,21 @@ Android appce — bez nutnosti je kompilovat pro bionic/NDK.
   `lx gcc` najde `ld`). Host `.zshrc`/`.bashrc` = `eval "$(… init …)"`.
   Demo pro prezentaci `tools/demo.zsh` (5 kroků, „stejné jádro, dva
   userspace") — [postup.md#L2795](postup.md#L2795).
+- **Past: jeden rc soubor pro oba světy — nikdy nezadrátovat `/root/…`**
+  (2026-10-15): `/root/.zshrc` a `$ROOTFS/root/.zshrc` jsou **tentýž inode**,
+  liší se jen `$HOME` (host `$ROOTFS/root`, guest `/root`); host bionic shell
+  **nemá `/root` vůbec**. Instalátor spuštěný z dw guest shellu (`HOME=/root`)
+  si zapíše guest-absolutní cestu — sdkman `export SDKMAN_DIR="/root/.sdkman"`
+  → v host shellu se nenačte nic, shell funkce zůstanou nedefinované a
+  `command_not_found_handler` je pošle loaderu
+  (`[-] open(…/usr/local/sbin/__sdkman_echo_debug)`, plus
+  `find: '/root/.sdkman/src': No such file or directory`). Řešení: v rc vždy
+  `$HOME/…`. Host-absolutní `$ROOTFS/…` funguje v obou světech (`/data` je
+  v `shim_excluded`), guest-absolutní jen pod loaderem. Po každé instalaci
+  (sdkman/idm/cargo/nvm) `grep -n '/root/' ~/.bashrc ~/.zshrc`. Není to bug
+  loaderu. Mimochodem: `mount(2)` je v app doméně **ENOSYS** (seccomp), takže
+  `mount --bind` uvnitř rootfs nelze — použít symlink.
+
 - **Host `.zshrc` — `lx` toolkit (kompletní zápis)**: proměnné/cesty,
   prompt, `lx`/`lxq`/`lxdbg`/`lxhelper`/`lxlog`/`lxdiag`/`lxinfo`/`lxfault`,
   `lxtest` regresní sada, `command_not_found_handler`, `help`, starship/
@@ -239,6 +254,20 @@ Milníky:
   dosáhne Adreno 618 (`vkCreateDevice` OK). Limity: callbacky bionic→guest,
   vlákna driveru. Vypnout `ELF_LOADER_NO_BIONIC_BRIDGE=1`. Regresní test
   `test-all.sh bionic` (A/B) — [postup.md](postup.md) 2026-10-12.
+- **Statický ELF v rootfs přes guest-absolutní cestu → SIGSEGV — VYŘEŠENO**
+  (2026-10-15): `su_wrapper` (Magisk shim, statická non-PIE, žádný
+  `PT_INTERP`) spadl při `/usr/local/bin/su_wrapper`, ale běžel při
+  `$ROOTFS/usr/local/bin/su_wrapper`. Kontrola `is_glibc_elf()` byla jen ve
+  větvi „už pod ROOTFS" a v `shim_posix_spawnp`, **chyběla ve větvi
+  „Absolute guest path"** — ta cestu jen přeložila a poslala do `--ownall`.
+  Dokončení commitů `b840530`/`1737add` (zůstala třetí větev). Fix: nový
+  `elf_needs_real_exec()` (ELF magic + `!is_glibc_elf`, TLS-safe jen `raw_*`)
+  a gate po celém resolution chainu v `shim_execve` (pokrývá guest-absolutní,
+  relativní i bare-name cesty; `force_redirect` vyňat) i před stavbou
+  `--ownall` argv v `shim_posix_spawnp`. Pozn.: `su -c id` fungoval vždy —
+  padalo jen volání pod jménem `su_wrapper`/guest cestou. Regresní test
+  `test-all.sh staticexec` (A/B: `gcc -static -no-pie` binárka přes
+  guest-abs vs. `$ROOTFS`-abs cestu).
 - **tmux pod loaderem** — [postup.md#L2306](postup.md#L2306).
 - **Helper knihovny (`ELF_LOADER_HELPER`), náhodný SIGSEGV ~5 %
   (heap fix), Node ≤22 teardown `free(): invalid pointer` (EXIT=134)** —

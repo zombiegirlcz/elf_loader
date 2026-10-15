@@ -1167,6 +1167,49 @@ except OSError:
     fi
 }
 
+category_staticexec() {
+    echo ""
+    echo "=== staticky ELF v rootfs pres guest-absolutni cestu ==="
+    local env="ROOTFS=$R ELF_ROOTFS=$R ELF_LOADER=$L"
+    if [ ! -x "$R/usr/bin/gcc" ]; then
+        echo "SKIP staticexec: no gcc"
+        echo "SKIP: staticexec - no gcc" >> "$SKIP_LOG"
+        ((SKIP_COUNT++)) || true
+        return
+    fi
+    local dir="$R/tmp/staticexec.$$"
+    mkdir -p "$dir"
+    printf '%s\n' '#include <stdio.h>' 'int main(void){puts("STATIC-OK");return 0;}' \
+        > "$dir/s.c"
+    # -static -no-pie => zadny PT_INTERP => NESMI jit pres own-loading
+    ashell_out "$env $L --ownall $R/usr/bin/gcc -static -no-pie -o $dir/s ${dir#$R}/s.c" >/dev/null 2>&1
+    if [ ! -x "$dir/s" ]; then
+        echo "SKIP staticexec: static build selhal"
+        echo "SKIP: staticexec - static build failed" >> "$SKIP_LOG"
+        ((SKIP_COUNT++)) || true
+        rm -rf "$dir"
+        return
+    fi
+    # guest-absolutni cesta (driv: SIGSEGV, vetev "Absolute guest path"
+    # nekontrolovala is_glibc_elf); $ROOTFS-prefixovana cesta fungovala vzdy
+    local out_g out_r
+    out_g=$(ashell_out "$env $L --ownall $R/bin/bash -c '${dir#$R}/s'" 2>&1)
+    out_r=$(ashell_out "$env $L --ownall $R/bin/bash -c '$dir/s'" 2>&1)
+    rm -rf "$dir"
+    local ok=1
+    printf '%s' "$out_g" | grep -q "STATIC-OK" || ok=0
+    printf '%s' "$out_r" | grep -q "STATIC-OK" || ok=0
+    if [ "$ok" = 1 ]; then
+        echo "PASS staticexec: guest-abs i ROOTFS-abs cesta"
+        echo "PASS: staticexec - static ELF exec" >> "$PASS_LOG"
+        ((PASS_COUNT++)) || true
+    else
+        echo "FAIL staticexec: guest=[$out_g] rootfs=[$out_r]"
+        echo "FAIL: staticexec - static ELF exec | guest=$out_g rootfs=$out_r" >> "$FAIL_LOG"
+        ((FAIL_COUNT++)) || true
+    fi
+}
+
 category_selfexe() {
     echo ""
     echo "=== /proc/self/exe + make fast path (eaccess) ==="
@@ -1499,12 +1542,17 @@ case "${1:-all}" in
         category_selfexe
         print_summary
         ;;
+    staticexec)
+        category_staticexec
+        print_summary
+        ;;
     bigargv)
         category_bigargv
         print_summary
         ;;
     bionic)
         category_bionic
+        category_staticexec
         print_summary
         ;;
     lxc)
@@ -1558,6 +1606,7 @@ case "${1:-all}" in
         category_selfexe
         category_bigargv
         category_bionic
+        category_staticexec
         category_lxc
         category_dw
         category_pathops
