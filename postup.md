@@ -4199,8 +4199,36 @@ symboly → netiskne nic → FAIL; nová PASS.)
 spadl na `undefined reference to elf_timing_*`. `gcc -fsyntax-only` OK,
 lokální `make` OK, smoke: `echo hello` a `python3 -c 'print(6*7)'` → 42.
 
+### Wall-clock (host zsh mimo DW, `lxdw off`)
+
+Měřeno z bionic zsh spuštěného MIMO DW (`LX_DW=0`), 100× resp. 50×, průměr:
+
+| co | ms/exec |
+|---|---|
+| nativní `/system/bin/toybox true` | **18** |
+| `$L --ownall $R/bin/true` | **106** |
+| režie loaderu | **~88** |
+
+Z ~88 ms je ~61 ms interní práce loaderu (profil výše), ~27 ms bionic
+`linker64` + start procesu. Víc než odhad 34 ms z postup.md:3917, ale ten
+měřil `$ROOTFS/bin/true` přes shim proti přímému volání loaderu; tady je
+přímé volání loaderu proti nativnímu toyboxu (jiná základna).
+
+**Proot: z této session NEMEŘITELNÝ.** `proot` zde selhává na
+`execve("/usr/bin/true"): No such file or directory` (nested pod DW
+loaderem), jeho „rychlé" hodnoty (~18 ms) jsou okamžitý chybový exit, ne
+měření. Režim proot v `bench-nextgen.sh` je připravený, spustit na zařízení
+mimo DW. linuxsh SKIP (nejsme root).
+
+### Oprava: prostředí měření
+
+Původně jsem tvrdil, že session běží „uvnitř proot guestu" — **špatně**.
+Ověřeno z env (`LX_DW=1`, `LX_WORLD=rootfs`) a `PPID` (`elf_loader --ownall
+... node ... pi`): agent shell je **DW guest bash pod loaderem**, ne proot.
+Zanořené exec režie v DW režimu jsou skutečná cena loaderu, ne zkreslení.
+
 ### Otevřeno (navazuje)
 
-- Část 2: přesný rozpad 34 ms shim vs. direct (bench-nextgen nativně).
-- Část 4: kapitola „Naměřeno" v `docs/nextgen/proot-nahrada.md`.
+- Část 2: přesný rozpad režie (bench-nextgen nativně mimo DW, s prootem).
+- Proot a linuxsh sloupce tabulky doplnit z nativního běhu na zařízení.
 - Prompt 02/10 má podle profilu cílit na `load` + inline hooky, ne cache symbolů.
