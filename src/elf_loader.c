@@ -1,5 +1,6 @@
 #define _GNU_SOURCE
 #include "../include/elf_loader.h"
+#include "cache.h"
 
 #include <stdio.h>
 #include <stdlib.h>
@@ -1929,6 +1930,47 @@ static void *va(const elf_object_t *obj, size_t vaddr) {
     return (char *)obj->base_addr + (vaddr - map_base_vaddr(obj));
 }
 
+/* Vrati index slotu v cache pro dane syscall nr, nebo -1. */
+static int cache_slot(const cache_module_t *cm, long nr) {
+    if (!cm)
+        return -1;
+    for (int i = 0; i < CACHE_NR_COUNT; i++)
+        if (cm->nr[i] == nr)
+            return i;
+    return -1;
+}
+
+/* Zaznamena link-time vaddr prebiteho svc-site do cache modulu. Alokuje
+ * cm/list lazive; pri prekroceni CACHE_MAX_SITES prestane zaznamenavat.
+ * Cache soubor se zde NIKDY nezapisuje - to dela az volajici. */
+static void cache_record_site(elf_object_t *m, long nr, uintptr_t link_vaddr) {
+    if (!m)
+        return;
+    cache_module_t *cm = (cache_module_t *)m->cache;
+    if (!cm) {
+        cm = calloc(1, sizeof *cm);
+        if (!cm)
+            return;
+        m->cache = cm;
+    }
+    int slot = cache_slot(cm, nr);
+    if (slot < 0) {
+        for (int i = 0; i < CACHE_NR_COUNT; i++)
+            if (cm->nr[i] == 0 && cm->list[i].n == 0) { slot = i; break; }
+        if (slot < 0)
+            return;
+        cm->nr[slot] = nr;
+    }
+    if (cm->list[slot].n >= CACHE_MAX_SITES)
+        return;
+    uint32_t *no = realloc(cm->list[slot].off,
+                           ((size_t)cm->list[slot].n + 1) * sizeof(uint32_t));
+    if (!no)
+        return;
+    cm->list[slot].off = no;
+    cm->list[slot].off[cm->list[slot].n++] = (uint32_t)link_vaddr;
+}
+
 /* Prebije `svc #0` v guest modulu pro dany syscall nr. Slouzi pro syscally,
  * ktere app seccomp KILLuje (KILL nejde prebit filtrem ani SIGSYS handlerem):
  * rseq (293), set_robust_list (99, delka 24) a clone3 (435).
@@ -1949,6 +1991,33 @@ void elf_patch_syscall_sites(elf_object_t *m, long nr, long err) {
         repl = 0x92800000u | (((uint32_t)(err - 1) & 0xffffu) << 5); /* movn x0,#err-1 */
     else
         repl = 0xd503201fu;                                          /* nop */
+
+    /* Cache hit: preskoc linearni sken a prebij ulozene link-time vaddr.
+     * Runtime adresa = base_addr + (v - map_base_vaddr(m)). */
+    {
+        cache_module_t *cm = (cache_module_t *)m->cache;
+        int cslot = cache_slot(cm, nr);
+        if (cslot >= 0) {
+            size_t mbv = map_base_vaddr(m);
+            for (uint32_t t = 0; t < cm->list[cslot].n; t++) {
+                char *rt = (char *)m->base_addr +
+                           ((uintptr_t)cm->list[cslot].off[t] - mbv);
+                uintptr_t pg = (uintptr_t)rt & ~(uintptr_t)(PAGE_SIZE - 1);
+                if (mprotect((void *)pg, PAGE_SIZE,
+                             PROT_READ | PROT_WRITE | PROT_EXEC) == 0) {
+                    *(uint32_t *)rt = repl;
+                    __builtin___clear_cache(rt, rt + 4);
+                    mprotect((void *)pg, PAGE_SIZE, PROT_READ | PROT_EXEC);
+                }
+            }
+            if (elf_debug())
+                fprintf(stderr,
+                        "[patch] syscall %ld: cache hit (%u mist) v %s\n",
+                        nr, cm->list[cslot].n, m->soname ? m->soname : "?");
+            return;
+        }
+    }
+
     int patched = 0;
     for (int i = 0; i < m->phdr_count; i++) {
         if (m->phdr[i].p_type != PT_LOAD)
@@ -1975,6 +2044,7 @@ void elf_patch_syscall_sites(elf_object_t *m, long nr, long err) {
                         mprotect((void *)pg, PAGE_SIZE,
                                  PROT_READ | PROT_EXEC);
                         patched++;
+                        cache_record_site(m, nr, seg_vaddr + (uintptr_t)j * 4);
                     }
                     break;
                 }
@@ -1994,6 +2064,18 @@ void elf_patch_syscall_sites(elf_object_t *m, long nr, long err) {
     if (elf_debug())
         fprintf(stderr, "[patch] syscall %ld (err=%ld): prebito %d svc#0 v %s\n",
                 nr, err, patched, m->soname ? m->soname : "?");
+}
+
+void elf_patch_syscall_sites_all(elf_object_t *m) {
+    static const struct { long nr; long err; } kill_syscalls[] = {
+        { 99,  0 },      /* set_robust_list -> NOP */
+        { 293, 0 },      /* rseq            -> NOP */
+        { 435, 38 },     /* clone3          -> -ENOSYS */
+        { 151, 0 },      /* setfsuid        -> NOP */
+        { 152, 0 },      /* setfsgid        -> NOP */
+    };
+    for (size_t s = 0; s < sizeof(kill_syscalls) / sizeof(kill_syscalls[0]); s++)
+        elf_patch_syscall_sites(m, kill_syscalls[s].nr, kill_syscalls[s].err);
 }
 
 static uintptr_t read_tp(void) {
@@ -2467,6 +2549,16 @@ elf_object_t *elf_load(const char *path) {
     obj->base_addr = base;
     obj->total_size = total_size;
     obj->phdr_count = ehdr->e_phnum;
+    /* BuildID+size+mtime cache klic; miss = NULL (zadny problem). */
+    {
+        char kb[CACHE_KEY_MAX];
+        cache_build_key(file_map, (size_t)st.st_size,
+                        (long long)st.st_mtim.tv_sec * 1000000000LL +
+                            st.st_mtim.tv_nsec, kb, sizeof kb);
+        obj->cache_key = strdup(kb);
+        if (!getenv("ELF_LOADER_NO_CACHE"))
+            obj->cache = cache_load_module(kb);
+    }
     obj->entry_point = (void *)((char *)base + (ehdr->e_entry - map_base_vaddr_));
 
     {
@@ -3209,6 +3301,16 @@ elf_object_t *elf_load_shared(const char *path, elf_scope_t *scope) {
     m->base_addr = base;
     m->total_size = total_size;
     m->phdr_count = ehdr->e_phnum;
+    /* BuildID+size+mtime cache klic; miss = NULL (zadny problem). */
+    {
+        char kb[CACHE_KEY_MAX];
+        cache_build_key(file_map, (size_t)st.st_size,
+                        (long long)st.st_mtim.tv_sec * 1000000000LL +
+                            st.st_mtim.tv_nsec, kb, sizeof kb);
+        m->cache_key = strdup(kb);
+        if (!getenv("ELF_LOADER_NO_CACHE"))
+            m->cache = cache_load_module(kb);
+    }
     m->scope = scope;
     m->soname = soname;
     {
@@ -3311,16 +3413,12 @@ elf_object_t *elf_load_shared(const char *path, elf_scope_t *scope) {
      * (zsh zmodload, NSS, Python extension) se musi patchovat TADY - jinak
      * jejich konstruktor/inicializace syscall KILLne -> "Bad system call". */
     if (!getenv("ELF_LOADER_NO_PATCH") && m->phdr && m->phdr_count > 0) {
-        elf_patch_syscall_sites(m, 99, 0);    /* set_robust_list -> NOP */
-        elf_patch_syscall_sites(m, 293, 0);   /* rseq            -> NOP */
-        elf_patch_syscall_sites(m, 435, 38);  /* clone3          -> -ENOSYS */
-        /* setfsuid(151)/setfsgid(152): libtinfo (_nc_safe_fopen), glibc
-         * login_tty apod. je volaji PRIMO (ne pres nas override v PLT).
-         * App profil na ne vraci TRAP/KILL -> "Bad system call". Prebitim
-         * na NOP je zcela vyradime (navratova hodnota se ignoruje). */
-        elf_patch_syscall_sites(m, 151, 0);
-        elf_patch_syscall_sites(m, 152, 0);
+        elf_patch_syscall_sites_all(m);
     }
+    /* Cache modulu zapsat jednou, po vsech 5 pruchodech (jen kdyz existuje
+     * cache_key a neni zakazana pres ELF_LOADER_NO_CACHE). */
+    if (m->cache_key && m->cache && !getenv("ELF_LOADER_NO_CACHE"))
+        cache_store_module(m->cache_key, (cache_module_t *)m->cache);
     if (elf_debug())
         printf("[+] own-loaded module: %s (base %p, %zu dynsym)\n", path,
            (void *)base, m->dynsym_count);
@@ -5969,5 +6067,7 @@ void elf_unload(elf_object_t *obj) {
             dlclose(obj->handles[i]);
     free(obj->handles);
     free(obj->origin_dir);
+    free(obj->cache_key);
+    cache_module_free((cache_module_t *)obj->cache);
     free(obj);
 }

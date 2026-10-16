@@ -3,6 +3,7 @@
 #include <stdio.h>
 #include <signal.h>
 #include "../include/elf_loader.h"
+#include "cache.h"
 
 static void print_help(const char *prog) {
     fprintf(stdout,
@@ -4210,23 +4211,22 @@ static int run_ownall(const char *path, int argc, char **argv, char **envp) {
      * Tyká se hlavne libc (__tls_init_tp, start_thread, _Fork), ale projdeme
      * vsechny moduly. */
     {
-        static const struct { long nr; long err; } kill_syscalls[] = {
-            { 99,  0 },      /* set_robust_list -> NOP */
-            { 293, 0 },      /* rseq            -> NOP */
-            { 435, 38 },     /* clone3          -> -ENOSYS */
-            { 151, 0 },      /* setfsuid        -> NOP (app profil TRAPuje) */
-            { 152, 0 },      /* setfsgid        -> NOP */
-        };
-        size_t nsc = sizeof(kill_syscalls) / sizeof(kill_syscalls[0]);
         if (!getenv("ELF_LOADER_NO_PATCH")) {
-        for (size_t mi = 0; mi < scope->count; mi++) {
-            for (size_t s = 0; s < nsc; s++)
-                elf_patch_syscall_sites(scope->mods[mi], kill_syscalls[s].nr,
-                                        kill_syscalls[s].err);
+            for (size_t mi = 0; mi < scope->count; mi++)
+                elf_patch_syscall_sites_all(scope->mods[mi]);
+            elf_patch_syscall_sites_all(obj);
         }
-        for (size_t s = 0; s < nsc; s++)
-            elf_patch_syscall_sites(obj, kill_syscalls[s].nr,
-                                    kill_syscalls[s].err);
+        /* Zapis cache modulu jednou po vsech 5 pruchodech. */
+        if (!getenv("ELF_LOADER_NO_CACHE")) {
+            for (size_t mi = 0; mi < scope->count; mi++) {
+                elf_object_t *m = scope->mods[mi];
+                if (m->cache_key && m->cache)
+                    cache_store_module(m->cache_key,
+                                       (cache_module_t *)m->cache);
+            }
+            if (obj->cache_key && obj->cache)
+                cache_store_module(obj->cache_key,
+                                   (cache_module_t *)obj->cache);
         }
     }
     if (g_tls_trace)

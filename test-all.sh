@@ -1210,6 +1210,51 @@ category_staticexec() {
     fi
 }
 
+# BuildID cache prebitych svc-site (src/cache.c). Overuje: (a) dva behy
+# tehoz guest ELF daji identicky spravny vystup, (b) smazani cache mezi
+# behy vystup nezmeni, (c) dve ruzne binarky maji ruzny cache klic.
+category_execcache() {
+    echo ""
+    echo "=== BuildID cache prebitych svc-site ==="
+    local env="ROOTFS=$R ELF_ROOTFS=$R ELF_LOADER=$L"
+    local cdir="${LX_LOG:-$R/root/elf_loader}/cache"
+
+    if [ ! -x "$R/bin/true" ] || [ ! -x "$R/usr/bin/uname" ]; then
+        echo "SKIP execcache: chybi guest binarky"
+        echo "SKIP: execcache - no guest bins" >> "$SKIP_LOG"
+        ((SKIP_COUNT++)) || true
+        return
+    fi
+
+    local o1 o2 o3 rc1 rc2
+    rc1=$(ashell_rc "$env $L --ownall $R/usr/bin/uname -m")
+    o1=$(ashell_out "$env $L --ownall $R/usr/bin/uname -m" 2>&1)
+    # (b) smazat cache mezi behy
+    rm -rf "$cdir" 2>/dev/null || true
+    rc2=$(ashell_rc "$env $L --ownall $R/usr/bin/uname -m")
+    o2=$(ashell_out "$env $L --ownall $R/usr/bin/uname -m" 2>&1)
+    o3=$(ashell_out "$env $L --ownall $R/usr/bin/true" 2>&1)
+
+    local ok=1
+    [ "$rc1" = 0 ] && [ "$rc2" = 0 ] || ok=0
+    printf '%s' "$o1" | grep -Eq 'aarch64|arm64' || ok=0
+    printf '%s' "$o2" | grep -Eq 'aarch64|arm64' || ok=0
+    # (c) dve ruzne binarky -> dva ruzne cache soubory (po behu vyse)
+    local nkeys
+    nkeys=$(ls "$cdir" 2>/dev/null | grep -c . || true)
+    [ "${nkeys:-0}" -ge 2 ] || ok=0
+
+    if [ "$ok" = 1 ]; then
+        echo "PASS execcache: shodny vystup, cache smazani OK, $nkeys klicu"
+        echo "PASS: execcache - BuildID cache" >> "$PASS_LOG"
+        ((PASS_COUNT++)) || true
+    else
+        echo "FAIL execcache: rc1=$rc1 rc2=$rc2 o1=[$o1] o2=[$o2] keys=$nkeys o3=[$o3]"
+        echo "FAIL: execcache - BuildID cache | rc1=$rc1 rc2=$rc2 keys=$nkeys" >> "$FAIL_LOG"
+        ((FAIL_COUNT++)) || true
+    fi
+}
+
 category_timing() {
     echo ""
     echo "=== fázový profil exec (ELF_LOADER_TIMING) ==="
@@ -1574,6 +1619,10 @@ case "${1:-all}" in
         category_staticexec
         print_summary
         ;;
+    execcache)
+        category_execcache
+        print_summary
+        ;;
     bigargv)
         category_bigargv
         print_summary
@@ -1636,6 +1685,7 @@ case "${1:-all}" in
         category_bigargv
         category_bionic
         category_staticexec
+        category_execcache
         category_lxc
         category_dw
         category_pathops
