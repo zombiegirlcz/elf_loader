@@ -27,8 +27,11 @@ Android appce — bez nutnosti je kompilovat pro bionic/NDK.
   = A/B regrese. Profil: tři dominantní fáze `hooks_bti` 14,8 / `elf_load` 19,6
   / `svc_patch` 8,4 ms (celkem ~61 ms práce loaderu) — rezerva pro prompt
   02/10 je load + inline hooky, **ne** cache symbolů (relokace jen 2,3 ms).
-  Kapitola „Naměřeno" v `docs/nextgen/proot-nahrada.md` — [postup.md](postup.md)
-  2026-10-16.
+  Host-level (mimo DW, `LX_DW=0`, proot s `PROOT_LOADER`): nativ 11 / proot 28
+  / loader 56 ms na `/bin/true`; na cestově těžkém `find /usr` loader **~25×**
+  rychlejší (0,44 s vs 11 s). Loader se vyplatí na dlouhé procesy, ne na
+  krátký exec. Kapitola „Naměřeno" v `docs/nextgen/proot-nahrada.md` —
+  [postup.md](postup.md) 2026-10-16.
 - **Git / GitHub ochrana (2026-10-06):** ruleset `protect-master` (zákaz
   update/force-push/smazání, bypass jen admin = vlastník → cizí PR do `master`
   nejde mergnout), `protect-dev` (zákaz force-push/smazání). Workflow

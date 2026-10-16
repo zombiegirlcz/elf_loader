@@ -4199,26 +4199,40 @@ symboly → netiskne nic → FAIL; nová PASS.)
 spadl na `undefined reference to elf_timing_*`. `gcc -fsyntax-only` OK,
 lokální `make` OK, smoke: `echo hello` a `python3 -c 'print(6*7)'` → 42.
 
-### Wall-clock (host zsh mimo DW, `lxdw off`)
+### Wall-clock: loader vs. proot vs. nativní (host zsh mimo DW)
 
-Měřeno z bionic zsh spuštěného MIMO DW (`LX_DW=0`), 100× resp. 50×, průměr:
+Měřeno z bionic zsh MIMO DW (`LX_DW=0`), izolované smyčky (30×), bez `sh -c`
+obalu. Proot s `PROOT_LOADER=$PREFIX/bin/loader`, `PROOT_TMP_DIR`, `TMPDIR`
+a flagy jako `boot`. Klíč: proot potřebuje `PROOT_LOADER` (jinak padá na
+`execve("/usr/bin/true"): No such file or directory`) — to byl můj dřívější
+blok, ne nemožnost měřit.
 
-| co | ms/exec |
+**Lehký exec (30× `/bin/true`):**
+
+| režim | ms/exec |
 |---|---|
-| nativní `/system/bin/toybox true` | **18** |
-| `$L --ownall $R/bin/true` | **106** |
-| režie loaderu | **~88** |
+| nativní `/system/bin/toybox true` | **11** |
+| proot | **28** |
+| `$L --ownall $R/usr/bin/true` | **56** |
 
-Z ~88 ms je ~61 ms interní práce loaderu (profil výše), ~27 ms bionic
-`linker64` + start procesu. Víc než odhad 34 ms z postup.md:3917, ale ten
-měřil `$ROOTFS/bin/true` přes shim proti přímému volání loaderu; tady je
-přímé volání loaderu proti nativnímu toyboxu (jiná základna).
+**Proot je u lehkého execu ~2× rychlejší než loader** — loader platí
+relokace+hooky+svc_patch i na `/bin/true` (interní práce ~61 ms, profil výše).
 
-**Proot: z této session NEMEŘITELNÝ.** `proot` zde selhává na
-`execve("/usr/bin/true"): No such file or directory` (nested pod DW
-loaderem), jeho „rychlé" hodnoty (~18 ms) jsou okamžitý chybový exit, ne
-měření. Režim proot v `bench-nextgen.sh` je připravený, spustit na zařízení
-mimo DW. linuxsh SKIP (nejsme root).
+**Zátěž (medián 3, host-level):**
+
+| zátěž | loader | proot |
+|---|---|---|
+| `find /usr -type f` (107 784) | **0,44 s** | 11,0 s |
+| `git status` | ~0,20 s | ~0,14 s |
+| `python import numpy,pandas` | ~0,33 s | ~0,31 s |
+| `node -e 0` | ~0,50 s | ~0,19 s |
+
+**Loader vyhrává drtivě na cestově těžkých úlohách (`find` ~25×), proot na
+lehkých startech.** Pro strategii: loader se vyplatí na dlouhé procesy
+s mnoha cestovými syscally (buildy, find, apt), ne na jednotlivý exec.
+Rezerva promptu 02/10 = snížit startovní daň (61 ms → ~11 ms nativní).
+
+linuxsh chroot SKIP (nejsme root).
 
 ### Oprava: prostředí měření
 
@@ -4229,6 +4243,7 @@ Zanořené exec režie v DW režimu jsou skutečná cena loaderu, ne zkreslení.
 
 ### Otevřeno (navazuje)
 
-- Část 2: přesný rozpad režie (bench-nextgen nativně mimo DW, s prootem).
-- Proot a linuxsh sloupce tabulky doplnit z nativního běhu na zařízení.
-- Prompt 02/10 má podle profilu cílit na `load` + inline hooky, ne cache symbolů.
+- linuxsh chroot sloupec doplnit z root běhu na zařízení.
+- Zopakovat s BENCH_RUNS=5 a na jiném SoC (robustnost).
+- Prompt 02/10 má podle profilu cílit na `load` + inline hooky, ne cache symbolů
+  — a hlavně na **startovní daň** (loader 56 vs proot 28 vs nativ 11 ms/true).

@@ -512,33 +512,53 @@ Rozpad 34 ms (shim vs. direct) čeká na nativní `bench-nextgen.sh` — shim ce
 navíc platí druhý exec (bionic linker64 → loader) a env rekonstrukci
 (`env_without_preload`), ale to je wall-clock, ne interní profil.
 
-### Wall-clock: loader vs. nativní (host zsh mimo DW, `lxdw off`)
+### Wall-clock: loader vs. proot vs. nativní (host zsh mimo DW, `lxdw off`)
 
-Měřeno z bionic zsh spuštěného MIMO DW (`LX_DW=0`), takže každý `fork/exec`
-je čistý startovací úkon bez zanořeného překladu cest:
+Měřeno z bionic zsh spuštěného MIMO DW (`LX_DW=0`), izolované smyčky bez
+`sh -c` obalu, takže každý `fork/exec` je čistý startovní úkon. Proot běží
+s `PROOT_LOADER=$PREFIX/bin/loader`, `PROOT_TMP_DIR`, `TMPDIR` a flagy jako
+`boot` (`--kill-on-exit --link2symlink -L --change-id=0:0 -0 -w /`).
 
-| co | ms/exec |
+**Lehké spuštění (30× `/bin/true`), ms/exec:**
+
+| režim | ms/exec |
 |---|---|
-| nativní `/system/bin/toybox true` | **18** |
-| `$L --ownall $R/bin/true` | **106** |
-| **rozdíl (režie loaderu)** | **~88** |
+| nativní `/system/bin/toybox true` | **11** |
+| proot | **28** |
+| `$L --ownall $R/usr/bin/true` | **56** |
 
-Z toho ~61 ms je interní práce loaderu (fázový profil výše) a ~27 ms bionic
-`linker64` + start procesu. To je výrazně víc než odhad 34 ms z postup.md:3917
-— ale ten platil pro `$ROOTFS/bin/true` přes shim vs. přímé volání; tady je
-měřeno přímé volání loaderu proti nativnímu toyboxu (jiná referenční základna).
+**Překvapení: u lehkého execu je proot (28 ms) ~2× rychlejší než loader
+(56 ms).** Interní práce loaderu je ~61 ms (profil výše) — loader platí
+relokace+hooky+svc_patch i pro `/bin/true`, proot jen naklonuje proces a
+předá exec. To je přesně cena „vlastního načítání glibc" na každý start.
+
+**Zátěž podle typu (medián 3 běhů, host-level):**
+
+| zátěž | loader | proot | vítěz |
+|---|---|---|---|
+| `find /usr -type f` (107 784 souborů) | **0,44 s** | 11,0 s | **loader ~25×** |
+| `git status` (velký repo) | ~0,20 s | ~0,14 s | proot |
+| `python3 -c 'import numpy,pandas'` | ~0,33 s | ~0,31 s | ~remíza |
+| `node -e 0` | ~0,50 s | ~0,19 s | proot |
+
+**Interpretace:** proot vyhrává tam, kde je málo cestových syscallů (každý
+start/exit, git status s cache), protože neplatí relokační daň. Loader
+vyhrává drtivě na cestově těžkých úlohách (`find`), kde prootova ptrace
+kanonikalizace každé komponenty cesty stojí 2 přepnutí kontextu — 25×.
+
+To je **klíčové pro strategii**: loader se nevyplatí nasazovat kvůli
+jednotlivým `exec` (tam prohrává), ale kvůli dlouhým procesům, které hodně
+pracují se soubory (buildy, `find`, package managery). Rezerva pro prompt
+02/10 je snížit startovní daň (61 ms → blíž nativním 11 ms), aby se loader
+vyplatil i na krátkých úlohách.
 
 ### Stav měření (poctivě)
 
-- **Fázový profil: HOTOVO** (relativní, raw clock — vypovídá o rozložení práce).
-- **Loader vs. nativní: HOTOVO** (18 vs 106 ms/exec výše).
-- **Proot: NEMEŘITELNÝ z této session.** `proot` zde selhává na
-  `execve("/usr/bin/true"): No such file or directory` (nested pod DW
-  loaderem — proot se nedokáže inicializovat), takže jeho „rychlé" hodnoty
-  (~18 ms) jsou ve skutečnosti okamžitý chybový exit, ne měření. Proot režim
-  `tools/bench-nextgen.sh` je připravený, ale musí se spustit na zařízení
-  mimo DW (app terminál / bzsh).
-- **linuxsh chroot: SKIP** (session není root).
+- **Fázový profil: HOTOVO** (relativní, raw clock — rozložení práce).
+- **Loader vs. proot vs. nativní: HOTOVO** (tabulky výše, host-level mimo DW).
+- **linuxsh chroot: SKIP** (session není root; `chroot` vyžaduje root).
+- Naměřené hodnoty jsou z jedné session/zařízení; pro robustnost zopakovat
+  vícekrát (BENCH_RUNS=5) a na jiném SoC.
 
 ### Nástroje
 

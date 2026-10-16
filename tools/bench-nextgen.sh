@@ -25,16 +25,28 @@
 # iterací (default 50).
 set -u
 
+# Host-level nástroje (date/sort/awk/mkdir) musí být bionic/toybox, ne guest
+# glibc pod rootfs (jinak "command not found"). Tento skript se pouští
+# host shellem mimo DW.
+PATH="/system/bin:$PATH"
 D=/data/user/0/com.linux_core/files
 R=${ROOTFS:-$D/nh/distro/parrot}
 L=${L:-$D/usr/bin/elf_loader}
 PROOT=${PROOT:-$D/usr/bin/proot}
+# Proot potrebuje PROOT_LOADER (jinak padne na execve: No such file or directory)
+# a PROOT_TMP_DIR/TMPDIR (jinak warningy o /tmp). Stejne jako `boot`.
+export PROOT_LOADER=${PROOT_LOADER:-$D/usr/bin/loader}
+export PROOT_TMP_DIR=${PROOT_TMP_DIR:-$D/tmp}
+export TMPDIR=${TMPDIR:-$D/tmp}
+mkdir -p "$PROOT_TMP_DIR" 2>/dev/null || true
 RUNS=${BENCH_RUNS:-3}
 NLAUNCH=${BENCH_N:-50}
 WORK=${BENCH_WORK:-$R/tmp/bench.$$}
 
+# Režimy: z argumentů, nebo default. Přímo pozicionální parametry (funguje
+# i v zsh, který needělí $var na slova - na rozdíl od `set -- $MODES`).
+[ $# -gt 0 ] || set -- loader proot linuxsh
 MODES="$*"
-[ -z "$MODES" ] && MODES="loader proot linuxsh"
 
 median_ms() {
     sort -n | awk '{a[NR]=$1} END{
@@ -108,7 +120,7 @@ prepare_cjson() {
     [ -d "$CJSON" ]
 }
 
-for mode in $MODES; do
+for mode in "$@"; do
     case "$mode" in
         proot)   [ "$have_proot" = 1 ] || { echo "SKIP proot (chybí $PROOT)"; continue; } ;;
         linuxsh) [ "$is_root" = 1 ]    || { echo "SKIP linuxsh (nejsme root)"; continue; } ;;
