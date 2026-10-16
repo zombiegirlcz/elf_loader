@@ -475,8 +475,9 @@ tabulka zátěž × režim se plní přes `tools/bench-nextgen.sh` nativně (viz
 
 ### Fázový profil exec (loader, `--ownall $ROOTFS/bin/true`)
 
-Raw `CLOCK_MONOTONIC` uvnitř procesu (ne wall-clock; session agenta běží pod
-proot, absolutní čísla by byla zkreslená). Sloupec = delta fáze.
+Raw `CLOCK_MONOTONIC` uvnitř procesu (ne wall-clock; session agenta běží jako
+DW guest bash pod loaderem, `LX_DW=1`, absolutní čísla by zahrnovala zanořený
+exec shim). Sloupec = delta fáze.
 
 | fáze | ms | co to je |
 |---|---|---|
@@ -514,10 +515,12 @@ navíc platí druhý exec (bionic linker64 → loader) a env rekonstrukci
 ### Stav měření (poctivě)
 
 - **Fázový profil: HOTOVO** (relativní, raw clock — vypovídá o rozložení práce).
-- **Wall-clock tabulka zátěž × režim: NEDOKONČENA.** Session agenta běží uvnitř
-  proot guestu parrotu, takže `fork/exec` měření jsou zkreslená; `ashell`
-  (nativní kanál) v této session koliduje s fault handlerem loaderu. Spustit
-  `tools/bench-nextgen.sh` na zařízení nativně (přes app terminál / bzsh).
+- **Wall-clock tabulka zátěž × režim: NEDOKONČENA.** Session agenta běží jako
+  DW guest bash pod loaderem (`LX_DW=1`), takže každý `fork/exec` jde přes
+  exec shim → `elf_loader --ownall` zanořeně; `ashell` (nativní kanál) v této
+  session koliduje s fault handlerem loaderu. Spustit `tools/bench-nextgen.sh`
+  na zařízení nativně — přes app terminál / bzsh nebo po `lxdw off` na host
+  shellu (vypne překlad cest, jsme „venku").
 
 ### Nástroje
 

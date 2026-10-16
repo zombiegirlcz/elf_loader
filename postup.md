@@ -4119,7 +4119,7 @@ a `elf_loader.c` na hranicích fází. Výstup na fd 2:
 `[TIMING] <label> delta=<us>us total=<us>us`.
 
 Změřeno `--ownall $ROOTFS/bin/true` (raw CLOCK_MONOTONIC, ne wall-clock —
-session běží pod proot, takže absolutní wall-clock by byl zkreslený):
+session agenta běží jako DW guest shell pod loaderem, viz níže):
 
 ```
 [TIMING] main_start      delta=4us
@@ -4158,14 +4158,22 @@ než hypotéza „cache symbolů" z postup.md:3917. Rezerva pro prompt 02/10 je
 hlavně **load** (mmap/memcpy/relokace) a **inline hooky** (skenování .text
 kvůli prologům), ne symbol resolution.
 
-### Poznámka k měření
+### Poznámka k měření (OPRAVA)
 
-Absolutní wall-clock nelze v této session brát vážně: agent běží **uvnitř
-proot guestu** parrotu, takže každý `fork/exec` platí proot ptrace navíc.
-`ashell` (jediný platný nativní kanál dle AGENTS.md) zde navíc koliduje
-s fault handlerem loaderu (`FAULT-ENTER ...` místo výstupu). Proto jsou
-čísla výše **relativní (raw clock uvnitř procesu)**, což pro fázový profil
-stačí; definitivní wall-clock dodá `tools/bench-nextgen.sh` spuštěný nativně.
+Původně jsem zde tvrdil, že session běží „uvnitř proot guestu". **To bylo
+špatně.** Ověřeno z env (`LX_DW=1`, `LX_WORLD=rootfs`) a z `PPID`
+(`elf_loader --ownall ... node ... pi`): agent shell je **DW guest bash pod
+loaderem** (glibc bash 5.2.37, ne proot). Žádný `PROOT_L2S_DIR` v env není.
+
+Důsledek: naměřený wall-clock (`true` ~76 s / 5 běhů = ~15 s na exec?!)
+není zkreslení prootem — je to **skutečná cena zanořeného loader execu**
+v DW režimu (každý exec v guest bashe jde přes exec shim → `elf_loader
+--ownall`). To je přesně to, co prompt 01 měří, jen zanořeně. Interní
+raw-clock fáze proto zůstávají platné a reprezentativní pro práci loaderu.
+
+Čistá nativní čísla (bez DW vrstvy) vyžadují `lxdw off` na host shellu nebo
+běh mimo DW — odsud to nejde (`lxdw` je zsh funkce hostu, guest bash ji nemá).
+Definitivní wall-clock dodá `tools/bench-nextgen.sh` spuštěný nativně.
 
 ### Benchmark skript
 
