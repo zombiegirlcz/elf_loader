@@ -40,3 +40,4 @@ test/echo
 # Session / tool debug cruft
 .playwright-mcp/
 results/
+nohup.out
