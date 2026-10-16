@@ -4247,3 +4247,47 @@ Zanořené exec režie v DW režimu jsou skutečná cena loaderu, ne zkreslení.
 - Zopakovat s BENCH_RUNS=5 a na jiném SoC (robustnost).
 - Prompt 02/10 má podle profilu cílit na `load` + inline hooky, ne cache symbolů
   — a hlavně na **startovní daň** (loader 56 vs proot 28 vs nativ 11 ms/true).
+
+## 2026-10-16 — prompt 02: BuildID cache svc-site scanu (exec fast path)
+
+Fázový profil z promptu 01 ukázal, že `svc_patch` (`elf_patch_syscall_sites`,
+lineární sken `.text` pro `movz x8,#nr ; svc #0`) stojí 8,4 ms na každý exec
+a dělá se znovu pro každý modul i když se binárka nezměnila. To je čistá
+rezerva — scan je deterministický podle obsahu souboru.
+
+**Implementace (commit 4cd8eea):**
+- `src/cache.c`/`src/cache.h` — per-modul cache klíčovaná
+  `(GNU BuildID, size, mtime_ns, CACHE_FORMAT_VERSION)`:
+  `$LX_LOG/cache/<buildid|nobid>_<size>_<mtime_ns>_v1`. BuildID z `PT_NOTE`
+  `NT_GNU_BUILD_ID` (vzor `maybe_fixup_bionic_phdr`). Zápis atomicky
+  (`<key>.tmp.<pid>` + `rename`). Jakákoli chyba/nesouhlas verze = tichý miss,
+  nikdy nezastaví exec.
+- `elf_patch_syscall_sites` (elf_loader.c:1943): na cache hit přebije uložené
+  **link-time vaddr** přímo (runtime = `base_addr + (v - map_base_vaddr)`),
+  čímž přeskočí sken; na miss skenuje a zaznamená offsety do cache.
+  ASLR-safe (ukládá se link-time vaddr, ne runtime).
+- Nová `elf_patch_syscall_sites_all(m)` aplikuje všech 5 kill-syscallů
+  (99/293/435/151/152) jedním voláním; volají ji `main.c` i `elf_load_shared`.
+- Cache se zapisuje jednou po všech 5 průchodech.
+- Knoby: `ELF_LOADER_NO_CACHE=1` (vypne load/store), `ELF_LOADER_CACHE_TRACE=1`
+  (diagnostika hit/store). `ELF_LOADER_NO_PATCH` beze změny.
+
+**Ověření (host-level, bez zařízení):**
+`test/cache_test.c` (commit 781ae95) — 15/15 PASS: stabilita klíče,
+invalidace při změně mtime/size/BuildID, round-trip store→load, atomický zápis
+(žádný `.tmp` nezůstane), poškozený/chybějící soubor = tichý miss, reálný
+`elf_loader` ELF má GNU BuildID (`7e24e8b8…_651528_42_v1`). Bez zařízení.
+
+**NEověřeno na zařízení (poctivě):** `test-all.sh execcache` je napsaný, ale
+nespuštěný — session agenta běží jako DW guest pod loaderem (`LX_DW=1`) a
+`ashell` v ní faultuje (`FAULT-ENTER`). Chybí změření reálného zlepšení
+`svc_patch` na zařízení (očekáváno ~8,4 ms → ~0 na cache hit) a `test-all.sh all`
+bez regrese. Doplnit z root/bzsh session.
+
+**Statický bionic loader — zdokumentováno a přeskočeno:** `-static-pie`
+varianta (workflow `build.yml`) linkuje `src/dlfcn_stubs.c`, kde
+`dlopen/dlsym/dladdr` vrací NULL/0. Bionic bridge (guest glibc `dlopen`
+bionic `.so`, Vulkan/Adreno — `bb_dlopen`, `src/entry.S bb_stubs`) volá
+**skutečný** bionic `dlopen`, který statický bionic binárka nemá. Statický
+build tedy nelze nasadit jako default bez ztráty GPU bridge; zůstává
+sekundární artefakt. Dle promptu („když ne, zdokumentuj a přeskoč").
