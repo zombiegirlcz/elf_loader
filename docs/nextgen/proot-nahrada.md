@@ -464,3 +464,63 @@ tam, kde je (loader − chroot) × četnost největší.
    podle výsledku měření.
 7. **Strategické rozhodnutí:** own-loading (nezávislý na verzi glibc v rootfs, GPU
    bridge) vs. nativní ld.so mód (kapitola 6: jednodušší a rychlejší) — nebo hybrid.
+
+---
+
+## Naměřeno (2026-10-16, prompt 01 — část 1 a 3)
+
+Fázový profil loaderu (`ELF_LOADER_TIMING=1`) je hotový a přesný; srovnávací
+tabulka zátěž × režim se plní přes `tools/bench-nextgen.sh` nativně (viz níže
+„stav měření"). Čísla odhadů v kapitolách 1 a 5 nahrazuje reálný profil.
+
+### Fázový profil exec (loader, `--ownall $ROOTFS/bin/true`)
+
+Raw `CLOCK_MONOTONIC` uvnitř procesu (ne wall-clock; session agenta běží pod
+proot, absolutní čísla by byla zkreslená). Sloupec = delta fáze.
+
+| fáze | ms | co to je |
+|---|---|---|
+| main_start … seccomp_compat | 1,7 | start + compat seccomp filtr |
+| overrides_reg | 3,8 | `elf_register_override` × N (dl*, pthread, mmap, …) |
+| **load_done** | **19,6** | `elf_load`: čtení + mmap exe a všech deps |
+| hooks_got | 2,6 | GOT override tabulka |
+| hooks_nocancel/open/spawn | 3,5 | inline hooky `__open64_nocancel`, open64, posix_spawn |
+| **hooks_bti** | **14,8** | inline hooky BTI: fstatat/unlink/mkdir/rmdir/link |
+| reloc_done | 2,3 | `elf_relocate` |
+| **svc_patch** | **8,4** | `elf_patch_syscall_sites` × 5 syscallů × moduly |
+| tls_done + run + entry | 1,3 | TLS setup, guest stack, skok |
+| **celkem** | **~61** | práce loaderu (bez wall-clock režie exec/CI) |
+
+**Tři dominantní fáze (~43 ms, 70 %):** `hooks_bti` (14,8), `load_done`
+(19,6), `svc_patch` (8,4).
+
+### Důsledek pro kapitolu 5 (kde je rezerva)
+
+Hypotéza z postup.md:3917 („34 ms jde na opakované resolvování symbolů, námět
+cache symbolů") **není podle profilu hlavní**. Samotná relokace je 2,3 ms.
+Čas jde na:
+
+- **mapování a čtení binárek** (`elf_load`, 19,6 ms) → prompt 10 (image cache).
+- **skenování .text kvůli prologům** při inline hookách (`hooks_bti` +
+  nocancel/open/spawn = 18,3 ms) → zúžit skenované rozsahy, cachovat per
+  (BuildID+mtime), případně hookovat jen symboly, které binárka reálně importuje.
+- **přepis `svc #0`** (`svc_patch`, 8,4 ms) → prompt 04/05 to stejně řeší; teď je
+  vidět cena.
+
+Rozpad 34 ms (shim vs. direct) čeká na nativní `bench-nextgen.sh` — shim cesta
+navíc platí druhý exec (bionic linker64 → loader) a env rekonstrukci
+(`env_without_preload`), ale to je wall-clock, ne interní profil.
+
+### Stav měření (poctivě)
+
+- **Fázový profil: HOTOVO** (relativní, raw clock — vypovídá o rozložení práce).
+- **Wall-clock tabulka zátěž × režim: NEDOKONČENA.** Session agenta běží uvnitř
+  proot guestu parrotu, takže `fork/exec` měření jsou zkreslená; `ashell`
+  (nativní kanál) v této session koliduje s fault handlerem loaderu. Spustit
+  `tools/bench-nextgen.sh` na zařízení nativně (přes app terminál / bzsh).
+
+### Nástroje
+
+- `ELF_LOADER_TIMING=1` — fázový profil na stderr, default no-op.
+- `tools/bench-nextgen.sh [proot|loader|linuxsh]` — zátěžový benchmark, medián.
+- `test-all.sh timing` — A/B regrese (TIMING vypnutý = ticho).

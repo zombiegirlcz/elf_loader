@@ -4102,3 +4102,97 @@ se používá `len(m)`.
 napříč procesy i `dlopen` jsou pod loaderem v pořádku. Všechny čtyři nálezy
 z předchozí sekce jsou v cestách **exec/argv/path-resolution**, ne v jádru
 loaderu (VM + TLS).
+
+---
+
+## 2026-10-16 — Prompt 01: měření exec + fázový profil (ELF_LOADER_TIMING)
+
+Dokončena **část 1 a 3 promptu 01** (fázový profil + benchmark skript).
+Část 2 (vysvětlení 34 ms) a 4 (Naměřeno v proot-nahrada.md) navazují.
+
+### Fázový profil
+
+Nová proměnná `ELF_LOADER_TIMING=1` (default nic nestojí — jedna cache
+proměnná, žádný syscall). Značky v `src/timing.c` (raw `clock_gettime`=113 +
+raw `write`=64, bezpečné pod bionickým i guest TP), volané z `main.c`
+a `elf_loader.c` na hranicích fází. Výstup na fd 2:
+`[TIMING] <label> delta=<us>us total=<us>us`.
+
+Změřeno `--ownall $ROOTFS/bin/true` (raw CLOCK_MONOTONIC, ne wall-clock —
+session běží pod proot, takže absolutní wall-clock by byl zkreslený):
+
+```
+[TIMING] main_start      delta=4us
+[TIMING] seccomp_compat  delta=1651us    elf_install_compat (compat seccomp)
+[TIMING] ownall_start    delta=230us
+[TIMING] scope_create    delta=70us
+[TIMING] overrides_reg   delta=3810us    elf_register_override × N
+[TIMING] f2_filter       delta=70us
+[TIMING] load_done       delta=19636us   elf_load (mapování exe+deps)  ← #2
+[TIMING] hooks_enter     delta=115us
+[TIMING] hooks_got       delta=2620us    GOT override tabulka
+[TIMING] hooks_nocancel  delta=954us     __open64_nocancel inline
+[TIMING] hooks_open      delta=1493us    open64/openat64 PAC inline
+[TIMING] hooks_spawn     delta=1012us    posix_spawn inline
+[TIMING] hooks_bti       delta=14815us   fstatat/unlink/mkdir/rmdir/link inline  ← #1
+[TIMING] hooks_install   delta=2240us
+[TIMING] reloc_done      delta=2341us    elf_relocate
+[TIMING] inits_queued    delta=56us
+[TIMING] linkmap         delta=38us
+[TIMING] svc_patch       delta=8378us    elf_patch_syscall_sites × 5 syscallů ← #3
+[TIMING] tls_done        delta=824us     elf_setup_own_tls
+[TIMING] run_enter       delta=77us
+[TIMING] run_stack       delta=341us     stavba guest stacku
+[TIMING] entry           delta=104us     skok do guesta
+```
+
+Součet ~61 ms práce loaderu (bez wall-clock režie exec/CI).
+
+**Tři dominantní fáze (dohromady ~43 ms, 70 %):**
+1. `hooks_bti` 14,8 ms — inline hooky BTI funkcí (fstatat/unlink/mkdir/rmdir/link)
+2. `load_done` 19,6 ms — `elf_load` (čtení + mapování exe a všech deps)
+3. `svc_patch` 8,4 ms — `elf_patch_syscall_sites` (5 syscallů × všechny moduly)
+
+To je konkrétní odpověď na otázku promptu „kam jde čas" — a je to jiný obrázek
+než hypotéza „cache symbolů" z postup.md:3917. Rezerva pro prompt 02/10 je
+hlavně **load** (mmap/memcpy/relokace) a **inline hooky** (skenování .text
+kvůli prologům), ne symbol resolution.
+
+### Poznámka k měření
+
+Absolutní wall-clock nelze v této session brát vážně: agent běží **uvnitř
+proot guestu** parrotu, takže každý `fork/exec` platí proot ptrace navíc.
+`ashell` (jediný platný nativní kanál dle AGENTS.md) zde navíc koliduje
+s fault handlerem loaderu (`FAULT-ENTER ...` místo výstupu). Proto jsou
+čísla výše **relativní (raw clock uvnitř procesu)**, což pro fázový profil
+stačí; definitivní wall-clock dodá `tools/bench-nextgen.sh` spuštěný nativně.
+
+### Benchmark skript
+
+`tools/bench-nextgen.sh` — tři režimy (proot / loader / linuxsh chroot),
+zátěže z kapitoly 9 (1000× true, find /usr, git status, python import,
+java, gh, node, make -j8 cJSON, configure). Každé měření `BENCH_RUNS`×
+(default 3), medián. Režim proot použije stejné volby jako appka; linuxsh
+se přeskočí bez rootu; cJSON se klonuje jednou. Spuštění:
+`ashell -c "ROOTFS=$R L=$L bash tools/bench-nextgen.sh loader"` (jeden
+režim) nebo bez argumentů (všechny dostupné).
+
+### A/B regresní test
+
+`test-all.sh timing` (`category_timing`): `ELF_LOADER_TIMING=1` musí vypsat
+`[TIMING] main_start` i `[TIMING] entry`; default nesmí vypsat žádný
+`[TIMING]`. Zaregistrováno v `all`. (A/B: stará binárka bez timing.c nemá
+symboly → netiskne nic → FAIL; nová PASS.)
+
+### Build
+
+`timing.c` přidán do `Makefile` **i** do `.github/workflows/build.yml`
+(obě cross-compile úlohy — dynamická i static-PIE). Bez toho by NDK build
+spadl na `undefined reference to elf_timing_*`. `gcc -fsyntax-only` OK,
+lokální `make` OK, smoke: `echo hello` a `python3 -c 'print(6*7)'` → 42.
+
+### Otevřeno (navazuje)
+
+- Část 2: přesný rozpad 34 ms shim vs. direct (bench-nextgen nativně).
+- Část 4: kapitola „Naměřeno" v `docs/nextgen/proot-nahrada.md`.
+- Prompt 02/10 má podle profilu cílit na `load` + inline hooky, ne cache symbolů.

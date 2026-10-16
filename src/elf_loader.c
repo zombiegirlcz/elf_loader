@@ -5768,6 +5768,7 @@ static void elf_install_sigsys_lock(void) {
 int elf_run(elf_object_t *obj, int argc, char **argv, char **envp) {
     if (!obj)
         return -1;
+    elf_timing_mark("run_enter");
 
     apply_segment_prots(obj);
 
@@ -5883,6 +5884,7 @@ int elf_run(elf_object_t *obj, int argc, char **argv, char **envp) {
         }
     }
 
+    elf_timing_mark("run_stack");
     elf_install_fault_handlers();
 
     if (elf_debug())
@@ -5945,6 +5947,7 @@ static __attribute__((noreturn)) void elf_run_final(void *sp, void *entry,
         elf_install_sigsys_lock();
     fflush(stderr);
     { int _fd = raw_syscall6(56, (long)0xFFFFFFFFFFFFFF9CL, (long)(unsigned long)diag_path(), 0x441L /*O_WRONLY|O_CREAT|O_APPEND*/, 0644L, 0, (long)F2_SENTINEL); if (_fd >= 0) { const char _m[] = "JUMP\n"; raw_syscall6(64, _fd, (long)(unsigned long)_m, 5, 0, 0, (long)F2_SENTINEL); raw_syscall6(57, _fd, 0, 0, 0, 0, (long)F2_SENTINEL); } }
+    elf_timing_mark("entry");
     extern void elf_final_jump(void *, void *, uintptr_t, void (*)(void));
     elf_final_jump(sp, entry, g_tls_new_tp, elf_run_pending_inits);
     __builtin_unreachable();

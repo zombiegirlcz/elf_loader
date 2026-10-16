@@ -21,6 +21,14 @@ Android appce — bez nutnosti je kompilovat pro bionic/NDK.
 - Baterie testů (`make test`, `--ownall`) — [postup.md#L15](postup.md#L15).
 - Ověřené runtime hodnoty (GOT/TLS/arena) — [postup.md#L76](postup.md#L76).
 - Aktuální stav (linka po opravách) — [postup.md#L92](postup.md#L92).
+- **Měření exec (2026-10-16, prompt 01):** `ELF_LOADER_TIMING=1` = fázový
+  profil na stderr (raw clock, no-op v defaultu); `tools/bench-nextgen.sh
+  [proot|loader|linuxsh]` = zátěžový benchmark (medián); `test-all.sh timing`
+  = A/B regrese. Profil: tři dominantní fáze `hooks_bti` 14,8 / `elf_load` 19,6
+  / `svc_patch` 8,4 ms (celkem ~61 ms práce loaderu) — rezerva pro prompt
+  02/10 je load + inline hooky, **ne** cache symbolů (relokace jen 2,3 ms).
+  Kapitola „Naměřeno" v `docs/nextgen/proot-nahrada.md` — [postup.md](postup.md)
+  2026-10-16.
 - **Git / GitHub ochrana (2026-10-06):** ruleset `protect-master` (zákaz
   update/force-push/smazání, bypass jen admin = vlastník → cizí PR do `master`
   nejde mergnout), `protect-dev` (zákaz force-push/smazání). Workflow

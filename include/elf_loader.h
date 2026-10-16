@@ -193,4 +193,12 @@ void elf_debug_dump_memory(void *addr, size_t len);
 void elf_debug_set_level(int level);
 int elf_debug_get_level(void);
 
+/* Fázový profil exec (ELF_LOADER_TIMING=1). No-op v defaultu. Volat jen pod
+ * bionickym TP (mark pouziva raw syscally, getenv jen v elf_timing_init). */
+void elf_timing_init(void);
+int elf_timing_enabled(void);
+void elf_timing_mark(const char *label);
+void elf_timing_mark_us(const char *label, unsigned long long us);
+unsigned long long elf_timing_now_us(void);
+
 #endif

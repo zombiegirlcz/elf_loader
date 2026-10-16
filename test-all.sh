@@ -1210,6 +1210,30 @@ category_staticexec() {
     fi
 }
 
+category_timing() {
+    echo ""
+    echo "=== fázový profil exec (ELF_LOADER_TIMING) ==="
+    local env="ROOTFS=$R ELF_ROOTFS=$R ELF_LOADER=$L"
+    local on off
+    # Zapnuto: musí vypsat [TIMING] řádky na stderr a skončit 0.
+    on=$(ashell_out "$env ELF_LOADER_TIMING=1 $L --ownall $R/bin/true" 2>&1)
+    # Vypnuto (default): žádný [TIMING] řádek nesmí být.
+    off=$(ashell_out "$env $L --ownall $R/bin/true" 2>&1)
+    local ok=1
+    printf '%s' "$on"  | grep -q '\[TIMING\] main_start' || ok=0
+    printf '%s' "$on"  | grep -q '\[TIMING\] entry'      || ok=0
+    if printf '%s' "$off" | grep -q '\[TIMING\]'; then ok=0; fi
+    if [ "$ok" = 1 ]; then
+        echo "PASS timing: TIMING=1 vypisuje fáze, default tiše"
+        echo "PASS: timing - ELF_LOADER_TIMING fáze" >> "$PASS_LOG"
+        ((PASS_COUNT++)) || true
+    else
+        echo "FAIL timing: on=[$(printf '%s' "$on" | head -3 | tr '\n' '|')] off_has_timing=$(printf '%s' "$off" | grep -c '\[TIMING\]')"
+        echo "FAIL: timing - ELF_LOADER_TIMING fáze" >> "$FAIL_LOG"
+        ((FAIL_COUNT++)) || true
+    fi
+}
+
 category_selfexe() {
     echo ""
     echo "=== /proc/self/exe + make fast path (eaccess) ==="
@@ -1542,6 +1566,10 @@ case "${1:-all}" in
         category_selfexe
         print_summary
         ;;
+    timing)
+        category_timing
+        print_summary
+        ;;
     staticexec)
         category_staticexec
         print_summary
@@ -1604,6 +1632,7 @@ case "${1:-all}" in
         category_fstat
         category_nss
         category_selfexe
+        category_timing
         category_bigargv
         category_bionic
         category_staticexec

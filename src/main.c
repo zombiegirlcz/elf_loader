@@ -3518,8 +3518,10 @@ static void shim_register_overrides(void) {
 static void shim_install_hooks(void) {
     if (getenv("F2_DISABLE")) return;
     int ok = 0;
+    elf_timing_mark("hooks_enter");
     for (size_t i = 0; i < sizeof g_f2_hooks / sizeof g_f2_hooks[0]; i++)
         if (f2_only_match(g_f2_hooks[i].n) && hook_install(&g_f2_hooks[i])) ok++;
+    elf_timing_mark("hooks_got");
     /* Interni glibc open (__open64_nocancel) obchazi PLT override i inline
      * hooky na open/open64 - proto guest glibc cetl host /etc/resolv.conf
      * (neexistuje) a DNS nefungovalo. Inline-hook (PAC prolog) ho prelozi pod
@@ -3547,6 +3549,7 @@ static void shim_install_hooks(void) {
      * fopen("/etc/gitconfig"). Stejny preklad jako PLT override (shim_open64)
      * pres PAC-safe inline hook. open/__open/__open64 sdileji adresu s open64.
      * Vypnout lze F2_NO_OPEN_HOOK=1. */
+    elf_timing_mark("hooks_nocancel");
     if (g_shim_scope && !getenv("F2_NO_OPEN_HOOK")) {
         static const struct { const char *n; void *shim; void **orig; void **alias; } oh[] = {
             { "open64",   (void *)shim_open64,   &g_orig_open64,   &g_orig_open },
@@ -3571,6 +3574,7 @@ static void shim_install_hooks(void) {
      * a spusti ho pres loader (shim_posix_spawnp -> real posix_spawnp, ktery
      * jde do __spawni, ne do posix_spawn -> bez rekurze).
      * Vypnout lze F2_NO_SPAWN_HOOK=1. */
+    elf_timing_mark("hooks_open");
     if (g_shim_scope && !g_orig_posix_spawn && !getenv("F2_NO_SPAWN_HOOK") &&
         f2_only_match("posix_spawn")) {
         void *t = elf_scope_lookup(g_shim_scope, "posix_spawn");
@@ -3588,6 +3592,7 @@ static void shim_install_hooks(void) {
      * g_orig_* se stejnou adresou (fstatat64 = fstatat) musi dostat
      * trampolinu, jinak by fallback ukazal na patchnuty kod -> rekurze.
      * Vypnout lze F2_NO_BTI_HOOK=1. */
+    elf_timing_mark("hooks_spawn");
     if (g_shim_scope && !getenv("F2_NO_BTI_HOOK")) {
         static const struct { const char *n; void *shim; } bh[] = {
             { "fstatat", (void *)shim_fstatat },
@@ -3609,6 +3614,7 @@ static void shim_install_hooks(void) {
             if (elf_debug()) fprintf(stderr, "[hook] %s inline (BTI) OK\n", bh[i].n);
         }
     }
+    elf_timing_mark("hooks_bti");
     if (elf_debug())
         fprintf(stderr, "[F2-hooks] inline-patchnuto %d glibc funkci\n", ok);
 }
@@ -3681,6 +3687,7 @@ static int run_own(const char *path, const char *mod, int argc, char **argv,
 
 static int run_ownall(const char *path, int argc, char **argv, char **envp) {
     elf_install_fault_handlers();
+    elf_timing_mark("ownall_start");
     /* Zajisti fd 0/1/2. V Android app sandboxu (ashell -c) byva fd 0 zavreny;
      * prvni loaderuv open() pak dostane fd 0 a jeho close() zavre "stdin".
      * Node/libuv na to pada: uv__close Assertion `fd > STDERR_FILENO`.
@@ -3702,6 +3709,7 @@ static int run_ownall(const char *path, int argc, char **argv, char **envp) {
         fprintf(stderr, "[-] scope alloc failed\n");
         return 1;
     }
+    elf_timing_mark("scope_create");
     elf_own_deps = 1;
     elf_own_scope = scope;
     g_shim_scope = scope;
@@ -3890,6 +3898,7 @@ static int run_ownall(const char *path, int argc, char **argv, char **envp) {
     }
 
     shim_register_overrides();
+    elf_timing_mark("overrides_reg");
 
     g_loader_active = 1;  /* loaderuv kod (bionic TLS): jeho open = bionicky */
     /* F2 seccomp filtr je volitelny (F2_FILTER=1). Pri re-execu (shim_execve)
@@ -3907,8 +3916,10 @@ static int run_ownall(const char *path, int argc, char **argv, char **envp) {
             install_f2_path_filter();
         }
     }
+    elf_timing_mark("f2_filter");
     shim_strcpy(g_guest_exe_path, sizeof(g_guest_exe_path), path);
     elf_object_t *obj = elf_load(path);
+    elf_timing_mark("load_done");
     elf_own_scope = NULL;
     elf_set_crash_scope(scope);
     if (!obj) {
@@ -3930,6 +3941,7 @@ static int run_ownall(const char *path, int argc, char **argv, char **envp) {
         fprintf(stderr, "[F2] getcwd: host cesta (Bun / F2_NO_CWD_STRIP)\n");
     shim_install_hooks();    /* patch glibc leaf funkci (F2 / re-exec) */
     shim_resolve_fallback(); /* fallback real funkci (W^X) */
+    elf_timing_mark("hooks_install");
     g_real_libc_start_main = elf_scope_lookup(scope, "__libc_start_main");
     g_real_sigprocmask = elf_scope_lookup(scope, "sigprocmask");
     g_real_canonicalize = elf_scope_lookup(scope, "canonicalize_file_name");
@@ -4071,7 +4083,9 @@ static int run_ownall(const char *path, int argc, char **argv, char **envp) {
      * konstruktory hlavniho programu musime zaradit rucne. Bez toho nebezi
      * napr. OpenSSL ctor v node (staticky linkovany) -> zadny provider ->
      * CHECK(ncrypto::CSPRNG(nullptr,0)) assert. */
+    elf_timing_mark("reloc_done");
     elf_queue_module_inits(obj);
+    elf_timing_mark("inits_queued");
 
     /* ELF_LOADER_TRACE_CALL=0xADDR[,0xADDR...]: nainstaluj call-site tracer
      * (viz install_call_trace) na kazdou zadanou adresu. Diagnostika node
@@ -4185,6 +4199,7 @@ static int run_ownall(const char *path, int argc, char **argv, char **envp) {
     scope->exe = obj;   /* fallback pro symboly z hlavniho exe (PyExc_*, _PyRuntime) */
     ldso_install_exe_linkmap(obj, path);
     ldso_install_module_list(scope->mods, scope->count);
+    elf_timing_mark("linkmap");
 
     /* App seccomp KILLuje rseq (293), set_robust_list (99, delka 24) a
      * clone3 (435). KILL obchazi SIGSYS handler i nas ERRNO filtr, proto v
@@ -4228,9 +4243,11 @@ static int run_ownall(const char *path, int argc, char **argv, char **envp) {
             fclose(mf);
         }
     }
+    elf_timing_mark("svc_patch");
     elf_install_fault_handlers();
     g_loader_active = 0;  /* od ted bezi cilova binarka (parrot TLS) */
     elf_tls_ctx_t tls = elf_setup_own_tls(obj, scope);
+    elf_timing_mark("tls_done");
     int ret = elf_run(obj, argc, argv, envp);
     elf_teardown_own_tls(&tls);
     elf_scope_destroy(scope);
@@ -5009,6 +5026,10 @@ int main(int argc, char **argv, char **envp) {
     if (getenv("ELF_DEBUG"))
         setvbuf(stdout, NULL, _IONBF, 0);
 
+    /* Fázový profil: flag nascachovat TED (bionicky TP, getenv funguje). */
+    elf_timing_init();
+    elf_timing_mark("main_start");
+
     /* Ensure a valid RLIMIT_STACK (at least 8MB) so glibc NPTL pthread_create
      * does not fail in allocate_stack with size == 0 on Android host */
     struct rlimit rl_stack = { 8 * 1024 * 1024, 8 * 1024 * 1024 };
@@ -5018,6 +5039,7 @@ int main(int argc, char **argv, char **envp) {
      * ELF_LOADER_NO_COMPAT=1 filtr preskoci (izolace, zda SIGSYS neni nas). */
     if (!getenv("ELF_LOADER_NO_COMPAT"))
         elf_install_compat();
+    elf_timing_mark("seccomp_compat");
     /* Fault handler hned od zacatku (driv jen s NO_COMPAT): jinak pady behem
      * nacitani modulu (pred elf_run) koncily tichym "Segmentation fault"
      * bez PC/adresy - napr. nahodny SIGSEGV ~5 % po "tls-done" libc.
