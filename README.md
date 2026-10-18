@@ -62,9 +62,9 @@ lx gcc hello.c -o hello && lx ./hello   # compile + run inside the guest
 | variable | meaning | default |
 |---|---|---|
 | `D` | app files dir | `$HOME` |
-| `ROOTFS` | guest rootfs | `$D/nh/distro/parrot` |
+| `ROOTFS` | guest rootfs (Termux-aware autodetect) | `$D/nh/distro/parrot` |
 | `R` | alias for `ROOTFS` | `$ROOTFS` |
-| `L` | loader binary | `$D/usr/bin/elf_loader` |
+| `L` | loader binary (autodetect, incl. `$PREFIX/bin`) | `$D/usr/bin/elf_loader` |
 | `LX_LOG` | log directory | `$HOME/.cache/lx` |
 | `LOCPATH` | guest locale dir (only if it exists) | `$ROOTFS/usr/lib/locale` |
 | `LC_ALL` | locale | `C.UTF-8` |
