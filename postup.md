@@ -4291,3 +4291,124 @@ bionic `.so`, Vulkan/Adreno — `bb_dlopen`, `src/entry.S bb_stubs`) volá
 **skutečný** bionic `dlopen`, který statický bionic binárka nemá. Statický
 build tedy nelze nasadit jako default bez ztráty GPU bridge; zůstává
 sekundární artefakt. Dle promptu („když ne, zdokumentuj a přeskoč").
+
+## 2026-10-16 (jadx/Java pod loaderem — otevřený bug, neizolováno)
+
+Uživatel chtěl vyzkoušet `jadx` na `base.apk` (Revolut) pod `--ownall`. `jadx`
+samo je shell skript → volá `java` z `$R/usr/lib/jvm/java-{17,21}-openjdk-arm64`.
+Balíčky (`default-jdk`, `openjdk-17/21/25-jdk`) jsou v rootfs nainstalované,
+JVM se own-loadne (`libjli.so`, `libjava.so`, `libjvm.so` — 513 dynsym, 118698
+relokací, vše proběhne bez chyby v `ELF_DEBUG=1`), ale `java -version` i
+`jadx --version` skončí vždy:
+
+```
+Error occurred during initialization of VM
+Failed setting boot class path.
+```
+
+Příkaz (JDK 17 i 21, stejný výsledek):
+```sh
+JH=$R/usr/lib/jvm/java-21-openjdk-arm64
+ashell -c "ROOTFS=$R ELF_ROOTFS=$R HOME=$D JAVA_HOME=$JH PATH=$JH/bin:/usr/bin:/bin:/system/bin $L --ownall $JH/bin/java -version"
+```
+
+**Vyloučeno** (žádná z hypotéz nebyla potvrzena jako root cause):
+- `JAVA_HOME`/`PATH` — nastaveno správně, launcher najde a own-loadne všechny
+  `.so` (libjli/libjava/libjvm) bez chyby.
+- Soubor `lib/modules` (140 MB jimage) — `open`/`fstat`/`pread64`/`mmap` přes
+  Python `ctypes`-styl test pod stejným `--ownall` během **fungují** (čte se
+  správný guest obsah, magic `CAFEDADA` sedí).
+- `fopen()` guest absolutní cesty z vlastního test programu (`gcc -o t3fopen`,
+  `--ownall`) — **funguje** (`fopen=0x7f000002a0`), tzn. PLT/GOT override pro
+  `fopen` z externí binárky je OK.
+- `-Xlog:all=debug:stdout`, `-Xshare:off`, `-Djava.home=$JH` — žádný extra
+  log ani změna chování; chyba padá **dřív**, než se rozjede JVM logging
+  (tedy v `libjli` launcheru, ne v HotSpot `Arguments::set_boot_class_path`).
+
+**Pozorování, které NEVYLOUČENO jako příčina:** `ELF_DEBUG=1` při startu
+hlásí pro `open`, `openat`, `__openat`/`__openat64` (NOTFOUND), `opendir`,
+`realpath`, `dlopen`, `fopen`, `fopen64`, `pathconf` — `[hook] <jmeno>:
+non-B-thunk (ins0=d503233f), skip`. Inline-hook (`hook_inline_prologue`,
+PAC-safe) je v `shim_install_hooks` (`src/main.c:3555` `oh[]`) zapsaný
+**jen pro `open64`/`openat64`** (alias `open`/`__open`/`__open64`), BTI-leaf
+hooky (`bh[]`, `src/main.c:3598`) jen pro `fstatat/unlink/mkdir/rmdir/link`.
+`fopen/fopen64/realpath/dlopen/opendir/pathconf` **nemají inline hook vůbec**
+— glibc-interní `bl` volání na tyto funkce (ne přes vlastní GOT voajícího
+modulu) by tak četly host cesty netransformované. Nepotvrzeno testem (vlastní
+`fopen()` test prošel), ale `libjli`/`libjvm` mohou tyto funkce volat jinak
+(např. staticky vázaná/hidden-visibility volání v rámci stejné `.so`, kde
+žádný GOT vůbec neexistuje) — klasický vzorec ze sekce 10 (BTI/PAC prolog
+obchází i GOT override, ne jen inline hook).
+
+**Root cause #1 („Failed setting boot class path.") — VYŘEŠENO** (2026-10-16/17,
+commit na `dev`): `ldso_dladdr()` (`src/elf_loader.c`) vracel `m->soname`
+(basename `"libjvm.so"`), ale `os::jvm_path()` v libjvm ho bere jako **cestu**
+a volá na něj `os::Posix::realpath("libjvm.so")`. Mimo cwd `lib/server/`
+(odkud libjvm pochází) `realpath` vrátí ENOENT → prázdný `jvm_path` →
+`os::set_boot_path` nenajde `lib/modules` (skládá ho z prázdného `java.home`)
+→ `vm_exit_during_initialization("Failed setting boot class path.")`.
+Důkaz: `cd $JH/lib/server && java -version` **fungovalo** i se starou
+binárkou. glibc `dladdr` vrací PLNou cestu (`dli_fname`), ne basename.
+Fix: nové pole `full_path` v `elf_object_t` (`include/elf_loader.h`),
+plněno v `elf_load_shared` (`strdup(resolved)`), `ldso_dladdr` vrací
+`m->full_path ? m->full_path : m->soname`. Navíc `finale_loader_build.py`
+nezahrnoval `src/timing.c`/`src/cache.c` v `srcs` → link error; doplněno.
+**A/B** (neutrální cwd, `ashell -c`):
+- `elf_loader.prev2`: `Failed setting boot class path.` RC=1
+- nová: `openjdk version "21.0.12.1"` RC=0
+`java -version` OK pro JDK 17 i 21; `jadx --version` → `dev`, RC=0.
+
+**Root cause #2 (SIGSEGV při reálné dekompilaci) — OTEVŘENO:** `jadx -d out
+base.apk` (i `javac Hello.java`, i `jimage list`) padá v `libjvm.so` **po**
+inicializaci VM (fáze „loading"), konzistentně `sig=11 si_addr=0x8`
+(NULL+8 deref), `x1=0x0000ffe51ce0` ve všech bězích. Není to regrese
+fixu #1 (stará binárka se k němu vůbec nedostala). `jimage list` vypíše 526
+řádků a pak spadne. Pravděpodobně běhové prostředí, které JVM očekává
+(thready/TLS/memory layout) — nutná diagnostika offsetu PC v libjvm
+(`su`/`strace` na zařízení).
+
+**Workaround pro #2:** zatím žádný; `jadx` na reálné APK pod `--ownall`
+nedokončí dekompilaci.
+
+---
+
+## 2026-10-18: `.elfrc` — jeden rc pro host i guest, Termux detekce, verze 0.7
+
+**Problém:** starship/zoxide integrace pro host bionic shell žila v `~/.zshrc`
+(na zařízení, mimo git) nebo se musela ručně kopírovat; bash dostával jiný
+(často žádný) blok. Navíc `init zsh|bash` měl defaulty natvrdo
+(`$D/usr/bin/elf_loader`, `$D/nh/distro/parrot`), takže v Termuxu (proot-distro
+rootfs pod `$PREFIX/var/lib/proot-distro/...`, loader v `$PREFIX/bin`) nefungoval.
+
+**Řešení — `.elfrc`:** nový uživatelský soubor `~/.elfrc` (override `ELF_RC`,
+skip `LX_NO_RC=1`) se source-uje na **konci** `elf_loader init zsh` i `init bash`,
+takže je dostupný `lxwhich`/`lx`. Je to jediné místo pro starship, zoxide a
+vlastní aliasy — ne `.zshrc`/`.bashrc` (past s `/root` a dvojím světem, viz
+sekce 5 AGENTS.md). Obojshellový: zsh-only části pod `if [ -n "$ZSH_VERSION" ]`.
+Obsah (zoxide s `lx` wrapperem + cache init skriptu, starship s 2s cache promptu
+přes `typeset -g`/`declare -g` a cache initu se `sed "s|$L|starship|g"`) žije
+jako `ELF_RC_EXAMPLE[]` v `src/main.c`.
+
+**Nové podpříkazy:**
+- `elf_loader init example [zsh|bash]` — vytiskne vzorový `.elfrc` na stdout
+  (stejný pro oba shelly, argument shellu je zatím no-op).
+- `elf_loader init install [--force]` — zapíše vzor do `${ELF_RC:-$HOME/.elfrc}`
+  (vytvoří parent dir); existující soubor bez `--force` = chyba (exit 1).
+
+**Termux detekce v preamble** (`elf_print_init_env`, platná pro zsh i bash):
+- `ROOTFS`: první existující z `$D/nh/distro/parrot`, `$D/parrot`,
+  `$D/.local/share/parrot`, `$D/../usr/var/lib/proot-distro/installed-rootfs/parrot`,
+  `${PREFIX:+$PREFIX/var/lib/proot-distro/installed-rootfs/parrot}`; fallback
+  `$D/nh/distro/parrot`.
+- `L`: když `$L` chybí nebo není spustitelné, první existující z
+  `$D/usr/bin/elf_loader`, `${PREFIX:+$PREFIX/bin/elf_loader}`,
+  `/system/bin/elf_loader`, `$ROOTFS/usr/bin/elf_loader`, pak `command -v
+  elf_loader`; fallback `$D/usr/bin/elf_loader`.
+- `LX_LOG` se vytváří (`mkdir -p`, tiše), `LOCPATH` jen když locale v rootfs
+  existuje (v `if ...; fi`, aby blok nekončil nenulovým exit kódem).
+
+**Test:** nová kategorie `test-all.sh elfrc` (v `all`): `init example` obsahuje
+`starship` i `zoxide`, `init zsh|bash` obsahuje `.elfrc`, `init install` do
+`ELF_RC` zapíše, druhý běh bez `--force` selže (exit 1), s `--force` projde.
+
+**Verze:** `ELF_LOADER_VERSION` 0.3 → 0.7.

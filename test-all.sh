@@ -1055,6 +1055,46 @@ EOS
     fi
 }
 
+category_elfrc() {
+    echo ""
+    echo "=== .elfrc: example / install / init hook ==="
+    local dir="$D/coredir/elfrc.$$"
+    mkdir -p "$dir"
+    local out
+
+    out=$("$L" init example zsh 2>/dev/null)
+    if printf '%s' "$out" | grep -q 'starship' && printf '%s' "$out" | grep -q 'zoxide'; then
+        echo "PASS elfrc/example: obsahuje starship i zoxide"
+        echo "PASS: elfrc - example obsah" >> "$PASS_LOG"; ((PASS_COUNT++)) || true
+    else
+        echo "FAIL elfrc/example: chybi starship/zoxide"
+        echo "FAIL: elfrc - example obsah" >> "$FAIL_LOG"; ((FAIL_COUNT++)) || true
+    fi
+
+    if "$L" init zsh 2>/dev/null | grep -q '.elfrc' \
+       && "$L" init bash 2>/dev/null | grep -q '.elfrc'; then
+        echo "PASS elfrc/hook: init zsh i bash source-uje .elfrc"
+        echo "PASS: elfrc - init hook" >> "$PASS_LOG"; ((PASS_COUNT++)) || true
+    else
+        echo "FAIL elfrc/hook: init zsh/bash neobsahuje .elfrc"
+        echo "FAIL: elfrc - init hook" >> "$FAIL_LOG"; ((FAIL_COUNT++)) || true
+    fi
+
+    local rc1 rc2 rc3 rcsize
+    rc1=$(ELF_RC="$dir/rc" "$L" init install >/dev/null 2>&1; echo $?)
+    rcsize=$(wc -c < "$dir/rc" 2>/dev/null || echo 0)
+    rc2=$(ELF_RC="$dir/rc" "$L" init install >/dev/null 2>&1; echo $?)
+    rc3=$(ELF_RC="$dir/rc" "$L" init install --force >/dev/null 2>&1; echo $?)
+    rm -rf "$dir"
+    if [ "$rc1" = 0 ] && [ "${rcsize:-0}" -gt 0 ] && [ "$rc2" = 1 ] && [ "$rc3" = 0 ]; then
+        echo "PASS elfrc/install: zapis=0, druhy bez --force=1, --force=0"
+        echo "PASS: elfrc - install" >> "$PASS_LOG"; ((PASS_COUNT++)) || true
+    else
+        echo "FAIL elfrc/install: rc1=$rc1 size=$rcsize rc2=$rc2 rc3=$rc3"
+        echo "FAIL: elfrc - install | rc1=$rc1 rc2=$rc2 rc3=$rc3" >> "$FAIL_LOG"; ((FAIL_COUNT++)) || true
+    fi
+}
+
 category_dw() {
     echo ""
     echo "=== dw: setgid shim + double-world (init zsh -dw) ==="
@@ -1640,6 +1680,10 @@ case "${1:-all}" in
         category_dw
         print_summary
         ;;
+    elfrc)
+        category_elfrc
+        print_summary
+        ;;
     pathops)
         category_pathops
         print_summary
@@ -1688,6 +1732,7 @@ case "${1:-all}" in
         category_execcache
         category_lxc
         category_dw
+        category_elfrc
         category_pathops
         category_madv
         category_venv

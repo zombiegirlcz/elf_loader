@@ -1,5 +1,5 @@
 #define _GNU_SOURCE 1
-#define ELF_LOADER_VERSION "0.3"
+#define ELF_LOADER_VERSION "0.7"
 #include <stdio.h>
 #include <signal.h>
 #include "../include/elf_loader.h"
@@ -18,6 +18,8 @@ static void print_help(const char *prog) {
         "  %s [--lazy] --ownall <elf> [args..]\n"
         "  %s [--lazy] --shim <elf> [args..]\n"
         "  %s init zsh|bash [-dw]\n"
+        "  %s init example [zsh|bash]\n"
+        "  %s init install [--force]\n"
         "  %s <elf>                        (introspect)\n"
         "\n"
         "Modes:\n"
@@ -28,6 +30,8 @@ static void print_help(const char *prog) {
         "  init zsh|bash print `eval`-able env defaults (LOCPATH/LC_ALL) + helpers\n"
         "                -dw/--double-world: cd do $ROOTFS spusti guest shell s\n"
         "                prekladem cest, cd .. z / zpet na host (toggle: lxdw on|off)\n"
+        "  init example  print example ~/.elfrc (starship/zoxide, spolecny zsh+bash)\n"
+        "  init install  write example to ${ELF_RC:-$HOME/.elfrc} (--force to overwrite)\n"
         "  <elf>         introspect base/entry/symbols without execution\n"
         "\n"
         "Options:\n"
@@ -48,7 +52,7 @@ static void print_help(const char *prog) {
         "  ROOTFS=/data/.../parrot %s --ownall /data/.../parrot/bin/ls -la /etc\n"
         "  ROOTFS=/data/.../parrot %s --shim /data/.../parrot/usr/bin/awk 'BEGIN{print 1+2}'\n"
         "  %s /data/.../parrot/bin/cat /etc/hostname\n",
-        prog, prog, prog, prog, prog, prog, prog, prog, prog,
+        prog, prog, prog, prog, prog, prog, prog, prog, prog, prog, prog,
         prog, prog, prog, prog, prog);
 }
 
@@ -4971,6 +4975,147 @@ static const char LX_DW_BASH[] =
     "  *) PROMPT_COMMAND=\"_lx_dw_precmd${PROMPT_COMMAND:+;$PROMPT_COMMAND};_lx_dw_tag\" ;;\n"
     "esac\n";
 
+/* Obsah example ~/.elfrc: starship/zoxide/vlastni aliasy pro HOST shell
+ * (bionicky zsh/bash). Jeden soubor pro oba shelly (rozdil jen pres
+ * $ZSH_VERSION); source-uje se na konci `init zsh|bash`, takze lxwhich/lx uz
+ * existuji. Proc ne do .zshrc: jeden rc pro host i guest svet (viz AGENTS.md,
+ * past s /root) - starship/zoxide patri host shellu, ne do rootfs rc. */
+static const char ELF_RC_EXAMPLE[] =
+    "# ~/.elfrc - uzivatelska konfigurace pro host shell (zsh i bash)\n"
+    "# Vygenerovano: elf_loader init example\n"
+    "# Nacte se na konci `eval \"$($L init zsh|bash)\"` (prepis cestou ELF_RC=...).\n"
+    "# Sem patri starship, zoxide a vlastni aliasy - ne do ~/.zshrc / ~/.bashrc.\n"
+    "# Preskoceni: LX_NO_RC=1\n"
+    "\n"
+    "command -v lxwhich >/dev/null 2>&1 || return 0 2>/dev/null || exit 0\n"
+    "\n"
+    "# --- zoxide (z = cd s pameti; data v hostim HOME) ---\n"
+    "if lxwhich zoxide >/dev/null 2>&1; then\n"
+    "  zoxide() { lx zoxide \"$@\" 2> >(grep -v '^\\[MMAP\\]' >&2); }\n"
+    "  export _ZO_DATA_DIR=\"${_ZO_DATA_DIR:-$HOME/.local/share/zoxide}\"\n"
+    "  if [ -n \"$ZSH_VERSION\" ]; then\n"
+    "    _zocache=$HOME/.cache/zoxide-init.zsh\n"
+    "    if [ ! -s \"$_zocache\" ] || [ \"$_zocache\" -ot \"$(lxwhich zoxide)\" ]; then\n"
+    "      lx zoxide init zsh --cmd z | sed 's/\\bcommand zoxide\\b/zoxide/g' > \"$_zocache\"\n"
+    "    fi\n"
+    "  else\n"
+    "    _zocache=$HOME/.cache/zoxide-init.bash\n"
+    "    if [ ! -s \"$_zocache\" ] || [ \"$_zocache\" -ot \"$(lxwhich zoxide)\" ]; then\n"
+    "      lx zoxide init bash --cmd z | sed 's/\\bcommand zoxide\\b/zoxide/g' > \"$_zocache\"\n"
+    "    fi\n"
+    "  fi\n"
+    "  [ -r \"$_zocache\" ] && . \"$_zocache\"\n"
+    "  unset _zocache\n"
+    "fi\n"
+    "\n"
+    "# --- starship (POSLEDNI blok: prepisuje PS1/PROMPT, musi bezet po dw tagu) ---\n"
+    "if lxwhich starship >/dev/null 2>&1; then\n"
+    "  export STARSHIP_CONFIG=\"${STARSHIP_CONFIG:-$HOME/.config/starship.toml}\"\n"
+    "  export STARSHIP_CACHE=\"${STARSHIP_CACHE:-$HOME/.cache/starship}\"\n"
+    "  starship() {\n"
+    "    if [ \"$1\" = prompt ]; then\n"
+    "      _ssnow=$(date +%s)\n"
+    "      if [ -n \"$_STARSHIP_PROMPT_CACHE\" ] && [ $((_ssnow - ${_STARSHIP_PROMPT_TIME:-0})) -lt 2 ]; then\n"
+    "        printf '%s' \"$_STARSHIP_PROMPT_CACHE\"\n"
+    "        return 0\n"
+    "      fi\n"
+    "      _ssout=$(lx starship \"$@\" 2> >(grep -v '^\\[MMAP\\]' >&2))\n"
+    "      if [ -n \"$_ssout\" ]; then\n"
+    "        if [ -n \"$ZSH_VERSION\" ]; then\n"
+    "          typeset -g _STARSHIP_PROMPT_CACHE=\"$_ssout\" _STARSHIP_PROMPT_TIME=$_ssnow\n"
+    "        else\n"
+    "          declare -g _STARSHIP_PROMPT_CACHE=\"$_ssout\" _STARSHIP_PROMPT_TIME=$_ssnow\n"
+    "        fi\n"
+    "      fi\n"
+    "      printf '%s' \"$_ssout\"\n"
+    "      return 0\n"
+    "    fi\n"
+    "    lx starship \"$@\"\n"
+    "  }\n"
+    "  if [ -n \"$ZSH_VERSION\" ]; then\n"
+    "    _sscache=$HOME/.cache/starship-init.zsh\n"
+    "    if [ ! -s \"$_sscache\" ] || [ \"$_sscache\" -ot \"$(lxwhich starship)\" ]; then\n"
+    "      lx starship init zsh | sed \"s|$L|starship|g\" > \"$_sscache\"\n"
+    "    fi\n"
+    "  else\n"
+    "    _sscache=$HOME/.cache/starship-init.bash\n"
+    "    if [ ! -s \"$_sscache\" ] || [ \"$_sscache\" -ot \"$(lxwhich starship)\" ]; then\n"
+    "      lx starship init bash | sed \"s|$L|starship|g\" > \"$_sscache\"\n"
+    "    fi\n"
+    "  fi\n"
+    "  [ -r \"$_sscache\" ] && . \"$_sscache\"\n"
+    "  unset _sscache\n"
+    "fi\n"
+    "\n"
+    "# --- tipy ---\n"
+    "# jiny soubor:   ELF_RC=~/muj.elfrc  (pak znovu eval \"$($L init zsh)\")\n"
+    "# preskocit:     LX_NO_RC=1\n"
+    "# regenerace:    rm ~/.cache/*-init.*\n";
+
+static void elf_print_elfrc(int shell) {
+    (void)shell;  /* example je spolecny pro zsh i bash */
+    fputs(ELF_RC_EXAMPLE, stdout);
+}
+
+/* `init install [--force]` - zapise example do ${ELF_RC:-$HOME/.elfrc}.
+ * Existujici soubor bez --force = chyba (neprepisovat uzivatelskou konfiguraci).
+ * Vytvori nadrazeny adresar (napr. $HOME/.config/elf/.elfrc). */
+static int elf_install_elfrc(int force) {
+    const char *env_rc = getenv("ELF_RC");
+    const char *home = getenv("HOME");
+    char path[4096];
+    if (env_rc && *env_rc) {
+        snprintf(path, sizeof path, "%s", env_rc);
+    } else if (home && *home) {
+        snprintf(path, sizeof path, "%s/.elfrc", home);
+    } else {
+        fprintf(stderr, "elf_loader: init install: ELF_RC ani HOME neni nastaveno\n");
+        return 1;
+    }
+
+    if (!force && access(path, F_OK) == 0) {
+        fprintf(stderr, "elf_loader: init install: '%s' uz existuje "
+                "(prepis: --force)\n", path);
+        return 1;
+    }
+
+    /* mkdir -p nadrazeneho adresare (path bez posledni komponenty) */
+    char dir[4096];
+    snprintf(dir, sizeof dir, "%s", path);
+    char *slash = strrchr(dir, '/');
+    if (slash && slash != dir) {
+        *slash = '\0';
+        for (char *p = dir + 1; *p; p++) {
+            if (*p != '/') continue;
+            *p = '\0';
+            if (mkdir(dir, 0700) != 0 && errno != EEXIST) {
+                fprintf(stderr, "elf_loader: init install: mkdir '%s': %s\n",
+                        dir, strerror(errno));
+                return 1;
+            }
+            *p = '/';
+        }
+        if (mkdir(dir, 0700) != 0 && errno != EEXIST) {
+            fprintf(stderr, "elf_loader: init install: mkdir '%s': %s\n",
+                    dir, strerror(errno));
+            return 1;
+        }
+    }
+
+    FILE *f = fopen(path, "w");
+    if (!f) {
+        fprintf(stderr, "elf_loader: init install: '%s': %s\n", path, strerror(errno));
+        return 1;
+    }
+    fputs(ELF_RC_EXAMPLE, f);
+    if (fclose(f) != 0) {
+        fprintf(stderr, "elf_loader: init install: zapis '%s': %s\n", path, strerror(errno));
+        return 1;
+    }
+    fprintf(stderr, "elf_loader: init install: zapsano do %s\n", path);
+    return 0;
+}
+
 /* `elf_loader init zsh` — stejny shell-integrace vzor jako `starship init zsh`/
  * `zoxide init zsh` (uz pouzivany v host .zshrc): vypise na stdout radky pro
  * `eval`, misto aby menil vlastni prostredi (setenv v tomto procesu by na
@@ -4988,11 +5133,42 @@ static void elf_print_init_env(int dw) {
     if (dw) fputs("export LX_DW=1\n", stdout);
     fputs(
         "export D=${D:-$HOME}\n"
-        "export ROOTFS=${ROOTFS:-$D/nh/distro/parrot}\n"
+        "# ROOTFS: kandidati (app files dir, Termux proot-distro, ...) - prvni existujici\n"
+        "if [ -z \"$ROOTFS\" ]; then\n"
+        "  for _rc in \"$D/nh/distro/parrot\" \"$D/parrot\" \"$D/.local/share/parrot\" \
+\"$D/../usr/var/lib/proot-distro/installed-rootfs/parrot\"; do\n"
+        "    [ -d \"$_rc\" ] && { ROOTFS=$_rc; break; }\n"
+        "  done\n"
+        "  if [ -z \"$ROOTFS\" ] && [ -n \"$PREFIX\" ] && \
+[ -d \"$PREFIX/var/lib/proot-distro/installed-rootfs/parrot\" ]; then\n"
+        "    ROOTFS=$PREFIX/var/lib/proot-distro/installed-rootfs/parrot\n"
+        "  fi\n"
+        "  unset _rc\n"
+        "  [ -n \"$ROOTFS\" ] || ROOTFS=$D/nh/distro/parrot\n"
+        "fi\n"
+        "export ROOTFS\n"
+        "# L: loader - $L override, pak kandidati ($D/usr/bin, Termux $PREFIX/bin,\n"
+        "# /system/bin, $ROOTFS/usr/bin), nakonec command -v elf_loader\n"
+        "if [ -z \"$L\" ] || [ ! -x \"$L\" ]; then\n"
+        "  L=\n"
+        "  for _lc in \"$D/usr/bin/elf_loader\" \"/system/bin/elf_loader\" \
+\"$ROOTFS/usr/bin/elf_loader\"; do\n"
+        "    [ -x \"$_lc\" ] && { L=$_lc; break; }\n"
+        "  done\n"
+        "  if [ -z \"$L\" ] && [ -n \"$PREFIX\" ] && [ -x \"$PREFIX/bin/elf_loader\" ]; then\n"
+        "    L=$PREFIX/bin/elf_loader\n"
+        "  fi\n"
+        "  if [ -z \"$L\" ]; then\n"
+        "    _lc=$(command -v elf_loader 2>/dev/null) && [ -x \"$_lc\" ] && L=$_lc\n"
+        "  fi\n"
+        "  unset _lc\n"
+        "  [ -n \"$L\" ] || L=$D/usr/bin/elf_loader\n"
+        "fi\n"
+        "export L\n"
         "export R=${R:-$ROOTFS}\n"
-        "export L=${L:-$D/usr/bin/elf_loader}\n"
         "export LX_LOG=${LX_LOG:-$HOME/.cache/lx}\n"
-        "[ -d \"$ROOTFS/usr/lib/locale\" ] && export LOCPATH=\"$ROOTFS/usr/lib/locale\"\n"
+        "mkdir -p \"$LX_LOG\" 2>/dev/null || true\n"
+        "if [ -d \"$ROOTFS/usr/lib/locale\" ]; then export LOCPATH=\"$ROOTFS/usr/lib/locale\"; fi\n"
         "export LC_ALL=${LC_ALL:-C.UTF-8}\n",
         stdout);
 }
@@ -5007,6 +5183,12 @@ static void elf_print_init_zsh(int dw) {
         stdout);
     fputs(LX_HELPERS_ZSH, stdout);
     fputs(LX_DW_ZSH, stdout);
+    fputs(
+        "# uživatelská konfigurace (starship/zoxide/vlastní aliasy); přeskoč s LX_NO_RC=1\n"
+        "if [ -z \"$LX_NO_RC\" ] && [ -r \"${ELF_RC:-$HOME/.elfrc}\" ]; then\n"
+        "  . \"${ELF_RC:-$HOME/.elfrc}\"\n"
+        "fi\n",
+        stdout);
 }
 
 static void elf_print_init_bash(int dw) {
@@ -5019,6 +5201,12 @@ static void elf_print_init_bash(int dw) {
         stdout);
     fputs(LX_HELPERS_BASH, stdout);
     fputs(LX_DW_BASH, stdout);
+    fputs(
+        "# uživatelská konfigurace (starship/zoxide/vlastní aliasy); přeskoč s LX_NO_RC=1\n"
+        "if [ -z \"$LX_NO_RC\" ] && [ -r \"${ELF_RC:-$HOME/.elfrc}\" ]; then\n"
+        "  . \"${ELF_RC:-$HOME/.elfrc}\"\n"
+        "fi\n",
+        stdout);
 }
 
 int main(int argc, char **argv, char **envp) {
@@ -5091,14 +5279,28 @@ int main(int argc, char **argv, char **envp) {
     }
 
     if (strcmp(argv[ai], "init") == 0) {
-        /* init [zsh|bash] [-dw|--double-world] (poradi libovolne) */
+        /* init [zsh|bash|example|install] [-dw|--double-world] [--force]
+         * (poradi libovolne, prvni ne-flag = shell nebo podprikaz) */
         const char *shell = "zsh";
-        int dw = 0;
+        int dw = 0, force = 0, have_target = 0;
         for (int i = ai + 1; i < argc; i++) {
             if (strcmp(argv[i], "-dw") == 0 || strcmp(argv[i], "--double-world") == 0)
                 dw = 1;
-            else
+            else if (strcmp(argv[i], "--force") == 0)
+                force = 1;
+            else if (argv[i][0] != '-' && !have_target) {
                 shell = argv[i];
+                have_target = 1;
+            } else if (argv[i][0] != '-') {
+                /* druhy ne-flag: jen shell pro `init example [zsh|bash]` */
+                if (strcmp(shell, "example") != 0) {
+                    fprintf(stderr, "elf_loader: init: nadbytecny argument '%s'\n", argv[i]);
+                    return 1;
+                }
+            } else {
+                fprintf(stderr, "elf_loader: init: nezname option '%s'\n", argv[i]);
+                return 1;
+            }
         }
         if (strcmp(shell, "zsh") == 0) {
             elf_print_init_zsh(dw);
@@ -5108,7 +5310,15 @@ int main(int argc, char **argv, char **envp) {
             elf_print_init_bash(dw);
             return 0;
         }
-        fprintf(stderr, "elf_loader: init: nepodporovany shell '%s' (zsh|bash [-dw])\n", shell);
+        if (strcmp(shell, "example") == 0) {
+            elf_print_elfrc(0);
+            return 0;
+        }
+        if (strcmp(shell, "install") == 0) {
+            return elf_install_elfrc(force);
+        }
+        fprintf(stderr, "elf_loader: init: nepodporovany cil '%s' "
+                "(zsh|bash|example|install [-dw] [--force])\n", shell);
         return 1;
     }
 

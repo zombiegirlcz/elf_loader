@@ -107,6 +107,11 @@ Android appce — bez nutnosti je kompilovat pro bionic/NDK.
 - **`elf_loader init zsh`** (shell-integrace vzor jako starship/zoxide,
   `eval`-able LOCPATH/LC_ALL pro host zsh) + build/deploy na zařízení —
   [postup.md#L2395](postup.md#L2395).
+- **`.elfrc` — jediný uživatelský rc pro host shell** (2026-10-18): starship/
+  zoxide/aliasy patří do `~/.elfrc` (`ELF_RC` override, `LX_NO_RC=1` skip),
+  source-uje se na konci `init zsh` i `init bash`. `init example` vzor vytiskne,
+  `init install [--force]` ho zapíše. Preamble navíc hledá `L`/`ROOTFS` i
+  v Termuxu (`$PREFIX/bin`, `$PREFIX/var/lib/proot-distro/...`). Verze 0.7.
 - **`init zsh|bash` produkčně — univerzální ROOTFS, žádný hardcode**
   (`elf_print_init_env` odvozuje D/ROOTFS/R/L/LX_LOG z `$HOME`; LOCPATH
   jen když locale existuje; `LX_HELPERS_BASH`; `lx` předává guest PATH →

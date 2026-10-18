@@ -71,6 +71,22 @@ lx gcc hello.c -o hello && lx ./hello   # compile + run inside the guest
 
 Overridable from outside: `ROOTFS=/other/rootfs zsh`.
 
+### `.elfrc` — uživatelská konfigurace
+
+Starship, zoxide a vlastní aliasy patří do **`~/.elfrc`**, ne do `.zshrc`/
+`.bashrc`: jeden soubor se source-uje na konci `init zsh` i `init bash`, takže
+funguje v obou shellech (`if [ -n "$ZSH_VERSION" ]` pro zsh-only části).
+
+```sh
+elf_loader init example          # vypíše vzorový .elfrc (starship + zoxide)
+elf_loader init install          # zapíše ho do ${ELF_RC:-$HOME/.elfrc}
+elf_loader init install --force  # přepíše existující soubor
+```
+
+Cestu lze přepsat `ELF_RC=~/muj.elfrc`, načtení úplně vypnout `LX_NO_RC=1`.
+`init` zároveň hledá loader (`L`) i rootfs (`ROOTFS`) i v Termuxu
+(`$PREFIX/bin/elf_loader`, `$PREFIX/var/lib/proot-distro/...`).
+
 ### Shell helpers
 
 | command | description |
@@ -103,6 +119,8 @@ elf_loader [--lazy] --own   <elf> <shared.so>  own-load one shared module
 elf_loader [--lazy] --ownall <elf> [args..]    own-load all deps (guest glibc)
 elf_loader [--lazy] --shim  <elf> [args..]     F2 path-translation shim
 elf_loader init zsh|bash                        print eval-able shell env
+elf_loader init example [zsh|bash]              print example ~/.elfrc
+elf_loader init install [--force]               write example to ${ELF_RC:-$HOME/.elfrc}
 elf_loader <elf>                                introspect (no execution)
 ```
 
