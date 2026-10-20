@@ -459,13 +459,23 @@ Milníky:
   → lokální IFUNC `JUMP_SLOT` zůstal na stubu; historie bugu `memcpy`
   u `ls`/`dir`), (2) `DF_BIND_NOW`/`DF_1_NOW`/`DT_BIND_NOW`/`LD_BIND_NOW` se
   neřešily — nový `obj_wants_bind_now()`. Zapínání `ELF_LOADER_LAZY=1`
-  (dědí se do zanořených exec, `--lazy` ne). **Měření: lazy nepřináší nic**
-  — `/bin/true` 22,2 vs 21,6 ms (šum), `bash -c true` 23,6 vs 25,5 ms
-  (horší), `reloc_done` 1013 vs 1052 µs. Důvod: Parrot libc/ld.so jsou `-z now`,
-  takže si eager vynutí samy (`BIND_NOW -> eager` u 3 objektů), a po GNU hashi
-  je relokace už jen ~1 ms. **Známý limit:** `python3` (nePIE interpret) pod
-  lazy padá `FAULT-ENTER` na vstupu guestu (bionic build na zařízení; lokální
-  glibc build ne) — root cause neizolován. A/B `test-all.sh lazybind`.
+  (dědí se do zanořených exec, `--lazy` ne). **Pád `python3` pod lazy
+  VYŘEŠEN** (commit `c69eeac`): `elf_lazy_resolve()` se volá z guest kódu
+  (PLT stub v `entry.S`), takže běžel pod **guest TP**, zatímco uvnitř dělá
+  loaderův C kód závislý na bionickém TLS (`getenv`, `fprintf`, override
+  tabulka, IFUNC resolver) → korupce guest TLS. Fix: tělo do
+  `elf_lazy_resolve_inner()` a wrapper s `dl_enter_host()`/`dl_leave_host()`
+  — **třetí výskyt téže pasti** v projektu (viz `4602b18`, `80c3ffd`).
+  Device: `python3 -c 'print(6*7)'` 5/5 → 42 (dřív 100 % SIGSEGV); plná sada
+  s oběma částmi **192/0/33** = jako default. **Měření však zisk nepotvrzuje**
+  (odpinovaně, knob na téže binárce): `/bin/true` 41,0 vs 39,5 ms,
+  `bash -c true` 41,9 vs 37,4 ms, `python3 -c pass` 205,3 vs 174,9 ms — vše
+  v šumu, rozptyl uvnitř jedné konfigurace (30,7–47,2 ms) je větší než rozdíl
+  mezi nimi, a fázová čísla si odporují (`reloc_done` bash 969 → 2208 µs,
+  python3 1503 → 915 µs). Důvod: Parrot libc/ld.so jsou `-z now`, takže si
+  eager vynutí samy (`BIND_NOW -> eager` u 3 objektů), a po GNU hashi je
+  relokace jen ~1 ms. **Default proto zůstává vypnutý — volbou podle měření,
+  ne kvůli pádu.** A/B `test-all.sh lazybind` (python3 je kritérium PASS).
 - **Prompt 10 část A (cache RELRO obrazů) — IMPLEMENTOVÁNA, default vypnutá**
   (2026-10-20, `src/imgcache.c`): ukládá `PT_GNU_RELRO` úseky modulů, moduly
   mapuje na tytéž báze (`MAP_FIXED_NOREPLACE`), klíč = BuildID+size+mtime exe
@@ -488,8 +498,8 @@ Milníky:
   [postup.md](postup.md) 2026-10-20 (5).
 - **Běhy `all` k promptu 10 (2026-10-20):** default **192/0/33**,
   `ELF_LOADER_IMGCACHE=1` (část A) **192/0/33**, obě části zapnuté
-  **160/31/34** — všech 31 pádů jde za částí B (`ELF_LOADER_LAZY=1` sám
-  rozbije `python3`, `IMGCACHE=1` sám ne), proto lazy zůstává vypnutý.
+  **160/31/34** před fixem `c69eeac` (všech 31 pádů za lazy) a po fixu
+  **192/0/33**, tedy bez regrese.
   Odpinovaně (`nh cpu unpin`) potvrzeno knobem `ELF_LOADER_NO_HASH=1` na téže
   binárce: `python3` `hooks_bti` 5538 → 1295 µs, `reloc_done` 21 228 →
   1473 µs, total 55,6 → **16,7 ms** (−70 %). **Metodika:** pinování mění

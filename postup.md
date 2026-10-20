@@ -4956,3 +4956,28 @@ ELF_LOADER_LAZY=1 … test-all.sh all`, `ashell -c`, odpinované CPU):
 jako jen s částí A. Před fixem `c69eeac` byl tentýž běh **160 / 31 / 34**,
 kde všech 31 FAILů šlo na lazy. Tím je prompt 10 část B funkčně hotová:
 cesta je ověřená celou sadou, ne jen vlastním testem kategorie.
+
+**Benchmark lazy vs eager po fixu** (odpinované CPU, `ashell`, medián ze 3
+běhů; `ELF_LOADER_LAZY` jako knob na téže binárce):
+
+| měření | eager | lazy |
+|---|---|---|
+| `/bin/true` ×300 | 41,0 ms/launch (38,5 / 43,1 / 41,0) | 39,5 (47,2 / 39,5 / 30,7) |
+| `bash -c true` ×150 | 41,9 ms (40,1 / 41,9 / 47,3) | 37,4 (37,4 / 36,6 / 39,8) |
+| `python3 -c pass` ×40 | 205,3 ms (205,3 / 176,3 / 228,5) | 174,9 (174,9 / 194,8 / 166,9) |
+| `bash` fáze `reloc_done` | 969 µs | 2208 µs |
+| `bash` fáze total | 14,9 ms | 23,2 ms |
+| `python3` fáze `reloc_done` | 1503 µs | 915 µs |
+| `python3` fáze total | 29,7 ms | 26,3 ms |
+
+**Závěr: lazy je výkonnostně neutrální, default zůstává vypnutá.** Rozptyl
+*uvnitř jedné* konfigurace (`/bin/true` 30,7–47,2 ms) je větší než rozdíl mezi
+konfiguracemi, a fázová čísla si navzájem odporují (`reloc_done` u `bash`
+lazy horší 2,2× , u `python3` lepší 1,6×) — to je podpis šumu odpinovaných
+malých jader, ne efektu. Důvod, proč tam zisk opravdu není, je nezměněný:
+Parrot `libc`/`ld.so` jsou `-z now`, takže si eager vynutí samy, a po
+`DT_GNU_HASH` je relokace už jen ~1 ms z ~15–30 ms exec.
+
+Co se změnilo proti (4): **cesta je funkčně hotová a bezpečná** — plná sada
+s oběma částmi dává 192/0/33. Zapnutí přes `ELF_LOADER_LAZY=1` je tedy
+podporované; default vypnutý je volba podle měření, ne kvůli pádu.
