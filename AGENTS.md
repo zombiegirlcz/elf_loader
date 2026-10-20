@@ -50,6 +50,26 @@ Android appce — bez nutnosti je kompilovat pro bionic/NDK.
   host unit test `test/cache_test.c` 20/20. Nasazený **NDK build loaderu GNU
   BuildID nemá** (jen `.note.android.ident`) — [postup.md](postup.md) 2026-10-20.
 
+- **DT_GNU_HASH lookup (2026-10-20, commit `396f9d3`) — exec 48 → 26 ms:**
+  `elf_scope_find` byl **lineární sken se `strcmp` přes dynsym všech modulů**
+  (libc ~3000 symbolů) → jeden lookup ~19 µs, a lookupů je na exec stovky
+  (`hooks_bti` 590, relokace jeden na každý `JUMP_SLOT`). Doplněna kopie
+  sekce `.gnu.hash` (`load_gnu_hash`, `elf_object_t.gnu_hash`) + bloom/bucket/
+  chain lookup s validací indexů; `elf_scope_find` počítá hash jednou pro
+  scope, modul bez tabulky jde dál lineárně. Navíc `hooks_bti` resolvuje 118
+  jmen `g_f2_hooks` jednou dopředu (bylo 5 × 118). Device: `hooks_bti`
+  12,3 → **1,8 ms**, `reloc_done` 1,9–14,5 → **0,3–2,2 ms**, interní total
+  `/bin/true` 30,1 → **13,5 ms**, `python3` 45,9 → **17,4 ms**; wall-clock
+  1000× `/bin/true` 51,6 → **25,8 ms/launch** (−50 %), `python3 -c 0`
+  150,6 → **102,8 ms** (−32 %). Proti stavu před cache i hashem:
+  47,4 → 25,8 / 208 → 102,8 ms. Knoby `ELF_LOADER_NO_HASH=1`,
+  `ELF_LOADER_HASH_CHECK=1` (porovná hash vs lineární sken — 0 nesouhlasů
+  lokálně i na zařízení, node 26 OK). A/B `test-all.sh symhash` (stará
+  `hooks_bti`=18 439 µs FAIL, nová 1647 µs PASS); `all` FAIL 0 (189 PASS).
+  **Důsledek: prompt 10 (cache obrazů, líné vázání) se neimplementuje** —
+  jeho vstupní podmínka po hashi nedrží, relokace je už jen 2–12 % exec —
+  [postup.md](postup.md) 2026-10-20 (3).
+
 - **Git / GitHub ochrana (2026-10-06):** ruleset `protect-master` (zákaz
   update/force-push/smazání, bypass jen admin = vlastník → cizí PR do `master`
   nejde mergnout), `protect-dev` (zákaz force-push/smazání). Workflow
@@ -427,11 +447,14 @@ Milníky:
   PATH FAILuje na guest-abs i `$ROOTFS`-abs cestě. Hypotéza: RAW `execve`
   (žádný `PT_INTERP`) → dítě bez svc-patchů i bez SIGSYS handleru (resetuje se
   při `execve`) → `set_robust_list`/`rseq` ze startu statické glibc je KILLnutý.
-- Kandidát 3 promptu 02 (cache klasifikace ELF v exec shimu — `is_glibc_elf`,
-  `elf_needs_real_exec`, shebang, symlink chain) **neimplementován**: týká se
-  jiné cesty než měřený `--ownall` start (shim pod guest TP → jen `raw_*`,
-  sdílená tabulka v memfd) a profil ukazuje rezervu v `hooks_bti`/`load`.
-  Měřit na zátěži „guest, který hodně execuje" (`make -j8`).
+- Kandidát 3 promptu 02 (cache klasifikace ELF v exec shimu) **zamítnut
+  měřením** (2026-10-20): mikro-benchmark přesné syscall sekvence dává
+  38–60 µs na exec proti ~26–48 ms celkem = 0,1 %, tedy hluboko pod šumem.
+  Vrátit se k tomu, až bude exec pod ~1 ms.
+- Prompt 10 (cache RELRO obrazů, líné vázání `JUMP_SLOT`) **neimplementován
+  záměrně**: jeho vstupní podmínka („relokace je pořád velký podíl exec") po
+  `DT_GNU_HASH` nedrží — relokace spadla na 2–12 %. Zbylá dominantní položka
+  je `ownall_start`/`load` (mmap + čtení), ne relokace.
 - Test na reálném 16K Android 15+ zařízení (Task 3).
 - ~~Bionic dlerror/errno test (Task 4).~~ **Vyřešeno** — `ldso_dlerror()` +
   guest `dlopen/dlsym/dlerror/dlclose/dladdr` nad `_rtld_global` ověřeno

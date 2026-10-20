@@ -4615,3 +4615,88 @@ v loaderu (PIE+ASLR) — po (1) nemusí být vůbec potřeba.
 smyčky v `hooks_bti` (adresy 118 jmen resolvovat jednou → 118 místo 590
 lookupů, očekávaně ~12 → ~2,5 ms). Prošla jen `gcc -fsyntax-only`; **není
 zbuilděná ani otestovaná na zařízení**, takže jakékoli číslo by byl odhad.
+
+## 2026-10-20 (3) — DT_GNU_HASH: exec ze 48 na 26 ms (prompt 02 cíl splněn)
+
+Pokračování nálezu z (2): `elf_scope_find` neměl hash tabulku. Doplněn
+`DT_GNU_HASH` lookup (commit `396f9d3`) + inverze zanořené smyčky v
+`hooks_bti`.
+
+### Implementace
+
+- `elf_object_t.gnu_hash` / `gnu_hash_words` — kopie sekce `.gnu.hash`
+  (`SHT_GNU_HASH`), nahrává `load_gnu_hash()` při loadu exe i každého modulu.
+  Indexy v `chain` ukazují do `dynsym`, protože `load_table` kopíruje
+  `.dynsym` v původním pořadí — proto se nic nemusí přemapovávat.
+- `module_hash_find()` — standardní GNU hash (bloom filtr → bucket → chain).
+  Všechny indexy se validují proti `gnu_hash_words` a `dynsym_count`, takže
+  poškozená tabulka nemůže vyjít z bufferu; v nejhorším vrátí NULL.
+- `elf_scope_find()` počítá hash **jednou** pro celý scope. Modul bez
+  `.gnu.hash` jde dál lineárně → nic se neztratí.
+- `hooks_bti`: adresy 118 jmen z `g_f2_hooks` se resolvují jednou dopředu
+  místo v zanořené smyčce (bylo 5 × 118 = **590** lookupů na každý exec).
+- Knoby: `ELF_LOADER_NO_HASH=1` (starý lineární sken, bisekce),
+  `ELF_LOADER_HASH_CHECK=1` (každý hash lookup se porovná s lineárním
+  skenem a nesouhlas se vypíše).
+
+### Korektnost
+
+`ELF_LOADER_HASH_CHECK=1` — **0 nesouhlasů** hash vs. lineární sken:
+
+- lokální glibc build: `/bin/true`, `/bin/echo`, `/bin/ls`, `bash -c true`,
+  `git --version`, `gcc --version`, `python3 -c 'print(6*7)'` → 42
+- device (`ashell -c`): `/bin/true`, `uname -m` → `aarch64`,
+  `git --version` → `git version 2.47.3`, `python3` → 42
+- node v26.10.0 `-e 'console.log(6*7)'` → 42
+
+### Naměřeno (device, `ashell -c`, medián N=7)
+
+| cíl | `reloc_done` | | `hooks_bti` | | interní total | |
+|---|---|---|---|---|---|---|
+| | před | po | před | po | před | po |
+| `/bin/true` | 1933 | **283** | 12 756 | **1759** | 30 094 | **13 523** |
+| `python3 -c 0` | 14 533 | **2230** | 12 252 | **1891** | 45 892 | **17 416** |
+| `gcc --version` | 4163 | **965** | 12 049 | **1888** | 28 709 | **15 098** |
+| `git --version` | 7464 | **2092** | 11 857 | **1791** | 35 268 | **17 102** |
+| `bash -c true` | 5853 | **1527** | 11 830 | **1752** | 33 805 | **16 091** |
+
+(µs; „před" = build s cache v2 bez hashe, tedy čistě efekt hashe.)
+
+Wall-clock A/B (`elf_loader.prev` = build bez hashe, medián z 3 smyček):
+
+| zátěž | před | po | |
+|---|---|---|---|
+| 1000× `$R/bin/true` | 51,6 ms/launch | **25,8 ms/launch** | −50 % |
+| 100× `python3 -c 0` | 150,6 ms/launch | **102,8 ms/launch** | −32 % |
+
+**Proti stavu na začátku dne** (před cache i hashem): `/bin/true`
+47,4 → **25,8 ms** (−46 %), `python3 -c 0` 208 → **102,8 ms** (−51 %).
+Cíl promptu 02 („48 → ~20 ms") je tím v podstatě splněn.
+
+### A/B regresní test
+
+Nová kategorie `test-all.sh symhash` (v `all`): (a) hash i
+`ELF_LOADER_NO_HASH=1` dají `42`, (b) `ELF_LOADER_HASH_CHECK=1` nehlásí ani
+jeden nesouhlas, (c) `hooks_bti` < 6000 µs.
+
+```
+NOVÁ:   PASS symhash: hash==linear, 0 nesouhlasu, hooks_bti=1647us (<6000)
+STARÁ:  FAIL symhash: ... mismatch=0 hooks_bti=18439us
+```
+
+Regrese: všechny kategorie **FAIL 0** (189 PASS / 34 SKIP), navíc node 26
+a `test-all.sh madv`. Bun (`claude.exe`) se otestovat nedal — binárka už na
+zařízení není (`$R/root/claudetest/` neexistuje).
+
+### Důsledek pro prompt 10 — části A i B jsou tím odložené
+
+Prompt 10 má vstupní podmínku „pokračuj jen pokud profil ukazuje, že
+relokace/lookupy jsou pořád velký podíl exec". **Po hashi už neplatí:**
+relokace spadla z 6–31 % na **2–12 %** (283–2230 µs). Část A (cache RELRO
+obrazů) i část B (líné vázání `JUMP_SLOT` s resolver trampolínou pod guest
+TP) by tedy řešily nejvýš jednotky procent exec — za cenu nejrizikovějších
+změn v celém loaderu (obraz s pointery na shimy v PIE loaderu s ASLR,
+resp. resolver pod guest TP, IFUNC/TLSDESC eager, `DF_1_NOW`).
+**Rozhodnutí: neimplementovat**, dokud profil neukáže něco jiného. Pokud se
+k tomu někdo vrátí, ať nejdřív zopakuje tabulku výše — zbylá dominantní
+položka je `ownall_start`/`load` (mmap + čtení souborů), ne relokace.

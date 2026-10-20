@@ -1323,6 +1323,46 @@ category_execcache() {
     fi
 }
 
+# DT_GNU_HASH lookup symbolu (src/elf_loader.c). Overuje: (a) hash a
+# linearni sken daji stejny vysledek programu, (b) kontrolni rezim nehlasi
+# ani jeden nesouhlas hash vs linear, (c) faze hooks_bti spadla pod 6 ms
+# (pred hashem ~12 ms na kazde binarce - 590 lookupu x ~19 us).
+category_symhash() {
+    echo ""
+    echo "=== DT_GNU_HASH lookup symbolu ==="
+    local env="ROOTFS=$R ELF_ROOTFS=$R ELF_LOADER=$L"
+    local py="$R/usr/bin/python3"
+    if [ ! -x "$py" ]; then
+        echo "SKIP symhash: chybi python3"
+        echo "SKIP: symhash - no python3" >> "$SKIP_LOG"
+        ((SKIP_COUNT++)) || true
+        return
+    fi
+
+    local o_hash o_lin n_mis bti ok=1
+    o_hash=$(ashell_out "$env $L --ownall $py -c 'print(6*7)'" 2>&1)
+    o_lin=$(ashell_out "$env ELF_LOADER_NO_HASH=1 $L --ownall $py -c 'print(6*7)'" 2>&1)
+    n_mis=$(ashell_out "$env ELF_LOADER_HASH_CHECK=1 $L --ownall $py -c 'print(6*7)'" 2>&1 \
+            | grep -c 'hashcheck' || true)
+    bti=$(ashell_out "$env ELF_LOADER_TIMING=1 $L --ownall $py -c 0" 2>&1 \
+          | grep '] hooks_bti ' | sed 's/.*delta=\([0-9]*\)us.*/\1/' | tail -1)
+
+    printf '%s' "$o_hash" | grep -q 42 || ok=0
+    printf '%s' "$o_lin"  | grep -q 42 || ok=0
+    [ "${n_mis:-1}" = 0 ] || ok=0
+    [ -n "$bti" ] && [ "$bti" -lt 6000 ] || ok=0
+
+    if [ "$ok" = 1 ]; then
+        echo "PASS symhash: hash==linear, 0 nesouhlasu, hooks_bti=${bti}us (<6000)"
+        echo "PASS: symhash - DT_GNU_HASH lookup" >> "$PASS_LOG"
+        ((PASS_COUNT++)) || true
+    else
+        echo "FAIL symhash: hash=[$o_hash] linear=[$o_lin] mismatch=$n_mis hooks_bti=${bti}us"
+        echo "FAIL: symhash - DT_GNU_HASH | mismatch=$n_mis hooks_bti=$bti" >> "$FAIL_LOG"
+        ((FAIL_COUNT++)) || true
+    fi
+}
+
 category_timing() {
     echo ""
     echo "=== fázový profil exec (ELF_LOADER_TIMING) ==="
@@ -1691,6 +1731,10 @@ case "${1:-all}" in
         category_execcache
         print_summary
         ;;
+    symhash)
+        category_symhash
+        print_summary
+        ;;
     bigargv)
         category_bigargv
         print_summary
@@ -1758,6 +1802,7 @@ case "${1:-all}" in
         category_bionic
         category_staticexec
         category_execcache
+        category_symhash
         category_lxc
         category_dw
         category_elfrc
