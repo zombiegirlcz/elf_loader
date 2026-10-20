@@ -41,3 +41,4 @@ test/echo
 .playwright-mcp/
 results/
 nohup.out
+cache/

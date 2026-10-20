@@ -2,7 +2,9 @@
  *
  * Verifies: key stability, invalidation on mtime/size/BuildID change,
  * store->load round trip, atomic write leaves no .tmp, corrupt file = miss,
- * missing file = miss, and that the real loader ELF yields a BuildID key.
+ * missing file = miss, that the real loader ELF yields a BuildID key, and
+ * (format v2) that a NEGATIVE scan result (scanned, 0 sites) round-trips
+ * while an inconsistent slot (sites without `scanned`) is rejected.
  * Build: cc -Wall -Iinclude -Isrc test/cache_test.c src/cache.c -o /tmp/ct
  */
 #define _GNU_SOURCE
@@ -69,8 +71,11 @@ int main(int argc, char **argv) {
     cm.nr[0] = 99; cm.nr[1] = 293; cm.nr[2] = 435; cm.nr[3] = 151; cm.nr[4] = 152;
     uint32_t a1[] = { 0x1234, 0x5678 };
     uint32_t a2[] = { 0x9abc };
-    cm.list[0].n = 2; cm.list[0].off = a1;
-    cm.list[1].n = 1; cm.list[1].off = a2;
+    cm.list[0].n = 2; cm.list[0].off = a1; cm.list[0].scanned = 1;
+    cm.list[1].n = 1; cm.list[1].off = a2; cm.list[1].scanned = 1;
+    /* slot 2 = naskenovano, zadny nalez (negativni vysledek) */
+    cm.list[2].scanned = 1;
+    /* sloty 3,4 = nenaskenovano */
     CHECK(cache_store_module(k1, &cm) == 1, "store returns success");
 
     char tmppath[5000];
@@ -92,7 +97,25 @@ int main(int argc, char **argv) {
               "round trip preserves nr/offsets (slot 0)");
         CHECK(cm2->list[1].n == 1 && cm2->list[1].off[0] == 0x9abc,
               "round trip preserves nr/offsets (slot 1)");
+        CHECK(cm2->list[2].scanned == 1 && cm2->list[2].n == 0,
+              "negative result (scanned, 0 sites) round-trips");
+        CHECK(cm2->list[3].scanned == 0 && cm2->list[4].scanned == 0,
+              "un-scanned slots stay un-scanned");
         cache_module_free(cm2);
+    }
+
+    /* Nekonzistentni slot (nalezy bez `scanned`) = poskozeny zapis -> miss. */
+    {
+        cache_module_t bad;
+        memset(&bad, 0, sizeof bad);
+        bad.nr[0] = 99;
+        bad.list[0].n = 1; bad.list[0].off = a2; bad.list[0].scanned = 0;
+        char kbad[CACHE_KEY_MAX];
+        cache_build_key(img, sizeof img, 7777, kbad, sizeof kbad);
+        CHECK(cache_store_module(kbad, &bad) == 1, "store of inconsistent slot writes");
+        cache_module_t *cb = cache_load_module(kbad);
+        CHECK(cb == NULL, "sites without `scanned` -> rejected on load");
+        if (cb) cache_module_free(cb);
     }
 
     int fd = open(tmppath, O_WRONLY);
@@ -101,10 +124,15 @@ int main(int argc, char **argv) {
     CHECK(cm2 == NULL, "corrupt cache file -> silent miss");
     if (cm2) cache_module_free(cm2);
 
-    cm2 = cache_load_module("doesnotexist_1_1_v1");
+    cm2 = cache_load_module("doesnotexist_1_1_v2");
     CHECK(cm2 == NULL, "missing cache file -> silent miss");
 
-    const char *self = argc > 1 ? argv[1] : "/root/elf_loader/elf_loader";
+    /* Pozn.: NDK build loaderu GNU BuildID NEMA (jen .note.android.ident),
+     * takze se kontroluje ELF z rootfs (glibc je BuildID vzdy ma) - to je
+     * i modul, u ktereho na cache skutecne zalezi. */
+    const char *self = argc > 1 ? argv[1] :
+        "/data/user/0/com.linux_core/files/nh/distro/parrot"
+        "/usr/lib/aarch64-linux-gnu/libc.so.6";
     FILE *f = fopen(self, "rb");
     if (f) {
         fseek(f, 0, SEEK_END); long sz = ftell(f); fseek(f, 0, SEEK_SET);
@@ -114,7 +142,7 @@ int main(int argc, char **argv) {
                 char kk[CACHE_KEY_MAX];
                 cache_build_key(buf, (size_t)sz, 42, kk, sizeof kk);
                 printf("info: key(%s) = %s\n", self, kk);
-                CHECK(strstr(kk, "nobid") == NULL, "real ELF has GNU BuildID");
+                CHECK(strstr(kk, "nobid") == NULL, "real glibc ELF has GNU BuildID");
             }
             free(buf);
         }

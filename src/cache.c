@@ -76,6 +76,22 @@ static void hex(const unsigned char *b, size_t n, char *out)
     out[2 * n] = 0;
 }
 
+/* Identita buildu loaderu. Cache nese VYSLEDKY jeho skenu, takze po
+ * prekladu loaderu (zmena patch logiky, jinych kill-syscallu) musi stara
+ * cache propadnout - jinak by se prebila jina mista, nez novy loader chce.
+ * FNV-1a z __DATE__/__TIME__: compile-time, zadna runtime cena, v ramci
+ * jednoho buildu konstantni. */
+static unsigned loader_build_tag(void)
+{
+    static const char stamp[] = __DATE__ " " __TIME__;
+    unsigned h = 2166136261u;
+    for (size_t i = 0; i < sizeof stamp - 1; i++) {
+        h ^= (unsigned char)stamp[i];
+        h *= 16777619u;
+    }
+    return h;
+}
+
 void cache_build_key(const void *file_map, size_t fsize, long long mtime_ns,
                      char *out, size_t outsz)
 {
@@ -89,8 +105,9 @@ void cache_build_key(const void *file_map, size_t fsize, long long mtime_ns,
         hex(raw, rawlen, bid);
     else
         strcpy(bid, "nobid");
-    snprintf(out, outsz, "%s_%llu_%lld_v%u", bid,
-             (unsigned long long)fsize, mtime_ns, (unsigned)CACHE_FORMAT_VERSION);
+    snprintf(out, outsz, "%s_%llu_%lld_v%u-%08x", bid,
+             (unsigned long long)fsize, mtime_ns,
+             (unsigned)CACHE_FORMAT_VERSION, loader_build_tag());
 }
 
 /* ------------------------------------------------------------------ */
@@ -162,10 +179,10 @@ static unsigned char *serialize(const cache_module_t *cm, size_t *out_sz)
     for (int i = 0; i < CACHE_NR_COUNT; i++) {
         int64_t nr = cm->nr[i];
         uint32_t cnt = cm->list[i].n;
-        uint32_t pad = 0;
+        uint32_t scanned = cm->list[i].scanned ? 1u : 0u;
         memcpy(p, &nr, 8); p += 8;
         memcpy(p, &cnt, 4); p += 4;
-        memcpy(p, &pad, 4); p += 4;
+        memcpy(p, &scanned, 4); p += 4;
         if (cnt) {
             memcpy(p, cm->list[i].off, (size_t)cnt * 4);
             p += (size_t)cnt * 4;
@@ -219,13 +236,16 @@ cache_module_t *cache_load_module(const char *key)
     int ok = 1;
     for (int i = 0; i < CACHE_NR_COUNT && ok; i++) {
         if (p + 16 > end) { ok = 0; break; }
-        int64_t nr; uint32_t cnt;
+        int64_t nr; uint32_t cnt, scanned;
         memcpy(&nr, p, 8); p += 8;
         memcpy(&cnt, p, 4); p += 4;
-        p += 4;
+        memcpy(&scanned, p, 4); p += 4;
         if (cnt > CACHE_MAX_SITES || p + (size_t)cnt * 4 > end) { ok = 0; break; }
+        /* n > 0 bez `scanned` by byl nekonzistentni zapis -> zahod cely soubor. */
+        if (cnt && !scanned) { ok = 0; break; }
         cm->nr[i] = (long)nr;
         cm->list[i].n = cnt;
+        cm->list[i].scanned = scanned ? 1u : 0u;
         if (cnt) {
             cm->list[i].off = malloc((size_t)cnt * 4);
             if (!cm->list[i].off) { ok = 0; break; }

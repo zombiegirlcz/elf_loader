@@ -6,7 +6,10 @@
 
 /* BuildID-keyed cache pro vysledky skenu/hook-lookupu v exec ceste.
  *
- * Cache soubor = <cache_dir>/<buildid hex or "nobid">_<size>_<mtime_ns>_<ver>
+ * Cache soubor =
+ *   <cache_dir>/<buildid hex or "nobid">_<size>_<mtime_ns>_v<ver>-<loader tag>
+ * `loader tag` = FNV-1a z __DATE__/__TIME__ loaderu, takze po jeho prekladu
+ * se stara cache (vysledky skenu stareho loaderu) nikdy nepouzije.
  * Kazdy modul ma vlastni soubor. Pri zmene binarky (jiny BuildID/size/mtime)
  * vznikne jiny klic -> stara cache se nikdy nepouzije.
  *
@@ -14,8 +17,12 @@
  * TP), takze stdio/malloc/getenv jsou bezpecne. Zadny kod pod guest TP je
  * odsud nevolá. */
 
-/* Format cache souboru. Pri zmene layoutu bumpni. */
-#define CACHE_FORMAT_VERSION 1u
+/* Format cache souboru. Pri zmene layoutu bumpni.
+ * v2: slot nese priznak `scanned`, takze se cachuje i NEGATIVNI vysledek
+ *     skenu (modul pro dane syscall cislo zadny svc-site nema). Bez toho
+ *     se moduly bez nalezu (libm, libz, libexpat...) skenovaly pri kazdem
+ *     exec znovu - viz postup.md 2026-10-20. */
+#define CACHE_FORMAT_VERSION 2u
 
 /* Pocet syscall cisel, ktera elf_patch_syscall_sites prebiji (99,151,152,
  * 293,435) a jejichz svc-site offsety se do cache ukladaji. */
@@ -23,11 +30,16 @@
 #define CACHE_MAX_SITES 64
 #define CACHE_KEY_MAX  192
 
-/* Vysledek skenu pro jedno syscall cislo: file offsety (p_offset-relative)
- * instrukci `svc #0` patri­cich sekvenci `movz x8,#nr ; ... ; svc #0`. */
+/* Vysledek skenu pro jedno syscall cislo: link-time vaddr instrukci `svc #0`
+ * patri­cich sekvenci `movz x8,#nr ; ... ; svc #0`.
+ *
+ * `scanned` = sken pro tohle cislo uz probehl a `n`/`off` jsou jeho UPLNY
+ * vysledek (vcetne n == 0). Jen tak lze preskocit sken i u modulu, ktere
+ * zadny svc-site nemaji - a tech je vetsina. */
 typedef struct {
     uint32_t n;
-    uint32_t *off;   /* malloc'd pole n file offsetu */
+    uint32_t scanned;
+    uint32_t *off;   /* malloc'd pole n link-time vaddr */
 } cache_nr_t;
 
 /* Cela cache jednoho modulu: pevne CACHE_NR_COUNT cisel. */

@@ -63,6 +63,8 @@ typedef struct {
     struct elf_scope *scope;
 
     char *cache_key;   /* malloc'd BuildID+size+mtime klic (NULL nezjistitelny) */
+    int   svc_patched; /* elf_patch_syscall_sites_all uz nad modulem probehl */
+    int   cache_dirty; /* probehl sken -> cache souboru se musi zapsat */
     void *cache;       /* cache_module_t* - opaque, viz src/cache.h */
 } elf_object_t;
 

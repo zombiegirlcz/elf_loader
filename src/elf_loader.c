@@ -1930,13 +1930,64 @@ static void *va(const elf_object_t *obj, size_t vaddr) {
     return (char *)obj->base_addr + (vaddr - map_base_vaddr(obj));
 }
 
-/* Vrati index slotu v cache pro dane syscall nr, nebo -1. */
+/* Cache zapnuta? (ELF_LOADER_NO_CACHE=1 vypne load i store.) */
+static int cache_enabled(void) {
+    static int e = -1;
+    if (e < 0)
+        e = getenv("ELF_LOADER_NO_CACHE") ? 0 : 1;
+    return e;
+}
+
+/* Zneplatni slot pro dane nr: vysledek skenu je neuplny, takze se nesmi
+ * ulozit jako hotovy (jinak by se pri dalsim exec nekterá misto nepatchlo). */
+static void cache_invalidate(elf_object_t *m, long nr) {
+    cache_module_t *cm = m ? (cache_module_t *)m->cache : NULL;
+    if (!cm)
+        return;
+    for (int i = 0; i < CACHE_NR_COUNT; i++)
+        if (cm->nr[i] == nr) {
+            cm->list[i].scanned = 0;
+            cm->list[i].n = 0;
+            m->cache_dirty = 1;
+        }
+}
+
+/* Vrati index slotu v cache pro dane syscall nr, nebo -1. Slot musi byt
+ * `scanned` - jinak je to jen prazdna polozka, ne vysledek skenu. */
 static int cache_slot(const cache_module_t *cm, long nr) {
     if (!cm)
         return -1;
     for (int i = 0; i < CACHE_NR_COUNT; i++)
-        if (cm->nr[i] == nr)
+        if (cm->nr[i] == nr && cm->list[i].scanned)
             return i;
+    return -1;
+}
+
+/* Zalozi (nebo najde) slot pro dane nr a oznaci ho jako naskenovany. Vraci
+ * index slotu nebo -1. Volat PRED skenem: i sken s nulovym nalezem se musi
+ * do cache zapsat, jinak se modul sken­uje pri kazdem exec znovu. */
+static int cache_mark_scanned(elf_object_t *m, long nr) {
+    if (!m)
+        return -1;
+    cache_module_t *cm = (cache_module_t *)m->cache;
+    if (!cm) {
+        cm = calloc(1, sizeof *cm);
+        if (!cm)
+            return -1;
+        m->cache = cm;
+    }
+    for (int i = 0; i < CACHE_NR_COUNT; i++)
+        if (cm->nr[i] == nr && cm->list[i].scanned)
+            return i;
+    for (int i = 0; i < CACHE_NR_COUNT; i++) {
+        if (cm->list[i].scanned)
+            continue;
+        cm->nr[i] = nr;
+        cm->list[i].scanned = 1;
+        cm->list[i].n = 0;
+        m->cache_dirty = 1;   /* obsah cache se zmenil -> zapsat */
+        return i;
+    }
     return -1;
 }
 
@@ -1946,27 +1997,20 @@ static int cache_slot(const cache_module_t *cm, long nr) {
 static void cache_record_site(elf_object_t *m, long nr, uintptr_t link_vaddr) {
     if (!m)
         return;
-    cache_module_t *cm = (cache_module_t *)m->cache;
-    if (!cm) {
-        cm = calloc(1, sizeof *cm);
-        if (!cm)
-            return;
-        m->cache = cm;
-    }
-    int slot = cache_slot(cm, nr);
-    if (slot < 0) {
-        for (int i = 0; i < CACHE_NR_COUNT; i++)
-            if (cm->nr[i] == 0 && cm->list[i].n == 0) { slot = i; break; }
-        if (slot < 0)
-            return;
-        cm->nr[slot] = nr;
-    }
-    if (cm->list[slot].n >= CACHE_MAX_SITES)
+    int slot = cache_mark_scanned(m, nr);
+    if (slot < 0)
         return;
+    cache_module_t *cm = (cache_module_t *)m->cache;
+    if (cm->list[slot].n >= CACHE_MAX_SITES) {
+        cache_invalidate(m, nr);   /* neuplny seznam -> priste znovu skenovat */
+        return;
+    }
     uint32_t *no = realloc(cm->list[slot].off,
                            ((size_t)cm->list[slot].n + 1) * sizeof(uint32_t));
-    if (!no)
+    if (!no) {
+        cache_invalidate(m, nr);
         return;
+    }
     cm->list[slot].off = no;
     cm->list[slot].off[cm->list[slot].n++] = (uint32_t)link_vaddr;
 }
@@ -2018,6 +2062,11 @@ void elf_patch_syscall_sites(elf_object_t *m, long nr, long err) {
         }
     }
 
+    /* Miss -> skenujeme. Slot zaloz PRED skenem, aby se zapsal i NEGATIVNI
+     * vysledek (0 nalezu): jinak by se modul skenoval pri kazdem exec znovu. */
+    if (cache_enabled())
+        cache_mark_scanned(m, nr);
+
     int patched = 0;
     for (int i = 0; i < m->phdr_count; i++) {
         if (m->phdr[i].p_type != PT_LOAD)
@@ -2045,6 +2094,10 @@ void elf_patch_syscall_sites(elf_object_t *m, long nr, long err) {
                                  PROT_READ | PROT_EXEC);
                         patched++;
                         cache_record_site(m, nr, seg_vaddr + (uintptr_t)j * 4);
+                    } else {
+                        /* Misto se nepodarilo prepsat -> cache by tvrdila, ze
+                         * sken je hotovy, a priste by se uz nehledalo. */
+                        cache_invalidate(m, nr);
                     }
                     break;
                 }
@@ -2067,6 +2120,16 @@ void elf_patch_syscall_sites(elf_object_t *m, long nr, long err) {
 }
 
 void elf_patch_syscall_sites_all(elf_object_t *m) {
+    if (!m)
+        return;
+    /* Moduly nactene pres elf_load_shared se patchi uz pri loadu; smycka
+     * v main.c je pak probehne znovu a cely .text skenuje podruhe (na
+     * druhy pruchod uz zadne misto nenajde - svc je prepsany). Priznak
+     * ten druhy pruchod usetri. ELF_LOADER_DOUBLE_PATCH=1 vrati stare
+     * chovani (bisekce). */
+    if (m->svc_patched && !getenv("ELF_LOADER_DOUBLE_PATCH"))
+        return;
+    m->svc_patched = 1;
     static const struct { long nr; long err; } kill_syscalls[] = {
         { 99,  0 },      /* set_robust_list -> NOP */
         { 293, 0 },      /* rseq            -> NOP */
@@ -3417,8 +3480,10 @@ elf_object_t *elf_load_shared(const char *path, elf_scope_t *scope) {
     }
     /* Cache modulu zapsat jednou, po vsech 5 pruchodech (jen kdyz existuje
      * cache_key a neni zakazana pres ELF_LOADER_NO_CACHE). */
-    if (m->cache_key && m->cache && !getenv("ELF_LOADER_NO_CACHE"))
+    if (m->cache_key && m->cache && m->cache_dirty && cache_enabled()) {
         cache_store_module(m->cache_key, (cache_module_t *)m->cache);
+        m->cache_dirty = 0;
+    }
     if (elf_debug())
         printf("[+] own-loaded module: %s (base %p, %zu dynsym)\n", path,
            (void *)base, m->dynsym_count);

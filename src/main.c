@@ -4221,16 +4221,22 @@ static int run_ownall(const char *path, int argc, char **argv, char **envp) {
             elf_patch_syscall_sites_all(obj);
         }
         /* Zapis cache modulu jednou po vsech 5 pruchodech. */
+        /* Zapisuj jen moduly, nad kterymi sken skutecne probehl (cache_dirty).
+         * Na cache hit se tim nezapisuje vubec nic. */
         if (!getenv("ELF_LOADER_NO_CACHE")) {
             for (size_t mi = 0; mi < scope->count; mi++) {
                 elf_object_t *m = scope->mods[mi];
-                if (m->cache_key && m->cache)
+                if (m->cache_key && m->cache && m->cache_dirty) {
                     cache_store_module(m->cache_key,
                                        (cache_module_t *)m->cache);
+                    m->cache_dirty = 0;
+                }
             }
-            if (obj->cache_key && obj->cache)
+            if (obj->cache_key && obj->cache && obj->cache_dirty) {
                 cache_store_module(obj->cache_key,
                                    (cache_module_t *)obj->cache);
+                obj->cache_dirty = 0;
+            }
         }
     }
     if (g_tls_trace)
