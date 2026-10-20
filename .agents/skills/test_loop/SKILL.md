@@ -39,9 +39,9 @@ cokoliv prohlásíš za funkční/opravené, projdi obě:
 ## Prostředí — co kde je
 
 - **Proot (lokální workspace agenta)**: `/root/elf_loader`. Tady píšu kód, tady běží `modal`, `bash`, kompilace.
-- **Device mount**: `files/` v repu je bind‑mount na device `/data/user/0/com.linux_core/files`
+- **Device mount**: `/data` v proot je bind‑mount na device `/data/user/0/com.linux_core/files`
   (privátní data složka appky, vlastník `u0_a310` = uid 10310).
-  ⇒ zápis do `/root/elf_loader/files/...` == zápis na device. Žádný `adb push`, žádný `su`.
+  ⇒ zápis do `/data/user/0/com.linux_core/files/...` == zápis na device. Žádný `adb push`, žádný `su`.
 - **Sdílený rootfs**: `files/nh/distro/parrot` == device `/data/.../files/nh/distro/parrot`
   (parrot/NetHunter glibc rootfs, proměnná `$ROOTFS`). Proot a device vidí **identické** prostředí —
   to je důvod, proč testovací smyčka funguje konzistentně bez přepínání kontextu.
@@ -54,7 +54,7 @@ cokoliv prohlásíš za funkční/opravené, projdi obě:
 1. Napíšeš kód              →  /root/elf_loader/src/*.c  (v prootu)
 2. Zkompiluješ             →  modal run finale_loader_build.py
                               (NDK cross‑compile, cloud image; výstup /tmp/elf_loader_ndk)
-3. Pushneš ven z prootu    →  cp /tmp/elf_loader_ndk /root/elf_loader/files/usr/bin/elf_loader
+3. Pushneš ven z prootu    →  cp /tmp/elf_loader_ndk /data/../files/usr/bin/elf_loader
                               && chmod 755        (jde rovnou na device přes mount)
 4. Otestuješ přes ashell   →  ashell -c '<device prikaz>'
 ```
@@ -79,7 +79,7 @@ Krok po kroku:
 
 ## ashell konfigurace
 
-- **Config**: `ashellrc=/root/elf_loader/files/ashell.conf` (na device, zrcadleno v `files/ashell.conf`).
+- **Config**: `ashellrc/data=../files/ashell.conf` .
   Nastavuje env app shellu (PATH, ROOTFS, ELF_LOADER, TERMINFO, …) a ukazuje ashell na
   správné device adresáře.
 - **`apps hell` (ashell)** = omezený shell appky; běží jako uid 10310 v SELinux doméně appky.

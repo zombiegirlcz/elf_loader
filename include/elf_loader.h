@@ -49,6 +49,7 @@ typedef struct {
 
     char *origin_dir;
     char *soname;
+    char *full_path;   /* host cesta, ze ktere byl modul nacten (pro dladdr) */
 
     Elf64_Rela *jmp_rela;
     size_t jmp_size;

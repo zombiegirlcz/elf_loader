@@ -1735,7 +1735,10 @@ int ldso_dladdr(const void *addr, void *info_out) {
         if (!m || !m->base_addr) continue;
         uintptr_t b = (uintptr_t)m->base_addr;
         if (a >= b && a < b + m->total_size) {
-            out[0] = m->soname;
+            /* glibc dladdr vraci PLNou cestu (dli_fname), ne basename -
+             * os::jvm_path() z ni dela realpath("libjvm.so") a jinak selze
+             * (ENOENT mimo cwd) -> "Failed setting boot class path." */
+            out[0] = m->full_path ? m->full_path : m->soname;
             out[1] = (const char *)b;
             return 1;
         }
@@ -3642,6 +3645,7 @@ elf_object_t *elf_load_shared(const char *path, elf_scope_t *scope) {
     }
     m->scope = scope;
     m->soname = soname;
+    m->full_path = strdup(resolved);
     {
         const char *slash = strrchr(path, '/');
         m->origin_dir = slash ? strndup(path, slash - path) : strdup(".");
@@ -5130,10 +5134,25 @@ static void fault_handler(int sig, siginfo_t *si, void *ctx) {
                  * bionickym TP -> V8 by prectl garbage (0x2853_xxxx_xxxx),
                  * neodemkl by RO heap stranku a instrukce by znovu faultla
                  * (FAULT#2). Po navratu TP obnovime. */
-                extern uintptr_t g_tls_new_tp;
+                extern uintptr_t g_tls_new_tp, g_tls_old_tp;
                 uintptr_t saved_tp = dl_tp_get();
-                int sw = (g_tls_new_tp && saved_tp != g_tls_new_tp);
-                if (sw) dl_tp_set(g_tls_new_tp);
+                /* Chain MUSI bezet pod GUEST (parrot) TP TOHOTO vlakna.
+                 * Kdyz uz pod guest TP jsme (typicky SIGSEGV z JIT kodu
+                 * HotSpotu na libovolnem vlacne - implicit null-check),
+                 * NEPREPINAT na hlavni g_tls_new_tp: hotspot handler pak
+                 * cte Thread::current() z ciziho TLS -> sam faultuje ->
+                 * nekonecny re-fault (FAULT#2..#N, stejne PC). Prepneme
+                 * jen kdyz bezime pod host (bionic) TP; pro vedlejsi
+                 * vlakna najdeme guest TP pres bb_pair_find. */
+                uintptr_t guest_tp = 0;
+                if (g_tls_old_tp && saved_tp != g_tls_old_tp) {
+                    guest_tp = saved_tp;                     /* uz pod guest TP */
+                } else {
+                    guest_tp = bb_pair_find(saved_tp, 0);    /* host -> guest */
+                    if (!guest_tp) guest_tp = g_tls_new_tp;
+                }
+                int sw = (guest_tp && saved_tp != guest_tp);
+                if (sw) dl_tp_set(guest_tp);
                 if (gflags & 0x4UL /* SA_SIGINFO */)
                     ((void (*)(int, siginfo_t *, void *))gh)(sig, si, ctx);
                 else
