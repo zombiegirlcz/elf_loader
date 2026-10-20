@@ -4155,7 +4155,17 @@ int elf_relocate(elf_object_t *obj) {
     for (size_t off = 0; off < rela_size; off += sizeof(Elf64_Rela)) {
         Elf64_Rela *r = (Elf64_Rela *)((char *)rela + off);
         uint64_t *where = (uint64_t *)(base + (r->r_offset - mbv));
-        if (img_relro_covers(obj, where)) { count++; continue; }
+        /* TLS relokace se NESMI preskocit ani kdyz je slot v obnovenem
+         * RELRO: relocate_tls() ma vedlejsi efekty (TLS blok/offset modulu),
+         * ne jen zapis hodnoty. Bez toho padal guest hned na vstupu
+         * (FAULT-ENTER) - viz postup.md 2026-10-20 (5). */
+        /* Obrazova cache preskakuje VYHRADNE JUMP_SLOT (drahe symbol
+         * lookupy). Sirsi preskakovani rozbilo guest uz na vstupu
+         * (FAULT-ENTER), i kdyz obsah obrazu byl bitove shodny s plnou
+         * relokaci - nektera relokace ma tedy vedlejsi efekt, ne jen zapis
+         * hodnoty (RELATIVE/COPY/TLS). Viz postup.md 2026-10-20 (5). */
+        if (ELF64_R_TYPE(r->r_info) == R_AARCH64_JUMP_SLOT &&
+            img_relro_covers(obj, where)) { count++; continue; }
         size_t sym_idx = ELF64_R_SYM(r->r_info);
         switch (ELF64_R_TYPE(r->r_info)) {
         case R_AARCH64_RELATIVE:
@@ -4217,7 +4227,8 @@ int elf_relocate(elf_object_t *obj) {
         Elf64_Rela *r = (Elf64_Rela *)((char *)jmp_rela + off);
         uint64_t *where = (uint64_t *)(base + (r->r_offset - mbv));
 
-        if (img_relro_covers(obj, where)) { count++; continue; }
+        if (ELF64_R_TYPE(r->r_info) == R_AARCH64_JUMP_SLOT &&
+            img_relro_covers(obj, where)) { count++; continue; }
         if (ELF64_R_TYPE(r->r_info) == R_AARCH64_IRELATIVE)
             continue;
         if (ELF64_R_TYPE(r->r_info) == R_AARCH64_TLSDESC ||
