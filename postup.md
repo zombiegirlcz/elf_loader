@@ -4769,3 +4769,95 @@ s ASLR — buď pevná báze loaderu, nebo přepisování GOT položek po načte
 obrazu. Poměr přínos/riziko je neobhajitelný. **Neimplementováno**; kdyby se
 k tomu někdo vracel, ať nejdřív zopakuje fázový profil — dominantní položka
 je dnes `ownall_start`/`load` (mmap + čtení souborů), ne relokace.
+
+## 2026-10-20 (5) — prompt 10 část A: obrazová cache RELRO (implementována, default vypnutá)
+
+Implementováno v novém `src/imgcache.c` (commity `1d69535`, `4049f7b`,
+`20fdd76`, `9316f82`, `2fd1e72`). Po relokaci se uloží `PT_GNU_RELRO` úseky
+modulů (GOT, `.got.plt`, `.data.rel.ro`) a při dalším exec se moduly mapují
+na **tytéž báze** a RELRO se načte z obrazu místo relokace.
+
+### Klíč a determinismus
+
+- Klíč obrazu: BuildID+size+mtime hlavní binárky (ten už nese **build tag
+  loaderu** z `cache.c`) + `PAGE_SIZE` + `AT_HWCAP`/`AT_HWCAP2` (IFUNC
+  resolvery závisí na CPU). Každý modul navíc nese svůj cache klíč, který se
+  při restore porovnává; nesouhlas = plná relokace.
+- Báze: `g_img_pref_base` + `MAP_FIXED_NOREPLACE` v `map_elf_segments`.
+  Když je místo obsazené, mmap selže a jde se standardní cestou.
+- Zápis atomicky (`tmp` + `rename`).
+
+### Pointery do loaderu — rozhodnutí (prompt to vyžaduje zdůvodnit)
+
+Loader je PIE, který mapuje bionic linker, takže **pevnou bázi vynutit nelze**.
+Zvolena druhá varianta: neukládá se absolutní adresa, ale **offset od báze
+obrazu loaderu**, a při restore se přičte aktuální báze. Rozsah obrazu se bere
+z `PT_LOAD` přes `dl_iterate_phdr` — **přesně**, ne odhadem; odhad „64 MB od
+báze" by zahrnul haldu loaderu a rebase by ji rozbil. Platnost zajišťuje klíč:
+nese build tag loaderu, takže obraz z jiného buildu se nikdy nepoužije.
+
+### Čtyři věci, které vyšly až z běhu (ne z návrhu)
+
+1. **Ukládat celé `PF_W` segmenty nejde.** První verze to dělala a restore
+   spolehlivě padal SIGSEGV: `.data`/`.bss` drží per-běhový stav
+   (`__curbrk` = báze haldové arény, `__libc_stack_end`, stack guard).
+   Zúženo na `PT_GNU_RELRO` — což je i to, co prompt myslí „RELRO-sharing".
+2. **Přeskočit celé `elf_relocate()` nejde.** Pak nikdy neproběhl
+   `apply_segment_prots()`, takže `.text` zůstal bez `PROT_EXEC` (a `RELATIVE`
+   relokace v `.data` se neaplikovaly) → SIGSEGV na prvním volání do libc.
+   Nově obraz pokrývá jen **RELRO sloty**: `img_relro_covers()` řekne
+   `elf_relocate`, které sloty jsou hotové, vše ostatní proběhne normálně.
+3. **Klasifikace „je to pointer?" se nedá dělat heuristikou.** Filtr
+   „hodnota > 0x10000" i „hodnota leží v nějakém mapování" dávaly falešná
+   pozitiva: `0x430f0a10` (konstanta v RELRO ld.so, **identická** na glibc
+   i bionic buildu) a `0x706f706364` (ASCII „dcpop") nejsou adresy. Nakonec
+   platí whitelist: pointer = cíl uvnitř modulu / obrazu loaderu / guest
+   arény; cokoli jiného jsou data a kopírují se verbatim.
+4. **Úroveň 1 nesmí do paměti zapsat nic.** Měla být bezpečná (relokace běží
+   plně), ale obraz do RELRO zapisovala — slova, která relokace nepřepisuje,
+   zůstala ze starého běhu → `FAULT-ENTER` i na úrovni 1.
+
+### Úrovně a verifikace
+
+`ELF_LOADER_IMGCACHE` má proto **úrovně**:
+
+- **1** = záznam + verifikace, relokace běží **plně** (bezpečné)
+- **2** = obraz se skutečně použije k přeskočení RELRO relokace
+  (**experimentální**)
+
+`ELF_LOADER_IMG_VERIFY=1` porovná obraz s plnou relokací. Po všech opravách
+hlásí **0 rozdílů** z 749 slov (ld.so) a **0 z 1520** (libc.so.6) — obnovené
+RELRO je tedy bitově shodné s plnou relokací. (Dřívějších 24 rozdílů byly
+pointery s jinou bází, než jakou měl modul při uložení.)
+
+**Úroveň 2 přesto u binárky s uloženým obrazem padá `FAULT-ENTER`**, zatímco
+`ls`/`python3`/`git` (bez obrazu) projdou. Root cause neizolován, proto
+zůstává vypnutá.
+
+### Benchmark (device, `ashell -c`, medián z 3 smyček)
+
+| zátěž | bez cache | úroveň 1 |
+|---|---|---|
+| 200× `$R/bin/true` | 29,6 ms/launch | 39,2 ms/launch |
+| 120× `$R/bin/bash -c true` | 41,1 ms/launch | 44,4 ms/launch |
+| `reloc_done` (`bash -c true`) | 2242 µs | 1063 µs |
+
+Úroveň 1 je **pomalejší** — kopíruje RELRO a zapisuje ~20 KB obraz, aniž by
+něco přeskočila. Úroveň 2 je jediná, která by mohla vydělat, ale padá; a její
+teoretický strop je `reloc_done` ≈ **1–2 ms z ~22–30 ms exec** (po
+`DT_GNU_HASH`). **Závěr: část A zůstává vypnutá** — ne proto, že by nebyla
+dodělaná, ale protože měření říká, že se při dnešní ceně relokace nevyplatí.
+
+### A/B regresní test
+
+`test-all.sh imgcache` (v `all`): s úrovní 1 je výstup identický jako bez
+cache (`uname`, `ls`, `python3` → 42), trace nahlásí `ulozeno`/`hit`,
+verifikace hlásí **0 rozdílů** a nezůstane žádný `.tmp`.
+A/B: nová **PASS**; stará binárka (před fixem „úroveň 1 nezapisuje") v
+kategorii ani nedojede — zapisovala obraz do RELRO a padala.
+
+**Past na testy (znovu):** bare `grep` se v own-loadovaném guestu resolvuje na
+**host toybox**, který nezná BRE `\|`. Kontrola v kategorii proto vracela 0
+přes zjevně odpovídající vstup. Používat `grep -E`. Druhá past: `ashell_out`
+má `timeout 2`, do kterého se chladný běh se zápisem obrazu nevejde —
+takové kontroly potřebují vlastní `$R/usr/bin/timeout 25`.

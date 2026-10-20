@@ -466,11 +466,32 @@ Milníky:
   je relokace už jen ~1 ms. **Známý limit:** `python3` (nePIE interpret) pod
   lazy padá `FAULT-ENTER` na vstupu guestu (bionic build na zařízení; lokální
   glibc build ne) — root cause neizolován. A/B `test-all.sh lazybind`.
-- **Prompt 10 část A (cache RELRO obrazů) — zamítnuta měřením**: zlevňovala by
-  přesně to, co `DT_GNU_HASH` už zlevnil (`reloc_done` 283–2230 µs = 2–12 %
-  exec), tedy max ~1–2 ms z ~22 ms, za cenu klíče s hwcaps/page size/hooky
-  a adresami shimů v PIE loaderu s ASLR. Dominantní položka je dnes
-  `ownall_start`/`load` (mmap + čtení), ne relokace.
+- **Prompt 10 část A (cache RELRO obrazů) — IMPLEMENTOVÁNA, default vypnutá**
+  (2026-10-20, `src/imgcache.c`): ukládá `PT_GNU_RELRO` úseky modulů, moduly
+  mapuje na tytéž báze (`MAP_FIXED_NOREPLACE`), klíč = BuildID+size+mtime exe
+  (nese build tag loaderu) + `PAGE_SIZE` + `AT_HWCAP`/`HWCAP2`. **Pointery do
+  loaderu** (prompt žádá rozhodnutí): pevnou bázi PIE vynutit nelze, takže se
+  ukládá **offset od báze obrazu loaderu** (přesný rozsah z `dl_iterate_phdr`)
+  a při restore se přičte aktuální báze. `ELF_LOADER_IMGCACHE` má **úrovně**:
+  1 = záznam + verifikace (relokace běží plně, bezpečné), 2 = skutečné
+  přeskočení RELRO relokace (**experimentální, padá** u binárky s uloženým
+  obrazem). `ELF_LOADER_IMG_VERIFY=1` porovná obraz s plnou relokací → **0
+  rozdílů** z 749 (ld.so) i 1520 slov (libc). Benchmark: úroveň 1 je
+  **pomalejší** (`/bin/true` 29,6 → 39,2 ms — kopíruje RELRO a zapisuje ~20 KB
+  bez přeskakování), strop úrovně 2 je `reloc_done` ≈ 1–2 ms z ~22–30 ms exec.
+  **Čtyři pasti z implementace:** celé `PF_W` segmenty ukládat nelze
+  (`.data`/`.bss` drží `__curbrk`/`__libc_stack_end`/stack guard → SIGSEGV);
+  přeskočit celé `elf_relocate` nelze (neproběhne `apply_segment_prots` →
+  `.text` bez `PROT_EXEC`); „je to pointer?" nejde heuristikou (`0x430f0a10`
+  v RELRO ld.so a `0x706f706364` = ASCII jsou data); úroveň 1 nesmí do paměti
+  zapsat nic. A/B `test-all.sh imgcache` —
+  [postup.md](postup.md) 2026-10-20 (5).
+- **Pasti v `test-all.sh` (2026-10-20):** bare `grep` se v own-loadovaném
+  guestu resolvuje na **host toybox**, který nezná BRE `\|` → používat
+  `grep -E`. `ashell_out` má `timeout 2`; chladný běh se zápisem cache se do
+  něj nevejde → vlastní `$R/usr/bin/timeout 25`. Celou sadu `all` nespouštět
+  obalenou v `nohup … &` uvnitř background volání (vznikne osiřelý proces,
+  který harness zabije) — spustit ji přímo jako background příkaz.
 - Test na reálném 16K Android 15+ zařízení (Task 3).
 - ~~Bionic dlerror/errno test (Task 4).~~ **Vyřešeno** — `ldso_dlerror()` +
   guest `dlopen/dlsym/dlerror/dlclose/dladdr` nad `_rtld_global` ověřeno

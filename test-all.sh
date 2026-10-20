@@ -1436,17 +1436,26 @@ category_imgcache() {
         printf '%s' "$p" | grep -q 42 || { ok=0; detail="$detail [python3: $p]"; }
     fi
 
-    # Obraz se musi ulozit (nebo hlasit, proc ne) - ne tise nic
+    # Obraz se musi ulozit nebo nacist - ne tise nic. POZOR: tenhle beh je
+    # chladny (zapis obrazu) a do 2s timeoutu v ashell_out se nevejde, proto
+    # vlastni delsi timeout.
+    rm -rf "$idir" 2>/dev/null || true
     local why
-    why=$(ashell_out "$env ELF_LOADER_IMGCACHE=1 ELF_LOADER_IMG_TRACE=1 $L --ownall $R/usr/bin/uname -m" 2>&1 \
-          | grep -c 'ulozeno\|hit ' || true)
+    why=$("$R/usr/bin/timeout" 25 "$R/bin/bash" -c \
+          "$env ELF_LOADER_IMGCACHE=1 ELF_LOADER_IMG_TRACE=1 $L --ownall $R/usr/bin/uname -m" 2>&1 \
+          | grep -cE 'ulozeno|hit ' || true)   # -E: bare grep je host toybox, nezna \|
     [ "${why:-0}" -ge 1 ] || { ok=0; detail="$detail [img trace nic nehlasi]"; }
 
-    # Verifikace: uroven 1 relokuje plne, takze vystup MUSI byt spravny
-    # i kdyz se obnovene RELRO od plne relokace lisi (znamy limit urovne 2).
-    local v
-    v=$(ashell_out "$env ELF_LOADER_IMGCACHE=1 ELF_LOADER_IMG_VERIFY=1 $L --ownall $R/usr/bin/uname -m" 2>&1)
-    printf '%s' "$v" | grep -q aarch64 || { ok=0; detail="$detail [verify rezim: $v]"; }
+    # Verifikace: obnovene RELRO musi byt BITOVE SHODNE s plnou relokaci
+    # (0 rozdilu) - jinak obraz nese neco per-behoveho.
+    local vr
+    vr=$("$R/usr/bin/timeout" 25 "$R/bin/bash" -c \
+         "$env ELF_LOADER_IMGCACHE=1 ELF_LOADER_IMG_VERIFY=1 $L --ownall $R/usr/bin/uname -m" 2>&1)
+    printf '%s' "$vr" | grep -q aarch64 || { ok=0; detail="$detail [verify rezim nedojel]"; }
+    local nd
+    nd=$(printf '%s' "$vr" | grep -o '[0-9]* rozdilu' | awk '{s+=$1} END{print s+0}')
+    [ "${nd:-1}" = 0 ] || { ok=0; detail="$detail [verify: $nd rozdilu]"; }
+
 
     local ntmp
     ntmp=$(ls "$idir" 2>/dev/null | grep -c '\.tmp\.' || true)
