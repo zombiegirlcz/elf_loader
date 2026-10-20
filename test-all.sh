@@ -1382,14 +1382,12 @@ category_lazybind() {
         [ -n "$a" ] || { ok=0; detail="$detail [${t##*/}: prazdny vystup]"; }
     done
 
-    # python3 (nePIE interpret) pod lazy PADA uz na vstupu guestu
-    # (FAULT-ENTER) - ZNAMY LIMIT, proto je lazy default VYPNUTY a tahle
-    # kontrola je jen informativni, ne kriterium PASS/FAIL. Az se to opravi,
-    # presunout do kriterii.
+    # python3 pod lazy: driv padal SIGSEGV (lazy resolver bezel pod guest TP),
+    # po fixu dl_enter_host je to KRITERIUM, ne jen informace.
     local pyinfo="n/a"
     if [ -x "$R/usr/bin/python3" ]; then
         if ashell_out "$env ELF_LOADER_LAZY=1 $L --ownall $R/usr/bin/python3 -c 'print(6*7)'" 2>&1 \
-           | grep -q 42; then pyinfo="OK"; else pyinfo="PADA (znamy limit)"; fi
+           | grep -q 42; then pyinfo="OK"; else pyinfo="PADA"; ok=0; detail="$detail [python3 pod lazy nedal 42]"; fi
     fi
 
     # BIND_NOW (libc.so.6 je -z now) musi lazy vypnout
@@ -1399,7 +1397,7 @@ category_lazybind() {
     [ "${nbn:-0}" -ge 1 ] || { ok=0; detail="$detail [BIND_NOW nedetekovan]"; }
 
     if [ "$ok" = 1 ]; then
-        echo "PASS lazybind: lazy==eager (uname/ls/dir), BIND_NOW eager u $nbn objektu, python3=$pyinfo"
+        echo "PASS lazybind: lazy==eager (uname/ls/dir/python3), BIND_NOW eager u $nbn objektu, python3=$pyinfo"
         echo "PASS: lazybind - ELF_LOADER_LAZY" >> "$PASS_LOG"
         ((PASS_COUNT++)) || true
     else

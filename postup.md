@@ -4916,3 +4916,36 @@ a zapisuje obraz, aniž by něco přeskočila.
 **Poznámka k metodice do budoucna:** výkonová čísla měřit vždy při stejné CPU
 politice a A/B dělat knobem na jedné binárce (ne dvěma buildy v různých
 sezeních). Pinování mění absolutní hodnoty o desítky procent.
+
+## 2026-10-20 (7) — prompt 10 část B: VYŘEŠENO (lazy resolver běžel pod guest TP)
+
+Pád `python3` pod `ELF_LOADER_LAZY=1`, který v (4) vedl k „lazy zůstává
+vypnutá", měl konkrétní root cause — a je to **ta samá past, kterou repo už
+dvakrát řešilo** (AGENTS.md sekce 8, commity `4602b18` a `80c3ffd`).
+
+**Root cause:** `elf_lazy_resolve()` se volá **z guest kódu** (PLT stub
+`lazy_plt_stub` v `entry.S`), takže běžel pod **guest (parrot) TP**. Samo
+resolvování je ale loaderův C kód: `elf_debug()`/`getenv`, `fprintf`,
+override tabulka, `call_ifunc_resolver`. Tyhle věci závisí na **bionickém**
+TLS → běh pod guest TP korumpoval guest TLS. `bash` to přežil, `python3`
+(hodně lazy symbolů a intenzivní TLS) padal SIGSEGV hned po startu.
+
+**Fix** (commit `c69eeac`): tělo přesunuto do `elf_lazy_resolve_inner()`
+a wrapper kolem něj dělá `dl_enter_host()` / `dl_leave_host()` — přepne na
+host TP a zablokuje asynchronní signály, aby guest handler nedorazil v okně
+s cizím TP. Stejný vzor jako u `_rtld_global_ro` shimu.
+
+**Ověření na zařízení** (`ashell -c`, `ELF_LOADER_LAZY=1`):
+`uname -m` → `aarch64`, `git --version` → `git version 2.47.3`,
+`bash -c` + `ls` → OK, `python3 -c 'print(6*7)'` → **42, 5/5 běhů**
+(dřív SIGSEGV 100 %).
+
+**A/B `test-all.sh lazybind`:** python3 je teď **kritérium**, ne jen
+informace. Nová binárka `PASS lazybind: lazy==eager (uname/ls/dir/python3),
+BIND_NOW eager u 3 objektu`; stará `FAIL lazybind: [python3 pod lazy nedal
+42]`.
+
+**Poučení do příště:** cokoli, co se volá z guest kódu (PLT stuby, shimy,
+signal handlery, trampolíny), musí buď být TLS-safe (`raw_*`/`shim_*`), nebo
+na začátku přepnout TP přes `dl_enter_host()`. Je to už třetí výskyt téhož
+bugu v tomhle projektu.
