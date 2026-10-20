@@ -1835,9 +1835,6 @@ struct ldr_rng { uintptr_t lo, hi; };
 static int ldr_rng_cb(struct dl_phdr_info *info, size_t sz, void *data) {
     (void)sz;
     struct ldr_rng *r = (struct ldr_rng *)data;
-    /* Hlavni objekt (loader) ma prazdne jmeno. */
-    if (info->dlpi_name && info->dlpi_name[0])
-        return 0;
     uintptr_t lo = (uintptr_t)-1, hi = 0;
     for (int i = 0; i < info->dlpi_phnum; i++) {
         if (info->dlpi_phdr[i].p_type != PT_LOAD)
@@ -1847,11 +1844,16 @@ static int ldr_rng_cb(struct dl_phdr_info *info, size_t sz, void *data) {
         if (a < lo) lo = a;
         if (b > hi) hi = b;
     }
-    if (hi > lo) {
+    /* Loader poznavame podle toho, ze obsahuje TUHLE funkci. Na glibcu ma
+     * hlavni objekt prazdne dlpi_name, na bionicu ne - proto se jmeno
+     * nepouziva vubec. */
+    uintptr_t self = (uintptr_t)(void *)&ldr_rng_cb;
+    if (hi > lo && self >= lo && self < hi) {
         r->lo = lo;
         r->hi = hi;
+        return 1;   /* nalezeno, dal nehledat */
     }
-    return 1;   /* dal nehledat */
+    return 0;
 }
 
 /* PRESNY rozsah obrazu loaderu z jeho PT_LOAD (ne odhad) - jinak by se do
