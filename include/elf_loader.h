@@ -63,6 +63,12 @@ typedef struct {
     struct elf_scope *scope;
 
     char *cache_key;   /* malloc'd BuildID+size+mtime klic (NULL nezjistitelny) */
+    /* Kopie sekce .gnu.hash (SHT_GNU_HASH). Indexy v chain ukazuji do
+     * `dynsym`, protoze load_table kopiruje .dynsym v puvodnim poradi.
+     * NULL = modul hash tabulku nema -> linearni sken. */
+    uint32_t *gnu_hash;
+    size_t    gnu_hash_words;
+
     int   svc_patched; /* elf_patch_syscall_sites_all uz nad modulem probehl */
     int   cache_dirty; /* probehl sken -> cache souboru se musi zapsat */
     void *cache;       /* cache_module_t* - opaque, viz src/cache.h */

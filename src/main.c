@@ -3606,14 +3606,27 @@ static void shim_install_hooks(void) {
             { "rmdir",   (void *)shim_rmdir },
             { "link",    (void *)shim_link },     /* sem_open -> link() */
         };
+        /* Adresy vsech jmen z g_f2_hooks resolvuj JEDNOU dopredu. Driv se
+         * `elf_scope_lookup` volal v zanorene smycce, tedy 5 x 118 = 590x
+         * misto 118x - a jeden lookup stoji ~19 us, takze fáze `hooks_bti`
+         * zrala ~12 ms na KAZDEM exec (nejvetsi jednotliva polozka profilu,
+         * nezavisla na cilove binarce). Semantika se nemeni: adresa symbolu
+         * se behem teto smycky zmenit nemuze a `!*orig` se dal kontroluje
+         * za behu (orig muze nastavit predchozi iterace). */
+        enum { F2_N = sizeof g_f2_hooks / sizeof g_f2_hooks[0] };
+        static void *f2_addr[F2_N];
+        for (size_t j = 0; j < F2_N; j++)
+            f2_addr[j] = (!*g_f2_hooks[j].orig && f2_only_match(g_f2_hooks[j].n))
+                             ? elf_scope_lookup(g_shim_scope, g_f2_hooks[j].n)
+                             : NULL;
+
         for (size_t i = 0; i < sizeof bh / sizeof bh[0]; i++) {
             if (!f2_only_match(bh[i].n)) continue;
             void *t = elf_scope_lookup(g_shim_scope, bh[i].n);
             void *tramp = NULL;
             if (!t || !hook_inline_prologue(t, bh[i].shim, &tramp) || !tramp) continue;
-            for (size_t j = 0; j < sizeof g_f2_hooks / sizeof g_f2_hooks[0]; j++)
-                if (!*g_f2_hooks[j].orig &&
-                    elf_scope_lookup(g_shim_scope, g_f2_hooks[j].n) == t)
+            for (size_t j = 0; j < F2_N; j++)
+                if (!*g_f2_hooks[j].orig && f2_addr[j] == t)
                     *g_f2_hooks[j].orig = tramp;
             ok++;
             if (elf_debug()) fprintf(stderr, "[hook] %s inline (BTI) OK\n", bh[i].n);

@@ -2212,6 +2212,10 @@ static void *map_elf_segments(int fd, void *file_map, Elf64_Ehdr *ehdr, size_t *
     return base;
 }
 
+/* Definice u elf_scope_find (potrebuje ji i nacitani exe vyse). */
+static void load_gnu_hash(const char *file_map, const Elf64_Ehdr *ehdr,
+                          uint32_t **out, size_t *out_words);
+
 static int load_table(const char *file_map, const Elf64_Ehdr *ehdr,
                       Elf64_Sym **sym_out, char **str_out, size_t *count_out, unsigned want) {
     Elf64_Shdr *file_shdr = (Elf64_Shdr *)((char *)file_map + ehdr->e_shoff);
@@ -2665,6 +2669,7 @@ elf_object_t *elf_load(const char *path) {
     if (load_table(file_map, ehdr, &obj->dynsym, &obj->dynstr,
                    &obj->dynsym_count, SHT_DYNSYM) < 0)
         goto cleanup_obj;
+    load_gnu_hash(file_map, ehdr, &obj->gnu_hash, &obj->gnu_hash_words);
 
     if (elf_debug()) printf("[dbg3] tls-block done\n");
     munmap(file_map, st.st_size);
@@ -2732,22 +2737,162 @@ void *elf_scope_lookup(const elf_scope_t *s, const char *name) {
     return NULL;
 }
 
+#ifndef SHT_GNU_HASH
+#define SHT_GNU_HASH 0x6ffffff6
+#endif
+
+/* Hash lookup zapnuty? ELF_LOADER_NO_HASH=1 vrati stary linearni sken
+ * (bisekce). */
+static int hash_enabled(void) {
+    static int e = -1;
+    if (e < 0)
+        e = getenv("ELF_LOADER_NO_HASH") ? 0 : 1;
+    return e;
+}
+
+/* Kontrolni rezim: kazdy hash lookup se porovna s linearnim skenem a
+ * nesouhlas se vypise (ELF_LOADER_HASH_CHECK=1). Jen pro overeni. */
+static int hash_check(void) {
+    static int c = -1;
+    if (c < 0)
+        c = getenv("ELF_LOADER_HASH_CHECK") ? 1 : 0;
+    return c;
+}
+
+/* Nacte kopii sekce .gnu.hash z file_map. 0 = OK (nebo sekce neni). */
+static void load_gnu_hash(const char *file_map, const Elf64_Ehdr *ehdr,
+                          uint32_t **out, size_t *out_words) {
+    *out = NULL;
+    *out_words = 0;
+    if (!file_map || !ehdr || ehdr->e_shoff == 0 || ehdr->e_shnum == 0)
+        return;
+    const Elf64_Shdr *sh = (const Elf64_Shdr *)(file_map + ehdr->e_shoff);
+    for (int i = 0; i < ehdr->e_shnum; i++) {
+        if (sh[i].sh_type != SHT_GNU_HASH)
+            continue;
+        if (sh[i].sh_size < 16 || sh[i].sh_size > (64u << 20))
+            return;
+        uint32_t *buf = (uint32_t *)malloc(sh[i].sh_size);
+        if (!buf)
+            return;
+        memcpy(buf, file_map + sh[i].sh_offset, sh[i].sh_size);
+        *out = buf;
+        *out_words = sh[i].sh_size / 4;
+        return;
+    }
+}
+
+/* GNU hash (djb2 varianta z ld.so). */
+static uint32_t gnu_hash_name(const char *name) {
+    uint32_t h = 5381;
+    for (const unsigned char *p = (const unsigned char *)name; *p; p++)
+        h = h * 33 + *p;
+    return h;
+}
+
+/* Najde symbol v modulu pres .gnu.hash. NULL = v tabulce neni.
+ * Vsechny indexy se validuji proti gnu_hash_words / dynsym_count, takze
+ * poskozena tabulka nemuze vyst z bufferu - v nejhorsim vrati NULL. */
+static const Elf64_Sym *module_hash_find(const elf_object_t *m,
+                                         const char *name, uint32_t h) {
+    if (!m || !m->gnu_hash || m->gnu_hash_words < 4 || !m->dynsym || !m->dynstr)
+        return NULL;
+    const uint32_t *gh = m->gnu_hash;
+    uint32_t nbuckets   = gh[0];
+    uint32_t symoffset  = gh[1];
+    uint32_t bloom_size = gh[2];
+    uint32_t bloom_shift = gh[3];
+    if (!nbuckets || !bloom_size || (bloom_size & (bloom_size - 1)))
+        return NULL;   /* bloom_size musi byt mocnina dvou */
+
+    /* layout: hdr[4] | uint64 bloom[bloom_size] | uint32 buckets[nbuckets]
+     *         | uint32 chain[...] (index symoffset -> chain[0]) */
+    size_t bloom_words = (size_t)bloom_size * 2;
+    size_t need = 4 + bloom_words + nbuckets;
+    if (m->gnu_hash_words < need)
+        return NULL;
+    const uint64_t *bloom = (const uint64_t *)(const void *)(gh + 4);
+    const uint32_t *buckets = gh + 4 + bloom_words;
+    const uint32_t *chain = buckets + nbuckets;
+    size_t chain_words = m->gnu_hash_words - need;
+
+    uint64_t word = bloom[(h / 64) % bloom_size];
+    uint64_t mask = (1ULL << (h % 64)) |
+                    (1ULL << ((h >> (bloom_shift % 64)) % 64));
+    if ((word & mask) != mask)
+        return NULL;   /* bloom filtr: symbol tu urcite neni */
+
+    uint32_t n = buckets[h % nbuckets];
+    if (n < symoffset)
+        return NULL;
+    for (;;) {
+        size_t ci = (size_t)n - symoffset;
+        if (ci >= chain_words || n >= m->dynsym_count)
+            return NULL;
+        uint32_t c = chain[ci];
+        if ((c | 1u) == (h | 1u)) {
+            const Elf64_Sym *sym = &m->dynsym[n];
+            if (sym->st_name && sym->st_shndx != SHN_UNDEF &&
+                ELF64_ST_BIND(sym->st_info) != STB_LOCAL &&
+                strcmp(m->dynstr + sym->st_name, name) == 0)
+                return sym;
+        }
+        if (c & 1u)
+            return NULL;   /* konec retezu */
+        n++;
+    }
+}
+
+/* Linearni sken jednoho modulu (puvodni chovani). */
+static const Elf64_Sym *module_linear_find(const elf_object_t *m,
+                                           const char *name) {
+    if (!m || !m->dynsym || !m->dynstr)
+        return NULL;
+    for (size_t j = 0; j < m->dynsym_count; j++) {
+        const Elf64_Sym *sym = &m->dynsym[j];
+        if (sym->st_name == 0 || sym->st_shndx == SHN_UNDEF)
+            continue;
+        if (ELF64_ST_BIND(sym->st_info) == STB_LOCAL)
+            continue;
+        if (strcmp(m->dynstr + sym->st_name, name) != 0)
+            continue;
+        return sym;
+    }
+    return NULL;
+}
+
+/* Jeden modul: hash kdyz je k dispozici, jinak linearne. */
+static const Elf64_Sym *module_find(const elf_object_t *m, const char *name,
+                                    uint32_t h) {
+    if (hash_enabled() && m && m->gnu_hash) {
+        const Elf64_Sym *hs = module_hash_find(m, name, h);
+        if (hash_check()) {
+            const Elf64_Sym *ls = module_linear_find(m, name);
+            if (hs != ls)
+                fprintf(stderr,
+                        "[hashcheck] %s v %s: hash=%p linear=%p\n", name,
+                        m->soname ? m->soname : "?", (const void *)hs,
+                        (const void *)ls);
+        }
+        return hs;
+    }
+    return module_linear_find(m, name);
+}
+
 elf_object_t *elf_scope_find(const elf_scope_t *s, const char *name,
                              const Elf64_Sym **out_sym) {
     if (!s || !name)
         return NULL;
+    /* Hash se pocita jednou pro cely scope. Driv to byl linearni sken se
+     * `strcmp` pres dynsym VSECH modulu (libc ~3000 symbolu) = ~19 us na
+     * lookup; relokace i hook tabulka z toho delaji stovky lookupu na exec. */
+    uint32_t h = gnu_hash_name(name);
     for (size_t i = 0; i < s->count; i++) {
         elf_object_t *m = s->mods[i];
-        if (!m || !m->dynsym || !m->dynstr)
+        if (!m)
             continue;
-        for (size_t j = 0; j < m->dynsym_count; j++) {
-            const Elf64_Sym *sym = &m->dynsym[j];
-            if (sym->st_name == 0 || sym->st_shndx == SHN_UNDEF)
-                continue;
-            if (ELF64_ST_BIND(sym->st_info) == STB_LOCAL)
-                continue;
-            if (strcmp(m->dynstr + sym->st_name, name) != 0)
-                continue;
+        const Elf64_Sym *sym = module_find(m, name, h);
+        if (sym) {
             if (out_sym)
                 *out_sym = sym;
             return m;
@@ -2756,15 +2901,9 @@ elf_object_t *elf_scope_find(const elf_scope_t *s, const char *name,
     /* Fallback: hlavni exe (Python extension moduly potrebuji PyExc_*,
      * PyTuple_Type, _PyRuntime z python3.13, ktery neni v mods). */
     elf_object_t *e = s->exe;
-    if (e && e->dynsym && e->dynstr) {
-        for (size_t j = 0; j < e->dynsym_count; j++) {
-            const Elf64_Sym *sym = &e->dynsym[j];
-            if (sym->st_name == 0 || sym->st_shndx == SHN_UNDEF)
-                continue;
-            if (ELF64_ST_BIND(sym->st_info) == STB_LOCAL)
-                continue;
-            if (strcmp(e->dynstr + sym->st_name, name) != 0)
-                continue;
+    if (e) {
+        const Elf64_Sym *sym = module_find(e, name, h);
+        if (sym) {
             if (out_sym)
                 *out_sym = sym;
             return e;
@@ -3388,6 +3527,7 @@ elf_object_t *elf_load_shared(const char *path, elf_scope_t *scope) {
 
     load_table(file_map, ehdr, &m->dynsym, &m->dynstr, &m->dynsym_count,
                SHT_DYNSYM);
+    load_gnu_hash(file_map, ehdr, &m->gnu_hash, &m->gnu_hash_words);
     if (elf_debug()) printf("[dbg3] dynsym %s: %zu\n", path, m->dynsym_count);
 
     for (int i = 0; i < m->phdr_count; i++) {
@@ -6132,6 +6272,8 @@ void elf_unload(elf_object_t *obj) {
             dlclose(obj->handles[i]);
     free(obj->handles);
     free(obj->origin_dir);
+    free(obj->gnu_hash);
+    obj->gnu_hash = NULL;
     free(obj->cache_key);
     cache_module_free((cache_module_t *)obj->cache);
     free(obj);
