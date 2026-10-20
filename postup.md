@@ -4861,3 +4861,58 @@ kategorii ani nedojede — zapisovala obraz do RELRO a padala.
 přes zjevně odpovídající vstup. Používat `grep -E`. Druhá past: `ashell_out`
 má `timeout 2`, do kterého se chladný běh se zápisem obrazu nevejde —
 takové kontroly potřebují vlastní `$R/usr/bin/timeout 25`.
+
+## 2026-10-20 (6) — běhy `all` (default / část A / obě části) a přeměření bez pinování
+
+### Tři běhy `test-all.sh all` (jeden celý běh, ne po blocích)
+
+| konfigurace | PASS | FAIL | SKIP |
+|---|---|---|---|
+| default (obě části promptu 10 vypnuté) | **192** | **0** | 33 |
+| `ELF_LOADER_IMGCACHE=1` (část A, úroveň 1) | **192** | **0** | 33 |
+| `ELF_LOADER_IMGCACHE=1 ELF_LOADER_LAZY=1` (obě) | 160 | **31** | 34 |
+
+Všechny čtyři nové kategorie (`execcache`, `symhash`, `lazybind`, `imgcache`)
+jsou v `all` a v prvních dvou bězích prošly.
+
+**Vina za 31 pádů je jednoznačně přiřazená části B**, ne části A:
+
+| konfigurace | `python3 -c 'print(6*7)'` |
+|---|---|
+| default | 42 |
+| `ELF_LOADER_IMGCACHE=1` | 42 |
+| `ELF_LOADER_LAZY=1` | **Segmentation fault** |
+| obě | **Segmentation fault** |
+
+Padající kategorie v kombinovaném běhu (`pathops` 3×, `bionic` 2×, `nss`,
+`fstat`, `symhash`, `imgcache`, `curl`, `wget`, `nmap`) jdou přes python/
+vícemodulové binárky, tedy přes ten samý známý limit lazy režimu. Část A sama
+je bez regrese. Prompt 10 část B má „default až po ověření" — ověření ho
+nepustilo, takže `ELF_LOADER_LAZY` zůstává vypnutý.
+
+### Přeměření bez CPU pinování (`nh cpu unpin`, maska ff)
+
+Předchozí tabulky v (3)–(5) vznikly pod pinováním. Po odpinování se **absolutní
+čísla zhoršila** (úlohy mohou padnout na malá jádra: `/bin/true` ~39–59 ms
+místo ~26 ms) a wall-clock se hodně rozptýlil (`python3` 167–299 ms mezi
+smyčkami). Spolehlivý signál proto dávají **interní raw-clock fáze**, ne
+wall-clock. A/B se dělá knobem `ELF_LOADER_NO_HASH=1` na **téže binárce**:
+
+`python3 -c 0`, medián N=7, odpinováno:
+
+| fáze | bez hashe | s hashem |
+|---|---|---|
+| `hooks_bti` | 5538 µs | **1295 µs** |
+| `reloc_done` | 21 228 µs | **1473 µs** |
+| total | 55 585 µs | **16 722 µs** (−70 %) |
+
+Wall-clock odpinovaně (medián z 3 smyček): `/bin/true` 67,5 → **58,8 ms**,
+`python3 -c 0` 234 → 228 ms (v šumu — rozptyl smyček je větší než rozdíl).
+
+Část A, odpinovaně: `/bin/true` bez cache 45,3 → úroveň 1 **53,3 ms**, tedy
+stejný závěr jako pinovaně — úroveň 1 je pomalejší, protože kopíruje RELRO
+a zapisuje obraz, aniž by něco přeskočila.
+
+**Poznámka k metodice do budoucna:** výkonová čísla měřit vždy při stejné CPU
+politice a A/B dělat knobem na jedné binárce (ne dvěma buildy v různých
+sezeních). Pinování mění absolutní hodnoty o desítky procent.

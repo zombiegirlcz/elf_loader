@@ -486,6 +486,16 @@ Milníky:
   v RELRO ld.so a `0x706f706364` = ASCII jsou data); úroveň 1 nesmí do paměti
   zapsat nic. A/B `test-all.sh imgcache` —
   [postup.md](postup.md) 2026-10-20 (5).
+- **Běhy `all` k promptu 10 (2026-10-20):** default **192/0/33**,
+  `ELF_LOADER_IMGCACHE=1` (část A) **192/0/33**, obě části zapnuté
+  **160/31/34** — všech 31 pádů jde za částí B (`ELF_LOADER_LAZY=1` sám
+  rozbije `python3`, `IMGCACHE=1` sám ne), proto lazy zůstává vypnutý.
+  Odpinovaně (`nh cpu unpin`) potvrzeno knobem `ELF_LOADER_NO_HASH=1` na téže
+  binárce: `python3` `hooks_bti` 5538 → 1295 µs, `reloc_done` 21 228 →
+  1473 µs, total 55,6 → **16,7 ms** (−70 %). **Metodika:** pinování mění
+  absolutní čísla o desítky procent a odpinovaný wall-clock je rozptýlený
+  (malá jádra) → měřit při stejné CPU politice a A/B dělat knobem, ne dvěma
+  buildy.
 - **Pasti v `test-all.sh` (2026-10-20):** bare `grep` se v own-loadovaném
   guestu resolvuje na **host toybox**, který nezná BRE `\|` → používat
   `grep -E`. `ashell_out` má `timeout 2`; chladný běh se zápisem cache se do
