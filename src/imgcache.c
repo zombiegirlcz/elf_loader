@@ -91,14 +91,59 @@ static size_t     g_img_size = 0;
 static img_hdr_t  g_img_hdr;
 static int        g_restored = 0, g_recorded = 0;
 
-int img_enabled(void) {
+/* ---- mapovani procesu -------------------------------------------------
+ * Hodnota ulozena v RELRO je POINTER jen kdyz lezi v nejakem mapovani
+ * procesu. Cokoli mimo (treba 0x430f0a10 = MIDR-like konstanta v RELRO
+ * ld.so) jsou data a kopiruji se verbatim. Bez tohoto rozliseni byl filtr
+ * "hodnota > 0x10000" tak hruby, ze obraz nikdy nevznikl. */
+#define IMG_MAX_MAPS 512
+static struct { uintptr_t lo, hi; } g_maps[IMG_MAX_MAPS];
+static size_t g_nmaps = 0;
+static int g_maps_loaded = 0;
+
+static void load_maps(void) {
+    if (g_maps_loaded)
+        return;
+    g_maps_loaded = 1;
+    FILE *f = fopen("/proc/self/maps", "r");
+    if (!f)
+        return;
+    char line[512];
+    while (g_nmaps < IMG_MAX_MAPS && fgets(line, sizeof line, f)) {
+        unsigned long long a = 0, b = 0;
+        if (sscanf(line, "%llx-%llx", &a, &b) != 2)
+            continue;
+        g_maps[g_nmaps].lo = (uintptr_t)a;
+        g_maps[g_nmaps].hi = (uintptr_t)b;
+        g_nmaps++;
+    }
+    fclose(f);
+}
+
+static int in_any_map(uintptr_t v) {
+    load_maps();
+    for (size_t i = 0; i < g_nmaps; i++)
+        if (v >= g_maps[i].lo && v < g_maps[i].hi)
+            return 1;
+    return 0;
+}
+
+/* Uroven: 0 = vypnuto, 1 = zaznam + verifikace (BEZPECNE, relokace probiha
+ * normalne), 2 = obraz se SKUTECNE pouzije k preskoceni RELRO relokace
+ * (EXPERIMENTALNI - viz postup.md 2026-10-20 (5): obnovene RELRO se lisi od
+ * plne relokace, zatim neizolovano). */
+static int img_level(void) {
     static int e = -1;
     if (e < 0) {
         const char *v = getenv("ELF_LOADER_IMGCACHE");
-        e = (v && v[0] && strcmp(v, "0") != 0) ? 1 : 0;
+        e = (v && v[0] && strcmp(v, "0") != 0) ? atoi(v) : 0;
+        if (e < 0) e = 0;
+        if (v && v[0] && e == 0 && strcmp(v, "0") != 0) e = 1;  /* "yes"/"on" */
     }
     return e;
 }
+
+int img_enabled(void) { return img_level() > 0; }
 
 int img_trace(void) {
     static int t = -1;
@@ -234,6 +279,41 @@ uintptr_t img_preferred_base(const char *path) {
 
 /* ---- restore -------------------------------------------------------- */
 
+/* Runtime rozsahy obnoveneho RELRO (per modul). elf_relocate je pak
+ * preskakuje - to je ta usetrena prace (symbol lookupy pro GOT). */
+#define IMG_MAX_RESTORED 64
+static struct { const elf_object_t *m; uintptr_t lo, hi; } g_rst[IMG_MAX_RESTORED];
+static size_t g_nrst = 0;
+
+static struct {
+    const elf_object_t *m;
+    unsigned char *addr;
+    unsigned char *img;
+    size_t len;
+    const char *path;
+} g_ver[IMG_MAX_RESTORED];
+static size_t g_nver = 0;
+
+/* ELF_LOADER_IMG_VERIFY=1: obraz se nacte, ale relokace probehne PLNE
+ * a vysledek se s obrazem POROVNA - vypise se prvni rozdily. Diagnostika
+ * pro otazku "co v RELRO je per-behove". */
+static int img_verify(void) {
+    static int v = -1;
+    if (v < 0)
+        v = getenv("ELF_LOADER_IMG_VERIFY") ? 1 : 0;
+    return v;
+}
+
+int img_relro_covers(const elf_object_t *m, const void *addr) {
+    if (img_level() < 2 || img_verify())
+        return 0;   /* uroven 1 = relokace probiha plne (bezpecne) */
+    uintptr_t a = (uintptr_t)addr;
+    for (size_t i = 0; i < g_nrst; i++)
+        if (g_rst[i].m == m && a >= g_rst[i].lo && a < g_rst[i].hi)
+            return 1;
+    return 0;
+}
+
 int img_restore_module(elf_object_t *m, const char *path) {
     if (!img_enabled() || g_img_bad || !g_have_img || !m || !m->base_addr)
         return 0;
@@ -288,14 +368,73 @@ int img_restore_module(elf_object_t *m, const char *path) {
         memcpy(dst, &v, 8);
     }
 
-    m->relocated = 1;
+    /* Rozsahy si zapamatuj: elf_relocate je preskoci, ale VSE OSTATNI
+     * (RELATIVE v .data, TLS template, apply_segment_prots -> PROT_EXEC)
+     * musi probehnout normalne. Prvni verze nastavovala m->relocated = 1
+     * a preskakovala elf_relocate cele - .text pak zustal bez PROT_EXEC
+     * a program spadl na prvnim volani do libc. */
+    for (uint32_t s = 0; s < im->nseg && g_nrst < IMG_MAX_RESTORED; s++) {
+        const img_seg_t *sg = &im->seg[s];
+        uintptr_t lo = (uintptr_t)m->base_addr + (sg->vaddr - im->map_base_vaddr);
+        g_rst[g_nrst].m = m;
+        g_rst[g_nrst].lo = lo;
+        g_rst[g_nrst].hi = lo + sg->len;
+        g_nrst++;
+    }
     g_restored++;
     if (img_trace())
         fprintf(stderr, "[img] restore %s (%u useku)\n", path, im->nseg);
+    if (img_verify()) {
+        /* Zapamatuj si, co obraz tvrdi; porovnani udela img_verify_module()
+         * po relokaci. */
+        for (uint32_t s = 0; s < im->nseg && g_nver < IMG_MAX_RESTORED; s++) {
+            const img_seg_t *sg = &im->seg[s];
+            unsigned char *cp = malloc(sg->len);
+            if (!cp) break;
+            memcpy(cp, g_img_buf + sg->data_off, sg->len);
+            /* fixupy teto sekce dopocitej stejne jako vyse */
+            for (uint32_t f = 0; f < g_img_hdr.nfix; f++) {
+                const img_fix_t *fx = img_fix_at(f);
+                if (!fx || fx->mod != idx || fx->seg != s) continue;
+                uintptr_t llo2 = 0, lhi2 = 0;
+                if (!elf_loader_range(&llo2, &lhi2)) break;
+                uintptr_t v2 = llo2 + fx->ldr_off;
+                if (fx->off + 8 <= sg->len) memcpy(cp + fx->off, &v2, 8);
+            }
+            g_ver[g_nver].m = m;
+            g_ver[g_nver].addr = (unsigned char *)m->base_addr +
+                                 (sg->vaddr - im->map_base_vaddr);
+            g_ver[g_nver].img = cp;
+            g_ver[g_nver].len = sg->len;
+            g_ver[g_nver].path = path;
+            g_nver++;
+        }
+    }
     return 1;
 }
 
 /* ---- zaznam --------------------------------------------------------- */
+
+void img_verify_report(void) {
+    if (!img_verify())
+        return;
+    for (size_t i = 0; i < g_nver; i++) {
+        size_t diffs = 0;
+        for (size_t o = 0; o + 8 <= g_ver[i].len; o += 8) {
+            uint64_t a, b;
+            memcpy(&a, g_ver[i].addr + o, 8);
+            memcpy(&b, g_ver[i].img + o, 8);
+            if (a == b) continue;
+            if (diffs < 12)
+                fprintf(stderr, "[imgver] %s+%#zx: relokace=%#llx obraz=%#llx\n",
+                        g_ver[i].path, o, (unsigned long long)a,
+                        (unsigned long long)b);
+            diffs++;
+        }
+        fprintf(stderr, "[imgver] %s: %zu rozdilu z %zu slov\n", g_ver[i].path,
+                diffs, g_ver[i].len / 8);
+    }
+}
 
 void img_record_module(elf_object_t *m, const char *path) {
     if (!img_enabled() || g_img_bad || !m || !m->base_addr || !m->cache_key)
@@ -356,6 +495,8 @@ void img_record_module(elf_object_t *m, const char *path) {
             uintptr_t v;
             memcpy(&v, cp + o, 8);
             if (v < 0x10000UL) continue;
+            /* Mimo vsechna mapovani = data, ne pointer -> kopiruj verbatim. */
+            if (!in_any_map(v)) continue;
             if (v >= llo && v < lhi) {
                 /* pointer do obrazu loaderu -> fixup (nize) */
             } else {

@@ -3667,9 +3667,11 @@ elf_object_t *elf_load_shared(const char *path, elf_scope_t *scope) {
     /* Obrazova cache (prompt 10 cast A): kdyz obraz sedi (tentyz klic modulu
      * i baze), nactou se hotove RW/RELRO stranky misto relokace. Jakykoli
      * nesouhlas = plna relokace. */
-    if (!img_restore_module(m, resolved)) {
-        elf_relocate(m);
-        img_record_module(m, resolved);
+    {
+        int restored = img_restore_module(m, resolved);
+        elf_relocate(m);            /* RELRO sloty z obrazu preskoci */
+        if (!restored)
+            img_record_module(m, resolved);
     }
     if (elf_debug()) printf("[dbg2] reloc-done\n");
 
@@ -4153,6 +4155,7 @@ int elf_relocate(elf_object_t *obj) {
     for (size_t off = 0; off < rela_size; off += sizeof(Elf64_Rela)) {
         Elf64_Rela *r = (Elf64_Rela *)((char *)rela + off);
         uint64_t *where = (uint64_t *)(base + (r->r_offset - mbv));
+        if (img_relro_covers(obj, where)) { count++; continue; }
         size_t sym_idx = ELF64_R_SYM(r->r_info);
         switch (ELF64_R_TYPE(r->r_info)) {
         case R_AARCH64_RELATIVE:
@@ -4214,6 +4217,7 @@ int elf_relocate(elf_object_t *obj) {
         Elf64_Rela *r = (Elf64_Rela *)((char *)jmp_rela + off);
         uint64_t *where = (uint64_t *)(base + (r->r_offset - mbv));
 
+        if (img_relro_covers(obj, where)) { count++; continue; }
         if (ELF64_R_TYPE(r->r_info) == R_AARCH64_IRELATIVE)
             continue;
         if (ELF64_R_TYPE(r->r_info) == R_AARCH64_TLSDESC ||

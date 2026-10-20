@@ -50,6 +50,10 @@ uintptr_t img_preferred_base(const char *path);
  * (volajici MUSI preskocit elf_relocate), 0 = jde se plnou relokaci. */
 int img_restore_module(elf_object_t *m, const char *path);
 
+/* 1 = adresa lezi v RELRO useku obnovenem z obrazu -> elf_relocate ji ma
+ * preskocit (hotova hodnota). */
+int img_relro_covers(const elf_object_t *m, const void *addr);
+
 /* Zaznam modulu do obrazu (po uspesne relokaci). Zapis na disk dela
  * img_commit(). */
 void img_record_module(elf_object_t *m, const char *path);
@@ -60,5 +64,8 @@ void img_commit(const char *exe_key);
 /* Statistika pro ELF_LOADER_TIMING/diagnostiku: kolik modulu se restoroval
  * a kolik se zaznamenalo. */
 void img_stats(int *restored, int *recorded);
+
+/* ELF_LOADER_IMG_VERIFY=1: vypise rozdily obraz vs. plna relokace. */
+void img_verify_report(void);
 
 #endif

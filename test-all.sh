@@ -1436,11 +1436,17 @@ category_imgcache() {
         printf '%s' "$p" | grep -q 42 || { ok=0; detail="$detail [python3: $p]"; }
     fi
 
-    # Odmitnuti obrazu musi byt hlaseno, ne tiche
+    # Obraz se musi ulozit (nebo hlasit, proc ne) - ne tise nic
     local why
     why=$(ashell_out "$env ELF_LOADER_IMGCACHE=1 ELF_LOADER_IMG_TRACE=1 $L --ownall $R/usr/bin/uname -m" 2>&1 \
-          | grep -c 'neklasifikovatelny pointer\|ulozeno' || true)
+          | grep -c 'ulozeno\|neklasifikovatelny pointer\|hit ' || true)
     [ "${why:-0}" -ge 1 ] || { ok=0; detail="$detail [img trace nic nehlasi]"; }
+
+    # Verifikace: uroven 1 relokuje plne, takze vystup MUSI byt spravny
+    # i kdyz se obnovene RELRO od plne relokace lisi (znamy limit urovne 2).
+    local v
+    v=$(ashell_out "$env ELF_LOADER_IMGCACHE=1 ELF_LOADER_IMG_VERIFY=1 $L --ownall $R/usr/bin/uname -m" 2>&1)
+    printf '%s' "$v" | grep -q aarch64 || { ok=0; detail="$detail [verify rezim: $v]"; }
 
     local ntmp
     ntmp=$(ls "$idir" 2>/dev/null | grep -c '\.tmp\.' || true)

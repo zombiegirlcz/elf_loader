@@ -4271,6 +4271,7 @@ static int run_ownall(const char *path, int argc, char **argv, char **envp) {
      * vypnuta). Klic = klic hlavni binarky. */
     if (obj->cache_key)
         img_commit(obj->cache_key);
+    img_verify_report();
     if (img_enabled() && elf_debug()) {
         int ir = 0, irec = 0;
         img_stats(&ir, &irec);
