@@ -4700,3 +4700,72 @@ resp. resolver pod guest TP, IFUNC/TLSDESC eager, `DF_1_NOW`).
 **Rozhodnutí: neimplementovat**, dokud profil neukáže něco jiného. Pokud se
 k tomu někdo vrátí, ať nejdřív zopakuje tabulku výše — zbylá dominantní
 položka je `ownall_start`/`load` (mmap + čtení souborů), ne relokace.
+
+## 2026-10-20 (4) — prompt 10 část B (líné vázání) a definitivní zamítnutí části A
+
+### Co v repu už bylo a co chybělo
+
+Líné vázání `JUMP_SLOT` bylo z větší části naimplementované už dřív
+(`elf_set_lazy`, `elf_lazy_resolve`, `entry.S lazy_plt_stub`, priorita F2
+override v lazy resolvování), ale šlo zapnout jen argv flagem `--lazy`
+a mělo **dvě skutečné mezery** proti zadání promptu (commit `df5b87d`):
+
+1. **IFUNC nebyl eager.** Větev `if (lazy_binding)` byla **před** kontrolou
+   `is_local_ifunc_reloc()`, takže lokální IFUNC `JUMP_SLOT` (`memcpy` a spol.
+   v libc) dostal `lazy_plt_stub`. Navíc post-prots IFUNC průchod měl
+   `tsz = lazy_binding ? 0 : jmp_size`, tedy se v lazy režimu `jmp_rela`
+   **přeskočila celá** a resolver modulu se nikdy nezavolal. To je přesně
+   historie bugu `memcpy` u `/bin/ls` a `/bin/dir` (AGENTS.md sekce 2).
+   Opraveno: ifunc check je první a post-prots průchod jde vždy.
+2. **`DF_BIND_NOW`/`DF_1_NOW`/`DT_BIND_NOW`/`LD_BIND_NOW` se neřešily vůbec.**
+   Nový `obj_wants_bind_now()` je kontroluje per-objekt → `lazy_this`.
+3. Doplněn `ELF_LOADER_LAZY=1` (prompt ho vyžaduje): dědí se do zanořených
+   exec, kde si shim staví argv sám a flag by zmizel.
+
+### Zjištění #1 — libc si eager vynutí sama
+
+`ELF_DEBUG` s lazy hlásí `BIND_NOW -> eager` u **3 objektů** (`libc.so.6`,
+`ld-linux-aarch64.so.1` a jeden další): Parrot rootfs je stavěný s full RELRO
+(`-z now`). Modul s nejvíc PLT slotů tedy líné vázání **nikdy nepoužije**.
+
+### Zjištění #2 — benchmark: lazy nepřináší nic
+
+Device, `ashell -c`, medián z 3 smyček:
+
+| zátěž | eager | lazy | |
+|---|---|---|---|
+| 300× `$R/bin/true` | 22,2 ms/launch | 21,6 ms/launch | v šumu |
+| 150× `$R/bin/bash -c true` | 23,6 ms/launch | 25,5 ms/launch | **horší** |
+| `reloc_done` (`bash -c true`, N=7) | 1013 µs | 1052 µs | beze změny |
+
+Důvod je jasný: po `DT_GNU_HASH` je relokace celkově ~1 ms a to, co z ní
+zbylo, drží BIND_NOW objekty, které lazy režim obchází.
+
+### Zjištění #3 — python3 pod lazy padá (známý limit)
+
+`ELF_LOADER_LAZY=1 … python3 -c 0` padá hned na vstupu guestu
+(`FAULT-ENTER tp=… ` → SIGSEGV, entry `0x61aec0`), zatímco `bash`, `uname`,
+`ls` i `dir` fungují a dávají **identický výstup jako eager**. python3 je
+nePIE `ET_EXEC` interpret; root cause neizolován. Lokální glibc build přitom
+python3 pod lazy zvládne — reprodukuje se jen na bionic NDK buildu na
+zařízení.
+
+**Rozhodnutí:** lazy zůstává **default vypnutý**, přesně jak prompt
+předepisuje („default až po ověření") — ověření našlo reálný pád a nulový
+přínos. Kategorie `test-all.sh lazybind` (v `all`) proto hlídá ověřený
+rozsah: `lazy == eager` u `uname`/`ls`/`dir` (regresní pojistka na IFUNC)
+a detekci BIND_NOW; python3 je v ní jen informativní (`python3=PADA (znamy
+limit)`), ne kritérium PASS. A/B: stará binárka FAIL („BIND_NOW nedetekovan"),
+nová PASS.
+
+### Část A (cache RELRO obrazů) — zamítnuta měřením
+
+Část A má zlevnit přesně tu práci, kterou `DT_GNU_HASH` už zlevnil:
+`reloc_done` je teď **283–2230 µs** (2–12 % exec), u `bash -c true` 1013 µs.
+Obraz RELRO stránek by tedy ušetřil maximálně ~1–2 ms z ~22 ms exec, a to za
+cenu nejrizikovější změny v loaderu: klíč by musel zahrnout hwcaps (IFUNC),
+page size, přítomné hooky a hlavně **adresy shimů v loaderu**, který je PIE
+s ASLR — buď pevná báze loaderu, nebo přepisování GOT položek po načtení
+obrazu. Poměr přínos/riziko je neobhajitelný. **Neimplementováno**; kdyby se
+k tomu někdo vracel, ať nejdřív zopakuje fázový profil — dominantní položka
+je dnes `ownall_start`/`load` (mmap + čtení souborů), ne relokace.

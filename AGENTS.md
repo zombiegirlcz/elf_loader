@@ -451,10 +451,26 @@ Milníky:
   měřením** (2026-10-20): mikro-benchmark přesné syscall sekvence dává
   38–60 µs na exec proti ~26–48 ms celkem = 0,1 %, tedy hluboko pod šumem.
   Vrátit se k tomu, až bude exec pod ~1 ms.
-- Prompt 10 (cache RELRO obrazů, líné vázání `JUMP_SLOT`) **neimplementován
-  záměrně**: jeho vstupní podmínka („relokace je pořád velký podíl exec") po
-  `DT_GNU_HASH` nedrží — relokace spadla na 2–12 %. Zbylá dominantní položka
-  je `ownall_start`/`load` (mmap + čtení), ne relokace.
+- **Prompt 10 část B (líné vázání) — doplněna, ale default VYPNUTÁ**
+  (2026-10-20, commit `df5b87d`): v repu už byla (`elf_set_lazy`,
+  `elf_lazy_resolve`, `entry.S lazy_plt_stub`), chyběly dvě věci ze zadání —
+  (1) **IFUNC nebyl eager** (`if (lazy_binding)` bylo před
+  `is_local_ifunc_reloc`, post-prots průchod měl `tsz = lazy ? 0 : jmp_size`
+  → lokální IFUNC `JUMP_SLOT` zůstal na stubu; historie bugu `memcpy`
+  u `ls`/`dir`), (2) `DF_BIND_NOW`/`DF_1_NOW`/`DT_BIND_NOW`/`LD_BIND_NOW` se
+  neřešily — nový `obj_wants_bind_now()`. Zapínání `ELF_LOADER_LAZY=1`
+  (dědí se do zanořených exec, `--lazy` ne). **Měření: lazy nepřináší nic**
+  — `/bin/true` 22,2 vs 21,6 ms (šum), `bash -c true` 23,6 vs 25,5 ms
+  (horší), `reloc_done` 1013 vs 1052 µs. Důvod: Parrot libc/ld.so jsou `-z now`,
+  takže si eager vynutí samy (`BIND_NOW -> eager` u 3 objektů), a po GNU hashi
+  je relokace už jen ~1 ms. **Známý limit:** `python3` (nePIE interpret) pod
+  lazy padá `FAULT-ENTER` na vstupu guestu (bionic build na zařízení; lokální
+  glibc build ne) — root cause neizolován. A/B `test-all.sh lazybind`.
+- **Prompt 10 část A (cache RELRO obrazů) — zamítnuta měřením**: zlevňovala by
+  přesně to, co `DT_GNU_HASH` už zlevnil (`reloc_done` 283–2230 µs = 2–12 %
+  exec), tedy max ~1–2 ms z ~22 ms, za cenu klíče s hwcaps/page size/hooky
+  a adresami shimů v PIE loaderu s ASLR. Dominantní položka je dnes
+  `ownall_start`/`load` (mmap + čtení), ne relokace.
 - Test na reálném 16K Android 15+ zařízení (Task 3).
 - ~~Bionic dlerror/errno test (Task 4).~~ **Vyřešeno** — `ldso_dlerror()` +
   guest `dlopen/dlsym/dlerror/dlclose/dladdr` nad `_rtld_global` ověřeno
