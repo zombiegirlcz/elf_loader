@@ -1,6 +1,8 @@
 #define _GNU_SOURCE
 #include "../include/elf_loader.h"
 #include "cache.h"
+#include <link.h>
+#include "imgcache.h"
 
 #include <stdio.h>
 #include <stdlib.h>
@@ -1822,6 +1824,59 @@ static void *resolve_import_ldso(const char *name) {
 }
 
 static void *override_lookup(const char *name);  /* definováno níže; potřeba pro F2 lazy override */
+
+/* ---- pomucky pro obrazovou cache (src/imgcache.c) ----------------------- */
+
+/* Rozsah vlastniho mapovani loaderu. Loader je PIE s ASLR, takze pointery na
+ * shimy v ulozenem obrazu GOT nejsou pri dalsim behu platne - imgcache je
+ * musi poznat a prepsat. */
+struct ldr_rng { uintptr_t lo, hi; };
+
+static int ldr_rng_cb(struct dl_phdr_info *info, size_t sz, void *data) {
+    (void)sz;
+    struct ldr_rng *r = (struct ldr_rng *)data;
+    /* Hlavni objekt (loader) ma prazdne jmeno. */
+    if (info->dlpi_name && info->dlpi_name[0])
+        return 0;
+    uintptr_t lo = (uintptr_t)-1, hi = 0;
+    for (int i = 0; i < info->dlpi_phnum; i++) {
+        if (info->dlpi_phdr[i].p_type != PT_LOAD)
+            continue;
+        uintptr_t a = info->dlpi_addr + info->dlpi_phdr[i].p_vaddr;
+        uintptr_t b = a + info->dlpi_phdr[i].p_memsz;
+        if (a < lo) lo = a;
+        if (b > hi) hi = b;
+    }
+    if (hi > lo) {
+        r->lo = lo;
+        r->hi = hi;
+    }
+    return 1;   /* dal nehledat */
+}
+
+/* PRESNY rozsah obrazu loaderu z jeho PT_LOAD (ne odhad) - jinak by se do
+ * "pointer do loaderu" pletla jeho halda a rebase by ji rozbil. */
+int elf_loader_range(uintptr_t *lo, uintptr_t *hi) {
+    static struct ldr_rng r = { 0, 0 };
+    if (!r.hi)
+        dl_iterate_phdr(ldr_rng_cb, &r);
+    if (!r.hi)
+        return 0;
+    *lo = r.lo;
+    *hi = r.hi;
+    return 1;
+}
+
+/* Jmeno override (shimu) pro danou adresu, nebo NULL. */
+const char *elf_override_name_for_addr(const void *addr) {
+    for (size_t i = 0; i < override_count; i++)
+        if ((const void *)overrides[i].fn == addr)
+            return overrides[i].name;
+    return NULL;
+}
+
+/* Adresa shimu podle jmena (public wrapper nad override_lookup). */
+void *elf_override_addr(const char *name) { return override_lookup(name); }
 static void *resolve_jmp_symbol(elf_object_t *obj, Elf64_Rela *r) {
     void *addr = NULL;
     const char *via = "?";
@@ -1956,6 +2011,10 @@ static size_t map_base_vaddr(const elf_object_t *obj) {
     }
     return ALIGN_DOWN(min_vaddr, PAGE_SIZE);
 }
+
+/* Preferovana baze pro NEJBLIZSI map_elf_segments (nastavuje imgcache).
+ * Definovana pred map_elf_segments, protoze ji cte. */
+uintptr_t g_img_pref_base = 0;
 
 static void *va(const elf_object_t *obj, size_t vaddr) {
     return (char *)obj->base_addr + (vaddr - map_base_vaddr(obj));
@@ -2202,7 +2261,19 @@ static void *map_elf_segments(int fd, void *file_map, Elf64_Ehdr *ehdr, size_t *
     size_t mbv = ALIGN_DOWN(min_vaddr, PAGE_SIZE);
     size_t total = ALIGN_UP(max_vaddr, PAGE_SIZE) - mbv;
     void *base;
-    if (ehdr->e_type == ET_EXEC) {
+    /* Obrazova cache potrebuje modul na TOTEZ bazi jako pri ulozeni (obraz
+     * obsahuje absolutni adresy). MAP_FIXED_NOREPLACE: kdyz je misto obsazene,
+     * mmap selze a jde se standardni cestou (obraz se pak zahodi). */
+    if (g_img_pref_base && ehdr->e_type != ET_EXEC) {
+        base = mmap((void *)g_img_pref_base, total, PROT_READ | PROT_WRITE,
+                    MAP_PRIVATE | MAP_ANONYMOUS | MAP_FIXED_NOREPLACE, -1, 0);
+        g_img_pref_base = 0;
+        if (base == MAP_FAILED)
+            base = mmap(NULL, total, PROT_READ | PROT_WRITE,
+                        MAP_PRIVATE | MAP_ANONYMOUS, -1, 0);
+        if (base == MAP_FAILED)
+            return NULL;
+    } else if (ehdr->e_type == ET_EXEC) {
         base = mmap((void *)mbv, total, PROT_READ | PROT_WRITE,
                     MAP_PRIVATE | MAP_ANONYMOUS | MAP_FIXED_NOREPLACE, -1, 0);
         if (base == MAP_FAILED)
@@ -2656,6 +2727,9 @@ elf_object_t *elf_load(const char *path) {
         obj->cache_key = strdup(kb);
         if (!getenv("ELF_LOADER_NO_CACHE"))
             obj->cache = cache_load_module(kb);
+        /* Obrazovou cache otevri PRED nacitanim deps - potrebuje jim rict
+         * preferovane baze. Klicem je hlavni binarka. */
+        img_open(kb);
     }
     obj->entry_point = (void *)((char *)base + (ehdr->e_entry - map_base_vaddr_));
 
@@ -3515,7 +3589,10 @@ elf_object_t *elf_load_shared(const char *path, elf_scope_t *scope) {
     }
 
     size_t total_size = 0, mbv = 0;
+    /* Obrazova cache: modul musi skoncit na tez bazi jako pri ulozeni. */
+    g_img_pref_base = img_preferred_base(resolved);
     void *base = map_elf_segments(fd, file_map, ehdr, &total_size, &mbv);
+    g_img_pref_base = 0;
     loader_phase = "loading";
     if (!base) {
         fprintf(stderr, "[-] %s: no LOAD segments\n", path);
@@ -3585,7 +3662,13 @@ elf_object_t *elf_load_shared(const char *path, elf_scope_t *scope) {
     load_module_needed(m, scope);
     elf_scope_add(scope, m);
     if (elf_debug()) printf("[dbg2] reloc-start %s\n", path);
-    elf_relocate(m);
+    /* Obrazova cache (prompt 10 cast A): kdyz obraz sedi (tentyz klic modulu
+     * i baze), nactou se hotove RW/RELRO stranky misto relokace. Jakykoli
+     * nesouhlas = plna relokace. */
+    if (!img_restore_module(m, resolved)) {
+        elf_relocate(m);
+        img_record_module(m, resolved);
+    }
     if (elf_debug()) printf("[dbg2] reloc-done\n");
 
     patch_module_heap_syms(m);

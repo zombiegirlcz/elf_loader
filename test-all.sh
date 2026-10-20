@@ -1409,6 +1409,54 @@ category_lazybind() {
     fi
 }
 
+# Obrazova cache RELRO stranek (prompt 10 cast A, ELF_LOADER_IMGCACHE=1).
+# Overuje: (a) s cache zapnutou je vystup IDENTICKY jako bez ni (bezpecny
+# fallback), (b) cache odmitne vytvorit obraz, ktery by nesel revalidovat
+# (RELRO ld.so/libc drzi pointery do mallocovane pameti loaderu -> obraz
+# se nevytvori), (c) na disku nezustane zadny .tmp.
+category_imgcache() {
+    echo ""
+    echo "=== obrazova cache RELRO (ELF_LOADER_IMGCACHE) ==="
+    local env="ROOTFS=$R ELF_ROOTFS=$R ELF_LOADER=$L"
+    local idir="${LX_LOG:-$R/root/elf_loader}/cache/img"
+    local ok=1 detail=""
+
+    rm -rf "$idir" 2>/dev/null || true
+    local t
+    for t in "$R/usr/bin/uname -m" "$R/bin/ls $R/tmp"; do
+        local a b
+        a=$(ashell_out "$env $L --ownall $t" 2>&1 | head -3)
+        b=$(ashell_out "$env ELF_LOADER_IMGCACHE=1 $L --ownall $t" 2>&1 | head -3)
+        [ -n "$a" ] || { ok=0; detail="$detail [${t##*/}: prazdny vystup]"; }
+        [ "$a" = "$b" ] || { ok=0; detail="$detail [${t##*/}: s cache != bez cache]"; }
+    done
+    if [ -x "$R/usr/bin/python3" ]; then
+        local p
+        p=$(ashell_out "$env ELF_LOADER_IMGCACHE=1 $L --ownall $R/usr/bin/python3 -c 'print(6*7)'" 2>&1)
+        printf '%s' "$p" | grep -q 42 || { ok=0; detail="$detail [python3: $p]"; }
+    fi
+
+    # Odmitnuti obrazu musi byt hlaseno, ne tiche
+    local why
+    why=$(ashell_out "$env ELF_LOADER_IMGCACHE=1 ELF_LOADER_IMG_TRACE=1 $L --ownall $R/usr/bin/uname -m" 2>&1 \
+          | grep -c 'neklasifikovatelny pointer\|ulozeno' || true)
+    [ "${why:-0}" -ge 1 ] || { ok=0; detail="$detail [img trace nic nehlasi]"; }
+
+    local ntmp
+    ntmp=$(ls "$idir" 2>/dev/null | grep -c '\.tmp\.' || true)
+    [ "${ntmp:-0}" = 0 ] || { ok=0; detail="$detail [zustal .tmp]"; }
+
+    if [ "$ok" = 1 ]; then
+        echo "PASS imgcache: s cache == bez cache, zadny rozbity obraz, 0 .tmp"
+        echo "PASS: imgcache - ELF_LOADER_IMGCACHE" >> "$PASS_LOG"
+        ((PASS_COUNT++)) || true
+    else
+        echo "FAIL imgcache:$detail"
+        echo "FAIL: imgcache - ELF_LOADER_IMGCACHE |$detail" >> "$FAIL_LOG"
+        ((FAIL_COUNT++)) || true
+    fi
+}
+
 category_timing() {
     echo ""
     echo "=== fázový profil exec (ELF_LOADER_TIMING) ==="
@@ -1785,6 +1833,10 @@ case "${1:-all}" in
         category_lazybind
         print_summary
         ;;
+    imgcache)
+        category_imgcache
+        print_summary
+        ;;
     bigargv)
         category_bigargv
         print_summary
@@ -1854,6 +1906,7 @@ case "${1:-all}" in
         category_execcache
         category_symhash
         category_lazybind
+        category_imgcache
         category_lxc
         category_dw
         category_elfrc

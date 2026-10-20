@@ -40,14 +40,14 @@ jobs:
         run: |
           set -eux
           FLAGS="-Wall -Wextra -g -O0 -std=c11"
-          SRCS="src/main.c src/elf_loader.c src/ldso_tls.c src/timing.c src/cache.c src/entry.S"
+          SRCS="src/main.c src/elf_loader.c src/ldso_tls.c src/timing.c src/cache.c src/imgcache.c src/entry.S"
           "$TC/aarch64-linux-android24-clang" $FLAGS $SRCS -ldl -o /tmp/elf_loader_ndk
 
       - name: Cross-compile (static-PIE)
         run: |
           set -eux
           FLAGS="-Wall -Wextra -g -O0 -std=c11"
-          SRCS="src/main.c src/elf_loader.c src/ldso_tls.c src/timing.c src/cache.c src/entry.S src/dlfcn_stubs.c"
+          SRCS="src/main.c src/elf_loader.c src/ldso_tls.c src/timing.c src/cache.c src/imgcache.c src/entry.S src/dlfcn_stubs.c"
           "$TC/aarch64-linux-android24-clang" $FLAGS -fPIE -static-pie $SRCS -o /tmp/elf_loader_ndk_staticpie
 
       - name: Verify interpreter is bionic

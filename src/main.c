@@ -4,6 +4,7 @@
 #include <signal.h>
 #include "../include/elf_loader.h"
 #include "cache.h"
+#include "imgcache.h"
 
 static void print_help(const char *prog) {
     fprintf(stdout,
@@ -4265,6 +4266,15 @@ static int run_ownall(const char *path, int argc, char **argv, char **envp) {
             }
             fclose(mf);
         }
+    }
+    /* Obrazova cache: zapis nasbiranych modulu (no-op pri hitu i kdyz je
+     * vypnuta). Klic = klic hlavni binarky. */
+    if (obj->cache_key)
+        img_commit(obj->cache_key);
+    if (img_enabled() && elf_debug()) {
+        int ir = 0, irec = 0;
+        img_stats(&ir, &irec);
+        fprintf(stderr, "[img] restorovano %d modulu, zaznamenano %d\n", ir, irec);
     }
     elf_timing_mark("svc_patch");
     elf_install_fault_handlers();
