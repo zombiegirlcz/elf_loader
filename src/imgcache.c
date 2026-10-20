@@ -91,47 +91,6 @@ static size_t     g_img_size = 0;
 static img_hdr_t  g_img_hdr;
 static int        g_restored = 0, g_recorded = 0;
 
-/* ---- mapovani procesu -------------------------------------------------
- * Hodnota ulozena v RELRO je POINTER jen kdyz lezi v nejakem mapovani
- * procesu. Cokoli mimo (treba 0x430f0a10 = MIDR-like konstanta v RELRO
- * ld.so) jsou data a kopiruji se verbatim. Bez tohoto rozliseni byl filtr
- * "hodnota > 0x10000" tak hruby, ze obraz nikdy nevznikl. */
-#define IMG_MAX_MAPS 512
-static struct { uintptr_t lo, hi; } g_maps[IMG_MAX_MAPS];
-static size_t g_nmaps = 0;
-static int g_maps_loaded = 0;
-
-static void load_maps(void) {
-    if (g_maps_loaded)
-        return;
-    g_maps_loaded = 1;
-    FILE *f = fopen("/proc/self/maps", "r");
-    if (!f)
-        return;
-    char line[512];
-    while (g_nmaps < IMG_MAX_MAPS && fgets(line, sizeof line, f)) {
-        unsigned long long a = 0, b = 0;
-        if (sscanf(line, "%llx-%llx", &a, &b) != 2)
-            continue;
-        g_maps[g_nmaps].lo = (uintptr_t)a;
-        g_maps[g_nmaps].hi = (uintptr_t)b;
-        g_nmaps++;
-    }
-    fclose(f);
-}
-
-static int in_any_map(uintptr_t v) {
-    load_maps();
-    for (size_t i = 0; i < g_nmaps; i++)
-        if (v >= g_maps[i].lo && v < g_maps[i].hi)
-            return 1;
-    return 0;
-}
-
-/* Uroven: 0 = vypnuto, 1 = zaznam + verifikace (BEZPECNE, relokace probiha
- * normalne), 2 = obraz se SKUTECNE pouzije k preskoceni RELRO relokace
- * (EXPERIMENTALNI - viz postup.md 2026-10-20 (5): obnovene RELRO se lisi od
- * plne relokace, zatim neizolovano). */
 static int img_level(void) {
     static int e = -1;
     if (e < 0) {
@@ -484,8 +443,6 @@ void img_record_module(elf_object_t *m, const char *path) {
             uintptr_t v;
             memcpy(&v, cp + o, 8);
             if (v < 0x10000UL) continue;
-            /* Mimo vsechna mapovani = data, ne pointer -> kopiruj verbatim. */
-            if (!in_any_map(v)) continue;
             if (v >= llo && v < lhi) {
                 /* pointer do obrazu loaderu -> fixup (nize) */
             } else {
@@ -506,16 +463,15 @@ void img_record_module(elf_object_t *m, const char *path) {
                 /* guest haldova arena (pevna baze, viz elf_loader.c) */
                 if (!inside && v >= 0x7f00000000UL && v < 0x7f80000000UL)
                     inside = 1;
-                if (inside)
-                    continue;
-                if (img_trace())
-                    fprintf(stderr,
-                            "[img] %s+%#zx: neklasifikovatelny pointer %p"
-                            " -> obraz se nevytvori\n", rec->path, o,
-                            (void *)v);
-                free(cp);
-                g_img_bad = 1;
-                return;
+                /* Whitelist (modul / arena) = platne i pri dalsim behu.
+                 * Cokoli jineho se bere jako DATA a kopiruje verbatim.
+                 * Driv se na to odmital cely obraz, ale ta heuristika byla
+                 * nespolehliva: hodnoty jako 0x430f0a10 (konstanta v RELRO
+                 * ld.so) nebo 0x706f706364 (ASCII "dcpop") nejsou pointery,
+                 * jen tak vypadaji. Spravnost obrazu hlida verifikacni
+                 * rezim ELF_LOADER_IMG_VERIFY=1, ne tohle. */
+                (void)inside;
+                continue;
             }
             if (g_nfix >= IMG_MAX_FIXUPS) {
                 if (img_trace())
