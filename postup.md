@@ -4557,3 +4557,61 @@ resetuje), takže `set_robust_list`/`rseq` ze startu statické glibc app seccomp
 KILLne. Fix z 2026-10-15 (`elf_needs_real_exec` gate) řešil SIGSEGV z own-loadu
 statické binárky, ne tohle. Pozn.: test tím pádem **nikdy neověřil běh**, jen
 cestu resolution — v `all` vždy jen SKIPnul.
+
+## 2026-10-20 (2) — prompt 02 kandidát 3 a vstupní podmínka promptu 10 (měření)
+
+### Kandidát 3 (cache klasifikace ELF v exec shimu) — měřením zamítnut
+
+Mikro-benchmark `$R/tmp/clsbench/c.c` reprodukuje přesnou syscall sekvenci
+`elf_needs_real_exec()` + 2× `is_glibc_elf()` (tři call-sites v
+`shim_execve`/`shim_posix_spawnp`), spuštěno pod loaderem na zařízení:
+
+```
+klasifikace 3x na exec: 37.9 us/exec   (cíl /bin/true,   n=5000)
+klasifikace 3x na exec: 59.7 us/exec   (cíl python3,     n=5000)
+```
+
+Proti ceně jednoho exec (~48 000 µs, zanořený exec v guest bashi 48,2 ms/exec,
+N=200×3) je to **0,08–0,12 %**. Cache klasifikace tedy **nemůže** splnit
+vlastní kritérium promptu („benchmark ukazuje zlepšení") — zlepšení by leželo
+tři řády pod šumem měření (±2 ms). Neimplementováno **na základě měření**,
+ne odhadu. Kdyby se cena exec někdy dostala pod ~1 ms, vrátit se k tomu.
+
+### Vstupní podmínka promptu 10 — splněna, ale příčina je jiná
+
+Podíl relokace na exec (device, `ashell -c`, medián N=7):
+
+| cíl | `reloc_done` | podíl | `hooks_bti` | total |
+|---|---|---|---|---|
+| `/bin/true` | 1933 µs | 6 % | 12 756 µs | 30,1 ms |
+| `python3 -c 0` | 14 533 µs | **31 %** | 12 252 µs | 45,9 ms |
+| `gcc --version` | 4163 µs | 14 % | 12 049 µs | 28,7 ms |
+| `git --version` | 7464 µs | 21 % | 11 857 µs | 35,3 ms |
+| `bash -c true` | 5853 µs | 17 % | 11 830 µs | 33,8 ms |
+
+Relokace je tedy opravdu velký podíl (14–31 % u reálných binárek), ale
+**`hooks_bti` ~12 ms je u každé binárky ještě větší a je konstantní**.
+
+### ROOT CAUSE obojího: `elf_scope_find` nemá hash tabulku
+
+`src/elf_loader.c:elf_scope_find()` je **lineární sken se `strcmp` přes
+`dynsym` všech modulů scope** (libc.so.6 má ~3000 symbolů) — žádný
+`DT_GNU_HASH`/`DT_HASH`. Jeden lookup proto stojí ~19 µs. Z toho plyne:
+
+- `hooks_bti` 12 ms = **590 lookupů** (zanořená smyčka 5 × 118 položek
+  `g_f2_hooks`),
+- `hooks_got` 2,6 ms, a hlavně
+- `reloc_done` 1,9–14,5 ms — každý `JUMP_SLOT`/`GLOB_DAT` dělá jeden lookup.
+
+**Důsledek pro prompt 10:** cíle promptu (zlevnit relokaci) se dá dosáhnout
+implementací `DT_GNU_HASH` lookupu, což je **mnohem menší a bezpečnější
+změna** než část A (cache RELRO obrazů s pointery na shimy) i část B (líné
+vázání `JUMP_SLOT` s resolver trampolínou pod guest TP). Doporučené pořadí:
+(1) GNU hash lookup, (2) teprve pak znovu změřit, zda líné vázání ještě má co
+ušetřit. Část A by navíc musela do klíče brát hwcaps (IFUNC) a adresy shimů
+v loaderu (PIE+ASLR) — po (1) nemusí být vůbec potřeba.
+
+**Rozpracováno, NEOVĚŘENO:** v `src/main.c` je necommitnutá inverze zanořené
+smyčky v `hooks_bti` (adresy 118 jmen resolvovat jednou → 118 místo 590
+lookupů, očekávaně ~12 → ~2,5 ms). Prošla jen `gcc -fsyntax-only`; **není
+zbuilděná ani otestovaná na zařízení**, takže jakékoli číslo by byl odhad.
