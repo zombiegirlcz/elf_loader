@@ -304,6 +304,11 @@ static int img_verify(void) {
     return v;
 }
 
+/* Schova data, ktera obraz tvrdi (s dopoctenymi fixupy), aby je
+ * img_verify_report() mohl po relokaci porovnat. Nic nezapisuje do modulu. */
+static void img_stash_expected(const elf_object_t *m, const void *im_v,
+                               uint32_t idx, const char *path);
+
 int img_relro_covers(const elf_object_t *m, const void *addr) {
     if (img_level() < 2 || img_verify())
         return 0;   /* uroven 1 = relokace probiha plne (bezpecne) */
@@ -333,6 +338,16 @@ int img_restore_module(elf_object_t *m, const char *path) {
     }
     if (im->nseg > IMG_MAX_SEGS)
         return 0;
+
+    /* UROVEN 1 nesmi do pameti zapsat NIC. Zapsat obraz a pak nechat
+     * relokaci "doplnit" nefunguje: slova, ktera relokace neprepisuje,
+     * by zustala ze stareho behu -> SIGSEGV. Uroven 1 proto jen (volitelne)
+     * schova ocekavana data pro verifikaci a vrati 0 = relokuj normalne. */
+    if (img_level() < 2) {
+        if (img_verify())
+            img_stash_expected(m, im, idx, path);
+        return 0;
+    }
 
     /* Data useku */
     for (uint32_t s = 0; s < im->nseg; s++) {
@@ -384,32 +399,6 @@ int img_restore_module(elf_object_t *m, const char *path) {
     g_restored++;
     if (img_trace())
         fprintf(stderr, "[img] restore %s (%u useku)\n", path, im->nseg);
-    if (img_verify()) {
-        /* Zapamatuj si, co obraz tvrdi; porovnani udela img_verify_module()
-         * po relokaci. */
-        for (uint32_t s = 0; s < im->nseg && g_nver < IMG_MAX_RESTORED; s++) {
-            const img_seg_t *sg = &im->seg[s];
-            unsigned char *cp = malloc(sg->len);
-            if (!cp) break;
-            memcpy(cp, g_img_buf + sg->data_off, sg->len);
-            /* fixupy teto sekce dopocitej stejne jako vyse */
-            for (uint32_t f = 0; f < g_img_hdr.nfix; f++) {
-                const img_fix_t *fx = img_fix_at(f);
-                if (!fx || fx->mod != idx || fx->seg != s) continue;
-                uintptr_t llo2 = 0, lhi2 = 0;
-                if (!elf_loader_range(&llo2, &lhi2)) break;
-                uintptr_t v2 = llo2 + fx->ldr_off;
-                if (fx->off + 8 <= sg->len) memcpy(cp + fx->off, &v2, 8);
-            }
-            g_ver[g_nver].m = m;
-            g_ver[g_nver].addr = (unsigned char *)m->base_addr +
-                                 (sg->vaddr - im->map_base_vaddr);
-            g_ver[g_nver].img = cp;
-            g_ver[g_nver].len = sg->len;
-            g_ver[g_nver].path = path;
-            g_nver++;
-        }
-    }
     return 1;
 }
 
@@ -607,4 +596,36 @@ void img_commit(const char *exe_key) {
     if (img_trace())
         fprintf(stderr, "[img] ulozeno %s (%zu modulu, %zu fixupu, %zu B)\n",
                 path, g_nmod, g_nfix, off);
+}
+
+static void img_stash_expected(const elf_object_t *m, const void *im_v,
+                               uint32_t idx, const char *path) {
+    const img_mod_t *im = (const img_mod_t *)im_v;
+    for (uint32_t s = 0; s < im->nseg && g_nver < IMG_MAX_RESTORED; s++) {
+        const img_seg_t *sg = &im->seg[s];
+        if (sg->data_off + sg->len > g_img_size)
+            return;
+        unsigned char *cp = malloc(sg->len);
+        if (!cp)
+            return;
+        memcpy(cp, g_img_buf + sg->data_off, sg->len);
+        for (uint32_t f = 0; f < g_img_hdr.nfix; f++) {
+            const img_fix_t *fx = img_fix_at(f);
+            if (!fx || fx->mod != idx || fx->seg != s)
+                continue;
+            uintptr_t llo = 0, lhi = 0;
+            if (!elf_loader_range(&llo, &lhi))
+                break;
+            uintptr_t v = llo + fx->ldr_off;
+            if (fx->off + 8 <= sg->len)
+                memcpy(cp + fx->off, &v, 8);
+        }
+        g_ver[g_nver].m = m;
+        g_ver[g_nver].addr = (unsigned char *)m->base_addr +
+                             (sg->vaddr - im->map_base_vaddr);
+        g_ver[g_nver].img = cp;
+        g_ver[g_nver].len = sg->len;
+        g_ver[g_nver].path = path;
+        g_nver++;
+    }
 }
