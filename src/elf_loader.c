@@ -1931,7 +1931,8 @@ static void *resolve_jmp_symbol(elf_object_t *obj, Elf64_Rela *r) {
     return addr;
 }
 
-void *elf_lazy_resolve(uintptr_t got_slot) {
+/* Vnitrni telo; bezi uz pod HOST (bionickym) TP - viz elf_lazy_resolve. */
+static void *elf_lazy_resolve_inner(uintptr_t got_slot) {
     elf_object_t *obj = NULL;
     for (size_t k = 0; k < lazy_obj_count; k++) {
         elf_object_t *cand = lazy_objs[k];
@@ -1973,6 +1974,22 @@ void *elf_lazy_resolve(uintptr_t got_slot) {
         fprintf(stderr, "[!] lazy: slot %p not in jmp_rela of %s\n",
                 (void *)got_slot, obj->soname ? obj->soname : "?");
     return 0;
+}
+
+/* Lazy resolver se vola Z GUEST KODU (PLT stub), takze bezi pod GUEST TP.
+ * Resolvovani je ale loaderovy C kod: `elf_debug()`/`getenv`, `fprintf`,
+ * `call_ifunc_resolver`, override tabulka - tedy veci zavisle na bionickem
+ * TLS. Bez prepnuti TP to korumpovalo guest TLS a `python3` (hodne lazy
+ * symbolu + intenzivni TLS) padal SIGSEGV, zatimco `bash` prosel.
+ * Stejny vzor jako `dl_enter_host` u `_rtld_global_ro` shimu (commit
+ * 80c3ffd): prepnout na host TP a zablokovat asynchronni signaly, aby
+ * guest handler nedorazil v okne s cizim TP. */
+void *elf_lazy_resolve(uintptr_t got_slot) {
+    dl_host_t st;
+    int sw = dl_enter_host(&st);
+    void *res = elf_lazy_resolve_inner(got_slot);
+    dl_leave_host(sw, &st);
+    return res;
 }
 
 void elf_register_override(const char *name, void *fn) {
