@@ -4949,3 +4949,10 @@ BIND_NOW eager u 3 objektu`; stará `FAIL lazybind: [python3 pod lazy nedal
 signal handlery, trampolíny), musí buď být TLS-safe (`raw_*`/`shim_*`), nebo
 na začátku přepnout TP přes `dl_enter_host()`. Je to už třetí výskyt téhož
 bugu v tomhle projektu.
+
+**Kombinovaný běh s oběma částmi zapnutými** (`ELF_LOADER_IMGCACHE=1
+ELF_LOADER_LAZY=1 … test-all.sh all`, `ashell -c`, odpinované CPU):
+**PASS 192 / FAIL 0 / SKIP 33** — tedy přesně stejné jako default a stejné
+jako jen s částí A. Před fixem `c69eeac` byl tentýž běh **160 / 31 / 34**,
+kde všech 31 FAILů šlo na lazy. Tím je prompt 10 část B funkčně hotová:
+cesta je ověřená celou sadou, ne jen vlastním testem kategorie.
