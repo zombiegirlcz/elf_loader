@@ -1,5 +1,9 @@
 # Prompt 01 — měření: proot vs. loader vs. chroot + fázový profil exec
 
+> **STAV: HOTOVO (2026-10-16).** Výsledky a metodické pasti viz
+> [00-README.md — Co je hotové](00-README.md#co-je-hotové-stav-2026-10-20),
+> `AGENTS.md` sekce 1 a `postup.md` 2026-10-16.
+
 Pracuješ v `/root/elf_loader`. Přečti `docs/nextgen/00-README.md` (společná
 pravidla), `AGENTS.md` a `docs/nextgen/proot-nahrada.md` kapitoly 1, 5 a 9.
 

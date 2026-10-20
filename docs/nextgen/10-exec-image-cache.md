@@ -1,5 +1,11 @@
 # Prompt 10 — cache připravených obrazů (RELRO-sharing styl) + líné vázání
 
+> **STAV: HOTOVO / UZAVŘENO (2026-10-20).** Obě části implementovány,
+> obě default vypnuté — po promptu 02 už nemají co ušetřit (relokace je
+> ~1 ms z 15–30 ms exec). Viz
+> [00-README.md — Co je hotové](00-README.md#co-je-hotové-stav-2026-10-20),
+> `AGENTS.md` sekce 10 a `postup.md` 2026-10-20 (4)–(7).
+
 Pracuješ v `/root/elf_loader`. Přečti `docs/nextgen/00-README.md`, `AGENTS.md`
 (sekce 2 — IFUNC, TLS, brk arena; sekce 9 — Bun a file-backed mapování) a
 `docs/nextgen/proot-nahrada.md` kapitoly 5.5, 5.6. **Předpoklad:** prompty 01

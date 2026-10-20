@@ -1,5 +1,11 @@
 # Prompt 02 — rychlé výhry exec (cíl 48 → ~20 ms)
 
+> **STAV: HOTOVO (2026-10-20).** Dva kandidáti implementováni (cache
+> svc-site skenu, `DT_GNU_HASH` lookup), dva zamítnuty (statický loader,
+> cache klasifikace ELF). Cíl splněn: exec 48 → **26 ms**. Viz
+> [00-README.md — Co je hotové](00-README.md#co-je-hotové-stav-2026-10-20),
+> `AGENTS.md` sekce 1 a `postup.md` 2026-10-20.
+
 Pracuješ v `/root/elf_loader`. Přečti `docs/nextgen/00-README.md`, `AGENTS.md`
 a `docs/nextgen/proot-nahrada.md` kapitolu 5. **Předpoklad:** prompt 01 je
 hotový — použij jeho fázový profil a začni tím, co stojí nejvíc.
