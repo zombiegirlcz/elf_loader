@@ -32,6 +32,24 @@ Android appce — bez nutnosti je kompilovat pro bionic/NDK.
   rychlejší (0,44 s vs 11 s). Loader se vyplatí na dlouhé procesy, ne na
   krátký exec. Kapitola „Naměřeno" v `docs/nextgen/proot-nahrada.md` —
   [postup.md](postup.md) 2026-10-16.
+- **Cache svc-site skenu dokončena (2026-10-20, prompt 02):** `cache_nr_t.scanned`
+  (formát v2) cachuje i **negativní** výsledek skenu — dřív se modul bez nálezu
+  (libm, libz, libexpat, většina `.so`) skenoval 5× při každém exec a `python3`
+  měl v cache jen 2 klíče. Dál `elf_object_t.svc_patched` ruší **dvojí** patchování
+  (load + smyčka v `main.c`), `cache_dirty` zapisuje jen po skutečném skenu
+  a klíč nese identitu buildu loaderu (FNV-1a z `__DATE__`/`__TIME__`).
+  Host-level (`ashell`, mimo DW/proot): `svc_patch` 966 µs → **4 µs**
+  (`python3` 30,2 ms → **5 µs**), interní total `/bin/true` 28,4 → 23,4 ms,
+  `python3` 81,9 → 49,0 ms; wall-clock `python3 -c 0` 208 → **163 ms/launch**
+  (−22 %), 1000× `/bin/true` 47,4 → 45,3 ms (v šumu — exec režie dominuje).
+  **Pozor:** profil z promptu 01 byl měřen zanořeně pod DW loaderem, takže
+  `load_done` 19,6 / `svc_patch` 8,4 ms neplatí jako baseline; host-level je
+  dominantní fáze `hooks_bti` ~12,3 ms. Knoby `ELF_LOADER_NO_CACHE=1`,
+  `ELF_LOADER_CACHE_TRACE=1`, `ELF_LOADER_DOUBLE_PATCH=1`. A/B `test-all.sh
+  execcache` (stará: 2 klíče + 41 skenů na teplo; nová: 10 klíčů, 0 skenů),
+  host unit test `test/cache_test.c` 20/20. Nasazený **NDK build loaderu GNU
+  BuildID nemá** (jen `.note.android.ident`) — [postup.md](postup.md) 2026-10-20.
+
 - **Git / GitHub ochrana (2026-10-06):** ruleset `protect-master` (zákaz
   update/force-push/smazání, bypass jen admin = vlastník → cizí PR do `master`
   nejde mergnout), `protect-dev` (zákaz force-push/smazání). Workflow
@@ -402,6 +420,18 @@ Milníky:
   je per-jméno; při přidání shimu zkontrolovat aliasy v `libc.so.6`
   (`nm -D`, stejná adresa) a importy binárek (`nm -D --undefined-only`;
   toybox `readelf` relokace nevypisuje).
+- **Statický glibc ELF v rootfs končí `SIGSYS`** („Bad system call", RC=159) —
+  nalezeno 2026-10-20 při regresi, **není regrese** (`elf_loader.prev` padá
+  stejně). `test-all.sh staticexec` to v `all` **maskuje jako SKIP**: bez guest
+  PATH nenajde gcc `ld`, binárka se nepostaví → „static build selhal". S guest
+  PATH FAILuje na guest-abs i `$ROOTFS`-abs cestě. Hypotéza: RAW `execve`
+  (žádný `PT_INTERP`) → dítě bez svc-patchů i bez SIGSYS handleru (resetuje se
+  při `execve`) → `set_robust_list`/`rseq` ze startu statické glibc je KILLnutý.
+- Kandidát 3 promptu 02 (cache klasifikace ELF v exec shimu — `is_glibc_elf`,
+  `elf_needs_real_exec`, shebang, symlink chain) **neimplementován**: týká se
+  jiné cesty než měřený `--ownall` start (shim pod guest TP → jen `raw_*`,
+  sdílená tabulka v memfd) a profil ukazuje rezervu v `hooks_bti`/`load`.
+  Měřit na zátěži „guest, který hodně execuje" (`make -j8`).
 - Test na reálném 16K Android 15+ zařízení (Task 3).
 - ~~Bionic dlerror/errno test (Task 4).~~ **Vyřešeno** — `ldso_dlerror()` +
   guest `dlopen/dlsym/dlerror/dlclose/dladdr` nad `_rtld_global` ověřeno

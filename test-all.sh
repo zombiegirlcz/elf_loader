@@ -1284,13 +1284,41 @@ category_execcache() {
     nkeys=$(ls "$cdir" 2>/dev/null | grep -c . || true)
     [ "${nkeys:-0}" -ge 2 ] || ok=0
 
+    # (d) NEGATIVNI vysledek skenu se cachuje taky (format v2). Vicemodulova
+    # binarka: po prvnim behu musi mit cache zaznam pro KAZDY nacteny modul,
+    # i pro ty, kde se zadny svc-site nenasel (libm, libz, ...). Stara verze
+    # ukladala jen moduly s nalezem -> ~2 klice misto >=5.
+    # (e) na teplem behu se uz nesmi skenovat nic: ELF_DEBUG trace nesmi
+    # obsahovat radek "prebito" (= probehl sken), jen "cache hit".
+    local multi nmods nkeys2 scans
+    multi=$R/usr/bin/python3
+    [ -x "$multi" ] || multi=$R/bin/bash
+    rm -rf "$cdir" 2>/dev/null || true
+    if [ "$multi" = "$R/usr/bin/python3" ]; then
+        ashell_out "$env $multi -c 0" >/dev/null 2>&1 || true
+        ashell_out "$env $L --ownall $multi -c 0" >/dev/null 2>&1 || true
+        scans=$(ashell_out "$env ELF_DEBUG=1 $L --ownall $multi -c 0" 2>&1 \
+                | grep -c 'prebito' || true)
+    else
+        ashell_out "$env $L --ownall $multi -c true" >/dev/null 2>&1 || true
+        scans=$(ashell_out "$env ELF_DEBUG=1 $L --ownall $multi -c true" 2>&1 \
+                | grep -c 'prebito' || true)
+    fi
+    nkeys2=$(ls "$cdir" 2>/dev/null | grep -c . || true)
+    nmods=$(ashell_out "$env ELF_DEBUG=1 $L --ownall $multi -c true" 2>&1 \
+            | grep -c 'own-loaded module' || true)
+    [ "${nkeys2:-0}" -ge 5 ] || ok=0
+    [ "${scans:-1}" = 0 ] || ok=0
+
     if [ "$ok" = 1 ]; then
-        echo "PASS execcache: shodny vystup, cache smazani OK, $nkeys klicu"
-        echo "PASS: execcache - BuildID cache" >> "$PASS_LOG"
+        echo "PASS execcache: shodny vystup, cache smazani OK, $nkeys klicu;" \
+             "$nkeys2 klicu pro $(basename "$multi") ($nmods modulu), 0 skenu na teplo"
+        echo "PASS: execcache - BuildID cache (v2, negativni vysledek)" >> "$PASS_LOG"
         ((PASS_COUNT++)) || true
     else
-        echo "FAIL execcache: rc1=$rc1 rc2=$rc2 o1=[$o1] o2=[$o2] keys=$nkeys o3=[$o3]"
-        echo "FAIL: execcache - BuildID cache | rc1=$rc1 rc2=$rc2 keys=$nkeys" >> "$FAIL_LOG"
+        echo "FAIL execcache: rc1=$rc1 rc2=$rc2 o1=[$o1] o2=[$o2] keys=$nkeys" \
+             "keys2=$nkeys2 scans_warm=$scans o3=[$o3]"
+        echo "FAIL: execcache - BuildID cache | rc1=$rc1 rc2=$rc2 keys=$nkeys keys2=$nkeys2 scans=$scans" >> "$FAIL_LOG"
         ((FAIL_COUNT++)) || true
     fi
 }

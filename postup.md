@@ -4412,3 +4412,148 @@ jako `ELF_RC_EXAMPLE[]` v `src/main.c`.
 `ELF_RC` zapíše, druhý běh bez `--force` selže (exit 1), s `--force` projde.
 
 **Verze:** `ELF_LOADER_VERSION` 0.3 → 0.7.
+
+## 2026-10-20 — prompt 02 dokončení: cache svc-site skenu (host-level měření)
+
+Navazuje na 2026-10-16 (commit `4cd8eea` + „NEověřeno na zařízení"). Tentokrát
+měřeno **host-level přes `ashell -c`** (TracerPid 0, mimo proot i mimo DW) —
+na rozdíl od promptu 01, jehož profil byl pořízen **zanořeně pod DW loaderem**
+a je proto nadhodnocený. Čísla z promptu 01 (`load_done` 19,6 / `hooks_bti`
+14,8 / `svc_patch` 8,4 ms) neplatí jako baseline pro čistý exec.
+
+### Co bylo rozbité (root cause)
+
+Diagnostika `ELF_DEBUG=1 ELF_LOADER_CACHE_TRACE=1` na `python3 -c 0`:
+
+```
+[patch] syscall 99 (err=0): prebito 0 svc#0 v libm.so.6     ← každý exec znovu
+[patch] syscall 293 (err=0): prebito 0 svc#0 v libm.so.6
+...                                                           (a totéž libz, libexpat)
+[patch] syscall 99: cache hit (2 mist) v libc.so.6           ← dvakrát za běh
+```
+
+1. **Negativní výsledek skenu se neukládal.** `cache_record_site()` se volalo
+   jen při nálezu, takže modul bez nálezu (libm, libz, libexpat — většina `.so`)
+   neměl v cache žádný záznam a jeho celý `.text` se skenoval 5× (5 kill
+   syscallů) při **každém** exec. Proto měl `python3` v cache jen 2 klíče.
+2. **Každý modul se skenoval dvakrát** — raz v `elf_load_shared` při loadu,
+   raz ve smyčce v `main.c`. Druhý průchod už nic najít nemohl (`svc` je
+   přepsaný), byl to čistý sken naprázdno.
+3. Cache soubory se **přepisovaly při každém exec**, i když byl hit.
+
+### Fix (commit `b8ccdd7`)
+
+- `cache_nr_t.scanned` — slot nese „sken proběhl", takže se cachuje i nulový
+  nález. `CACHE_FORMAT_VERSION` 1 → 2.
+- `cache_mark_scanned()` zakládá slot **před** skenem; `cache_invalidate()`
+  ho zruší, když je výsledek neúplný (přetečení `CACHE_MAX_SITES`, selhání
+  `realloc` nebo `mprotect`) — jinak by se nepatchnuté místo příště už
+  nehledalo. Load odmítne nekonzistentní soubor (nálezy bez `scanned`).
+- `elf_object_t.svc_patched` — `elf_patch_syscall_sites_all` nad modulem
+  proběhne jen jednou (`ELF_LOADER_DOUBLE_PATCH=1` vrátí staré chování).
+- `elf_object_t.cache_dirty` — zápis jen po skutečném skenu, na hit nic.
+- Klíč nese **identitu buildu loaderu** (FNV-1a z `__DATE__`/`__TIME__`):
+  cache drží výsledky skenu loaderu, takže po jeho překladu musí propadnout.
+  (Prompt to vyžaduje jako „verze loaderu"; `/proc/self/exe` by tady nešel —
+  je shimnutý a stat při každém exec je zbytečný.)
+- `finale_loader_build.py` doplněn `timing.c` + `cache.c` (Modal build je
+  neměl; `build.yml` i `Makefile` ano).
+
+### Naměřeno (device, `ashell -c`, prostřídané A/B, medián z N=15)
+
+Interní raw-clock fáze (`ELF_LOADER_TIMING=1`):
+
+| cíl | verze | `svc_patch` | `load_done` | celkem (total) |
+|---|---|---|---|---|
+| `/bin/true` | stará (cache v1) | 966 µs | 2519 µs | **28,4 ms** |
+| `/bin/true` | nová, cache ON | **4 µs** | 1704 µs | **23,4 ms** |
+| `/bin/true` | nová, cache OFF | 141 µs | 9033 µs | 31,1 ms |
+| `python3 -c 0` | stará (cache v1) | 30 217 µs | 13 539 µs | **81,9 ms** |
+| `python3 -c 0` | nová, cache ON | **5 µs** | 12 093 µs | **49,0 ms** |
+| `python3 -c 0` | nová, cache OFF | 23 825 µs | 24 607 µs | 87,2 ms |
+
+(U `cache OFF` se sken projeví v `load_done` — `svc_patched` ruší druhý
+průchod, takže fáze `svc_patch` je prázdná i bez cache.)
+
+Wall-clock (medián z 3 smyček):
+
+| zátěž | stará | nová | zlepšení |
+|---|---|---|---|
+| 1000× `$R/bin/true` | 47,4 ms/launch | 45,3 ms/launch | ~2–4 ms (šum 41–49) |
+| 100× `python3 -c 0` | 208,1 ms/launch | 162,7 ms/launch | **−22 %** |
+
+Nová verze je i **stabilnější**: `python3` 160/163/163 ms vs. stará
+178/208/229 ms.
+
+**Interpretace:** u krátkého `/bin/true` tvoří práci loaderu jen ~23 ms
+z ~45 ms wall-clocku — zbytek je exec/kernel režie, kterou cache neovlivní,
+takže zlepšení mizí v šumu. Čím víc modulů binárka nese, tím větší výhra
+(`python3`: 5 modulů → −33 ms interně, −45 ms wall). Dominantní fází je teď
+**`hooks_bti` ~12,3 ms** (inline hooky BTI prologů) a `load_done` — to je cíl
+pro další práci, ne svc-site sken.
+
+### A/B regresní test
+
+`test-all.sh execcache` rozšířen o dvě kritéria, která stará binárka nesplní:
+(d) vícemodulová binárka musí mít po prvním běhu v cache záznam pro **každý**
+načtený modul (≥ 5 klíčů), (e) na teplém běhu nesmí `ELF_DEBUG` trace
+obsahovat ani jeden řádek `prebito` (= proběhl sken).
+
+```
+NOVÁ:   PASS execcache: … 10 klíčů pro python3 (5 modulů), 0 skenů na teplo
+STARÁ:  FAIL execcache: … keys2=2 scans_warm=41
+```
+
+Host-side unit test `test/cache_test.c` (bez zařízení): **20/20 PASS** —
+přidán round-trip negativního výsledku a odmítnutí nekonzistentního slotu.
+
+### Mimochodem (oprava dřívějšího tvrzení)
+
+Záznam z 2026-10-16 tvrdil, že „reálný `elf_loader` ELF má GNU BuildID". To
+platí jen pro **lokální glibc build**. **Nasazený NDK build GNU BuildID nemá**
+(`readelf -n` ukáže jen `.note.android.ident`), takže by se klíčoval jako
+`nobid_<size>_<mtime>`. Unit test proto kontroluje BuildID na rootfs glibc ELF
+(`libc.so.6`) — tedy na modulu, kde na cache skutečně záleží.
+
+### Zbývá z promptu 02
+
+Kandidát 3 (cache klasifikace ELF v exec shimu — `is_glibc_elf`,
+`elf_needs_real_exec`, shebang, řetěz symlinků) **neimplementován**. Není to
+škrt z lenosti: týká se jiné cesty než měřený `--ownall` start (shim běží pod
+guest TP → jen `raw_*`, žádný malloc → sdílená tabulka v memfd/mmapu) a profil
+výše ukazuje, že rezerva startu leží v `hooks_bti`/`load`. Má smysl ho měřit
+a dělat až na zátěži „guest, který hodně execuje" (např. `make -j8`), ne na
+jednom `--ownall`.
+
+### Regresní sada po fixu
+
+Všechny kategorie, device, `ashell -c`, **FAIL 0**. Spuštěno po blocích
+(`basic`…`extended` 86 PASS/0 FAIL/14 SKIP, pak `extra` 72, `python` 4,
+`uv` 4, `symlink` 3, `fstat` 1, `nss` 1, `selfexe` 2, `timing` 1, `bigargv` 1,
+`bionic` 2, `execcache` 1, `lxc` 1, `dw` 2, `elfrc` 3, `pathops` 4, `madv` 1,
+`venv` 1, `net_real` 7) — dohromady **197 PASS / 0 FAIL**. Důvod blokového
+běhu: celá sada na pozadí se v téhle session nedoběhla do konce (proces skončil
+v `extra`), tak se zbytek pustil v popředí po částech.
+
+### NOVÝ otevřený bug (nalezen při regresi, NENÍ z této změny)
+
+**Statický glibc ELF v rootfs končí `SIGSYS` („Bad system call", RC=159).**
+`category_staticexec` v `all` **SKIPuje** — bez guest PATH nenajde gcc `ld`
+(`collect2: fatal error: cannot find 'ld'`), binárka se nepostaví a test se
+vyhodnotí jako „static build selhal". Teprve s guest PATH se dostane dál
+a FAILuje:
+
+```
+$ gcc -static -no-pie -o /tmp/st1/s /tmp/st1/s.c   # pod loaderem, guest PATH
+$ bash -c '/tmp/st1/s'        → Bad system call  RC=159
+$ bash -c '$R/tmp/st1/s'      → Bad system call  RC=159
+```
+
+**A/B: `elf_loader.prev` (před tímto fixem) padá identicky** → regrese to
+není. Pravděpodobná příčina: statická binárka nemá `PT_INTERP`, jde tedy přes
+`elf_needs_real_exec()` → RAW `execve` → dítě nemá ani naše svc-patche, ani
+SIGSYS handler (ten se podle `.agents/skills/test_loop/SKILL.md` při `execve`
+resetuje), takže `set_robust_list`/`rseq` ze startu statické glibc app seccomp
+KILLne. Fix z 2026-10-15 (`elf_needs_real_exec` gate) řešil SIGSEGV z own-loadu
+statické binárky, ne tohle. Pozn.: test tím pádem **nikdy neověřil běh**, jen
+cestu resolution — v `all` vždy jen SKIPnul.
