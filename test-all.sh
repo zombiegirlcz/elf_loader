@@ -1363,6 +1363,70 @@ category_symhash() {
     fi
 }
 
+# Prompt 03: absolutni symlinky -> kanonicky relativni tvar + clamp ".." nad
+# guest korenem. A/B se dela KNOBEM na teze binarce (ELF_LOADER_NO_RELSYM /
+# ELF_LOADER_NO_DOTDOT_CLAMP = chovani pred promptem 03).
+category_relsym() {
+    echo ""
+    echo "=== absolutni symlinky -> relativni, clamp '..' (prompt 03) ==="
+    local env="ROOTFS=$R ELF_ROOTFS=$R ELF_LOADER=$L"
+    local g="/tmp/relsym.$$" h="$R/tmp/relsym.$$"
+    local ok=1 detail=""
+    mkdir -p "$h/d1/d2"
+    echo marker > "$h/target.txt"
+
+    # 1) `ln -s` s absolutnim guest cilem musi na disk zapsat RELATIVNE.
+    #    "Co je v rootfs" cteme s vypnutym fixupem readlinku (NO_RELSYM).
+    ashell_out "$env $L --ownall $R/bin/bash -c '/bin/ln -sfn $g/target.txt $g/d1/d2/link'" >/dev/null 2>&1
+    local raw fixed
+    raw=$(ashell_out "$env ELF_LOADER_NO_RELSYM=1 $L --ownall $R/bin/readlink $g/d1/d2/link" 2>&1)
+    fixed=$(ashell_out "$env $L --ownall $R/bin/readlink $g/d1/d2/link" 2>&1)
+    case "$raw" in
+        ../*) ;;
+        *) ok=0; detail="$detail [na disku neni relativni: '$raw']" ;;
+    esac
+    # 2) readlink pod loaderem hlasi kanonicky relativni cil zpet absolutne
+    [ "$fixed" = "$g/target.txt" ] || { ok=0; detail="$detail [readlink nevratil '$g/target.txt' ale '$fixed']"; }
+
+    # 3) stat/cteni pres link funguje BEZ exec shimu (resi ho jadro)
+    local via
+    via=$(ashell_out "$env $L --ownall $R/bin/cat $g/d1/d2/link" 2>&1)
+    [ "$via" = marker ] || { ok=0; detail="$detail [cteni pres link: '$via']"; }
+
+    # 4) stara verze (NO_RELSYM pri zapisu) ulozi absolutni cil, ktery jadro
+    #    vyhodnoti proti HOST koreni -> cteni pres link selze = A/B dukaz
+    ashell_out "$env ELF_LOADER_NO_RELSYM=1 $L --ownall $R/bin/bash -c '/bin/ln -sfn $g/target.txt $g/d1/d2/old'" >/dev/null 2>&1
+    local oldraw oldvia
+    oldraw=$(ashell_out "$env ELF_LOADER_NO_RELSYM=1 $L --ownall $R/bin/readlink $g/d1/d2/old" 2>&1)
+    oldvia=$(ashell_out "$env ELF_LOADER_NO_RELSYM=1 $L --ownall $R/bin/cat $g/d1/d2/old" 2>&1)
+    [ "$oldraw" = "$g/target.txt" ] || { ok=0; detail="$detail [A/B: stara verze nezapsala absolutni cil: '$oldraw']"; }
+    [ "$oldvia" = marker ] && { ok=0; detail="$detail [A/B: absolutni link cetl pres HOST koren a presto uspel]"; }
+
+    # 5) host cil (/system) musi zustat absolutni
+    ashell_out "$env $L --ownall $R/bin/bash -c '/bin/ln -sfn /system/bin/sh $g/hostlink'" >/dev/null 2>&1
+    local hl
+    hl=$(ashell_out "$env ELF_LOADER_NO_RELSYM=1 $L --ownall $R/bin/readlink $g/hostlink" 2>&1)
+    [ "$hl" = "/system/bin/sh" ] || { ok=0; detail="$detail [host cil nezustal absolutni: '$hl']"; }
+
+    # 6) clamp "..": v chrootu je /.. == /, prelozena cesta by utekla nad ROOTFS
+    local cl clold
+    cl=$(ashell_out "$env $L --ownall $R/bin/cat /../..$g/target.txt" 2>&1)
+    clold=$(ashell_out "$env ELF_LOADER_NO_DOTDOT_CLAMP=1 $L --ownall $R/bin/cat /../..$g/target.txt" 2>&1)
+    [ "$cl" = marker ] || { ok=0; detail="$detail [clamp: /../.. neuzavren ('$cl')]"; }
+    [ "$clold" = marker ] && { ok=0; detail="$detail [A/B: bez clampu to preslo taky]"; }
+
+    rm -rf "$h"
+    if [ "$ok" = 1 ]; then
+        echo "PASS relsym: zapis relativne, readlink absolutne, clamp '..' drzi (A/B knobem)"
+        echo "PASS: relsym - absolutni symlinky + clamp .." >> "$PASS_LOG"
+        ((PASS_COUNT++)) || true
+    else
+        echo "FAIL relsym:$detail"
+        echo "FAIL: relsym - absolutni symlinky + clamp .. |$detail" >> "$FAIL_LOG"
+        ((FAIL_COUNT++)) || true
+    fi
+}
+
 # Line vazani JUMP_SLOT (prompt 10 cast B, ELF_LOADER_LAZY=1). Overuje, ze
 # lazy rezim da IDENTICKY vysledek jako eager u binarek, ktere historicky
 # padaly na IFUNC (ls/dir -> memcpy), u interpretu i u shellu - a ze
@@ -1846,6 +1910,10 @@ case "${1:-all}" in
         category_lazybind
         print_summary
         ;;
+    relsym)
+        category_relsym
+        print_summary
+        ;;
     imgcache)
         category_imgcache
         print_summary
@@ -1920,6 +1988,7 @@ case "${1:-all}" in
         category_symhash
         category_lazybind
         category_imgcache
+        category_relsym
         category_lxc
         category_dw
         category_elfrc

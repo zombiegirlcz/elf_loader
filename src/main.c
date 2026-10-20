@@ -360,10 +360,13 @@ static int shim_excluded(const char *p) {
     return 0;
 }
 
+#include "relsym.h"
 /* 1 = prelozeno (out naplneno), 0 = ponechat */
 static int shim_translate(const char *p, char *out, size_t n) {
     if (!p || p[0] != '/') return 0;
     if (!g_shim_root || !g_shim_root[0]) return 0;
+    char cl[4096];
+    if (shim_clamp_dotdot(p, cl, sizeof cl)) p = cl;
     size_t rl = shim_strlen(g_shim_root);
     if (shim_strncmp(p, g_shim_root, rl) == 0 && (p[rl] == '/' || p[rl] == 0)) return 0;
     /* /dev/shm na Androidu neexistuje (shm_open/sem_open -> ENOENT) -> guest
@@ -1258,13 +1261,20 @@ typedef int (*fp_symlink)(const char *, const char *);
 static int shim_symlink(const char *t, const char *lp) {
     char b[8192]; const char *linkpath = lp;
     if (shim_translate(lp, b, sizeof b)) linkpath = b;
-    fp_symlink f = (fp_symlink)g_orig_symlink; return f ? f(t, linkpath) : -1;
+    /* absolutni guest cil zapis rovnou relativne (invariant rootfs, viz
+     * hlavicka u shim_abs_target_to_rel) */
+    char rel[4096]; const char *target = t;
+    if (shim_abs_target_to_rel(t, linkpath, rel, sizeof rel)) target = rel;
+    fp_symlink f = (fp_symlink)g_orig_symlink; return f ? f(target, linkpath) : -1;
 }
 typedef int (*fp_symlinkat)(const char *, int, const char *);
 static int shim_symlinkat(const char *t, int ndfd, const char *lp) {
     char b[8192]; const char *linkpath = lp;
     if (ndfd == -100 && lp && lp[0] == '/') { if (shim_translate(lp, b, sizeof b)) linkpath = b; }
-    fp_symlinkat f = (fp_symlinkat)g_orig_symlinkat; return f ? f(t, ndfd, linkpath) : -1;
+    char rel[4096]; const char *target = t;
+    /* hloubku linku umime urcit jen u AT_FDCWD (jinak cil nechavame, jak byl) */
+    if (ndfd == -100 && shim_abs_target_to_rel(t, linkpath, rel, sizeof rel)) target = rel;
+    fp_symlinkat f = (fp_symlinkat)g_orig_symlinkat; return f ? f(target, ndfd, linkpath) : -1;
 }
 typedef int (*fp_link)(const char *, const char *);
 static int shim_link(const char *o, const char *n) {
@@ -2376,6 +2386,23 @@ static int shim_is_proc_self_exe(const char *p) {
     shim_strcat(buf, sizeof buf, "/exe");
     return shim_strcmp(p, buf) == 0;
 }
+/* Kanonicky relativni cil ohlas zpet jako guest-absolutni (update-alternatives
+ * cile porovnava). Vstup je vysledek skutecneho readlinku: b[0..r-1], bez NUL. */
+static ssize_t shim_readlink_fixup(const char *host_path, char *b, size_t n, ssize_t r) {
+    if (r <= 0 || g_no_relsym) return r;
+    if ((size_t)r >= n) return r;            /* vysledek uriznuty -> nesahat */
+    if (b[0] == '/') return r;
+    char tgt[4096];
+    if ((size_t)r >= sizeof tgt) return r;
+    shim_memcpy(tgt, b, (size_t)r);
+    tgt[r] = 0;
+    char abs[4096];
+    if (!shim_rel_target_to_abs(tgt, host_path, abs, sizeof abs)) return r;
+    size_t al = shim_strlen(abs);
+    if (al > n) al = n;
+    shim_memcpy(b, abs, al);
+    return (ssize_t)al;
+}
 static ssize_t shim_readlink(const char *p, char *b, size_t n) {
     if (shim_is_proc_self_exe(p) && g_guest_exe_path[0]) {
         size_t len = shim_strlen(g_guest_exe_path);
@@ -2384,7 +2411,9 @@ static ssize_t shim_readlink(const char *p, char *b, size_t n) {
         return (ssize_t)len;
     }
     char x[8192]; const char *path = p; if (shim_translate(p, x, sizeof x)) path = x;
-    fp_readlink f = (fp_readlink)g_orig_readlink; return f ? f(path, b, n) : -1;
+    fp_readlink f = (fp_readlink)g_orig_readlink;
+    if (!f) return -1;
+    return shim_readlink_fixup(path, b, n, f(path, b, n));
 }
 static ssize_t shim_readlinkat(int d, const char *p, char *b, size_t n) {
     if (d == -100 && shim_is_proc_self_exe(p) && g_guest_exe_path[0]) {
@@ -2395,7 +2424,11 @@ static ssize_t shim_readlinkat(int d, const char *p, char *b, size_t n) {
     }
     char x[8192]; const char *path = p;
     if (d == -100 && p && p[0] == '/') { if (shim_translate(p, x, sizeof x)) path = x; }
-    fp_readlinkat f = (fp_readlinkat)g_orig_readlinkat; return f ? f(d, path, b, n) : -1;
+    fp_readlinkat f = (fp_readlinkat)g_orig_readlinkat;
+    if (!f) return -1;
+    ssize_t r = f(d, path, b, n);
+    if (d != -100) return r;   /* hloubku linku umime urcit jen u AT_FDCWD */
+    return shim_readlink_fixup(path, b, n, r);
 }
 /* Guest-aware kanonizace: glibc realpath prochazi komponenty a absolutni cil
  * symlinku (venv: .venv/bin/python -> /bin/python3) vyhodnoti proti HOST
@@ -3722,6 +3755,8 @@ static int run_ownall(const char *path, int argc, char **argv, char **envp) {
     g_tls_trace = getenv("ELF_LOADER_TLS_TRACE") != NULL;
     g_exec_trace = getenv("ELF_LOADER_EXEC_TRACE") != NULL;
     g_vmtrace = getenv("ELF_LOADER_VMTRACE") != NULL;
+    g_no_relsym = getenv("ELF_LOADER_NO_RELSYM") != NULL;
+    g_no_dotdot_clamp = getenv("ELF_LOADER_NO_DOTDOT_CLAMP") != NULL;
     g_ro_keep_write = getenv("ELF_LOADER_RO_KEEP_WRITE") != NULL;
     elf_scope_t *scope = elf_scope_create();
     if (!scope) {
