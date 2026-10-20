@@ -1363,6 +1363,48 @@ category_symhash() {
     fi
 }
 
+# Line vazani JUMP_SLOT (prompt 10 cast B, ELF_LOADER_LAZY=1). Overuje, ze
+# lazy rezim da IDENTICKY vysledek jako eager u binarek, ktere historicky
+# padaly na IFUNC (ls/dir -> memcpy), u interpretu i u shellu - a ze
+# BIND_NOW objekty (libc.so.6 je stavena s -z now) jdou eager.
+category_lazybind() {
+    echo ""
+    echo "=== line vazani JUMP_SLOT (ELF_LOADER_LAZY) ==="
+    local env="ROOTFS=$R ELF_ROOTFS=$R ELF_LOADER=$L"
+    local ok=1 detail=""
+
+    local t
+    for t in "$R/usr/bin/uname -m" "$R/bin/ls $R/tmp" "$R/bin/dir $R/tmp"; do
+        local a b
+        a=$(ashell_out "$env $L --ownall $t" 2>&1 | head -3)
+        b=$(ashell_out "$env ELF_LOADER_LAZY=1 $L --ownall $t" 2>&1 | head -3)
+        [ "$a" = "$b" ] || { ok=0; detail="$detail [${t##*/}: eager!=lazy]"; }
+        [ -n "$a" ] || { ok=0; detail="$detail [${t##*/}: prazdny vystup]"; }
+    done
+
+    if [ -x "$R/usr/bin/python3" ]; then
+        local p
+        p=$(ashell_out "$env ELF_LOADER_LAZY=1 $L --ownall $R/usr/bin/python3 -c 'print(6*7)'" 2>&1)
+        printf '%s' "$p" | grep -q 42 || { ok=0; detail="$detail [python3: $p]"; }
+    fi
+
+    # BIND_NOW (libc.so.6 je -z now) musi lazy vypnout
+    local nbn
+    nbn=$(ashell_out "$env ELF_LOADER_LAZY=1 ELF_DEBUG=1 $L --ownall $R/bin/true" 2>&1 \
+          | grep -c 'BIND_NOW -> eager' || true)
+    [ "${nbn:-0}" -ge 1 ] || { ok=0; detail="$detail [BIND_NOW nedetekovan]"; }
+
+    if [ "$ok" = 1 ]; then
+        echo "PASS lazybind: lazy==eager (uname/ls/dir/python3), BIND_NOW eager u $nbn objektu"
+        echo "PASS: lazybind - ELF_LOADER_LAZY" >> "$PASS_LOG"
+        ((PASS_COUNT++)) || true
+    else
+        echo "FAIL lazybind:$detail"
+        echo "FAIL: lazybind - ELF_LOADER_LAZY |$detail" >> "$FAIL_LOG"
+        ((FAIL_COUNT++)) || true
+    fi
+}
+
 category_timing() {
     echo ""
     echo "=== fázový profil exec (ELF_LOADER_TIMING) ==="
@@ -1735,6 +1777,10 @@ case "${1:-all}" in
         category_symhash
         print_summary
         ;;
+    lazybind)
+        category_lazybind
+        print_summary
+        ;;
     bigargv)
         category_bigargv
         print_summary
@@ -1803,6 +1849,7 @@ case "${1:-all}" in
         category_staticexec
         category_execcache
         category_symhash
+        category_lazybind
         category_lxc
         category_dw
         category_elfrc

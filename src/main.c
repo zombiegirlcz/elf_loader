@@ -5276,6 +5276,16 @@ int main(int argc, char **argv, char **envp) {
 
     int ai = 1;
     int lazy_was_set = 0;
+    /* ELF_LOADER_LAZY=1 je ekvivalent --lazy, ale na rozdil od argv se
+     * dedi do zanorenych exec (exec shim stavi argv sam, flag by zmizel).
+     * Prompt 10 cast B to vyzaduje; default je porad eager. */
+    {
+        const char *lz = getenv("ELF_LOADER_LAZY");
+        if (lz && lz[0] && strcmp(lz, "0") != 0) {
+            elf_set_lazy(1);
+            lazy_was_set = 1;
+        }
+    }
     while (ai + 1 < argc && strcmp(argv[ai], "--lazy") == 0) {
         elf_set_lazy(1);
         lazy_was_set = 1;

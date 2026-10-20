@@ -310,6 +310,37 @@ static void apply_segment_prots(elf_object_t *obj);
 static void maybe_fixup_bionic_phdr(elf_object_t *obj);
 static char *find_in_paths(const char *soname, const char *search);
 
+/* Lazy vazani se musi vypnout pro objekt, ktery si vyzada eager binding:
+ * DT_BIND_NOW, DF_BIND_NOW v DT_FLAGS, DF_1_NOW v DT_FLAGS_1, nebo globalne
+ * LD_BIND_NOW. Prompt 10 cast B to vyzaduje explicitne. */
+static int obj_wants_bind_now(const elf_object_t *obj) {
+    static int env_now = -1;
+    if (env_now < 0) {
+        const char *v = getenv("LD_BIND_NOW");
+        env_now = (v && v[0] && strcmp(v, "0") != 0) ? 1 : 0;
+    }
+    if (env_now)
+        return 1;
+    if (!obj)
+        return 0;
+    for (int i = 0; i < obj->phdr_count; i++) {
+        if (obj->phdr[i].p_type != PT_DYNAMIC)
+            continue;
+        Elf64_Dyn *d = (Elf64_Dyn *)((char *)obj->base_addr +
+                                     (obj->phdr[i].p_vaddr - map_base_vaddr(obj)));
+        for (; d->d_tag != DT_NULL; d++) {
+            if (d->d_tag == DT_BIND_NOW)
+                return 1;
+            if (d->d_tag == DT_FLAGS && (d->d_un.d_val & DF_BIND_NOW))
+                return 1;
+            if (d->d_tag == DT_FLAGS_1 && (d->d_un.d_val & DF_1_NOW))
+                return 1;
+        }
+        break;
+    }
+    return 0;
+}
+
 void elf_set_lazy(int on) {
     lazy_binding = on;
 }
@@ -4022,10 +4053,15 @@ int elf_relocate(elf_object_t *obj) {
 
     obj->jmp_rela = jmp_rela;
     obj->jmp_size = jmp_size;
-    if (lazy_binding) {
+    /* `lazy_this` = lazy pro TENTO objekt (BIND_NOW ho vypina). */
+    int lazy_this = lazy_binding && !obj_wants_bind_now(obj);
+    if (lazy_this) {
         lazy_current = obj;
         if (lazy_obj_count < MAX_LAZY_OBJS)
             lazy_objs[lazy_obj_count++] = obj;
+    } else if (lazy_binding && elf_debug()) {
+        fprintf(stderr, "[lazy] %s: BIND_NOW -> eager\n",
+                obj->soname ? obj->soname : "EXE");
     }
 
     int count = 0;
@@ -4104,13 +4140,17 @@ int elf_relocate(elf_object_t *obj) {
         if (obj->soname && strcmp(obj->soname, "libc.so.6") == 0 && ELF64_R_SYM(r->r_info) < obj->dynsym_count) {
             /* no-op */
         }
-        if (lazy_binding) {
+        if (is_local_ifunc_reloc(obj, r))
+            continue;  /* resolver az po apply_segment_prots (viz nize).
+                        * MUSI byt PRED lazy vetvi: IFUNC se resolvuje vzdy
+                        * eager (historie bugu `memcpy`, AGENTS.md sekce 2) -
+                        * jinak by na slotu zustal lazy_plt_stub a resolver
+                        * modulu se nikdy nezavolal. */
+        if (lazy_this) {
             *where = (uint64_t)lazy_plt_stub;
             count++;
             continue;
         }
-        if (is_local_ifunc_reloc(obj, r))
-            continue;  /* resolver az po apply_segment_prots (viz nize) */
         void *addr = resolve_jmp_symbol(obj, r);
         if (addr) {
             *where = (uint64_t)addr;
@@ -4162,7 +4202,10 @@ int elf_relocate(elf_object_t *obj) {
      * modulu, takze stejne jako IRELATIVE az po apply_segment_prots. */
     for (int pass = 0; pass < 2; pass++) {
         Elf64_Rela *tab = pass ? jmp_rela : rela;
-        size_t tsz = pass ? (lazy_binding ? 0 : jmp_size) : rela_size;
+        /* Driv `lazy_binding ? 0 : jmp_size` - v lazy rezimu se jmp_rela
+         * preskocila cela, takze lokalni IFUNC JUMP_SLOT zustal na stubu.
+         * IFUNC je eager vzdy, takze se prochazi i v lazy rezimu. */
+        size_t tsz = pass ? jmp_size : rela_size;
         for (size_t off = 0; tab && off < tsz; off += sizeof(Elf64_Rela)) {
             Elf64_Rela *r = (Elf64_Rela *)((char *)tab + off);
             if (!is_local_ifunc_reloc(obj, r))
