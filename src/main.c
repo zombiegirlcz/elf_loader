@@ -346,7 +346,12 @@ static char **guest_environ(void) {
     }
     return environ;
 }
+#include "binds.h"
+/* shim_excluded = "cesta se NEprekladu pod ROOTFS, nechat hostovou" = v tabulce
+ * bindu IDENTITY shoda (host==guest). Pred binds_init (g_binds_ready=0) fallback
+ * na puvodni natvrdo zapsany seznam, aby brzke volani melo stejne chovani. */
 static int shim_excluded(const char *p) {
+    if (g_binds_ready) return bind_kind(p) == BIND_IDENTITY;
     static const char *excl[] = {
         "/proc", "/dev", "/sys", "/system", "/data", "/apex", "/linkerconfig",
         "/metadata", "/sdcard", "/storage", "/vendor", "/odm", "/product",
@@ -389,10 +394,20 @@ static int shim_translate(const char *p, char *out, size_t n) {
      * zasobniku (shim_translate vola i L1 stub na cizim, treba Go 8 KB
      * zasobniku). `p` pak ukazuje do `out` a prefix se doplni pred nej. */
     if (n > rl + 2 && shim_clamp_dotdot(p, out + rl, n - rl)) p = out + rl;
-    /* /dev/shm na Androidu neexistuje (shm_open/sem_open -> ENOENT) -> guest
-     * $R/dev/shm (vytvari shim_register_overrides). Zbytek /dev zustava host. */
-    int shm = shim_strncmp(p, "/dev/shm", 8) == 0 && (p[8] == '/' || p[8] == 0);
-    if (!shm && shim_excluded(p)) return 0;
+    /* Tabulka bindu (prompt 06): longest-prefix. IDENTITY (dnesni "excluded")
+     * -> nechat host cestu; REMAP (user bind / default /dev/shm) -> out; NONE
+     * -> default $ROOTFS prefix nize. Pred binds_init fallback na puvodni
+     * /dev/shm special-case + shim_excluded. */
+    if (g_binds_ready) {
+        int ro;
+        int bk = bind_translate(p, out, n, &ro);
+        if (bk == BIND_IDENTITY) return 0;
+        if (bk == BIND_REMAP) return 1;
+    } else {
+        /* /dev/shm na Androidu neexistuje -> guest $R/dev/shm; zbytek /dev host */
+        int shm = shim_strncmp(p, "/dev/shm", 8) == 0 && (p[8] == '/' || p[8] == 0);
+        if (!shm && shim_excluded(p)) return 0;
+    }
     size_t pl = shim_strlen(p);
     if (rl + pl + 1 > n) return 0;            /* out neni zkraceno -> bezpecne */
     shim_memcpy(out, g_shim_root, rl);
@@ -3941,6 +3956,11 @@ static int run_ownall(const char *path, int argc, char **argv, char **envp) {
         }
     }
     if (g_shim_loader && g_shim_loader[0]) setenv("ELF_LOADER", g_shim_loader, 1);
+
+    /* Tabulka bindu (prompt 06): default identity exclude list + /dev/shm remap
+     * + config ($ROOTFS/etc/lx-binds, LX_BINDS). Musi byt PRED prvnim prekladem
+     * (shim_translate/shim_excluded ji ctou pres g_binds_ready). */
+    binds_init();
 
     /* Shebang podpora na urovni loader entry: `lx modal` predava
      * /usr/local/bin/modal (Python skript s #!/usr/bin/python3), elf_load pak
