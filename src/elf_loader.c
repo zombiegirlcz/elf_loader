@@ -2471,6 +2471,44 @@ uintptr_t elf_read_tp(void) { return read_tp(); }
 
 extern void tlsdesc_return(void);
 
+/* ===== L2 (prompt 05) guest okno: pevne VA pasmo, do ktoreho se presune PIE
+ * guest exe (MAP_FIXED), aby jeho text-range lezel v znamem miste a NEkolidoval
+ * s ASLR pozdeji forknute HOST binarky (bionic 0x5x/0x7x). 4 GiB v jednom hi32
+ * pasmu (0x11) -> filtr vystaci s jednim hi32 compare. ET_EXEC guest binarky
+ * (gh, Bun, staticke) maji pevnou nizkou adresu mimo ASLR, do okna je netreba.
+ * Zbytek L2 (filtr, setup, lazy) je v src/l2.h. */
+#define L2_WIN_LO 0x1100000000UL
+#define L2_WIN_HI 0x1200000000UL
+static uintptr_t g_l2_win_base = 0;    /* zacatek rezervace (0 = nerezervovano) */
+static uintptr_t g_l2_win_next = 0;    /* bump alokator uvnitr okna */
+static int g_l2_want_window = 0;       /* map_elf_segments: dalsi ET_DYN do okna */
+
+/* Rezervuj cele okno jednim PROT_NONE mmapem (MAP_FIXED_NOREPLACE neni na 4.14,
+ * tak overime navratovou adresu). 1 = ok. */
+static int l2_reserve_window(void) {
+    if (g_l2_win_base) return 1;
+    size_t sz = L2_WIN_HI - L2_WIN_LO;
+    void *p = mmap((void *)L2_WIN_LO, sz, PROT_NONE,
+                   MAP_PRIVATE | MAP_ANONYMOUS | MAP_NORESERVE, -1, 0);
+    if (p == MAP_FAILED) return 0;
+    if ((uintptr_t)p != L2_WIN_LO) { munmap(p, sz); return 0; }
+    g_l2_win_base = L2_WIN_LO;
+    g_l2_win_next = L2_WIN_LO;
+    return 1;
+}
+
+/* Alokace `total` B uvnitr okna (MAP_FIXED pres rezervaci). NULL = plno. */
+static void *l2_window_alloc(size_t total) {
+    if (!g_l2_win_base) return NULL;
+    total = ALIGN_UP(total, PAGE_SIZE);
+    if (g_l2_win_next + total > L2_WIN_HI) return NULL;
+    void *p = mmap((void *)g_l2_win_next, total, PROT_READ | PROT_WRITE,
+                   MAP_PRIVATE | MAP_ANONYMOUS | MAP_FIXED, -1, 0);
+    if (p == MAP_FAILED) return NULL;
+    g_l2_win_next += total;
+    return p;
+}
+
 static void *map_elf_segments(int fd, void *file_map, Elf64_Ehdr *ehdr, size_t *out_total,
                               size_t *out_min_vaddr) {
     Elf64_Phdr *fp = (Elf64_Phdr *)((char *)file_map + ehdr->e_phoff);
@@ -2494,7 +2532,18 @@ static void *map_elf_segments(int fd, void *file_map, Elf64_Ehdr *ehdr, size_t *
     /* Obrazova cache potrebuje modul na TOTEZ bazi jako pri ulozeni (obraz
      * obsahuje absolutni adresy). MAP_FIXED_NOREPLACE: kdyz je misto obsazene,
      * mmap selze a jde se standardni cestou (obraz se pak zahodi). */
-    if (g_img_pref_base && ehdr->e_type != ET_EXEC) {
+    if (g_l2_want_window && ehdr->e_type != ET_EXEC) {
+        /* L2: PIE guest exe do pevneho okna, aby jeho text-range byl v znamem
+         * pasmu (nekoliduje s ASLR host binarek). Jen hlavni exe (flag nuluje
+         * main.c pred nactenim zavislosti); imgcache se pod L2 nepouziva. */
+        g_img_pref_base = 0;
+        base = l2_window_alloc(total);
+        if (base == MAP_FAILED || !base)
+            base = mmap(NULL, total, PROT_READ | PROT_WRITE,
+                        MAP_PRIVATE | MAP_ANONYMOUS, -1, 0);
+        if (base == MAP_FAILED)
+            return NULL;
+    } else if (g_img_pref_base && ehdr->e_type != ET_EXEC) {
         base = mmap((void *)g_img_pref_base, total, PROT_READ | PROT_WRITE,
                     MAP_PRIVATE | MAP_ANONYMOUS | MAP_FIXED_NOREPLACE, -1, 0);
         g_img_pref_base = 0;
@@ -5814,6 +5863,11 @@ static void f2_reinstall_sigsys(void) {
  * a kazdy TRAP skonci "SIGSYS: bad system call"). */
 #define NOSP __attribute__((no_stack_protector))
 static unsigned long g_go_lo, g_go_hi;
+/* 1 = getcwd(2) z guest textu NEstripovat $ROOTFS (jako g_cwd_keep_host
+ * v main.c pro jmenne hooky). Pod L2 vzdy 0: raw getcwd se prekladu na
+ * guest cestu stejne jako raw open, takze binarka (vc. Bun) vidi jen guest. */
+static int g_f2_cwd_keep_host = 0;
+void f2_set_cwd_keep_host(int v) { g_f2_cwd_keep_host = v; }
 static const char *g_go_loader;
 static volatile int g_go_lock;
 static const char *g_go_host[] = {
@@ -5946,6 +6000,26 @@ NOSP static int go_handle(long nr, ucontext_t *ctx) {
         case 221: r[0] = (unsigned long long)go_execve((const char *)r[0],
                          (char *const *)r[1], (char *const *)r[2]);
                   return 1;
+        case 17: {   /* getcwd: vstup zadny, vysledek = guest cesta (strip $ROOTFS).
+                      * Prave tohle odstrani potrebu Bun hacku F2_NO_CWD_STRIP:
+                      * Bun dela getcwd raw syscallem, takze ho jmenny hook
+                      * neviduje - L2 ho zachyti a vysledek strpne na guest. */
+            long rr = raw_syscall6(17, (long)r[0], (long)r[1], 0, 0, 0, (long)F2_SENTINEL);
+            if (rr > 0 && !g_f2_cwd_keep_host && g_f2_root) {
+                char *buf = (char *)(unsigned long)r[0];
+                size_t rl = f2_slen(g_f2_root);
+                if (rl && (size_t)rr > rl && f2_sncmp(buf, g_f2_root, rl) == 0) {
+                    if (buf[rl] == 0) { buf[0] = '/'; buf[1] = 0; rr = 2; }
+                    else if (buf[rl] == '/') {
+                        long nb = rr - (long)rl;             /* vcetne NUL */
+                        for (long i = 0; i < nb; i++) buf[i] = buf[rl + i];
+                        rr = nb;
+                    }
+                }
+            }
+            r[0] = (unsigned long long)rr;
+            return 1;
+        }
         case 49:  pa = 0; break;                 /* chdir */
         case 56: case 79: case 48: case 78: case 291: case 34: case 35:
         case 53: case 54: case 88: pa = 1; break;
@@ -5964,7 +6038,20 @@ NOSP static int go_handle(long nr, ucontext_t *ctx) {
         go_translate((const char *)a[pb], tb, sizeof tb);
         a[pb] = (long)tb;
     }
-    r[0] = (unsigned long long)raw_syscall6(nr, a[0], a[1], a[2], a[3], a[4], (long)F2_SENTINEL);
+    long rr = raw_syscall6(nr, a[0], a[1], a[2], a[3], a[4], (long)F2_SENTINEL);
+    /* readlinkat(78): cil muze byt hostove absolutni (pod $ROOTFS) -> ohlas
+     * ho zpet jako guest-absolutni, aby guest nikdy nevidel host cestu. */
+    if (nr == 78 && rr > 0 && !g_f2_cwd_keep_host && g_f2_root) {
+        char *buf = (char *)a[2];      /* readlinkat(dirfd, path, BUF, sz) */
+        size_t rl = f2_slen(g_f2_root);
+        if (rl && (size_t)rr > rl && f2_sncmp(buf, g_f2_root, rl) == 0 &&
+            (buf[rl] == '/' || (size_t)rr == rl)) {
+            long nb = rr - (long)rl;
+            if (nb <= 0) { buf[0] = '/'; rr = 1; }
+            else { for (long i = 0; i < nb; i++) buf[i] = buf[rl + i]; rr = nb; }
+        }
+    }
+    r[0] = (unsigned long long)rr;
     return 1;
 }
 
@@ -6018,26 +6105,25 @@ int elf_has_verdef_prefix(const elf_object_t *m, const char *pfx) {
     return 0;
 }
 
-int elf_go_mode_setup(elf_object_t *m) {
-    unsigned long bias = (unsigned long)m->base_addr - map_base_vaddr(m);
-    int isgo = go_is_go(m, bias);
-    if (getenv("ELF_LOADER_DIAG"))
-        fprintf(stderr, "[go] root=%s base=%p bias=%lx phdrs=%d go=%d\n",
-                g_f2_root ? g_f2_root : "(null)", m->base_addr, bias, m->phdr_count, isgo);
-    if (!g_f2_root || !isgo) return 0;
-    unsigned long lo = ~0UL, hi = 0;
-    for (int i = 0; i < m->phdr_count; i++) {
-        const Elf64_Phdr *ph = &m->phdr[i];
-        if (ph->p_type != PT_LOAD || !(ph->p_flags & PF_X)) continue;
-        unsigned long s = bias + ph->p_vaddr, e = s + ph->p_memsz;
-        if (s < lo) lo = s;
-        if (e > hi) hi = e;
-    }
+/* Nainstaluje stackovany seccomp filtr, ktery pro cestove syscally TRAPne,
+ * JEN kdyz instruction_pointer lezi v [lo,hi) (= text guest exe). SIGSYS
+ * handler to pak obslouzi pres go_handle (preklad cesty + emulace). Sdili
+ * ho Go mod (per-Go-binarka) i L2 (jakakoli guest exe + staticke binarky).
+ * Nastavuje g_go_lo/g_go_hi (handler je cte) a vrati 1 pri uspechu.
+ *
+ * Filtr keyuje VYHRADNE na IP, ne na x5 SENTINEL: handleruv raw syscall bezi
+ * z textu loaderu (mimo [lo,hi)) -> ALLOW, takze se nezacykli. Pozdeji
+ * forknute HOST binarky (bionic, ASLR 0x5x/0x7x) nemaji IP v [lo,hi) ->
+ * filtr se jich netkne, i kdyz ho zdedi a nejde odebrat. */
+static int l2_install_range_filter(unsigned long lo, unsigned long hi, const char *tag) {
     if (hi <= lo || (lo >> 32) != ((hi - 1) >> 32)) {
-        fprintf(stderr, "[go] text range %lx-%lx nepodporovan, Go mod vypnut\n", lo, hi);
+        fprintf(stderr, "[%s] text range %lx-%lx nepodporovan (prekracuje 4GB band)\n",
+                tag, lo, hi);
         return 0;
     }
-    static const unsigned nrs[] = { 56, 79, 48, 78, 291, 221, 49, 34, 35, 38,
+    /* 17=getcwd (fixup vysledku), 49=chdir, 34/35/48/53/54/56/78/79/88/291=path,
+     * 36=symlinkat, 37=linkat, 38/276=renameat, 221=execve, 135/134=sig. */
+    static const unsigned nrs[] = { 17, 56, 79, 48, 78, 291, 221, 49, 34, 35, 38,
                                     276, 53, 54, 88, 37, 36, 135 };
     struct sock_filter prog[64];
     size_t n = 0;
@@ -6071,7 +6157,7 @@ int elf_go_mode_setup(elf_object_t *m) {
     prog[n].jt = (unsigned char)(i_allow - n - 1);   /* low32(act)==0 -> jen cteni */
     prog[n].jf = (unsigned char)(i_trap - n - 1); n++;
     if (n != i_allow) {
-        fprintf(stderr, "[go] BUG: filtr n=%zu i_allow=%zu\n", n, i_allow);
+        fprintf(stderr, "[%s] BUG: filtr n=%zu i_allow=%zu\n", tag, n, i_allow);
         return 0;
     }
     prog[n++] = (struct sock_filter)BPF_STMT(BPF_RET | BPF_K, SECCOMP_RET_ALLOW);
@@ -6080,25 +6166,58 @@ int elf_go_mode_setup(elf_object_t *m) {
     prctl(PR_SET_NO_NEW_PRIVS, 1, 0, 0, 0);
     long rs = syscall((long)277, 1UL, 0UL, &fp);
     if (rs != 0) {
-        fprintf(stderr, "[go] seccomp filtr selhal (%ld), Go mod vypnut\n", rs);
+        fprintf(stderr, "[%s] seccomp filtr selhal (%ld), vrstva vypnuta\n", tag, rs);
         return 0;
     }
     g_go_lo = lo;
     g_go_hi = hi;
     f2_reinstall_sigsys();
     if (getenv("ELF_LOADER_DIAG"))
-        fprintf(stderr, "[go] Go mod: text %lx-%lx\n", lo, hi);
+        fprintf(stderr, "[%s] text %lx-%lx\n", tag, lo, hi);
     return 1;
 }
 
+/* Vrati text (PF_X) rozsah modulu jako [*lo,*hi). 0 = zadny / nevalidni. */
+static int elf_text_range(elf_object_t *m, unsigned long *lo_out, unsigned long *hi_out) {
+    unsigned long bias = (unsigned long)m->base_addr - map_base_vaddr(m);
+    unsigned long lo = ~0UL, hi = 0;
+    for (int i = 0; i < m->phdr_count; i++) {
+        const Elf64_Phdr *ph = &m->phdr[i];
+        if (ph->p_type != PT_LOAD || !(ph->p_flags & PF_X)) continue;
+        unsigned long s = bias + ph->p_vaddr, e = s + ph->p_memsz;
+        if (s < lo) lo = s;
+        if (e > hi) hi = e;
+    }
+    if (hi <= lo) return 0;
+    *lo_out = lo; *hi_out = hi;
+    return 1;
+}
+
+int elf_go_mode_setup(elf_object_t *m) {
+    unsigned long bias = (unsigned long)m->base_addr - map_base_vaddr(m);
+    int isgo = go_is_go(m, bias);
+    if (getenv("ELF_LOADER_DIAG"))
+        fprintf(stderr, "[go] root=%s base=%p bias=%lx phdrs=%d go=%d\n",
+                g_f2_root ? g_f2_root : "(null)", m->base_addr, bias, m->phdr_count, isgo);
+    if (!g_f2_root || !isgo) return 0;
+    unsigned long lo, hi;
+    if (!elf_text_range(m, &lo, &hi)) return 0;
+    return l2_install_range_filter(lo, hi, "go");
+}
+
+#include "l2.h"
+
 NOSP static void sigsys_handler(int sig, siginfo_t *si, void *uc) {
     (void)sig;
-    /* Go mod: syscall z text segmentu Go binarky (pc uz ukazuje za svc). */
+    /* Go mod / L2: syscall z text segmentu guest exe (pc uz ukazuje za svc).
+     * Oba nastavuji g_go_lo/g_go_hi a sdili go_handle. */
     if (g_go_hi) {
         ucontext_t *gctx = (ucontext_t *)uc;
         unsigned long gpc = (unsigned long)gctx->uc_mcontext.pc - 4;
-        if (gpc >= g_go_lo && gpc < g_go_hi && go_handle(si->si_syscall, gctx))
+        if (gpc >= g_go_lo && gpc < g_go_hi && go_handle(si->si_syscall, gctx)) {
+            l2_lazy_rewrite(gpc);   /* opt-in: priste bez signalu (L1 stub) */
             return;
+        }
     }
     if (g_tls_trace) { static const char _m[] = "HANDLER-ENTER\n"; int _fd = raw_syscall6(56, (long)0xFFFFFFFFFFFFFF9CL, (long)(unsigned long)diag_path(), 0x441L, 0644L, 0, (long)F2_SENTINEL); if (_fd >= 0) { raw_syscall6(64, _fd, (long)(unsigned long)_m, sizeof(_m) - 1, 0, 0, (long)F2_SENTINEL); raw_syscall6(57, _fd, 0, 0, 0, 0, (long)F2_SENTINEL); } }
     if (g_tls_trace) {

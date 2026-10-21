@@ -4041,7 +4041,12 @@ static int run_ownall(const char *path, int argc, char **argv, char **envp) {
     }
     elf_timing_mark("f2_filter");
     shim_strcpy(g_guest_exe_path, sizeof(g_guest_exe_path), path);
+    /* L2 (prompt 05): PIE guest exe presun do pevneho okna, aby jeho text-range
+     * nekolidoval s ASLR pozdeji forknute host binarky. Flag plati jen pro exe,
+     * zavislosti (libc/ld.so) resi L1. */
+    elf_l2_prepare_exe_load();
     elf_object_t *obj = elf_load(path);
+    elf_l2_after_exe_load();
     elf_timing_mark("load_done");
     elf_own_scope = NULL;
     elf_set_crash_scope(scope);
@@ -4049,17 +4054,27 @@ static int run_ownall(const char *path, int argc, char **argv, char **envp) {
         elf_scope_destroy(scope);
         return 1;
     }
-    /* Go binarky volaji syscally napric (mimo PLT overridy) -> seccomp
-     * path-preklad omezeny na jejich text segment. ELF_LOADER_GOMODE=0 vypne. */
+    /* L2 zahrnuje Go mod (jakakoli guest exe, nejen Go), takze kdyz je zapnute,
+     * instaluje filtr ono a Go mod se preskoci. Go binarky volaji syscally
+     * napric (mimo PLT overridy) -> preklad omezeny na jejich text segment.
+     * ELF_LOADER_GOMODE=0 vypne Go mod, ELF_LOADER_L2=1 zapne L2. */
     if (g_shim_root && g_shim_root[0]) {
-        const char *gm = getenv("ELF_LOADER_GOMODE");
-        if (!gm || gm[0] != '0') {
-            f2_set_root(g_shim_root);
-            f2_set_loader(g_shim_loader);
-            elf_go_mode_setup(obj);
+        f2_set_root(g_shim_root);
+        f2_set_loader(g_shim_loader);
+        if (elf_l2_enabled()) {
+            elf_l2_mode_setup(obj);
+        } else {
+            const char *gm = getenv("ELF_LOADER_GOMODE");
+            if (!gm || gm[0] != '0')
+                elf_go_mode_setup(obj);
         }
     }
     g_cwd_keep_host = getenv("F2_NO_CWD_STRIP") || elf_has_verdef_prefix(obj, "BUN_");
+    /* Pod L2 se getcwd(2) prekladu na guest cestu i pro Bun (raw getcwd zachyti
+     * L2 filtr, viz go_handle case 17), takze hack F2_NO_CWD_STRIP neni potreba.
+     * Jmenne hooky pod L2 bezi soubezne, drz je konzistentni (strip pro vsechny). */
+    f2_set_cwd_keep_host(elf_l2_enabled() ? 0 : g_cwd_keep_host);
+    if (elf_l2_enabled()) g_cwd_keep_host = 0;
     if (elf_debug() && g_cwd_keep_host)
         fprintf(stderr, "[F2] getcwd: host cesta (Bun / F2_NO_CWD_STRIP)\n");
     shim_install_hooks();    /* patch glibc leaf funkci (F2 / re-exec) */

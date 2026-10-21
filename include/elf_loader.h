@@ -114,6 +114,11 @@ void f2_set_root(const char *r);          /* F2: nastav ROOTFS pro seccomp path-
 void install_f2_path_filter(void);     /* F2: stackovany RET_TRAP filtr pro openat/statx/... */
 void f2_set_loader(const char *p);      /* Go mod: cesta k loaderu pro re-exec */
 int elf_go_mode_setup(elf_object_t *m); /* Go mod: 1 = Go binarka, filtr aktivni */
+void f2_set_cwd_keep_host(int v);       /* L2/Go: getcwd NEstripovat $ROOTFS */
+int  elf_l2_enabled(void);              /* L2 (prompt 05): ELF_LOADER_L2 */
+void elf_l2_prepare_exe_load(void);     /* rezervuj okno, PIE exe do nej */
+void elf_l2_after_exe_load(void);       /* zavislosti uz do okna nechceme */
+int  elf_l2_mode_setup(elf_object_t *m);/* instaluj L2 filtr pro guest exe */
 int elf_has_verdef_prefix(const elf_object_t *m, const char *pfx); /* DT_VERDEF jmeno s prefixem */
 elf_tls_ctx_t elf_setup_own_tls(elf_object_t *exe, elf_scope_t *scope);
 void elf_teardown_own_tls(elf_tls_ctx_t *ctx);
