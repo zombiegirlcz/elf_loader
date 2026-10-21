@@ -1106,6 +1106,61 @@ static int shim_rofail(const char *p) {
 static int shim_open_is_write(int flags) {
     return (flags & O_ACCMODE) != O_RDONLY || (flags & (O_CREAT | O_TRUNC));
 }
+/* 1 (+ EBUSY) kdyz guest `p` je mountpoint remap bindu - jako jadro pro
+ * rmdir/unlink/rename mountpointu. Bez toho `rm -rf <mountpoint>` smazal
+ * i samotny zdroj bindu (2026-10-21: test s bindem /etc). */
+static int shim_busyfail(const char *p) {
+    if (!g_binds_ready || !p || p[0] != '/') return 0;
+    if (!bind_is_mountpoint(p)) return 0;
+    shim_guest_errno_set(EBUSY);
+    return 1;
+}
+/* Totez na hranici syscallu (L1 l1_before, L2 go_handle): jmenne shimy
+ * s shim_rofail/shim_busyfail pod ELF_LOADER_L1=2 vubec nejsou a raw svc
+ * (static/Go) je nikdy nepotka. `a` = argumenty syscallu x0..x5 PRED
+ * prekladem. Vraci -EROFS/-EBUSY (syscall se neprovede) nebo 0. Jen
+ * AT_FDCWD + absolutni cesta, jako jmenne hooky. Bezi pod guest TP i v
+ * SIGSYS handleru -> jen cteni tabulky (shim_str*). */
+static int shim_bind_ro_at(long dfd, unsigned long p) {
+    return dfd == -100 && p && ((const char *)p)[0] == '/' && bind_is_ro((const char *)p);
+}
+static int shim_bind_mp_at(long dfd, unsigned long p) {
+    return dfd == -100 && p && ((const char *)p)[0] == '/' &&
+           bind_is_mountpoint((const char *)p);
+}
+long shim_bind_deny(long nr, const unsigned long *a) {
+    if (!g_binds_ready) return 0;
+    switch (nr) {
+    case 56:                                   /* openat: jen zapisove mody */
+        if (!shim_open_is_write((int)a[2])) return 0;
+        return shim_bind_ro_at((long)a[0], a[1]) ? -EROFS : 0;
+    case 33: case 34: case 53: case 54: case 88:   /* mknodat mkdirat fchmodat fchownat utimensat */
+        return shim_bind_ro_at((long)a[0], a[1]) ? -EROFS : 0;
+    case 35:                                   /* unlinkat */
+        if (shim_bind_ro_at((long)a[0], a[1])) return -EROFS;
+        return shim_bind_mp_at((long)a[0], a[1]) ? -EBUSY : 0;
+    case 36:                                   /* symlinkat(cil, newdfd, linkpath) */
+        return shim_bind_ro_at((long)a[1], a[2]) ? -EROFS : 0;
+    case 37:                                   /* linkat: jen nova cesta */
+        return shim_bind_ro_at((long)a[2], a[3]) ? -EROFS : 0;
+    case 38: case 276:                         /* renameat(2) */
+        if (shim_bind_ro_at((long)a[0], a[1]) || shim_bind_ro_at((long)a[2], a[3]))
+            return -EROFS;
+        return (shim_bind_mp_at((long)a[0], a[1]) || shim_bind_mp_at((long)a[2], a[3]))
+                   ? -EBUSY : 0;
+    case 5: case 6: case 14: case 15: case 45: /* [l]setxattr [l]removexattr truncate */
+        return shim_bind_ro_at(-100, a[0]) ? -EROFS : 0;
+    default:
+        return 0;
+    }
+}
+/* L2/Go prekladac (go_translate v elf_loader.c) ma vlastni exclude seznam;
+ * remap bindy (mount --bind, LX_BINDS, /dev/shm) mu dava tenhle hook.
+ * 1 = out naplneno host cestou remapu, 0 = bez remap bindu. */
+static int shim_bind_remap(const char *in, char *out, size_t n) {
+    int ro;
+    return bind_translate(in, out, n, &ro) == BIND_REMAP;
+}
 static int shim_open(const char *p, int flags, ...) {
     if (shim_open_is_write(flags) && shim_rofail(p)) return -1;
     char buf[8192]; const char *path = p;
@@ -1359,6 +1414,7 @@ static int shim_link(const char *o, const char *n) {
 typedef int (*fp_rename)(const char *, const char *);
 static int shim_rename(const char *o, const char *n) {
     if (shim_rofail(o) || shim_rofail(n)) return -1;
+    if (shim_busyfail(o) || shim_busyfail(n)) return -1;
     char b1[8192], b2[8192]; const char *oldp = o, *newp = n;
     if (shim_translate(o, b1, sizeof b1)) oldp = b1;
     if (shim_translate(n, b2, sizeof b2)) newp = b2;
@@ -1370,6 +1426,7 @@ static int shim_rename(const char *o, const char *n) {
 typedef int (*fp_renameat)(int, const char *, int, const char *);
 static int shim_renameat(int odfd, const char *o, int ndfd, const char *n) {
     if ((odfd == -100 && shim_rofail(o)) || (ndfd == -100 && shim_rofail(n))) return -1;
+    if ((odfd == -100 && shim_busyfail(o)) || (ndfd == -100 && shim_busyfail(n))) return -1;
     char b1[8192], b2[8192]; const char *oldp = o, *newp = n;
     if (odfd == -100 && o && o[0] == '/') { if (shim_translate(o, b1, sizeof b1)) oldp = b1; }
     if (ndfd == -100 && n && n[0] == '/') { if (shim_translate(n, b2, sizeof b2)) newp = b2; }
@@ -1378,6 +1435,7 @@ static int shim_renameat(int odfd, const char *o, int ndfd, const char *n) {
 typedef int (*fp_renameat2)(int, const char *, int, const char *, unsigned int);
 static int shim_renameat2(int odfd, const char *o, int ndfd, const char *n, unsigned int flags) {
     if ((odfd == -100 && shim_rofail(o)) || (ndfd == -100 && shim_rofail(n))) return -1;
+    if ((odfd == -100 && shim_busyfail(o)) || (ndfd == -100 && shim_busyfail(n))) return -1;
     char b1[8192], b2[8192]; const char *oldp = o, *newp = n;
     if (odfd == -100 && o && o[0] == '/') { if (shim_translate(o, b1, sizeof b1)) oldp = b1; }
     if (ndfd == -100 && n && n[0] == '/') { if (shim_translate(n, b2, sizeof b2)) newp = b2; }
@@ -1385,7 +1443,7 @@ static int shim_renameat2(int odfd, const char *o, int ndfd, const char *n, unsi
 }
 typedef int (*fp_unlink)(const char *);
 static int shim_unlink(const char *p) {
-    if (shim_rofail(p)) return -1;
+    if (shim_rofail(p) || shim_busyfail(p)) return -1;
     char b[8192]; const char *path = p; if (shim_translate(p, b, sizeof b)) path = b;
     fp_unlink f = (fp_unlink)g_orig_unlink; return f ? f(path) : -1;
 }
@@ -1394,14 +1452,14 @@ static int shim_unlink(const char *p) {
  * $ROOTFS/tmp/x -> ENOENT ("cannot remove ... No such file or directory"). */
 typedef int (*fp_unlinkat)(int, const char *, int);
 static int shim_unlinkat(int dfd, const char *p, int flags) {
-    if (dfd == -100 && shim_rofail(p)) return -1;
+    if (dfd == -100 && (shim_rofail(p) || shim_busyfail(p))) return -1;
     char b[8192]; const char *path = p;
     if (dfd == -100 && p && p[0] == '/') { if (shim_translate(p, b, sizeof b)) path = b; }
     fp_unlinkat f = (fp_unlinkat)g_orig_unlinkat; return f ? f(dfd, path, flags) : -1;
 }
 typedef int (*fp_rmdirat)(int, const char *);
 static int shim_rmdirat(int dfd, const char *p) {
-    if (dfd == -100 && shim_rofail(p)) return -1;
+    if (dfd == -100 && (shim_rofail(p) || shim_busyfail(p))) return -1;
     char b[8192]; const char *path = p;
     if (dfd == -100 && p && p[0] == '/') { if (shim_translate(p, b, sizeof b)) path = b; }
     fp_rmdirat f = (fp_rmdirat)g_orig_rmdirat; return f ? f(dfd, path) : -1;
@@ -1421,7 +1479,7 @@ static int shim_mkdirat(int dfd, const char *p, unsigned int m) {
 }
 typedef int (*fp_rmdir)(const char *);
 static int shim_rmdir(const char *p) {
-    if (shim_rofail(p)) return -1;
+    if (shim_rofail(p) || shim_busyfail(p)) return -1;
     char b[8192]; const char *path = p; if (shim_translate(p, b, sizeof b)) path = b;
     fp_rmdir f = (fp_rmdir)g_orig_rmdir; return f ? f(path) : -1;
 }
@@ -4198,6 +4256,7 @@ static int run_ownall(const char *path, int argc, char **argv, char **envp) {
      * L2 filtr, viz go_handle case 17), takze hack F2_NO_CWD_STRIP neni potreba.
      * Jmenne hooky pod L2 bezi soubezne, drz je konzistentni (strip pro vsechny). */
     f2_set_cwd_keep_host(elf_l2_enabled() ? 0 : g_cwd_keep_host);
+    f2_set_bind_hooks(shim_bind_remap, shim_bind_deny, bind_reverse_inplace);
     if (elf_l2_enabled()) g_cwd_keep_host = 0;
     if (elf_debug() && g_cwd_keep_host)
         fprintf(stderr, "[F2] getcwd: host cesta (Bun / F2_NO_CWD_STRIP)\n");

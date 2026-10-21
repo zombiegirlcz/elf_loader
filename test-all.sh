@@ -1643,7 +1643,7 @@ category_binds() {
     local env="ROOTFS=$R ELF_ROOTFS=$R HOME=$D ELF_LOADER=$L"
     local ok=1 detail=""
     local T=/tmp/lxbt T2=/tmp/lxbtro
-    local mnt="$R/bin/mount" um="$R/bin/umount" ls="$R/bin/ls"
+    local mnt="$R/bin/mount" ls="$R/bin/ls"
     local mk="$R/bin/mkdir" tc="$R/bin/touch"
     local TO="$R/usr/bin/timeout 25 $R/bin/bash -c"
 
@@ -1663,14 +1663,25 @@ category_binds() {
         ok=0; detail="$detail [mount --bind: cil($(printf '%s\n' "$a"|grep -c .||true))!=zdroj($srcn)]"
     fi
 
-    # (2) umount vrati prazdny cil (bind odebran ze sdilene tabulky)
-    b=$($TO "$env $L --ownall $R/bin/bash -c '$mk -p $T; $mnt --bind /etc $T >/dev/null 2>&1; $um $T && $ls -A $T'" 2>&1 | sort)
-    local bn; bn=$(printf '%s\n' "$b" | grep -c . || true)
-    if [ "${bn:-1}" -eq 0 ]; then
-        echo "PASS binds: umount $T vrati prazdnou slozku"
-        echo "PASS: binds - umount odebere bind" >> "$PASS_LOG"; ((PASS_COUNT++)) || true
+    # (2) umount2() odebere bind ze sdilene tabulky -> cil zase prazdny.
+    # POZN: util-linux `umount` COMMAND potrebuje /proc/self/mountinfo (nas
+    # virtualni bind tam neni -> "not mounted") = prompt 07 (virtualizace
+    # /proc). Mechanismus odebrani (umount2 -> shim_umount2 -> bind_remove) je
+    # ale hotovy uz zde, testujeme ho primym umount2() pres ctypes. Python kod
+    # bere cil z argv (zadne jednoduche uvozovky -> bez quote kolize).
+    if [ -x "$R/usr/bin/python3" ]; then
+        local U2='import ctypes,sys;ctypes.CDLL(None).umount2(sys.argv[1].encode(),0)'
+        b=$($TO "$env $L --ownall $R/bin/bash -c \"$mk -p $T; $mnt --bind /etc $T >/dev/null 2>&1; $R/usr/bin/python3 -c '$U2' $T; $ls -A $T\"" 2>&1 | sort)
+        local bn; bn=$(printf '%s\n' "$b" | grep -c . || true)
+        if [ "${bn:-1}" -eq 0 ]; then
+            echo "PASS binds: umount2() odebere bind ($T zase prazdny)"
+            echo "PASS: binds - umount2 odebere bind" >> "$PASS_LOG"; ((PASS_COUNT++)) || true
+        else
+            ok=0; detail="$detail [umount2: cil neprazdny ($bn)]"
+        fi
     else
-        ok=0; detail="$detail [umount: cil neprazdny ($bn)]"
+        echo "SKIP binds: umount2 test (chybi python3)"
+        echo "SKIP: binds - umount2 (no python3)" >> "$SKIP_LOG"; ((SKIP_COUNT++)) || true
     fi
 
     # (3) ro bind: zapis -> EROFS (LX_BINDS host=$R/tmp aby pripadny prusak
@@ -1698,25 +1709,36 @@ category_binds() {
 # fallback), (b) cache odmitne vytvorit obraz, ktery by nesel revalidovat
 # (RELRO ld.so/libc drzi pointery do mallocovane pameti loaderu -> obraz
 # se nevytvori), (c) na disku nezustane zadny .tmp.
+# DESTRUKTIVNI kategorie (IMGCACHE + --ownall) -> NIKDY nad zivym parrotem
+# ($R), jen nad nepouzivanym kali rootfs (AGENTS.md "Bezpecnost", incident
+# 2026-10-21). Bez kali -> SKIP, ne fallback na $R.
 category_imgcache() {
     echo ""
     echo "=== obrazova cache RELRO (ELF_LOADER_IMGCACHE) ==="
-    local env="ROOTFS=$R ELF_ROOTFS=$R ELF_LOADER=$L"
-    local idir="${LX_LOG:-$R/root/elf_loader}/cache/img"
+    local KR=${ELF_TEST_KALI:-$D/nh/distro/kali}
+    if [ "$KR" = "$R" ] || [ ! -x "$KR/usr/bin/uname" ] || [ ! -x "$KR/bin/ls" ]; then
+        echo "SKIP imgcache: destruktivni test jen nad kali ($KR nedostupny)"
+        echo "SKIP: imgcache - neni kali rootfs" >> "$SKIP_LOG"; ((SKIP_COUNT++)) || true
+        return 0
+    fi
+    local lxl="$KR/tmp/lx-imgtest"
+    mkdir -p "$lxl"
+    local env="ROOTFS=$KR ELF_ROOTFS=$KR LX_LOG=$lxl ELF_LOADER=$L"
+    local idir="$lxl/cache/img"
     local ok=1 detail=""
 
     rm -rf "$idir" 2>/dev/null || true
     local t
-    for t in "$R/usr/bin/uname -m" "$R/bin/ls $R/tmp"; do
+    for t in "$KR/usr/bin/uname -m" "$KR/bin/ls $KR/tmp"; do
         local a b
         a=$(ashell_out "$env $L --ownall $t" 2>&1 | head -3)
         b=$(ashell_out "$env ELF_LOADER_IMGCACHE=1 $L --ownall $t" 2>&1 | head -3)
         [ -n "$a" ] || { ok=0; detail="$detail [${t##*/}: prazdny vystup]"; }
         [ "$a" = "$b" ] || { ok=0; detail="$detail [${t##*/}: s cache != bez cache]"; }
     done
-    if [ -x "$R/usr/bin/python3" ]; then
+    if [ -x "$KR/usr/bin/python3" ]; then
         local p
-        p=$(ashell_out "$env ELF_LOADER_IMGCACHE=1 $L --ownall $R/usr/bin/python3 -c 'print(6*7)'" 2>&1)
+        p=$(ashell_out "$env ELF_LOADER_IMGCACHE=1 $L --ownall $KR/usr/bin/python3 -c 'print(6*7)'" 2>&1)
         printf '%s' "$p" | grep -q 42 || { ok=0; detail="$detail [python3: $p]"; }
     fi
 
@@ -1726,7 +1748,7 @@ category_imgcache() {
     rm -rf "$idir" 2>/dev/null || true
     local why
     why=$("$R/usr/bin/timeout" 25 "$R/bin/bash" -c \
-          "$env ELF_LOADER_IMGCACHE=1 ELF_LOADER_IMG_TRACE=1 $L --ownall $R/usr/bin/uname -m" 2>&1 \
+          "$env ELF_LOADER_IMGCACHE=1 ELF_LOADER_IMG_TRACE=1 $L --ownall $KR/usr/bin/uname -m" 2>&1 \
           | grep -cE 'ulozeno|hit ' || true)   # -E: bare grep je host toybox, nezna \|
     [ "${why:-0}" -ge 1 ] || { ok=0; detail="$detail [img trace nic nehlasi]"; }
 
@@ -1734,7 +1756,7 @@ category_imgcache() {
     # (0 rozdilu) - jinak obraz nese neco per-behoveho.
     local vr
     vr=$("$R/usr/bin/timeout" 25 "$R/bin/bash" -c \
-         "$env ELF_LOADER_IMGCACHE=1 ELF_LOADER_IMG_VERIFY=1 $L --ownall $R/usr/bin/uname -m" 2>&1)
+         "$env ELF_LOADER_IMGCACHE=1 ELF_LOADER_IMG_VERIFY=1 $L --ownall $KR/usr/bin/uname -m" 2>&1)
     printf '%s' "$vr" | grep -q aarch64 || { ok=0; detail="$detail [verify rezim nedojel]"; }
     local nd
     nd=$(printf '%s' "$vr" | grep -o '[0-9]* rozdilu' | awk '{s+=$1} END{print s+0}')

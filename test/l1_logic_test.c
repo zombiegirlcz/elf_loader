@@ -46,6 +46,24 @@ static int shim_translate(const char *p, char *out, size_t n) {
     return 1;
 }
 static int shim_is_proc_self_exe(const char *p) { return p && !strcmp(p, "/proc/self/exe"); }
+/* binds (prompt 06), zjednodusene: ro pod /ro/, mountpoint /mnt/b, jehoz
+ * host cil je /data/R/srv/b. Plne verze pokryva test-all.sh binds. */
+static long shim_bind_deny(long nr, const unsigned long *a) {
+    const char *p = (const char *)a[1];
+    if ((nr == 34 || nr == 35) && (long)a[0] == -100 && p && !strncmp(p, "/ro/", 4)) return -30;
+    if (nr == 35 && (long)a[0] == -100 && p && !strcmp(p, "/mnt/b")) return -16;
+    return 0;
+}
+static size_t bind_reverse_inplace(char *buf, size_t cap) {
+    const char *h = "/data/R/srv/b", *g = "/mnt/b";
+    size_t hl = strlen(h), gl = strlen(g);
+    if (strncmp(buf, h, hl) || (buf[hl] && buf[hl] != '/')) return 0;
+    size_t rest = strlen(buf + hl);
+    if (gl + rest + 1 > cap) return 0;
+    memmove(buf + gl, buf + hl, rest + 1);
+    memcpy(buf, g, gl);
+    return gl + rest;
+}
 #include "l1.h"
 
 static int fails = 0;
@@ -142,6 +160,27 @@ int main(void) {
     l1_before(f, 17); f[20] = strlen(cwd4) + 1; l1_after(f, 17);
     CHECK(!strcmp(cwd4, "/data/R/home"), "getcwd: Bun (g_cwd_keep_host) -> host cesta");
     g_cwd_keep_host = 0;
+
+    /* getcwd pod remap bindem -> guest mountpoint, ne strip $ROOTFS */
+    char cwd5[64] = "/data/R/srv/b/sub";
+    mkframe(f, 17, (unsigned long)cwd5, sizeof cwd5, 0, 0);
+    l1_before(f, 17); f[20] = strlen(cwd5) + 1; l1_after(f, 17);
+    CHECK(!strcmp(cwd5, "/mnt/b/sub") && (long)f[20] == 11, "getcwd: host cil bindu -> /mnt/b/sub");
+
+    /* ro bind / mountpoint: l1_before syscall odmitne (vysledek ve frame[20],
+     * zadny slot, argument neprelozen) */
+    mkframe(f, 34, (unsigned long)-100, (unsigned long)"/ro/x", 0755, 0);
+    long dn = l1_before(f, 34);
+    CHECK(dn != 0 && (long)f[20] == -30 && f[21] == 0 && !strcmp((const char *)f[23], "/ro/x"),
+          "mkdirat pod ro bindem -> odmitnuto -EROFS bez prekladu a slotu");
+    CHECK(g_l1_owner[0] == 0, "odmitnuti: zadny slot drzen");
+    mkframe(f, 35, (unsigned long)-100, (unsigned long)"/mnt/b", 0x200, 0);
+    dn = l1_before(f, 35);
+    CHECK(dn != 0 && (long)f[20] == -16, "unlinkat mountpointu -> -EBUSY");
+    mkframe(f, 34, (unsigned long)-100, (unsigned long)"/etc/x", 0755, 0);
+    dn = l1_before(f, 34);
+    CHECK(dn == 0 && !strcmp((const char *)f[23], "/data/R/etc/x"), "mkdirat mimo bind -> preklad");
+    l1_after(f, 34);
 
     /* readlinkat: hostove absolutni cil (.l2s) -> strip, bez NUL */
     char lb[64]; memcpy(lb, "/data/R/.l2s/x", 14);

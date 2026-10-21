@@ -5882,6 +5882,20 @@ static const char *g_go_host[] = {
     "/debug_ramdisk", NULL
 };
 void f2_set_loader(const char *p) { g_go_loader = p; }
+/* Tabulka bindu (prompt 06, src/binds.h v main.c): remap guest->host,
+ * odmitnuti zapisu pod ro bindem / mazani mountpointu a zpetne mapovani
+ * getcwd. go_translate ma jinak vlastni exclude seznam a bindy by nevidel
+ * (Go, staticke binarky pod L2). main.c je registruje pri startu. */
+static int (*g_go_bind_remap)(const char *, char *, size_t);
+static long (*g_go_bind_deny)(long, const unsigned long *);
+static size_t (*g_go_bind_rev)(char *, size_t);
+void f2_set_bind_hooks(int (*remap)(const char *, char *, size_t),
+                       long (*deny)(long, const unsigned long *),
+                       size_t (*rev)(char *, size_t)) {
+    g_go_bind_remap = remap;
+    g_go_bind_deny = deny;
+    g_go_bind_rev = rev;
+}
 
 NOSP static int go_exists(const char *p) {
     struct f2_kstat st;
@@ -5896,6 +5910,7 @@ NOSP static int go_translate(const char *in, char *out, size_t outsz) {
     if (f2_sncmp(in, g_f2_root, rl) == 0 && (in[rl] == '/' || in[rl] == 0)) {
         f2_scpy(out, in); return 0;
     }
+    if (g_go_bind_remap && g_go_bind_remap(in, out, outsz)) return 1;   /* mount --bind */
     for (int i = 0; g_go_host[i]; i++) {
         size_t el = f2_slen(g_go_host[i]);
         if (f2_sncmp(in, g_go_host[i], el) == 0 && (in[el] == '/' || in[el] == 0)) {
@@ -6012,7 +6027,11 @@ NOSP static int go_handle(long nr, ucontext_t *ctx) {
                       * Bun dela getcwd raw syscallem, takze ho jmenny hook
                       * neviduje - L2 ho zachyti a vysledek strpne na guest. */
             long rr = raw_syscall6(17, (long)r[0], (long)r[1], 0, 0, 0, (long)F2_SENTINEL);
-            if (rr > 0 && !g_f2_cwd_keep_host && g_f2_root) {
+            size_t rv = 0;
+            if (rr > 0 && !g_f2_cwd_keep_host && g_go_bind_rev)   /* cwd pod bindem */
+                rv = g_go_bind_rev((char *)(unsigned long)r[0], (size_t)r[1]);
+            if (rv) rr = (long)rv + 1;
+            else if (rr > 0 && !g_f2_cwd_keep_host && g_f2_root) {
                 char *buf = (char *)(unsigned long)r[0];
                 size_t rl = f2_slen(g_f2_root);
                 if (rl && (size_t)rr > rl && f2_sncmp(buf, g_f2_root, rl) == 0) {
@@ -6034,6 +6053,10 @@ NOSP static int go_handle(long nr, ucontext_t *ctx) {
         case 37:  pa = 1; pb = 3; break;         /* linkat */
         case 36:  pa = 2; break;                 /* symlinkat: jen linkpath */
         default: return 0;
+    }
+    if (g_go_bind_deny) {                        /* ro bind / mountpoint */
+        long e = g_go_bind_deny(nr, (const unsigned long *)r);
+        if (e) { r[0] = (unsigned long long)e; return 1; }
     }
     char ta[4096], tb[4096];
     long a[6] = { (long)r[0], (long)r[1], (long)r[2], (long)r[3], (long)r[4], (long)r[5] };

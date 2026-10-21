@@ -5358,3 +5358,63 @@ Go-detekované binárky. L2 to dělá pro **jakoukoli** guest exe.
   každé cestové volání z textu exe jeden signál. Na default přepnout až
   s měřeným lazy nebo po ověření, že těžké binárky nedělají path svc v horké
   smyčce.
+
+---
+
+## 2026-10-21 (4) — prompt 06 stage 2 (HANDOFF pro fresh session)
+
+**INCIDENT (moje chyba).** Spustil jsem `test-all.sh all` i `test-all.sh
+imgcache` proti ŽIVÉMU parrotu. `category_imgcache` (`ELF_LOADER_IMGCACHE`
++ `--ownall`) je destruktivní → poškodil parrot `bin`/`lib`/`etc`, nutná
+obnova (apt), stála uživatele celý den. **Nové pravidlo (AGENTS.md sekce
+„Bezpečnost — destruktivní testy"): DESTRUKTIVNÍ testy NIKDY na parrot, jen
+na nepoužívaný kali rootfs `…/nh/distro/kali` (`ROOTFS=$K`). Destruktivní =
+`ELF_LOADER_IMGCACHE`, `--ownall`/`--shim` nad systémovými adresáři
+(`/bin`,`/usr/bin`,`/usr/lib`,`/etc`), přepis binárek — a tím i
+`test-all.sh all`/`imgcache` (směřovat na kali).** Parrot je OK pro
+NEdestruktivní testy (uživatel to potvrdil) — např. `category_binds` jen
+tvoří `/tmp` podsložky a dělá `mount --bind`, žádný `--ownall` nad
+systémem → na parrotu v pohodě.
+
+**Stav git repa:** lokální `.git` je POŠKOZENÉ — objekt commitu `a2764d6`
+je prázdný (`object file .git/objects/a2/764d…empty`, `fatal: bad object
+HEAD`). Commit `a2764d6` se ale ÚSPĚŠNĚ pushnul na `origin/dev`
+(99ae043..a2764d6). **Obnova ve fresh session:** `git fetch origin` +
+`git reset --hard origin/dev` (NEBO fresh clone), pak ověřit, že working
+tree = `a2764d6`. Edity Stage 2 jsou v commitu na origin.
+
+**Co je v `a2764d6` (prompt 06 stage 2, implementováno + host build čistý,
+NASAZENO na zařízení jako NDK run 39566370453):**
+- `src/binds.h` přepsán na sdílenou MAP_SHARED tabulku (`lx_bind_tab_t`
+  v souboru pod `$LX_LOG`/`$R/tmp`), cross-process přes `LX_BINDS_FILE`
+  force-injektovaný v `shim_child_envp`; atomický `count`/`active`
+  (release ordering) + generační čítač; `bind_add`/`bind_remove`/
+  `bind_is_ro`/`bind_reverse`.
+- `src/main.c`: `shim_mount`/`shim_umount`/`shim_umount2` v `g_f2_hooks`
+  (MS_BIND emulace — mount(2) je ENOSYS; úspěch bez syscallu; ostatní
+  mounty → ENOSYS). `shim_rofail` (ro→EROFS) v ~18 zapisujících shimech
+  (open write-mody, creat, mkdir(at), unlink(at), rmdir(at), rename(at/2),
+  symlink(at), link, truncate(64), chmod/chown, mknod/mkfifo, utimes).
+  Reverzní `getcwd` přes `bind_reverse`.
+- `test-all.sh`: `category_binds` (A/B mount --bind, umount2, ro); umount
+  sub-test přes `umount2()` (ctypes), ne util-linux `umount` command.
+
+**Ověřeno na zařízení PŘED incidentem (platné):**
+- ✅ Akceptační jádro: `mount --bind /etc /tmp/accept` → `ls` 196==196
+  (cross-process: mount a ls sourozenci přes sdílenou tabulku).
+- ✅ Druhé cross-process: `mount --bind /usr …` → 10==10.
+- ✅ `umount2()` (ctypes) → rc 0 (shim zavolán).
+
+**NEOVĚŘENO (dodělat ve fresh session, testy směřovat BEZPEČNĚ):**
+- `ro`→EROFS, reverzní `getcwd`, plný `category_binds`, regrese `all`
+  (všechno pouštět tak, aby nešlo na živý parrot destruktivně — ideálně
+  použít kali pro `--ownall`/imgcache větve).
+- Teprve po ověření: flipnout `docs/nextgen/00-README.md` řádek 06 na
+  „hotovo", dopsat `AGENTS.md` (vrstvy/knoby o bindech) a auto-paměť
+  `[[elf-loader-open-bugs]]`.
+
+**Architektonické zjištění:** util-linux `umount` COMMAND i `cat
+/proc/mounts` potřebují `/proc/self/mountinfo` → to je **prompt 07
+(virtualizace /proc)**, nezávislý. Mechanismus odebrání bindu
+(`umount2`→`bind_remove`) je hotový už v 06. Autor promptu 06 to sám
+bracketuje („cat /proc/mounts — pokud prompt 07 hotový").

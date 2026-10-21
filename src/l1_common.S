@@ -25,6 +25,8 @@
  *   96 x12,x13 | 112 x14,x15 | 128 x18,nzcv | 144 x29,x30
  *   160 vysledek svc (frame[20]) | 168 drzeny slot (frame[21]; 0 = l1_after
  *       se nevola, 1 = jen fixup vysledku, jinak ukazatel na slot)
+ *   l1_before vraci != 0 -> svc se PRESKOCI a vysledkem je frame[20], ktery
+ *       l1_before naplnil (odmitnuti ro bindem / mountpointem, prompt 06)
  *   176 argumenty SYSCALLU x0-x7 (frame[22..29]) - jen tyhle smi l1_before
  *       prepsat (prelozena cesta); frame[0..7] zustavaji PUVODNI
  *   240 q0-q31
@@ -85,7 +87,8 @@ l1_common:
     mov x0, sp                        /* frame */
     mov x1, x8                        /* nr (i u dynamickeho x8 je to zdroj) */
     bl l1_before
-
+    cbnz x0, 2f                       /* odmitnuto (ro bind/mountpoint): bez svc, */
+                                      /* vysledek uz je ve frame[20], frame[21]=0 */
     ldp x0, x1, [sp, #176]            /* argumenty SYSCALLU (mozna prelozene) */
     ldp x2, x3, [sp, #192]
     ldp x4, x5, [sp, #208]
@@ -93,6 +96,7 @@ l1_common:
     ldr x8, [sp, #64]
     svc #0
     str x0, [sp, #160]                /* frame[20]: vysledek (frame[0] = puvodni x0) */
+2:
     ldr x9, [sp, #168]                /* frame[21] == 0 -> l1_after neni treba */
     cbz x9, 1f                        /* (rychla cesta find/fts, viz l1_before) */
     mov x0, sp

@@ -12,6 +12,29 @@ binárek v procesu na AArch64 Androidu (bionic host). Preference non-root
 Nahrazuje `proot` — žádný ptrace překlad syscallů, takže uživatel může
 pouštět distro nástroje přímo v appce bez NDK rebuildu.
 
+## Bezpečnost — destruktivní testy (POVINNÉ)
+
+**Vývojové a testovací prostředí koexistují — NENÍ to kopie rootfs.** Živý
+parrot (`…/nh/distro/parrot`) je zároveň prostředí, ve kterém agent běží.
+Cokoli s možným destruktivním dopadem (`--ownall`/`--shim` nad adresářem,
+`ELF_LOADER_IMGCACHE`, přepis binárek, in-place shim operace) se proto **NIKDY
+nemíří na živý parrot** (`/bin`, `/usr/bin`, `/usr/lib`, `/etc`).
+
+Na destruktivní testy je vedle parrotu **nepoužívaný kali rootfs** — používej ho:
+
+```
+K=/data/user/0/com.linux_core/files/nh/distro/kali
+ROOTFS=$K elf_loader --ownall $K/bin/<elf> [args…]
+```
+
+Kali („Kali GNU/Linux Rolling", `…/nh/distro/kali`) nikdo nepoužívá, takže jeho
+případné poškození nic nezlomí; parrot ber v testech jen read-only.
+
+**Proč:** `elf_loader --ownall /bin` + `--ownall /usr/bin` nad živým parrotem
+(s `IMGCACHE`) poškodilo `bin`/`lib`/`etc` → nutná reinstalace (2026-10-21).
+dpkg DB přežila, obnova šla z `dpkg --get-selections`. Viz i bezpečnostní
+pravidla v kořenovém `CLAUDE.md` (bootloop 2026-08-23).
+
 ## Build a prostředí
 
 gcc 14.2 v prootu, `as` symlink fix [#L8]. Testy: `make test`, `--ownall`

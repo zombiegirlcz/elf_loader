@@ -146,10 +146,13 @@ static void l1_slot_release(l1_slot_t *s) {
  * L1_NEED_AFTER = jen fixup vysledku bez slotu, jinak ukazatel na drzeny slot. */
 #define L1_NEED_AFTER 1UL
 
-void l1_before(unsigned long *frame, long nr) {
+/* Vraci 0 = provest syscall; jinak l1_common `svc` PRESKOCI a volajici dostane
+ * frame[20] (odmitnuti ro/mountpoint bindem: -EROFS/-EBUSY, viz
+ * shim_bind_deny) - frame[21] pak zustava 0, l1_after se nevola. */
+long l1_before(unsigned long *frame, long nr) {
     unsigned mask = l1_path_args(nr);
     if (nr == 17 || nr == 78) frame[21] = L1_NEED_AFTER;   /* fixup vysledku */
-    if (!(mask & 0xffu)) return;                   /* nic na vstupu */
+    if (!(mask & 0xffu)) return 0;                 /* nic na vstupu */
     /* Rychla cesta: zadny ABSOLUTNI cestovy argument (find/fts jedou pres
      * dirfd + jmeno) -> nic k prekladu, zadny slot, zadny CAS a l1_after se
      * nevola. Na `find /usr` je takovych volani ~300 tisic. */
@@ -159,9 +162,16 @@ void l1_before(unsigned long *frame, long nr) {
         const char *p = (const char *)L1_ARG(frame, i);
         if (p && p[0] == '/') { any = 1; break; }
     }
-    if (!any) return;
+    if (!any) return 0;
+    /* ro bind / mountpoint: rozhoduje se z PUVODNICH (guest) cest */
+    long deny = shim_bind_deny(nr, &L1_ARG(frame, 0));
+    if (deny) {
+        frame[20] = (unsigned long)deny;
+        frame[21] = 0;
+        return 1;
+    }
     l1_slot_t *s = l1_slot_acquire(frame);
-    if (!s) return;                                /* jde neprelozene dal */
+    if (!s) return 0;                              /* jde neprelozene dal */
     frame[21] = (unsigned long)s;                  /* l1_after ho uvolni */
     int used = 0;
     for (int i = 0; i < 8 && used < L1_NPATH; i++) {
@@ -185,6 +195,7 @@ void l1_before(unsigned long *frame, long nr) {
                                    (const char *)L1_ARG(frame, 2), out, L1_PATHMAX))
             L1_ARG(frame, 0) = (unsigned long)out;
     }
+    return 0;
 }
 
 /* Odrizne prefix $ROOTFS z vysledku, ktery jadro naplnilo hostovou cestou.
@@ -219,7 +230,10 @@ void l1_after(unsigned long *frame, long nr) {
 
     if (ret > 0 && !g_cwd_keep_host) {
         if (nr == 17) {
-            frame[20] = (unsigned long)l1_strip_root_buf((char *)frame[0], ret, 1);
+            /* remap bind (mount --bind) -> guest prefix, jinak strip $ROOTFS */
+            size_t rv = bind_reverse_inplace((char *)frame[0], (size_t)frame[1]);
+            frame[20] = rv ? (unsigned long)(rv + 1)
+                           : (unsigned long)l1_strip_root_buf((char *)frame[0], ret, 1);
         } else if (nr == 78) {
             char *b = (char *)frame[2];
             size_t cap = (size_t)frame[3];

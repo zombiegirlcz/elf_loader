@@ -49,8 +49,9 @@ static unsigned long bf_args[8];
 static const char *g_replace_path;   /* != NULL -> l1_before prepise arg x1 */
 static int g_skip_after;             /* 1 -> l1_before necha frame[21]=0 (rychla cesta) */
 static long g_force_ret;             /* != 0    -> l1_after prepise vysledek */
+static long g_deny;                  /* != 0    -> l1_before syscall odmitne */
 
-void l1_before(unsigned long *frame, long nr) {
+long l1_before(unsigned long *frame, long nr) {
     bf_calls++;
     bf_nr = nr;
     for (int i = 0; i < 8; i++) bf_args[i] = frame[i];
@@ -68,6 +69,9 @@ void l1_before(unsigned long *frame, long nr) {
                      "movi d0, #0\n\tcmn xzr, xzr"
                      ::: "x9", "x10", "x11", "x12", "x13", "x14", "x15",
                          "x16", "x17", "d0", "cc");
+    /* odmitnuti (ro bind/mountpoint): vysledek do frame[20], bez l1_after */
+    if (g_deny) { frame[20] = (unsigned long)g_deny; frame[21] = 0; return 1; }
+    return 0;
 }
 void l1_after(unsigned long *frame, long nr) {
     af_calls++;
@@ -169,6 +173,19 @@ int main(void) {
           "frame[21]==0 -> l1_after preskocen, syscall i registry v poradku");
     if (r5 >= 0) close((int)(r5 & 0xffff));
     g_skip_after = 0;
+
+    /* ── 4c. odmitnuti: l1_before vrati != 0 -> svc se NEprovede, volajici
+     * dostane frame[20], l1_after se nevola, registry zachovane. Pouzita cesta
+     * existuje -> kdyby svc probehl, vratil by fd >= 0, ne -30. */
+    g_deny = -30;
+    af_before = af_calls;
+    long r6 = f(-100, "/etc/hostname", O_RDONLY);
+    CHECK(r6 == -30 && af_calls == af_before,
+          "l1_before odmitl -> bez svc, vysledek -EROFS, l1_after preskocen");
+    g_deny = 0;
+    long r7 = f(-100, "/etc/hostname", O_RDONLY);
+    CHECK(r7 >= 0 && (r7 & (1L << 16)) == 0, "po odmitnuti dalsi volani normalne (x1, x9, x10 ok)");
+    if (r7 >= 0) close((int)(r7 & 0xffff));
 
     /* ── 5. NZCV a d0 ──────────────────────────────────────────────────── */
     unsigned long nz_before = 0, nz_after = 0;
