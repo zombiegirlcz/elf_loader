@@ -1631,6 +1631,68 @@ category_lazybind() {
     fi
 }
 
+# Uzivatelska tabulka bindu + runtime mount --bind (prompt 06). mount(2) je v
+# app domene ENOSYS; MS_BIND emulujeme v path vrstve (sdilena MAP_SHARED
+# tabulka). util-linux mount (glibc, pod loaderem) dojde az k libc mount() ->
+# shim ho zachyti a vrati 0. POZOR: plne rootfs cesty ($R/bin/{mount,umount,ls,
+# mkdir,touch,rm}) - bare jmena by se resolvovala na HOST toybox (viz hlavicka),
+# ten bezi nativne mimo loader a shim ho nevidi.
+category_binds() {
+    echo ""
+    echo "=== uzivatelska tabulka bindu + mount --bind (prompt 06) ==="
+    local env="ROOTFS=$R ELF_ROOTFS=$R HOME=$D ELF_LOADER=$L"
+    local ok=1 detail=""
+    local T=/tmp/lxbt T2=/tmp/lxbtro
+    local mnt="$R/bin/mount" um="$R/bin/umount" ls="$R/bin/ls"
+    local mk="$R/bin/mkdir" tc="$R/bin/touch"
+    local TO="$R/usr/bin/timeout 25 $R/bin/bash -c"
+
+    # Referencni obsah zdroje /etc (pod loaderem -> $R/etc).
+    local src a b ro
+    src=$($TO "$env $L --ownall $ls -A /etc" 2>&1 | sort)
+    local srcn; srcn=$(printf '%s\n' "$src" | grep -c . || true)
+
+    # (1) runtime mount --bind: cil ukaze obsah zdroje. `mount` a `ls` jsou
+    # sourozenci (deti vnitrniho bash) -> bind zapsany procesem `mount` vidi
+    # proces `ls` pres sdilenou MAP_SHARED tabulku = cross-process.
+    a=$($TO "$env $L --ownall $R/bin/bash -c '$mk -p $T; $mnt --bind /etc $T && $ls -A $T'" 2>&1 | sort)
+    if [ "${srcn:-0}" -gt 0 ] && [ "$a" = "$src" ]; then
+        echo "PASS binds: mount --bind /etc $T ukaze obsah /etc ($srcn polozek, cross-process)"
+        echo "PASS: binds - runtime mount --bind cross-process" >> "$PASS_LOG"; ((PASS_COUNT++)) || true
+    else
+        ok=0; detail="$detail [mount --bind: cil($(printf '%s\n' "$a"|grep -c .||true))!=zdroj($srcn)]"
+    fi
+
+    # (2) umount vrati prazdny cil (bind odebran ze sdilene tabulky)
+    b=$($TO "$env $L --ownall $R/bin/bash -c '$mk -p $T; $mnt --bind /etc $T >/dev/null 2>&1; $um $T && $ls -A $T'" 2>&1 | sort)
+    local bn; bn=$(printf '%s\n' "$b" | grep -c . || true)
+    if [ "${bn:-1}" -eq 0 ]; then
+        echo "PASS binds: umount $T vrati prazdnou slozku"
+        echo "PASS: binds - umount odebere bind" >> "$PASS_LOG"; ((PASS_COUNT++)) || true
+    else
+        ok=0; detail="$detail [umount: cil neprazdny ($bn)]"
+    fi
+
+    # (3) ro bind: zapis -> EROFS (LX_BINDS host=$R/tmp aby pripadny prusak
+    # nepolutoval /etc). touch pres open(O_WRONLY|O_CREAT) -> shim_rofail.
+    ro=$($TO "$env LX_BINDS=$R/tmp:$T2:ro $L --ownall $R/bin/bash -c '$tc $T2/lxro_probe 2>&1; echo rc=\$?'" 2>&1)
+    if printf '%s' "$ro" | grep -qiE 'read-only|erofs'; then
+        echo "PASS binds: ro bind -> touch EROFS"
+        echo "PASS: binds - ro bind EROFS" >> "$PASS_LOG"; ((PASS_COUNT++)) || true
+    else
+        ok=0; detail="$detail [ro: touch neselhalo EROFS: $(printf '%s' "$ro" | head -c 80)]"
+    fi
+
+    # uklid (pod loaderem - rootfs rm je glibc binarka)
+    $TO "$env $L --ownall $R/bin/rm -rf $T $T2 $R/tmp/lxro_probe" >/dev/null 2>&1 || true
+
+    if [ "$ok" != 1 ]; then
+        echo "FAIL binds:$detail"
+        echo "FAIL: binds - uzivatelska tabulka / mount --bind |$detail" >> "$FAIL_LOG"
+        ((FAIL_COUNT++)) || true
+    fi
+}
+
 # Obrazova cache RELRO stranek (prompt 10 cast A, ELF_LOADER_IMGCACHE=1).
 # Overuje: (a) s cache zapnutou je vystup IDENTICKY jako bez ni (bezpecny
 # fallback), (b) cache odmitne vytvorit obraz, ktery by nesel revalidovat
@@ -2086,6 +2148,10 @@ case "${1:-all}" in
         category_imgcache
         print_summary
         ;;
+    binds)
+        category_binds
+        print_summary
+        ;;
     bigargv)
         category_bigargv
         print_summary
@@ -2156,6 +2222,7 @@ case "${1:-all}" in
         category_symhash
         category_lazybind
         category_imgcache
+        category_binds
         category_relsym
         category_l1
         category_l2

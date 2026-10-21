@@ -423,6 +423,7 @@ static int shim_translate(const char *p, char *out, size_t n) {
 static void *g_orig_open = NULL, *g_orig_open64 = NULL, *g_orig_openat = NULL,
             *g_orig_openat64 = NULL;
 static void *g_orig_open64_nocancel = NULL;  /* interni glibc open pro DNS/NSS */
+static void *g_orig_mount = NULL, *g_orig_umount = NULL, *g_orig_umount2 = NULL;
 static void *g_orig_stat = NULL, *g_orig_stat64 = NULL, *g_orig___xstat = NULL,
             *g_orig_lstat = NULL, *g_orig___lxstat = NULL;
 static void *g_orig_lstat64 = NULL, *g_orig_fstat64 = NULL, *g_orig_fstatat64 = NULL,
@@ -1089,7 +1090,24 @@ static int g_loader_active = 0;        /* 1 = loaderuv vlastni kod (bionic TLS) 
 typedef int (*fp_openat)(int, const char *, int, ...);
 static int shim_resolve_symlinks(const char *path, char *out, size_t outsz);
 static void shim_guest_errno_set(int v);
+/* 1 (+ EROFS) kdyz guest `p` spada pod ro bind (prompt 06 task 4). Vola se na
+ * zacatku zapisujicich shimu. Bezi pod GUEST TP -> shim_guest_errno_set, nikdy
+ * bionicke errno. Jen absolutni cesty (relativni pod ro bind bounded miss). */
+static int shim_rofail(const char *p) {
+    if (!g_binds_ready || !p || p[0] != '/') return 0;
+    if (!bind_is_ro(p)) return 0;
+    shim_guest_errno_set(EROFS);
+    return 1;
+}
+/* Zapis-flagy pro open: ne-RDONLY nebo tvorba/truncate. */
+#ifndef O_ACCMODE
+#define O_ACCMODE 03
+#endif
+static int shim_open_is_write(int flags) {
+    return (flags & O_ACCMODE) != O_RDONLY || (flags & (O_CREAT | O_TRUNC));
+}
 static int shim_open(const char *p, int flags, ...) {
+    if (shim_open_is_write(flags) && shim_rofail(p)) return -1;
     char buf[8192]; const char *path = p;
     if (shim_translate(p, buf, sizeof buf)) path = buf;
     char resolved[8192];
@@ -1105,6 +1123,7 @@ static int shim_open(const char *p, int flags, ...) {
  * (strlen/strncmp/snprintf jsou bez TLS) a vysledek volame pres shim_real,
  * coz je parrot glibc funkce (bezi ve spravnem glibc TLS kontextu). */
 static int shim_open64(const char *p, int flags, ...) {
+    if (shim_open_is_write(flags) && shim_rofail(p)) return -1;
     char buf[8192]; const char *path = p;
     if (shim_translate(p, buf, sizeof buf)) path = buf;
     char resolved[8192];
@@ -1114,6 +1133,7 @@ static int shim_open64(const char *p, int flags, ...) {
     return f ? f(path, flags, mode) : -1;
 }
 static int shim_openat(int dfd, const char *p, int flags, ...) {
+    if (dfd == -100 && shim_open_is_write(flags) && shim_rofail(p)) return -1;
     char buf[8192]; const char *path = p;
     if (dfd == -100 && p && p[0] == '/') {
         if (shim_translate(p, buf, sizeof buf)) path = buf;
@@ -1125,6 +1145,7 @@ static int shim_openat(int dfd, const char *p, int flags, ...) {
     return f ? f(dfd, path, flags, mode) : -1;
 }
 static int shim_openat64(int dfd, const char *p, int flags, ...) {
+    if (dfd == -100 && shim_open_is_write(flags) && shim_rofail(p)) return -1;
     char buf[8192]; const char *path = p;
     if (dfd == -100 && p && p[0] == '/') {
         if (shim_translate(p, buf, sizeof buf)) path = buf;
@@ -1294,6 +1315,7 @@ static int shim_newfstatat(int dfd, const char *p, void *st, int flags) {
  * Bez prekladu by zapisovaly na host cesty (ldapfig Can't link, dpkg chyby). */
 typedef int (*fp_symlink)(const char *, const char *);
 static int shim_symlink(const char *t, const char *lp) {
+    if (shim_rofail(lp)) return -1;
     char b[8192]; const char *linkpath = lp;
     if (shim_translate(lp, b, sizeof b)) linkpath = b;
     /* absolutni guest cil zapis rovnou relativne (invariant rootfs, viz
@@ -1304,6 +1326,7 @@ static int shim_symlink(const char *t, const char *lp) {
 }
 typedef int (*fp_symlinkat)(const char *, int, const char *);
 static int shim_symlinkat(const char *t, int ndfd, const char *lp) {
+    if (ndfd == -100 && shim_rofail(lp)) return -1;
     char b[8192]; const char *linkpath = lp;
     if (ndfd == -100 && lp && lp[0] == '/') { if (shim_translate(lp, b, sizeof b)) linkpath = b; }
     char rel[4096]; const char *target = t;
@@ -1313,6 +1336,7 @@ static int shim_symlinkat(const char *t, int ndfd, const char *lp) {
 }
 typedef int (*fp_link)(const char *, const char *);
 static int shim_link(const char *o, const char *n) {
+    if (shim_rofail(n)) return -1;
     char b1[8192], b2[8192]; const char *oldp = o, *newp = n;
     if (shim_translate(o, b1, sizeof b1)) oldp = b1;
     if (shim_translate(n, b2, sizeof b2)) newp = b2;
@@ -1334,6 +1358,7 @@ static int shim_link(const char *o, const char *n) {
 }
 typedef int (*fp_rename)(const char *, const char *);
 static int shim_rename(const char *o, const char *n) {
+    if (shim_rofail(o) || shim_rofail(n)) return -1;
     char b1[8192], b2[8192]; const char *oldp = o, *newp = n;
     if (shim_translate(o, b1, sizeof b1)) oldp = b1;
     if (shim_translate(n, b2, sizeof b2)) newp = b2;
@@ -1344,6 +1369,7 @@ static int shim_rename(const char *o, const char *n) {
  * $ROOTFS/tmp/x -> ENOENT ("cannot move ... No such file or directory"). */
 typedef int (*fp_renameat)(int, const char *, int, const char *);
 static int shim_renameat(int odfd, const char *o, int ndfd, const char *n) {
+    if ((odfd == -100 && shim_rofail(o)) || (ndfd == -100 && shim_rofail(n))) return -1;
     char b1[8192], b2[8192]; const char *oldp = o, *newp = n;
     if (odfd == -100 && o && o[0] == '/') { if (shim_translate(o, b1, sizeof b1)) oldp = b1; }
     if (ndfd == -100 && n && n[0] == '/') { if (shim_translate(n, b2, sizeof b2)) newp = b2; }
@@ -1351,6 +1377,7 @@ static int shim_renameat(int odfd, const char *o, int ndfd, const char *n) {
 }
 typedef int (*fp_renameat2)(int, const char *, int, const char *, unsigned int);
 static int shim_renameat2(int odfd, const char *o, int ndfd, const char *n, unsigned int flags) {
+    if ((odfd == -100 && shim_rofail(o)) || (ndfd == -100 && shim_rofail(n))) return -1;
     char b1[8192], b2[8192]; const char *oldp = o, *newp = n;
     if (odfd == -100 && o && o[0] == '/') { if (shim_translate(o, b1, sizeof b1)) oldp = b1; }
     if (ndfd == -100 && n && n[0] == '/') { if (shim_translate(n, b2, sizeof b2)) newp = b2; }
@@ -1358,6 +1385,7 @@ static int shim_renameat2(int odfd, const char *o, int ndfd, const char *n, unsi
 }
 typedef int (*fp_unlink)(const char *);
 static int shim_unlink(const char *p) {
+    if (shim_rofail(p)) return -1;
     char b[8192]; const char *path = p; if (shim_translate(p, b, sizeof b)) path = b;
     fp_unlink f = (fp_unlink)g_orig_unlink; return f ? f(path) : -1;
 }
@@ -1366,29 +1394,34 @@ static int shim_unlink(const char *p) {
  * $ROOTFS/tmp/x -> ENOENT ("cannot remove ... No such file or directory"). */
 typedef int (*fp_unlinkat)(int, const char *, int);
 static int shim_unlinkat(int dfd, const char *p, int flags) {
+    if (dfd == -100 && shim_rofail(p)) return -1;
     char b[8192]; const char *path = p;
     if (dfd == -100 && p && p[0] == '/') { if (shim_translate(p, b, sizeof b)) path = b; }
     fp_unlinkat f = (fp_unlinkat)g_orig_unlinkat; return f ? f(dfd, path, flags) : -1;
 }
 typedef int (*fp_rmdirat)(int, const char *);
 static int shim_rmdirat(int dfd, const char *p) {
+    if (dfd == -100 && shim_rofail(p)) return -1;
     char b[8192]; const char *path = p;
     if (dfd == -100 && p && p[0] == '/') { if (shim_translate(p, b, sizeof b)) path = b; }
     fp_rmdirat f = (fp_rmdirat)g_orig_rmdirat; return f ? f(dfd, path) : -1;
 }
 typedef int (*fp_mkdir)(const char *, unsigned int);
 static int shim_mkdir(const char *p, unsigned int m) {
+    if (shim_rofail(p)) return -1;
     char b[8192]; const char *path = p; if (shim_translate(p, b, sizeof b)) path = b;
     fp_mkdir f = (fp_mkdir)g_orig_mkdir; return f ? f(path, m) : -1;
 }
 typedef int (*fp_mkdirat)(int, const char *, unsigned int);
 static int shim_mkdirat(int dfd, const char *p, unsigned int m) {
+    if (dfd == -100 && shim_rofail(p)) return -1;
     char b[8192]; const char *path = p;
     if (dfd == -100 && p && p[0] == '/') { if (shim_translate(p, b, sizeof b)) path = b; }
     fp_mkdirat f = (fp_mkdirat)g_orig_mkdirat; return f ? f(dfd, path, m) : -1;
 }
 typedef int (*fp_rmdir)(const char *);
 static int shim_rmdir(const char *p) {
+    if (shim_rofail(p)) return -1;
     char b[8192]; const char *path = p; if (shim_translate(p, b, sizeof b)) path = b;
     fp_rmdir f = (fp_rmdir)g_orig_rmdir; return f ? f(path) : -1;
 }
@@ -1409,41 +1442,41 @@ static void *g_orig_chmod, *g_orig_lchmod, *g_orig_fchmodat, *g_orig_chown, *g_o
             *g_orig_listxattr, *g_orig_llistxattr, *g_orig_removexattr, *g_orig_lremovexattr,
             *g_orig_creat, *g_orig_creat64, *g_orig_pathconf, *g_orig_inotify_add_watch,
             *g_orig_bind, *g_orig_connect;
-static int shim_chmod(const char *p, unsigned int m) { SHIM_PATH_BUF;
+static int shim_chmod(const char *p, unsigned int m) { if (shim_rofail(p)) return -1; SHIM_PATH_BUF;
     int (*f)(const char *, unsigned int) = g_orig_chmod; return f ? f(TP(p), m) : -1; }
-static int shim_lchmod(const char *p, unsigned int m) { SHIM_PATH_BUF;
+static int shim_lchmod(const char *p, unsigned int m) { if (shim_rofail(p)) return -1; SHIM_PATH_BUF;
     int (*f)(const char *, unsigned int) = g_orig_lchmod; return f ? f(TP(p), m) : -1; }
 static int shim_fchmodat(int d, const char *p, unsigned int m, int fl) { SHIM_PATH_BUF;
     int (*f)(int, const char *, unsigned int, int) = g_orig_fchmodat; return f ? f(d, TP(p), m, fl) : -1; }
-static int shim_chown(const char *p, unsigned int u, unsigned int g) { SHIM_PATH_BUF;
+static int shim_chown(const char *p, unsigned int u, unsigned int g) { if (shim_rofail(p)) return -1; SHIM_PATH_BUF;
     int (*f)(const char *, unsigned int, unsigned int) = g_orig_chown; return f ? f(TP(p), u, g) : -1; }
-static int shim_lchown(const char *p, unsigned int u, unsigned int g) { SHIM_PATH_BUF;
+static int shim_lchown(const char *p, unsigned int u, unsigned int g) { if (shim_rofail(p)) return -1; SHIM_PATH_BUF;
     int (*f)(const char *, unsigned int, unsigned int) = g_orig_lchown; return f ? f(TP(p), u, g) : -1; }
 static int shim_fchownat(int d, const char *p, unsigned int u, unsigned int g, int fl) { SHIM_PATH_BUF;
     int (*f)(int, const char *, unsigned int, unsigned int, int) = g_orig_fchownat;
     return f ? f(d, TP(p), u, g, fl) : -1; }
 static int shim_utime(const char *p, const void *t) { SHIM_PATH_BUF;
     int (*f)(const char *, const void *) = g_orig_utime; return f ? f(TP(p), t) : -1; }
-static int shim_utimes(const char *p, const void *t) { SHIM_PATH_BUF;
+static int shim_utimes(const char *p, const void *t) { if (shim_rofail(p)) return -1; SHIM_PATH_BUF;
     int (*f)(const char *, const void *) = g_orig_utimes; return f ? f(TP(p), t) : -1; }
-static int shim_lutimes(const char *p, const void *t) { SHIM_PATH_BUF;
+static int shim_lutimes(const char *p, const void *t) { if (shim_rofail(p)) return -1; SHIM_PATH_BUF;
     int (*f)(const char *, const void *) = g_orig_lutimes; return f ? f(TP(p), t) : -1; }
 static int shim_futimesat(int d, const char *p, const void *t) { SHIM_PATH_BUF;
     int (*f)(int, const char *, const void *) = g_orig_futimesat; return f ? f(d, TP(p), t) : -1; }
 /* utimensat(fd, NULL, ...) = futimens - p muze byt NULL; shim_translate to snese. */
 static int shim_utimensat(int d, const char *p, const void *t, int fl) { SHIM_PATH_BUF;
     int (*f)(int, const char *, const void *, int) = g_orig_utimensat; return f ? f(d, TP(p), t, fl) : -1; }
-static int shim_truncate(const char *p, long l) { SHIM_PATH_BUF;
+static int shim_truncate(const char *p, long l) { if (shim_rofail(p)) return -1; SHIM_PATH_BUF;
     int (*f)(const char *, long) = g_orig_truncate; return f ? f(TP(p), l) : -1; }
-static int shim_truncate64(const char *p, long l) { SHIM_PATH_BUF;
+static int shim_truncate64(const char *p, long l) { if (shim_rofail(p)) return -1; SHIM_PATH_BUF;
     int (*f)(const char *, long) = g_orig_truncate64; return f ? f(TP(p), l) : -1; }
-static int shim_mknod(const char *p, unsigned int m, unsigned long dev) { SHIM_PATH_BUF;
+static int shim_mknod(const char *p, unsigned int m, unsigned long dev) { if (shim_rofail(p)) return -1; SHIM_PATH_BUF;
     int (*f)(const char *, unsigned int, unsigned long) = g_orig_mknod; return f ? f(TP(p), m, dev) : -1; }
-static int shim_mknodat(int d, const char *p, unsigned int m, unsigned long dev) { SHIM_PATH_BUF;
+static int shim_mknodat(int d, const char *p, unsigned int m, unsigned long dev) { if (d == -100 && shim_rofail(p)) return -1; SHIM_PATH_BUF;
     int (*f)(int, const char *, unsigned int, unsigned long) = g_orig_mknodat; return f ? f(d, TP(p), m, dev) : -1; }
-static int shim_mkfifo(const char *p, unsigned int m) { SHIM_PATH_BUF;
+static int shim_mkfifo(const char *p, unsigned int m) { if (shim_rofail(p)) return -1; SHIM_PATH_BUF;
     int (*f)(const char *, unsigned int) = g_orig_mkfifo; return f ? f(TP(p), m) : -1; }
-static int shim_mkfifoat(int d, const char *p, unsigned int m) { SHIM_PATH_BUF;
+static int shim_mkfifoat(int d, const char *p, unsigned int m) { if (d == -100 && shim_rofail(p)) return -1; SHIM_PATH_BUF;
     int (*f)(int, const char *, unsigned int) = g_orig_mkfifoat; return f ? f(d, TP(p), m) : -1; }
 static int shim_linkat(int od, const char *o, int nd, const char *n, int fl) {
     char b1[8192], b2[8192];
@@ -1469,9 +1502,9 @@ static int shim_removexattr(const char *p, const char *nm) { SHIM_PATH_BUF;
     int (*f)(const char *, const char *) = g_orig_removexattr; return f ? f(TP(p), nm) : -1; }
 static int shim_lremovexattr(const char *p, const char *nm) { SHIM_PATH_BUF;
     int (*f)(const char *, const char *) = g_orig_lremovexattr; return f ? f(TP(p), nm) : -1; }
-static int shim_creat(const char *p, unsigned int m) { SHIM_PATH_BUF;
+static int shim_creat(const char *p, unsigned int m) { if (shim_rofail(p)) return -1; SHIM_PATH_BUF;
     int (*f)(const char *, unsigned int) = g_orig_creat; return f ? f(TP(p), m) : -1; }
-static int shim_creat64(const char *p, unsigned int m) { SHIM_PATH_BUF;
+static int shim_creat64(const char *p, unsigned int m) { if (shim_rofail(p)) return -1; SHIM_PATH_BUF;
     int (*f)(const char *, unsigned int) = g_orig_creat64; return f ? f(TP(p), m) : -1; }
 static long shim_pathconf(const char *p, int nm) { SHIM_PATH_BUF;
     long (*f)(const char *, int) = g_orig_pathconf; return f ? f(TP(p), nm) : -1; }
@@ -2049,6 +2082,7 @@ static char **shim_child_envp(char *const envp[], const char *child_file) {
     for (int i = 0; envp && envp[i] && o < SHIM_CE_MAX - 8; i++) {
         if (shim_strncmp(envp[i], "ROOTFS=", 7) == 0) continue;
         if (shim_strncmp(envp[i], "ELF_ROOTFS=", 11) == 0) continue;
+        if (shim_strncmp(envp[i], "LX_BINDS_FILE=", 14) == 0) continue;  /* re-injekce nize */
         g_ce_ptrs[o++] = envp[i];
     }
     char *sp = g_ce_str;
@@ -2065,6 +2099,9 @@ static char **shim_child_envp(char *const envp[], const char *child_file) {
     } while (0)
     CE_PUSH("ROOTFS", root);
     CE_PUSH("ELF_ROOTFS", root);
+    /* Sdilena bind tabulka (prompt 06): potomek namapuje TUTEZ -> runtime
+     * mount --bind je cross-process. g_binds_file nastavil binds_init. */
+    if (g_binds_file[0]) CE_PUSH("LX_BINDS_FILE", g_binds_file);
     #undef CE_PUSH
     g_ce_ptrs[o] = NULL;
     return g_ce_ptrs;
@@ -2806,6 +2843,15 @@ static char *shim_getcwd(char *buf, size_t size) {
     char tmp[8192];
     char *r = f(tmp, sizeof tmp);
     if (!r) return NULL;
+    /* Zpetne mapovani host->guest pro remap bindy (prompt 06 task 3): host cwd
+     * pod bind targetem -> guest prefix. Jinak default $ROOTFS strip. */
+    char rev[8192];
+    if (g_binds_ready && bind_reverse(tmp, rev, sizeof rev)) {
+        size_t rl2 = shim_strlen(rev);
+        if (rl2 + 1 > size) { shim_guest_errno_set(ERANGE); return NULL; }
+        shim_memcpy(buf, rev, rl2 + 1);
+        return buf;
+    }
     shim_strip_root(tmp);
     size_t l = shim_strlen(tmp);
     if (l + 1 > size) { shim_guest_errno_set(ERANGE); return NULL; }
@@ -2821,6 +2867,62 @@ static char *shim_get_current_dir_name(void) {
     char *(*f)(void) = (char *(*)(void))g_orig_get_current_dir_name;
     char *r = f ? f() : NULL;
     return g_cwd_keep_host ? r : shim_strip_root(r);
+}
+
+/* ── prompt 06 Stage 2: runtime mount/umount (MS_BIND) ────────────────
+ * mount(2) je v app domene ENOSYS (seccomp), takze MS_BIND emulujeme v path
+ * vrstve: zaznam do sdilene tabulky (viz binds.h), uspech bez realneho
+ * syscallu. Ostatni typy mountu -> original (ENOSYS). Bezi pod GUEST TP ->
+ * jen shim a bind helpery a shim_guest_errno_set, zadny TLS-zavisly kod. */
+#ifndef MS_RDONLY
+#define MS_RDONLY 1
+#endif
+#ifndef MS_REMOUNT
+#define MS_REMOUNT 32
+#endif
+static int shim_mount(const char *source, const char *target,
+                      const char *fstype, unsigned long flags, const void *data) {
+    if ((flags & MS_BIND) && target && target[0] == '/') {
+        int ro = (flags & MS_RDONLY) ? 1 : 0;
+        if (flags & MS_REMOUNT) {
+            /* remount,bind,ro: jen zmen ro existujiciho bindu */
+            int i = bind_longest(target);
+            if (i >= 0 && g_tab->e[i].glen == (unsigned short)shim_strlen(target) &&
+                shim_strncmp(g_tab->e[i].guest, target, g_tab->e[i].glen) == 0) {
+                __atomic_store_n(&g_tab->e[i].ro, (unsigned char)ro, __ATOMIC_RELEASE);
+                __atomic_fetch_add(&g_tab->gen, 1, __ATOMIC_RELEASE);
+                return 0;
+            }
+            shim_guest_errno_set(EINVAL);
+            return -1;
+        }
+        /* source -> host cesta (guest /root -> $ROOTFS/root; identita beze zmeny) */
+        char hb[1024]; const char *hsrc = source;
+        if (source && shim_translate(source, hb, sizeof hb)) hsrc = hb;
+        if (!hsrc || hsrc[0] != '/') { shim_guest_errno_set(EINVAL); return -1; }
+        if (bind_add(target, hsrc, ro)) return 0;
+        shim_guest_errno_set(ENOMEM);   /* tabulka plna / cesta moc dlouha */
+        return -1;
+    }
+    int (*f)(const char *, const char *, const char *, unsigned long, const void *) =
+        (void *)g_orig_mount;
+    if (f) return f(source, target, fstype, flags, data);
+    shim_guest_errno_set(ENOSYS);
+    return -1;
+}
+static int shim_umount(const char *target) {
+    if (target && target[0] == '/' && bind_remove(target)) return 0;
+    int (*f)(const char *) = (void *)g_orig_umount;
+    if (f) return f(target);
+    shim_guest_errno_set(ENOSYS);
+    return -1;
+}
+static int shim_umount2(const char *target, int flags) {
+    if (target && target[0] == '/' && bind_remove(target)) return 0;
+    int (*f)(const char *, int) = (void *)g_orig_umount2;
+    if (f) return f(target, flags);
+    shim_guest_errno_set(ENOSYS);
+    return -1;
 }
 
 #include "l1.h"
@@ -3432,6 +3534,8 @@ static f2_hook_t g_f2_hooks[] = {
     {"nftw",(void*)shim_nftw,&g_orig_nftw},{"nftw64",(void*)shim_nftw64,&g_orig_nftw64},
     {"ftw",(void*)shim_ftw,&g_orig_ftw},{"ftw64",(void*)shim_ftw64,&g_orig_ftw64},
     {"glob",(void*)shim_glob,&g_orig_glob},{"glob64",(void*)shim_glob64,&g_orig_glob64},
+    {"mount",(void*)shim_mount,&g_orig_mount},
+    {"umount",(void*)shim_umount,&g_orig_umount},{"umount2",(void*)shim_umount2,&g_orig_umount2},
     /* close/flockfile/mprotect jsou diagnosticke shimy (Node ladeni) a
      * prlimit64 mel spatnou signaturu - dokud MAX_OVERRIDES=64 zahazoval vse
      * od 65. polozky, nikdy nebezely. Registrovat jen explicitne. */
