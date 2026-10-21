@@ -361,16 +361,34 @@ static int shim_excluded(const char *p) {
 }
 
 #include "relsym.h"
+/* Delka g_shim_root, spocitana jednou (shim_translate je nejteplejsi funkce
+ * loaderu: kazdy cestovy hook a pod L1 kazdy cestovy syscall; loader se
+ * stavi s -O0, takze bajtove smycky nejsou zadarmo). g_shim_root se
+ * nastavuje jednou pri startu, pred vlakny. */
+static size_t shim_root_len(void) {
+    static const char *cached = NULL;
+    static size_t len = 0;
+    if (cached != g_shim_root) {
+        len = g_shim_root ? shim_strlen(g_shim_root) : 0;
+        cached = g_shim_root;
+    }
+    return len;
+}
+
 /* 1 = prelozeno (out naplneno), 0 = ponechat */
 static int shim_translate(const char *p, char *out, size_t n) {
     if (!p || p[0] != '/') return 0;
     if (!g_shim_root || !g_shim_root[0]) return 0;
-    size_t rl = shim_strlen(g_shim_root);
+    size_t rl = shim_root_len();
+    /* Uz pod ROOTFS -> nic (idempotence: L1 dostava cesty, ktere uz prelozil
+     * jmenny hook). Testuje se PRED clampem: hostova cesta pod ROOTFS nad
+     * host koren utect nemuze, takze clamp by na ni nic nezmenil - jen by ji
+     * cely prosel. */
+    if (shim_strncmp(p, g_shim_root, rl) == 0 && (p[rl] == '/' || p[rl] == 0)) return 0;
     /* Clamp ".." pise PRIMO za misto pro prefix v `out` - zadny buffer na
      * zasobniku (shim_translate vola i L1 stub na cizim, treba Go 8 KB
      * zasobniku). `p` pak ukazuje do `out` a prefix se doplni pred nej. */
     if (n > rl + 2 && shim_clamp_dotdot(p, out + rl, n - rl)) p = out + rl;
-    if (shim_strncmp(p, g_shim_root, rl) == 0 && (p[rl] == '/' || p[rl] == 0)) return 0;
     /* /dev/shm na Androidu neexistuje (shm_open/sem_open -> ENOENT) -> guest
      * $R/dev/shm (vytvari shim_register_overrides). Zbytek /dev zustava host. */
     int shm = shim_strncmp(p, "/dev/shm", 8) == 0 && (p[8] == '/' || p[8] == 0);

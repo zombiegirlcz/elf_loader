@@ -47,6 +47,7 @@ static int bf_calls, af_calls, bf_frame_bad, bf_copy_bad;
 static long bf_nr, af_nr, af_ret, af_orig_x0;
 static unsigned long bf_args[8];
 static const char *g_replace_path;   /* != NULL -> l1_before prepise arg x1 */
+static int g_skip_after;             /* 1 -> l1_before necha frame[21]=0 (rychla cesta) */
 static long g_force_ret;             /* != 0    -> l1_after prepise vysledek */
 
 void l1_before(unsigned long *frame, long nr) {
@@ -56,6 +57,8 @@ void l1_before(unsigned long *frame, long nr) {
     if (frame[21] != 0) bf_frame_bad++;
     for (int i = 0; i < 8; i++) if (frame[22 + i] != frame[i]) bf_copy_bad++;
     if (g_replace_path) frame[22 + 1] = (unsigned long)g_replace_path;
+    /* kontrakt: frame[21] != 0 -> l1_common zavola l1_after (src/l1.h) */
+    if (!g_skip_after) frame[21] = 1;
     /* Realny prekladac (C) smi caller-saved registry libovolne prepsat -
      * mock to dela umyslne, jinak by chybejici obnovu v l1_common nikdo
      * neodhalil (prvni negativni kontrola na to prosla). */
@@ -157,6 +160,15 @@ int main(void) {
     /* ── 4. chyba syscallu projde nezmenena ────────────────────────────── */
     long r4 = f(-100, "/nonexistent-l1-test", O_RDONLY);
     CHECK(r4 < 0 && r4 > -4096, "chybovy kod syscallu dojde k volajicimu");
+
+    /* ── 4b. rychla cesta: frame[21] == 0 -> l1_after se NEvola ────────── */
+    g_skip_after = 1;
+    int af_before = af_calls;
+    long r5 = f(-100, "/etc/hostname", O_RDONLY);
+    CHECK(af_calls == af_before && r5 >= 0 && (r5 & (1L << 16)) == 0,
+          "frame[21]==0 -> l1_after preskocen, syscall i registry v poradku");
+    if (r5 >= 0) close((int)(r5 & 0xffff));
+    g_skip_after = 0;
 
     /* ── 5. NZCV a d0 ──────────────────────────────────────────────────── */
     unsigned long nz_before = 0, nz_after = 0;

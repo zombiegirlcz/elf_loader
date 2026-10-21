@@ -23,7 +23,8 @@
  * vsechny dole a q-pary (dosah 1008 B) nahore):
  *   0 x0,x1 | 16 x2,x3 | 32 x4,x5 | 48 x6,x7 | 64 x8,x9 | 80 x10,x11
  *   96 x12,x13 | 112 x14,x15 | 128 x18,nzcv | 144 x29,x30
- *   160 vysledek svc (frame[20]) | 168 drzeny slot (frame[21])
+ *   160 vysledek svc (frame[20]) | 168 drzeny slot (frame[21]; 0 = l1_after
+ *       se nevola, 1 = jen fixup vysledku, jinak ukazatel na slot)
  *   176 argumenty SYSCALLU x0-x7 (frame[22..29]) - jen tyhle smi l1_before
  *       prepsat (prelozena cesta); frame[0..7] zustavaji PUVODNI
  *   240 q0-q31
@@ -92,9 +93,12 @@ l1_common:
     ldr x8, [sp, #64]
     svc #0
     str x0, [sp, #160]                /* frame[20]: vysledek (frame[0] = puvodni x0) */
+    ldr x9, [sp, #168]                /* frame[21] == 0 -> l1_after neni treba */
+    cbz x9, 1f                        /* (rychla cesta find/fts, viz l1_before) */
     mov x0, sp
     ldr x1, [sp, #64]
     bl l1_after
+1:
 
     ldp q0, q1, [sp, #240]
     ldp q2, q3, [sp, #272]

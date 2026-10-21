@@ -137,9 +137,24 @@ static void l1_slot_release(l1_slot_t *s) {
  * L1 muze bezet SOUBEZNE s jmennymi hooky a dvojity prefix nevznikne. */
 #define L1_ARG(f, i) ((f)[22 + (i)])
 
+/* frame[21]: 0 = l1_after neni treba (l1_common ho vubec nezavola),
+ * L1_NEED_AFTER = jen fixup vysledku bez slotu, jinak ukazatel na drzeny slot. */
+#define L1_NEED_AFTER 1UL
+
 void l1_before(unsigned long *frame, long nr) {
     unsigned mask = l1_path_args(nr);
+    if (nr == 17 || nr == 78) frame[21] = L1_NEED_AFTER;   /* fixup vysledku */
     if (!(mask & 0xffu)) return;                   /* nic na vstupu */
+    /* Rychla cesta: zadny ABSOLUTNI cestovy argument (find/fts jedou pres
+     * dirfd + jmeno) -> nic k prekladu, zadny slot, zadny CAS a l1_after se
+     * nevola. Na `find /usr` je takovych volani ~300 tisic. */
+    int any = 0;
+    for (int i = 0; i < 8; i++) {
+        if (!(mask & (1u << i))) continue;
+        const char *p = (const char *)L1_ARG(frame, i);
+        if (p && p[0] == '/') { any = 1; break; }
+    }
+    if (!any) return;
     l1_slot_t *s = l1_slot_acquire(frame);
     if (!s) return;                                /* jde neprelozene dal */
     frame[21] = (unsigned long)s;                  /* l1_after ho uvolni */
@@ -218,7 +233,7 @@ void l1_after(unsigned long *frame, long nr) {
              * prelozena cesta linku, jinak hloubku nezname). Cil se kvuli NUL
              * kopiruje do buf[1] DRZENEHO slotu - jmenny shim_readlink_fixup
              * by si vzal 8 KB zasobniku. */
-            l1_slot_t *s = (l1_slot_t *)frame[21];
+            l1_slot_t *s = frame[21] > L1_NEED_AFTER ? (l1_slot_t *)frame[21] : NULL;
             const char *lp = (const char *)L1_ARG(frame, 1);
             if (s && ret > 0 && (size_t)ret < L1_PATHMAX && b[0] != '/' &&
                 (long)frame[0] == -100 && lp && lp[0] == '/' && !g_no_relsym) {
@@ -233,10 +248,9 @@ void l1_after(unsigned long *frame, long nr) {
     }
 
 release:
-    if (frame[21]) {                               /* slot drzi jen l1_before */
+    if (frame[21] > L1_NEED_AFTER)                 /* slot drzi jen l1_before */
         l1_slot_release((l1_slot_t *)frame[21]);
-        frame[21] = 0;
-    }
+    frame[21] = 0;
 }
 
 #endif /* ELF_LOADER_L1_H */
