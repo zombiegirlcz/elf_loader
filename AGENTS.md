@@ -1,590 +1,166 @@
-# AGENTS.md — elf_loader (komprimovaný rozcestník)
+# AGENTS.md — elf_loader
 
-Toto je hutný index k [postup.md](postup.md). Sekce jsou seřazeny tematicky
-(původní `postup.md` je chronologický deník). Odkazy vedou na řádky v
-`postup.md`, kde je plný kontext, čísla, diffy a ověření.
+Krátký provozní manuál: co to je, jak se to buildí/deployuje, jaká pravidla
+platí a co je otevřené. **Historie, root cause, diffy a naměřená čísla jsou
+v [postup.md](postup.md)** (chronologický deník; odkazy `[#L…]` = řádek tam).
 
-**Cíl loaderu:** vlastní načítání glibc (`libc.so.6` + deps) do privátního
-scope a běh glibc binárek v procesu na AArch64 Androidu (bionic host).
-Preference — non-root vlastní loading (`--ownall`); chroot (`linuxsh`) je
-rychlejší alternativa jen s rootem.
-**Původní myšlenka:** postavit něco, co zrychlí / nahradí `proot` (žádný
-ptrace překlad každého syscallu). **Pro uživatele:** zjednodušuje použití
-běžných Linux nástrojů (glibc binárek z distro rootfs) přímo v jejich
-Android appce — bez nutnosti je kompilovat pro bionic/NDK.
+## Cíl
 
----
+Vlastní načítání glibc (`libc.so.6` + deps) do privátního scope a běh glibc
+binárek v procesu na AArch64 Androidu (bionic host). Preference non-root
+(`--ownall`); chroot (`linuxsh`) je rychlá alternativa jen s rootem.
+Nahrazuje `proot` — žádný ptrace překlad syscallů, takže uživatel může
+pouštět distro nástroje přímo v appce bez NDK rebuildu.
 
-## 1. Základ
+## Build a prostředí
 
-- Sestavení, gcc 14.2 v prootu, `as` symlink fix — [postup.md#L8](postup.md#L8).
-- Baterie testů (`make test`, `--ownall`) — [postup.md#L15](postup.md#L15).
-- Ověřené runtime hodnoty (GOT/TLS/arena) — [postup.md#L76](postup.md#L76).
-- Aktuální stav (linka po opravách) — [postup.md#L92](postup.md#L92).
-- **Měření exec (2026-10-16, prompt 01):** `ELF_LOADER_TIMING=1` = fázový
-  profil na stderr (raw clock, no-op v defaultu); `tools/bench-nextgen.sh
-  [proot|loader|linuxsh]` = zátěžový benchmark (medián); `test-all.sh timing`
-  = A/B regrese. Profil: tři dominantní fáze `hooks_bti` 14,8 / `elf_load` 19,6
-  / `svc_patch` 8,4 ms (celkem ~61 ms práce loaderu) — rezerva pro prompt
-  02/10 je load + inline hooky, **ne** cache symbolů (relokace jen 2,3 ms).
-  Host-level (mimo DW, `LX_DW=0`, proot s `PROOT_LOADER`): nativ 11 / proot 28
-  / loader 56 ms na `/bin/true`; na cestově těžkém `find /usr` loader **~25×**
-  rychlejší (0,44 s vs 11 s). Loader se vyplatí na dlouhé procesy, ne na
-  krátký exec. Kapitola „Naměřeno" v `docs/nextgen/proot-nahrada.md` —
-  [postup.md](postup.md) 2026-10-16.
-- **Cache svc-site skenu dokončena (2026-10-20, prompt 02):** `cache_nr_t.scanned`
-  (formát v2) cachuje i **negativní** výsledek skenu — dřív se modul bez nálezu
-  (libm, libz, libexpat, většina `.so`) skenoval 5× při každém exec a `python3`
-  měl v cache jen 2 klíče. Dál `elf_object_t.svc_patched` ruší **dvojí** patchování
-  (load + smyčka v `main.c`), `cache_dirty` zapisuje jen po skutečném skenu
-  a klíč nese identitu buildu loaderu (FNV-1a z `__DATE__`/`__TIME__`).
-  Host-level (`ashell`, mimo DW/proot): `svc_patch` 966 µs → **4 µs**
-  (`python3` 30,2 ms → **5 µs**), interní total `/bin/true` 28,4 → 23,4 ms,
-  `python3` 81,9 → 49,0 ms; wall-clock `python3 -c 0` 208 → **163 ms/launch**
-  (−22 %), 1000× `/bin/true` 47,4 → 45,3 ms (v šumu — exec režie dominuje).
-  **Pozor:** profil z promptu 01 byl měřen zanořeně pod DW loaderem, takže
-  `load_done` 19,6 / `svc_patch` 8,4 ms neplatí jako baseline; host-level je
-  dominantní fáze `hooks_bti` ~12,3 ms. Knoby `ELF_LOADER_NO_CACHE=1`,
-  `ELF_LOADER_CACHE_TRACE=1`, `ELF_LOADER_DOUBLE_PATCH=1`. A/B `test-all.sh
-  execcache` (stará: 2 klíče + 41 skenů na teplo; nová: 10 klíčů, 0 skenů),
-  host unit test `test/cache_test.c` 20/20. Nasazený **NDK build loaderu GNU
-  BuildID nemá** (jen `.note.android.ident`) — [postup.md](postup.md) 2026-10-20.
+gcc 14.2 v prootu, `as` symlink fix [#L8]. Testy: `make test`, `--ownall`
+[#L15]. Ověřené runtime hodnoty (GOT/TLS/arena) [#L76].
 
-- **DT_GNU_HASH lookup (2026-10-20, commit `396f9d3`) — exec 48 → 26 ms:**
-  `elf_scope_find` byl **lineární sken se `strcmp` přes dynsym všech modulů**
-  (libc ~3000 symbolů) → jeden lookup ~19 µs, a lookupů je na exec stovky
-  (`hooks_bti` 590, relokace jeden na každý `JUMP_SLOT`). Doplněna kopie
-  sekce `.gnu.hash` (`load_gnu_hash`, `elf_object_t.gnu_hash`) + bloom/bucket/
-  chain lookup s validací indexů; `elf_scope_find` počítá hash jednou pro
-  scope, modul bez tabulky jde dál lineárně. Navíc `hooks_bti` resolvuje 118
-  jmen `g_f2_hooks` jednou dopředu (bylo 5 × 118). Device: `hooks_bti`
-  12,3 → **1,8 ms**, `reloc_done` 1,9–14,5 → **0,3–2,2 ms**, interní total
-  `/bin/true` 30,1 → **13,5 ms**, `python3` 45,9 → **17,4 ms**; wall-clock
-  1000× `/bin/true` 51,6 → **25,8 ms/launch** (−50 %), `python3 -c 0`
-  150,6 → **102,8 ms** (−32 %). Proti stavu před cache i hashem:
-  47,4 → 25,8 / 208 → 102,8 ms. Knoby `ELF_LOADER_NO_HASH=1`,
-  `ELF_LOADER_HASH_CHECK=1` (porovná hash vs lineární sken — 0 nesouhlasů
-  lokálně i na zařízení, node 26 OK). A/B `test-all.sh symhash` (stará
-  `hooks_bti`=18 439 µs FAIL, nová 1647 µs PASS); `all` FAIL 0 (189 PASS).
-  **Důsledek: prompt 10 (cache obrazů, líné vázání) se neimplementuje** —
-  jeho vstupní podmínka po hashi nedrží, relokace je už jen 2–12 % exec —
-  [postup.md](postup.md) 2026-10-20 (3).
+## Výkon — co má a nemá smysl řešit
 
-- **Git / GitHub ochrana (2026-10-06):** ruleset `protect-master` (zákaz
-  update/force-push/smazání, bypass jen admin = vlastník → cizí PR do `master`
-  nejde mergnout), `protect-dev` (zákaz force-push/smazání). Workflow
-  `.github/workflows/feedback-automerge.yml`: PR do `dev`, který mění **jen**
-  běžné soubory ve `feedback/`, se sám squash-mergne (`pull_request_target`,
-  kód PR se nespouští); jinak čeká na ruční review. Důsledek: `dev` může mít
-  commity navíc → před synchronizací `git pull origin dev`, pak teprve
-  `master` ← `dev` (ff), ne naslepo `dev` ← `master`.
+Měřeno host-level (mimo DW, `LX_DW=0`): nativ 11 / proot 28 / loader ~26 ms
+na `/bin/true`; `find /usr` ~25× rychlejší než proot. Loader se vyplatí na
+dlouhé procesy, ne na krátký exec.
 
-## 2. Klíčové opravy jádra loaderu
+Hotové optimalizace (detaily [#L92] a postup.md 2026-10-20): cache svc-site
+skenu (`cache_nr_t.scanned`, i negativní výsledek) a DT_GNU_HASH lookup
+(`elf_scope_find` už není lineární `strcmp`). Dohromady `python3 -c 0`
+208 → 102,8 ms, 1000× `/bin/true` 47,4 → 25,8 ms.
 
-- **IFUNC resolver (`memcpy` crash /bin/ls, /bin/dir)** — root cause + fix
-  v `resolve_jmp_symbol()` — [postup.md#L49](postup.md#L49).
-- **Static TLS pro načítaný exe (Step 2)** — mmap + kopie tcbhead, msr
-  `tpidr_el0` až v trampolině — [postup.md#L101](postup.md#L101).
-- **`strerror` `Unknown error` bez čísla** — nastavení
-  `*(char*)va(m, 0x1be009) = 1` v `run_module_init` — [postup.md#L121](postup.md#L121).
-- **Brk desync (dva alokátoři, jeden brk)** — private mmap arena
-  `0x7f00000000`, `write_heap_veneer`/`patch_module_heap_syms` — [postup.md#L279](postup.md#L279).
-- **TLS blok pod TP (negativní tls_offset)** — `min_off`/`span` v
-  `elf_setup_own_tls` — [postup.md#L303](postup.md#L303).
-- **Runtime PAGE_SIZE (`sysconf`) — Android 15+ 16K stránky** — [postup.md#L189](postup.md#L189).
-- **Tunable env override (`getenv` before default)** — [postup.md#L139](postup.md#L139).
+**Relokace je po hashi jen 2–12 % exec** → cache RELRO obrazů i lazy binding
+jsou hotové, ale defaultně vypnuté a měřením nepotvrzené. Neotvírat znovu
+bez nového měření.
 
-## 3. Bionic / NDK (Step 3)
+Knoby: `ELF_LOADER_TIMING`, `ELF_LOADER_NO_CACHE`, `ELF_LOADER_NO_HASH`,
+`ELF_LOADER_HASH_CHECK`, `ELF_LOADER_LAZY`, `ELF_LOADER_IMGCACHE`,
+`ELF_LOADER_NO_RELSYM`, `ELF_LOADER_NO_BIONIC_BRIDGE`, `ELF_LOADER_EXEC_TRACE`.
 
-- **Bionic static-PIE `p_vaddr` rebase** (`maybe_fixup_bionic_phdr`) —
-  [postup.md#L154](postup.md#L154).
-- **NDK cross-compile loaderu přes Modal, `dlfcn_stubs.c`** —
-  [postup.md#L210](postup.md#L210).
-- Empirický 16K test / bionic namespaces — [postup.md#L246](postup.md#L246),
-  [postup.md#L254](postup.md#L254).
+**Metodika:** pinování CPU mění čísla o desítky % → měřit při stejné CPU
+politice a A/B dělat knobem na téže binárce, ne dvěma buildy.
 
-## 4. Device deploy — Magisk modul, `elf` wrapper, `linuxsh`
+## Git / GitHub
 
-- **Magisk modul + `elf` wrapper (bionic NDK build), namespace workaround
-  `/data/adb/`** — [postup.md#L328](postup.md#L328).
-- **Opravený `elf` wrapper (výmysl `--library-path`), LD_LIBRARY_PATH
-  poisoning fix — pořadí `/system/lib64` PRVNÍ** — [postup.md#L406](postup.md#L406).
-- **Fixy #1 (`__stack_chk_guard`, rseq, `__libc_stack_end`)** + úklid
-  debug — [postup.md#L493](postup.md#L493).
-- **Fix #2 — emulated TLS `__emutls_get_address` z `__thread` guard v
-  `tunable_get_val`; nahrazeno `static int`** — [postup.md#L509](postup.md#L509).
-- **`linuxsh` (nativní chroot + `unshare -m` + `make-rprivate /`)** —
-  [postup.md#L558](postup.md#L558).
-- **KRITICKÝ FIX: mount propagace leak (342 mountů v global NS)** —
-  vždy `mount --make-rprivate /` hned po `unshare(CLONE_NEWNS)` —
-  [postup.md#L605](postup.md#L605).
-- Finální architektura spouštění (tabulka) — [postup.md#L598](postup.md#L598),
-  [postup.md#L731](postup.md#L731).
-- **`bzsh` — bundled bionic-native zsh (host shell)**: zsh 5.9.2 (NDK build,
-  linkuje jen `libc/libm/libdl`), trimnuté terminfo (~80K), generický `zshrc`
-  bez `com.linux_core` hardcode; instaluje se do `/data/adb/` stejně jako
-  `linuxsh` (Magisk mount není vidět v app namespace). `zshrc` evaluje
-  `elf_loader init zsh`, pokud je rootfs nastaven — jeden shell pro bionic
-  host i glibc guest.
-- Kompat parity `linuxsh` vs proot (22/23 identických) —
-  [postup.md#L716](postup.md#L716).
+Ruleset `protect-master` (zákaz update/force-push/smazání, bypass jen admin),
+`protect-dev` (zákaz force-push/smazání). `feedback-automerge.yml`: PR do
+`dev` měnící **jen** soubory ve `feedback/` se sám squash-mergne; jinak ruční
+review. Před synchronizací `git pull origin dev`, pak `master` ← `dev` (ff).
 
-## 5. C++ / Rust / TUI a další binárky
+## Deploy na zařízení
 
-- **Inity pod bionic TP → SIGSEGV libstdc++**: fronta initů, spuštění v
-  `elf_final_jump` pod parrot TP; `uselocale(NULL)+__ctype_init()` —
-  [postup.md#L628](postup.md#L628).
-- `nh fix apt` — merged-usr marker, systemd 241→257 no-op preinst —
-  [postup.md#L651](postup.md#L651).
-- **Wrapper `elf` finální — resolve-by-name, mksh pasti** —
-  [postup.md#L662](postup.md#L662).
-- **Rootfs absolutní symlinky nefungují mimo chroot** (např.
-  `libblas.so.3 -> /etc/alternatives/…`) — [postup.md#L674](postup.md#L674).
-- **Absolutní symlinky → kanonicky relativní + clamp `..` (2026-10-21,
-  prompt 03, commit `2af1bf5`):** jádro vyhodnocuje absolutní link uvnitř
-  `$ROOTFS` proti HOST kořeni; dosud to řešil jen shim za běhu. Nově držíme
-  invariant „v rootfs jsou takové linky relativní v kanonickém tvaru"
-  (hloubka × `../` + cesta od kořene) — jádro je pak vyhodnotí samo, **za
-  nulovou cenu za běhu**. `src/relsym.h` (vkládá se do `main.c`, běží pod
-  guest TP): `shim_abs_target_to_rel` (zápis — `shim_symlink`/`symlinkat`;
-  host mountpointy a `.l2s` cíle zůstávají absolutní), `shim_rel_target_to_abs`
-  (čtení — `readlink` hlásí kanonický tvar zpět absolutně, protože
-  `update-alternatives` cíle porovnává), `shim_clamp_dotdot` (odstraní **jen**
-  ty `..`, které by utekly nad kořen; plná lexikální normalizace by měnila
-  význam u `/a/symlink/../b`). Knoby `ELF_LOADER_NO_RELSYM=1`,
-  `ELF_LOADER_NO_DOTDOT_CLAMP=1`. Konverze rootfs `tools/relsymlinks.sh`
-  (`--dry-run`/`--check`/`--revert`, žurnál TSV): v rootfs je **1093**
-  absolutních linků (1081 převoditelných), **celorootfs konverze čeká na
-  potvrzení** — zásah do živého sdíleného rootfs. Past: `readlink` per link
-  = fork na desítky tisíc linků (>20 min) → `find -printf '%p\t%l\n'`
-  (8 min 45 s, bez forků), ale `-printf` je GNU → nástroj spouštět v guestu.
-  Testy: host unit `test/relsym_test.c` (33/33), A/B `test-all.sh relsym` —
-  a ten **musí** měřit HOST nástroji (`/system/bin/cat`), jinak absolutní cíl
-  zachrání `shim_resolve_symlinks` a A/B nedokáže nic.
-  **rootfd (kapitola 4.3) ZAMÍTNUT měřením:** `test/rootfd_bench.c` dá
-  2626 → 1246 ns na `newfstatat` (−52 %), ale `python3 -c pass` má jen 258
-  path syscallů s plnou cestou (= 0,36 ms, 2 % totalu) a cestově těžké
-  zátěže už jedou přes `dirfd` (`find`: 3088 syscallů s dirfd vs 36
-  s `AT_FDCWD`), takže tam rootfd nemá co ušetřit —
-  [postup.md](postup.md) 2026-10-21.
-- **LOCPATH/LC_ALL/SHELL defaulty natvrdo v `run_ownall`** (dřív ruční env
-  před tmuxem/shellem) — [postup.md#L2376](postup.md#L2376).
-- **`elf_loader init zsh`** (shell-integrace vzor jako starship/zoxide,
-  `eval`-able LOCPATH/LC_ALL pro host zsh) + build/deploy na zařízení —
-  [postup.md#L2395](postup.md#L2395).
-- **`.elfrc` — jediný uživatelský rc pro host shell** (2026-10-18): starship/
-  zoxide/aliasy patří do `~/.elfrc` (`ELF_RC` override, `LX_NO_RC=1` skip),
-  source-uje se na konci `init zsh` i `init bash`. `init example` vzor vytiskne,
-  `init install [--force]` ho zapíše. Preamble navíc hledá `L`/`ROOTFS` i
-  v Termuxu (`$PREFIX/bin`, `$PREFIX/var/lib/proot-distro/...`). Verze 0.7.
-- **`init zsh|bash` produkčně — univerzální ROOTFS, žádný hardcode**
-  (`elf_print_init_env` odvozuje D/ROOTFS/R/L/LX_LOG z `$HOME`; LOCPATH
-  jen když locale existuje; `LX_HELPERS_BASH`; `lx` předává guest PATH →
-  `lx gcc` najde `ld`). Host `.zshrc`/`.bashrc` = `eval "$(… init …)"`.
-  Demo pro prezentaci `tools/demo.zsh` (5 kroků, „stejné jádro, dva
-  userspace") — [postup.md#L2795](postup.md#L2795).
-- **Past: jeden rc soubor pro oba světy — nikdy nezadrátovat `/root/…`**
-  (2026-10-15): `/root/.zshrc` a `$ROOTFS/root/.zshrc` jsou **tentýž inode**,
-  liší se jen `$HOME` (host `$ROOTFS/root`, guest `/root`); host bionic shell
-  **nemá `/root` vůbec**. Instalátor spuštěný z dw guest shellu (`HOME=/root`)
-  si zapíše guest-absolutní cestu — sdkman `export SDKMAN_DIR="/root/.sdkman"`
-  → v host shellu se nenačte nic, shell funkce zůstanou nedefinované a
-  `command_not_found_handler` je pošle loaderu
-  (`[-] open(…/usr/local/sbin/__sdkman_echo_debug)`, plus
-  `find: '/root/.sdkman/src': No such file or directory`). Řešení: v rc vždy
-  `$HOME/…`. Host-absolutní `$ROOTFS/…` funguje v obou světech (`/data` je
-  v `shim_excluded`), guest-absolutní jen pod loaderem. Po každé instalaci
-  (sdkman/idm/cargo/nvm) `grep -n '/root/' ~/.bashrc ~/.zshrc`. Není to bug
-  loaderu. Mimochodem: `mount(2)` je v app doméně **ENOSYS** (seccomp), takže
-  `mount --bind` uvnitř rootfs nelze — použít symlink.
+- Magisk modul + `elf` wrapper (bionic NDK build), namespace workaround
+  `/data/adb/` [#L328]. `LD_LIBRARY_PATH` poisoning fix — `/system/lib64`
+  PRVNÍ [#L406].
+- `linuxsh` (chroot + `unshare -m`) [#L558]. **KRITICKÉ:** hned po
+  `unshare(CLONE_NEWNS)` → `mount --make-rprivate /` (jinak mounty leaknou
+  do global NS) [#L605]. Architektura spouštění [#L598], [#L731].
+- `bzsh` — bundled bionic zsh 5.9.2, instaluje se do `/data/adb/` stejně jako
+  `linuxsh` (Magisk mount není vidět v app namespace).
+- **`mount(2)` je v app doméně ENOSYS** (seccomp) — `mount --bind` v rootfs
+  nejde, použít symlink.
 
-- **Host `.zshrc` — `lx` toolkit (kompletní zápis)**: proměnné/cesty,
-  prompt, `lx`/`lxq`/`lxdbg`/`lxhelper`/`lxlog`/`lxdiag`/`lxinfo`/`lxfault`,
-  `lxtest` regresní sada, `command_not_found_handler`, `help`, starship/
-  zoxide integrace (cache + `/proc/self/exe` rewrite) — soubor žije jen
-  na zařízení, není v gitu — [postup.md#L2425](postup.md#L2425).
-- **Double world (`init zsh|bash -dw`, `lxdw on|off|status`) — náhrada
-  gbsh -dw (gbsh zrušen 2026-10-10)**: s `LX_DW=1` vstup cwd do `$ROOTFS`
-  (cd/pushd/start) spustí z precmd/PROMPT_COMMAND **guest shell pod loaderem**
-  (`LX_WORLD=rootfs`, guest `PWD`/`HOME=/root`/guest PATH + `/system/bin`);
-  loader v něm překládá všechny cesty (cd, redirecty, globy, argumenty).
-  `cd ..` z `/` nebo cwd mimo rootfs (`[[ $R$PWD -ef . ]]` — rootfs má i
-  vlastní `$R/data/user/0/...`!) guest ukončí přes marker `$LX_LOG/dw/mark.<pid>`
-  a host skončí v rodiči `$ROOTFS` / v cílové cestě; `exit` = zpět, odkud
-  se vstoupilo. Guest rc = `$LX_LOG/dw/rc` (`source ${LX_DW_RC:-~/.zshrc}` +
-  `init`). Pasti: rootfs `.zshrc` má `alias cd=z` → `function cd` + `unalias`,
-  původní alias se volá dál (`_lx_dw_cd`); zděděné fyzické `PWD` → guest by se
-  hned vrátil. Navíc **setuid/setgid/setres*/setre* shimy** (zsh `unsetopt
-  privileged` → `setgid(getgid())` → app seccomp „Bad system call" v
-  interaktivním zsh s Parrot `.zshrc`): stejné id = 0, jiné = EPERM.
-  Regresní test `test-all.sh dw` (A/B) — [postup.md](postup.md) 2026-10-10.
-- **`lxfb [-m pozn.] <cmd>`** (v `init zsh|bash`, jedno tělo pro oba shelly):
-  běh s `ELF_DEBUG`/`ELF_LOADER_DIAG`/`ELF_LOADER_SIGTRACE`, `tee` do logu,
-  report `$LX_LOG/feedback/<model>-<datum>-<cmd>-<čas>.md` (datum, zařízení/SoC,
-  Android+SDK, kernel, page size, loader verze+md5, rootfs OS + glibc z
-  `libc.so.6`, exit/signál, crash řádky, log ≤ `LXFB_MAX`=4000 ř., nové
-  `diag.<pid>.txt`) → PR do `dev` / `feedback/` (auto-merge). Ověřeno na zařízení
-  pod bzsh i guest bash.
+## Shelly: `lx`, `init`, double world
 
-- **rustc/cargo: `sysroot` se odvodí z `cwd`, ne z binárky** → `E0463:
-  can't find crate for std` u každého buildu. Otevřené, root cause
-  neizolován; workaround `--sysroot <toolchain>`. Detail a vyloučené
-  hypotézy v sekci 10 — [postup.md#L3988](postup.md#L3988).
+- **`init zsh|bash`** — univerzální ROOTFS, žádný hardcode:
+  `elf_print_init_env` odvozuje D/ROOTFS/R/L/LX_LOG z `$HOME`. Host
+  `.zshrc`/`.bashrc` = `eval "$(… init …)"` [#L2395].
+- **`.elfrc`** — jediný uživatelský rc pro host shell (starship/zoxide/aliasy),
+  `ELF_RC` override, `LX_NO_RC=1` skip; `init example` / `init install`.
+- **`lx` toolkit** (žije jen na zařízení, není v gitu) [#L2425].
+  `lx -c '<řádka>'` posílá celou řádku guest shellu → pipy/`&&`/redirecty.
+  `lxwhich`/`lx` zkouší první `$VIRTUAL_ENV/bin`.
+- **Double world** (`init zsh|bash -dw`, `lxdw on|off|status`): vstup cwd do
+  `$ROOTFS` spustí guest shell pod loaderem; `cd ..` z `/` ukončí guest přes
+  marker `$LX_LOG/dw/mark.<pid>`. Guest rc = `$LX_LOG/dw/rc`.
+- **`lxfb [-m pozn.] <cmd>`** — běh s debug env, `tee` do logu, report do
+  `$LX_LOG/feedback/` → PR do `dev`/`feedback/`.
 
-## 6. Seccomp compat filtr + fork veneer
+## Seccomp / exec
 
-- **App seccomp (kernel 4.14) — `clone3` SIGSYS, `close_range` atd.**;
-  `install_legacy_syscall_filter()` (RET_ERRNO ENOSYS pro 435/436/437/439),
-  fork veneer (vfork-style clone) — [postup.md#L685](postup.md#L685).
-- Ověření na zařízení + externí exec limit — [postup.md#L704](postup.md#L704),
-  [postup.md#L710](postup.md#L710).
+App seccomp (kernel 4.14): `clone3` SIGSYS, `close_range`… →
+`install_legacy_syscall_filter()` (RET_ERRNO ENOSYS pro 435/436/437/439),
+fork veneer (vfork-style clone) [#L685].
 
-## 7. Konkrétní opravy — dep libc.so.6, `--own` flow, gbsh (zrušen), nano
+## Pravidla a pasti (než sáhneš na kód)
 
-- #3 libc dep hard-exit; #5 `--own` pc=0x0 — [postup.md#L743](postup.md#L743).
-- #2 `ft6` syscall probe diagnostika — [postup.md#L758](postup.md#L758).
-- **gbsh v0.4/v0.5 (dual-world flag, cd navigace, dvojitý starship
-  prompt)** — gbsh **zrušen 2026-10-10**, `-dw` přeneseno do `init zsh|bash`
-  (sekce 5) — [postup.md#L772](postup.md#L772), [postup.md#L969](postup.md#L969).
-- **nano 8.4 — `derive_distro_libdirs`** — [postup.md#L795](postup.md#L795).
-- Termux proot-distro rootfs (glibc 2.28) — [postup.md#L846](postup.md#L846).
-- TUI testy (top/htop/btop/btm) — [postup.md#L870](postup.md#L870).
-- Docker-kopie test byl neplatný, reálný bug FLAKY —
-  [postup.md#L910](postup.md#L910).
-- gbsh static build (combined static OK, static-pie ne) —
-  [postup.md#L930](postup.md#L930).
+1. **Guest TP vs bionický TLS.** Kód, který běží pod guest (parrot) TP, nesmí
+   volat bionické TLS-závislé funkce (`snprintf`, `getpid`, `getenv`,
+   `fprintf`, `sigaction`, `sigaltstack`). Buď raw syscall, nebo obalit
+   `dl_enter_host()`/`dl_leave_host()`. `dl_enter_host` **musí** blokovat
+   async signály. Tato past se v projektu opakovala 3× (`4602b18`, `80c3ffd`,
+   `c69eeac`).
+2. **glibc 2.41 funkce začínají `BTI c`** → `hook_install` je nepatchuje a
+   glibc-interní `bl` obejde shim. Řešit wrapperem na vnější funkci nebo
+   `hook_inline_prologue`.
+3. **GOT override je per-jméno.** Při přidání shimu zkontrolovat aliasy
+   (`nm -D libc.so.6`) a importy binárek (`nm -D --undefined-only`).
+4. **Jeden rc pro oba světy — nikdy `/root/…` natvrdo.** `/root/.zshrc`
+   a `$ROOTFS/root/.zshrc` jsou tentýž inode, liší se jen `$HOME`; host
+   bionic shell `/root` nemá. Vždy `$HOME/…`. Po instalaci
+   `grep -n '/root/' ~/.zshrc ~/.bashrc`.
+5. **`su -c` běží přes proot a maskuje path bugy** — platný test je jen
+   `ashell -c`.
+6. **`test-all.sh`:** bare `grep` = host toybox (nezná BRE `\|`) → `grep -E`.
+   `ashell_out` má `timeout 2` → chladný zápis cache se nevejde, použít
+   `$R/usr/bin/timeout 25`. Sadu `all` nespouštět v `nohup … &` uvnitř
+   background volání (osiřelý proces).
+7. **Rootfs absolutní symlinky** jádro vyhodnocuje proti HOST kořeni →
+   v rootfs držet kanonicky relativní tvar (`src/relsym.h`). Test `relsym`
+   musí měřit HOST nástroji, jinak ho shim zachrání a A/B nic neprokáže.
+8. **Hardlinky (`link`) zakazuje SELinux app domény** i nativně — platformní
+   limit.
 
-## 8. Node saga (2026-09-22, pokračování 1–15)
+## Otevřené bugy
 
-Kompletní deník: [postup.md#L1004](postup.md#L1004) až [postup.md#L2272](postup.md#L2272).
-Milníky:
-
-- Testovací smyčka bez Modalu (GH Actions) — [postup.md#L1006](postup.md#L1006).
-- Call-site/entry tracer + dva vedlejší bugy (alloc_near underflow,
-  fprintf pod guest TP) — [postup.md#L1094](postup.md#L1094).
-- `ELF_LOADER_TRACE_RING`, deterministický cíl `0x199d560` —
-  [postup.md#L1181](postup.md#L1181).
-- Vyloučené hypotézy (IC/feedback/CompileLazy, verze node) —
-  [postup.md#L1257](postup.md#L1257).
-- V8 zdroj — potvrzení SharedFunctionInfo layoutu; getOffsetNanosecondsFor
-  vestigiální — [postup.md#L1314](postup.md#L1314), [postup.md#L1397](postup.md#L1397).
-- `--inspect-brk` blokován; PAUSE_ENTRY/PAUSE_CALL infra —
-  [postup.md#L1441](postup.md#L1441).
-- **GDB přes „chroot-jen-pro-gdb“ + attach podle PID** —
-  [postup.md#L1538](postup.md#L1538).
-- Řetěz bytecode→handler zmapován, JSDispatchTable objevena —
-  [postup.md#L1598](postup.md#L1598).
-- `--always-sparkplug` odhaluje pravdepodobný root cause —
-  [postup.md#L1744](postup.md#L1744).
-- **PRŮLOM #2: entry #4096 v JSDispatchTable má jinou identitu
-  nativně vs. pod loaderem; ~3352-položková init smyčka v
-  `Isolate::Init`** — [postup.md#L1883](postup.md#L1883).
-- Rozluštěno `Builtins::code()` — [postup.md#L2135](postup.md#L2135).
-- **SKUTEČNÝ FIX (Node 18 tiskne „42“) — SIGABRT handler bug v
-  `guest_sigaction`** (3 commity `fix-guest-sigaction`) —
-  [postup.md#L2164](postup.md#L2164).
-- v26.8.2 stále padá — dokumentovaný JSDispatchTable bug —
-  [postup.md#L2256](postup.md#L2256).
-- **pi + `@narumitw/pi-starship` v TTY SIGSEGV (RC=139) — VYŘEŠENO**
-  (commit `4602b18`): `elf_run_pending_inits` instaloval fault handler
-  `elf_install_fault_handlers()` pod **guest (parrot) TP**, ale
-  `sigaltstack`/`sigaction` jsou bionické → handler se nenainstaloval a
-  SIGSEGV šel na default action. Fix: instalace pod bionickým TP
-  (`mrs/msr tpidr_el0` dance). A/B (DEBUG_PC, 6 běhů): starý 0/6 render +
-  6× SIGSEGV, nový 6/6 render. test-all 160/0 —
-  [postup.md#L2742](postup.md#L2742).
-- **pi + pi-starship pod `script` (Node 26) SIGSEGV — VYŘEŠENO** (commit
-  `80c3ffd`): async signál (SIGWINCH/SIGCHLD/libuv) dorazil v okně, kdy
-  `dl_enter_host` přepnul TP na bionic kvůli `_rtld_global_ro` shimu
-  (`ldso_lookup_symbol_x` → `elf_scope_find`); kernel spustil guest handler
-  pod bionickým TP → glibc `THREAD_SELF->cancelhandling` (TP-0x618) → pád.
-  Fix: `dl_enter_host` blokuje nesynchronní signály (raw `rt_sigprocmask`),
-  `dl_leave_host` vrátí TP a pak masku. A/B 5/5 pád → 0/5. Nalezeno přes
-  core dump (gdb/strace pád maskovaly) — [postup.md](postup.md) 2026-10-06 (2)–(6).
-
-## 9. Ostatní binárky a poslední fixy
-
-- **Bun (`claude.exe`) — špatný `l_addr` v link_map** —
-  [postup.md#L2273](postup.md#L2273).
-- **claude (Bun standalone) `SyntaxError: Invalid character '\0'` při
-  interaktivním startu — VYŘEŠENO** (commit `c3c2d68`): Bun drží embedovaný JS
-  v sekci `.bun` a volá na ni `madvise(MADV_DONTNEED)`; `map_elf_segments`
-  mapoval segmenty anonymně + `memcpy` → stránky se vrátily jako nuly. Fix:
-  celé stránky uvnitř `p_filesz` mapovat ze souboru (`MAP_PRIVATE|MAP_FIXED`).
-  A/B 3/3 SyntaxError → 0/3; regresní test `test-all.sh madv`; test-all
-  161/0 — [postup.md](postup.md) 2026-10-06 (7).
-- **`lx` nepobral `|` — VYŘEŠENO** (2026-10-09): `lx` předával argumenty rovnou
-  loaderu jako argv, takže pipeline šla jen postavit na hostu a `lx -c` hlásilo
-  „'-c' není v rootfs". Nově `lx -c '<řádka>'` pošle celou řádku guest shellu
-  (`$LX_SHELL`, default `$R/bin/bash`) → fungují pipy/`&&`/redirecty v guestu,
-  včetně `lxfb -c '<řádka>'` (report se pojmenuje podle příkazu, ne podle `-c`).
-  Regresní test `test-all.sh lxc` (A/B).
-- **Dlouhý argv přetékal za guest stack — VYŘEŠENO** (2026-10-09, feedback
-  `feedback/m2101k6g-2026-10-09-trans-221301.md`): `trans` → `gawk` s celým awk
-  programem v argv → SIGSEGV v bionic `memcpy`. Místo pro argv/env řetězce na
-  guest stacku bylo odhadem `argc*128 + env*256` (`src/elf_loader.c`, stavba
-  stacku před `elf_run_final`); teď skutečný součet `strlen+1`. Stará verze
-  60 KB argument tiše uřízla nebo spadla. Regresní test `test-all.sh bigargv`
-  (A/B); `wget` v `net_real` vynucen `-4` (síť bez IPv6 trasy, wget nemá
-  fallback). `all` PASS 179/0.
-- **Bionic bridge — glibc guest `dlopen()` bionické `.so` — VYŘEŠENO**
-  (2026-10-12): dřív own-load tahal druhou bionic `libc.so` → SIGSEGV. Teď
-  `/system|/vendor|/apex|…` cesty → skutečný bionic `dlopen`, `dlsym` vrací asm
-  thunky (`entry.S` `bb_stubs`: přepnutí `tpidr_el0` + blok async signálů,
-  kopie stack argů), `vkGet*ProcAddr` thunkuje i výsledky. Glibc program
-  dosáhne Adreno 618 (`vkCreateDevice` OK). Limity: callbacky bionic→guest,
-  vlákna driveru. Vypnout `ELF_LOADER_NO_BIONIC_BRIDGE=1`. Regresní test
-  `test-all.sh bionic` (A/B) — [postup.md](postup.md) 2026-10-12.
-- **Statický ELF v rootfs přes guest-absolutní cestu → SIGSEGV — VYŘEŠENO**
-  (2026-10-15): `su_wrapper` (Magisk shim, statická non-PIE, žádný
-  `PT_INTERP`) spadl při `/usr/local/bin/su_wrapper`, ale běžel při
-  `$ROOTFS/usr/local/bin/su_wrapper`. Kontrola `is_glibc_elf()` byla jen ve
-  větvi „už pod ROOTFS" a v `shim_posix_spawnp`, **chyběla ve větvi
-  „Absolute guest path"** — ta cestu jen přeložila a poslala do `--ownall`.
-  Dokončení commitů `b840530`/`1737add` (zůstala třetí větev). Fix: nový
-  `elf_needs_real_exec()` (ELF magic + `!is_glibc_elf`, TLS-safe jen `raw_*`)
-  a gate po celém resolution chainu v `shim_execve` (pokrývá guest-absolutní,
-  relativní i bare-name cesty; `force_redirect` vyňat) i před stavbou
-  `--ownall` argv v `shim_posix_spawnp`. Pozn.: `su -c id` fungoval vždy —
-  padalo jen volání pod jménem `su_wrapper`/guest cestou. Regresní test
-  `test-all.sh staticexec` (A/B: `gcc -static -no-pie` binárka přes
-  guest-abs vs. `$ROOTFS`-abs cestu).
-- **tmux pod loaderem** — [postup.md#L2306](postup.md#L2306).
-- **Helper knihovny (`ELF_LOADER_HELPER`), náhodný SIGSEGV ~5 %
-  (heap fix), Node ≤22 teardown `free(): invalid pointer` (EXIT=134)** —
-  [postup.md#L2337](postup.md#L2337).
-- **uv/venv — glibc ELF a absolutní symlink mimo ROOTFS** (managed Python
-  pod `/data/.../uv/python/…`; `is_glibc_elf` + `force_redirect` v shimu,
-  `resolve_symlinks_under_root` host-cesta fallback; regresní test
-  `test-all.sh uv`) — [postup.md#L2529](postup.md#L2529).
-- **Entry shebang detekce + symlink chain** (`which -> alternatives ->
-  skript` hlásil „Not an ELF file“; `shim_resolve_symlinks` před `open(path)`
-  v `main()`; regresní test `test-all.sh symlink`) —
-  [postup.md#L2570](postup.md#L2570).
-- **`__fxstatat64`/`__fxstatat` 5-arg starý ABI** `(ver, fd, path, buf, flags)`
-  — EFAULT („Bad address“) u `stat` s `dir_fd` (Python `os.stat(dir_fd=)`,
-  `shutil.rmtree`, PEP517 build wheel); regresní test `test-all.sh fstat` —
-  [postup.md#L2606](postup.md#L2606).
-- **Test runner přes guest `bash -s` + `renameat`/`unlinkat` path-translace** —
-  `run_test` posílal `&&`/`|`/`>` jako argv loaderu (~27 falešných FAILů);
-  `mv`/`rm`/`rmdir` ENOENT kvůli chybějícím `renameat2`/`unlinkat`/`rmdirat`
-  shimům. PASS 131→157, FAIL 33→7.
-- **NSS `/etc/protocols` chyběl v `open64_nocancel` whitelistu** — `ping`
-  `unknown protocol icmp` (NSS files backend čte `/etc/protocols` interním
-  nocancel voláním; doplněno + `/etc/services`). Opraveny i chybné test-casy
-  (timeout/pslog/ping6) a ping/uptime/shred do `should_skip` (host limit).
-  **Regresní test** `test-all.sh nss` (`getprotobyname("icmp") == 1` přes
-  Python, bez setuid/raw-socket závislosti; v `all`).
-  Finálně PASS **160 / FAIL 0**, [postup.md#L2715](postup.md#L2715).
-- **`lx` nerespektoval aktivní Python venv** — po `source .venv/bin/activate`
-  `lx <konzolový_skript_z_venv>` hlásil „není v Parrot rootfs" (`lxwhich`
-  hledalo jen v pevném `$LX_PATH`, `lx()` navíc natvrdo přepisovalo PATH).
-  **Vyřešeno** (commit `c5b13e7`): `lxwhich`/`lx` zkouší nejdřív
-  `$VIRTUAL_ENV/bin` (s normalizací guest-relativní cesty na `$R`-prefixed).
-- **Bionic ELF uvnitř `$ROOTFS` se omylem own-loadoval jako glibc**
-  (`ashell` testovací nástroj v `usr/local/bin`) — `shim_execve`/
-  `shim_posix_spawnp`'s „uz pod ROOTFS" větev nekontrolovala
-  `is_glibc_elf()`. **Vyřešeno** (commity `b840530`, `1737add`): obě větve
-  teď ověří ELF magic + `is_glibc_elf()` před zabalením do `--ownall`.
-  **Vyřešeno i navazující testovací bug:** `test-all.sh`'s `ashell_rc`/
-  `ashell_out` používaly bare `timeout`/`bash`, které se v own-loadovaném
-  guestu resolvovaly na HOST `/system/bin/timeout` (PATH dává `/system/bin`
-  před rootfs) → RAW exec cíle bez hooků → "Permission denied". Oprava:
-  plné cesty `$R/usr/bin/timeout`/`$R/bin/bash`. Zároveň `test-all.sh` teď
-  běží přes jediné `ashell -c` (ne jeden na každý test) —
-  [postup.md](postup.md) 2026-10-06 (8)/(9).
-- **Audit SKIP vs. skutečný FAIL v `test-all.sh` + test heavy binárek a
-  pip balíčků z `/usr/bin`** — přehnaně široké substring vzory `*vi*`/`*nc*`
-  v `should_skip()` omylem skipovaly funkční `service`/`truncate`/
-  `gencat`/`loginctl`; `category_madv` hlásila `no gcc` jen kvůli
-  chybějícímu `$R/usr/bin` v PATH top-level bashe. Opraveno (commit
-  `9694076`). Dále reálně (přes `ashell -c`, ne `--version`) ověřeny OK:
-  `rg`, `eza`, `zoxide`, `openssl`, `bison`, `gpg`, `pandoc`, `batcat`,
-  `sq`, `gh`, `git-lfs`; Python `pandas`/`lxml`/`Pillow`/`scipy`/
-  `cryptography`/`numpy`. **Nový bug nalezen** (neopraveno): `/proc/self/exe`
-  v own-loadovaném procesu vrací cestu k loaderu, ne ke guest binárce —
-  rozbíjí self-introspekující nástroje (`cmake` generuje nefunkční
-  Makefile s `$(CMAKE_COMMAND)` ukazujícím na neexistující host cestu) —
-  [postup.md](postup.md) 2026-10-06 (10).
-
-## 10. Zbývá / otevřené body
-
+- **Statický glibc ELF v rootfs končí SIGSYS** (RC=159). Není regrese
+  (`elf_loader.prev` padá stejně). `test-all.sh staticexec` to v `all`
+  maskuje jako SKIP. Hypotéza: RAW `execve` (žádný `PT_INTERP`) → dítě bez
+  svc-patchů i SIGSYS handleru → `set_robust_list`/`rseq` je KILLnut.
+- **Vlastní `argv[0]` se při exec zahazuje** (`exec -a`, zsh `ARGV0=`, perlí
+  `exec {} LIST`) → rozbíjí Claude Code `grep` (re-exec jako `ugrep`).
+  Workaround `command grep` [#L3939].
+- **`/proc/self/cmdline` není shimnutý** a leakuje cestu k loaderu. Fix
+  analogický `shim_readlink` — pozor na TLS past [#L3973].
+- **Binárku mimo `$ROOTFS` nelze spustit** — `shim_execve` nalepí `$ROOTFS`
+  i na absolutní host cestu. Nejspíš táž vrstva jako vnořený `make`
+  (postup.md 2026-10-07 (2)) — řešit najednou [#L4029].
+- **rustc/cargo odvozuje `sysroot` z `cwd`, ne z binárky** → `E0463: can't
+  find crate for std`. Root cause neizolován. Workaround
+  `--sysroot $R/root/.rustup/toolchains/stable-aarch64-unknown-linux-gnu`
+  [#L3988].
+- **Celorootfs konverze absolutních symlinků čeká na potvrzení** (1093 linků,
+  1081 převoditelných) — `tools/relsymlinks.sh --dry-run`.
+- Test na reálném 16K Android 15+ (Task 3). `nmap` není v rootfs [#L680];
+  ostatní síťové binárky ověřeny OK.
 - Kosmetika: `src/main.c:149` sign-compare, `\]` escape.
-- ~~`/proc/self/exe` v own-loadovaném procesu vrací cestu k loaderu~~ —
-  **VYŘEŠENO** (2026-10-07): `run_ownall` ukládá resolvovanou host cestu
-  ke guest binárce do `g_guest_exe_path`; `shim_readlink`/`shim_readlinkat`
-  rozpoznají `/proc/self/exe` i `/proc/<pid>/exe` a vrátí tuto cestu místo
-  volání do skutečného readlink (ten by vrátil loader). Cesta pro `<pid>`
-  je sestavena ručně (žádný `snprintf`/`getpid()`) — první verze fixu
-  použila oba a rozbila python3 (`import os` SIGSEGV): tyto shimy běží
-  patchnuté přímo v glibc kódu pod GUEST TP, takže bionic `snprintf`/`getpid`
-  (TLS-dependent) korumpovaly guest TLS. Ověřeno `readlink /proc/self/exe`
-  pod `--ownall` → vrací `$ROOTFS/.../binárka` (dřív cestu k loaderu);
-  `test-all.sh all` PASS 171/0 (dřív 160, bez regrese). cmake `-S/-B`
-  configure fázi už nekrashuje a `CMAKE_COMMAND` v cache je korektní
-  guest-relativní cesta (dřív loader). Regresní test `test-all.sh selfexe`.
-- ~~GNU Make "fast path" `make: /usr/bin/X: No such file or directory`~~ —
-  **VYŘEŠENO** (2026-10-07, (3)): GNU Make 4.4 (gnulib `find_in_given_path`)
-  ověřuje program přes **`eaccess()`** PŘED `posix_spawn`; `eaccess` je
-  glibc alias `euidaccess` (stejná adresa), ale GOT override jde podle
-  jména a `eaccess` v tabulce chyběl (inline hook `euidaccess` se kvůli BTI
-  prologu přeskočí) → nepřeložená host cesta → ENOENT → `posix_spawn` se
-  vůbec nezavolal. Fix: `elf_register_override("eaccess", shim_euidaccess)`
-  v `shim_register_overrides`. Ověřeno: plný `cmake -S/-B` + `cmake --build`
-  triviálního projektu pod `--ownall` projde (s guest PATH), A/B regresní
-  test `test-all.sh selfexe` (stará binárka FAIL, nová PASS), `all` PASS
-  171/0. **Pozor (ladicí past):** `su -c` na tomhle zařízení běží přes
-  `proot` (`PROOT_L2S_DIR`), který překládá cesty na úrovni syscallů — bug
-  se tam neprojeví; jediný platný test je `ashell -c`. Diagnostika
-  `ELF_LOADER_EXEC_TRACE=1` (raw-syscall trace v exec/access shimech) —
-  [postup.md](postup.md) 2026-10-07 (2)/(3).
-- ~~Funkce s cestou mimo override tabulku~~ — **VYŘEŠENO** (2026-10-07, (4)):
-  audit importů 1927 ELF v rootfs; doplněny shimy `chmod/chown/utime*/
-  truncate/mknod/mkfifo/linkat/statfs/xattr/creat/pathconf/
-  inotify_add_watch` + AF_UNIX `bind`/`connect` (překlad `sun_path`).
-  Regresní test `test-all.sh pathops` (A/B). Navíc `mkdtemp` (glibc interní
-  `__mkdir` mimo GOT; rozbíjela cmake `try_compile` na guest cestách, apt/
-  dpkg, `strip`) — ověřeno reálným projektem cJSON (clone → cmake → build →
-  ctest 19/19 s guest cestami) — [postup.md](postup.md) 2026-10-07 (5).
-  Dále `remove` (interní `unlink`/`rmdir`), `nftw`/`ftw` + `glob` (kořen/vzor
-  přeložen, z callback cest a `gl_pathv` se odřízne prefix `$R`) a
-  **inline hook `posix_spawn` (BTI prolog)** → `system()`/`popen()` spouští
-  guest `/bin/sh` přes loader místo host `/system/bin/sh` (vypnout
-  `F2_NO_SPAWN_HOOK=1`) — [postup.md](postup.md) 2026-10-07 (6).
-  Dále (2026-10-07 (7)): BTI inline hooky `fstatat` (= stat/lstat uvnitř
-  glibc: `ftok`, `tempnam`), `unlink`, `mkdir`, `rmdir`, `link` (vypnout
-  `F2_NO_BTI_HOOK=1`); nocancel shim překládá `O_DIRECTORY` (`scandir`) +
-  whitelist zoneinfo/localtime/fstab/mtab/shadow/…; `/dev/shm` → `$R/dev/shm`
-  a `link` v shm → `renameat2(RENAME_NOREPLACE)` (`shm_open`, `sem_open`,
-  Python `multiprocessing`); `getcwd`/`getwd`/`get_current_dir_name` vrací
-  guest cestu — **kromě Bun** (raw syscally, detekce `DT_VERDEF` `BUN_*`,
-  ručně `F2_NO_CWD_STRIP=1`). Regresní test `pathops` (`LIBCOPS2 7`).
-  **Obecné pravidlo:** glibc 2.41 funkce začínají `BTI c` → `hook_install`
-  je nepatchuje → glibc-interní `bl` volání obchází shimy; řešit wrapperem
-  na vnější funkci nebo `hook_inline_prologue`.
-  Hardlinky (`link`) zakazuje
-  SELinux app domény i nativně — platformní limit. **Pravidlo:** GOT override
-  je per-jméno; při přidání shimu zkontrolovat aliasy v `libc.so.6`
-  (`nm -D`, stejná adresa) a importy binárek (`nm -D --undefined-only`;
-  toybox `readelf` relokace nevypisuje).
-- **Statický glibc ELF v rootfs končí `SIGSYS`** („Bad system call", RC=159) —
-  nalezeno 2026-10-20 při regresi, **není regrese** (`elf_loader.prev` padá
-  stejně). `test-all.sh staticexec` to v `all` **maskuje jako SKIP**: bez guest
-  PATH nenajde gcc `ld`, binárka se nepostaví → „static build selhal". S guest
-  PATH FAILuje na guest-abs i `$ROOTFS`-abs cestě. Hypotéza: RAW `execve`
-  (žádný `PT_INTERP`) → dítě bez svc-patchů i bez SIGSYS handleru (resetuje se
-  při `execve`) → `set_robust_list`/`rseq` ze startu statické glibc je KILLnutý.
-- Kandidát 3 promptu 02 (cache klasifikace ELF v exec shimu) **zamítnut
-  měřením** (2026-10-20): mikro-benchmark přesné syscall sekvence dává
-  38–60 µs na exec proti ~26–48 ms celkem = 0,1 %, tedy hluboko pod šumem.
-  Vrátit se k tomu, až bude exec pod ~1 ms.
-- **Prompt 10 část B (líné vázání) — doplněna, ale default VYPNUTÁ**
-  (2026-10-20, commit `df5b87d`): v repu už byla (`elf_set_lazy`,
-  `elf_lazy_resolve`, `entry.S lazy_plt_stub`), chyběly dvě věci ze zadání —
-  (1) **IFUNC nebyl eager** (`if (lazy_binding)` bylo před
-  `is_local_ifunc_reloc`, post-prots průchod měl `tsz = lazy ? 0 : jmp_size`
-  → lokální IFUNC `JUMP_SLOT` zůstal na stubu; historie bugu `memcpy`
-  u `ls`/`dir`), (2) `DF_BIND_NOW`/`DF_1_NOW`/`DT_BIND_NOW`/`LD_BIND_NOW` se
-  neřešily — nový `obj_wants_bind_now()`. Zapínání `ELF_LOADER_LAZY=1`
-  (dědí se do zanořených exec, `--lazy` ne). **Pád `python3` pod lazy
-  VYŘEŠEN** (commit `c69eeac`): `elf_lazy_resolve()` se volá z guest kódu
-  (PLT stub v `entry.S`), takže běžel pod **guest TP**, zatímco uvnitř dělá
-  loaderův C kód závislý na bionickém TLS (`getenv`, `fprintf`, override
-  tabulka, IFUNC resolver) → korupce guest TLS. Fix: tělo do
-  `elf_lazy_resolve_inner()` a wrapper s `dl_enter_host()`/`dl_leave_host()`
-  — **třetí výskyt téže pasti** v projektu (viz `4602b18`, `80c3ffd`).
-  Device: `python3 -c 'print(6*7)'` 5/5 → 42 (dřív 100 % SIGSEGV); plná sada
-  s oběma částmi **192/0/33** = jako default. **Měření však zisk nepotvrzuje**
-  (odpinovaně, knob na téže binárce): `/bin/true` 41,0 vs 39,5 ms,
-  `bash -c true` 41,9 vs 37,4 ms, `python3 -c pass` 205,3 vs 174,9 ms — vše
-  v šumu, rozptyl uvnitř jedné konfigurace (30,7–47,2 ms) je větší než rozdíl
-  mezi nimi, a fázová čísla si odporují (`reloc_done` bash 969 → 2208 µs,
-  python3 1503 → 915 µs). Důvod: Parrot libc/ld.so jsou `-z now`, takže si
-  eager vynutí samy (`BIND_NOW -> eager` u 3 objektů), a po GNU hashi je
-  relokace jen ~1 ms. **Default proto zůstává vypnutý — volbou podle měření,
-  ne kvůli pádu.** A/B `test-all.sh lazybind` (python3 je kritérium PASS).
-- **Prompt 10 část A (cache RELRO obrazů) — IMPLEMENTOVÁNA, default vypnutá**
-  (2026-10-20, `src/imgcache.c`): ukládá `PT_GNU_RELRO` úseky modulů, moduly
-  mapuje na tytéž báze (`MAP_FIXED_NOREPLACE`), klíč = BuildID+size+mtime exe
-  (nese build tag loaderu) + `PAGE_SIZE` + `AT_HWCAP`/`HWCAP2`. **Pointery do
-  loaderu** (prompt žádá rozhodnutí): pevnou bázi PIE vynutit nelze, takže se
-  ukládá **offset od báze obrazu loaderu** (přesný rozsah z `dl_iterate_phdr`)
-  a při restore se přičte aktuální báze. `ELF_LOADER_IMGCACHE` má **úrovně**:
-  1 = záznam + verifikace (relokace běží plně, bezpečné), 2 = skutečné
-  přeskočení RELRO relokace (**experimentální, padá** u binárky s uloženým
-  obrazem). `ELF_LOADER_IMG_VERIFY=1` porovná obraz s plnou relokací → **0
-  rozdílů** z 749 (ld.so) i 1520 slov (libc). Benchmark: úroveň 1 je
-  **pomalejší** (`/bin/true` 29,6 → 39,2 ms — kopíruje RELRO a zapisuje ~20 KB
-  bez přeskakování), strop úrovně 2 je `reloc_done` ≈ 1–2 ms z ~22–30 ms exec.
-  **Čtyři pasti z implementace:** celé `PF_W` segmenty ukládat nelze
-  (`.data`/`.bss` drží `__curbrk`/`__libc_stack_end`/stack guard → SIGSEGV);
-  přeskočit celé `elf_relocate` nelze (neproběhne `apply_segment_prots` →
-  `.text` bez `PROT_EXEC`); „je to pointer?" nejde heuristikou (`0x430f0a10`
-  v RELRO ld.so a `0x706f706364` = ASCII jsou data); úroveň 1 nesmí do paměti
-  zapsat nic. A/B `test-all.sh imgcache` —
-  [postup.md](postup.md) 2026-10-20 (5).
-- **Běhy `all` k promptu 10 (2026-10-20):** default **192/0/33**,
-  `ELF_LOADER_IMGCACHE=1` (část A) **192/0/33**, obě části zapnuté
-  **160/31/34** před fixem `c69eeac` (všech 31 pádů za lazy) a po fixu
-  **192/0/33**, tedy bez regrese.
-  Odpinovaně (`nh cpu unpin`) potvrzeno knobem `ELF_LOADER_NO_HASH=1` na téže
-  binárce: `python3` `hooks_bti` 5538 → 1295 µs, `reloc_done` 21 228 →
-  1473 µs, total 55,6 → **16,7 ms** (−70 %). **Metodika:** pinování mění
-  absolutní čísla o desítky procent a odpinovaný wall-clock je rozptýlený
-  (malá jádra) → měřit při stejné CPU politice a A/B dělat knobem, ne dvěma
-  buildy.
-- **Pasti v `test-all.sh` (2026-10-20):** bare `grep` se v own-loadovaném
-  guestu resolvuje na **host toybox**, který nezná BRE `\|` → používat
-  `grep -E`. `ashell_out` má `timeout 2`; chladný běh se zápisem cache se do
-  něj nevejde → vlastní `$R/usr/bin/timeout 25`. Celou sadu `all` nespouštět
-  obalenou v `nohup … &` uvnitř background volání (vznikne osiřelý proces,
-  který harness zabije) — spustit ji přímo jako background příkaz.
-- Test na reálném 16K Android 15+ zařízení (Task 3).
-- ~~Bionic dlerror/errno test (Task 4).~~ **Vyřešeno** — `ldso_dlerror()` +
-  guest `dlopen/dlsym/dlerror/dlclose/dladdr` nad `_rtld_global` ověřeno
-  (`src/elf_loader.c:1295`, `src/main.c:3185`).
-- Node 23+/v26.8.2 JSDispatchTable — plain `node -e` na v26.10.0 už
-  nepadá (5/5, 2026-10-06). `pi`+`pi-starship` TTY pád **vyřešen** (viz
-  sekce 8, commit `80c3ffd`).
-- Síťové binárky — starship, fzf, curl, wget, python `getaddrinfo`+HTTPS,
-  getent, ssh **ověřeny OK** (2026-10-06, nativně přes `ashell`, 3×).
-  Zbývá jen `nmap` (není v rootfs nainstalovaný) — [postup.md#L680](postup.md#L680).
-- ~~`env`/`timeout` spouštějící `ashell`~~ — **vyřešeno**, byl to PATH
-  ordering (bare jméno → host binárka), ne hook bypass; viz sekce 9.
 
-- **Zátěžový test multi-runtime + threading/mmap (2026-10-15)** — spuštěno
-  uvnitř reálného re-exec řetězu `lx zsh → elf_loader --ownall claude →
-  agentí bash -c` (ne izolovaný `--ownall`). Jádro loaderu čisté: pthreads
-  do 256 vláken s TLS canary, mmap/mremap/mprotect/msync/MAP_FIXED, 64 vláken
-  × 200 mmap cyklů, fork COW, MAP_SHARED mezi procesy, `dlopen`, python
-  threading/`multiprocessing`, node `worker_threads`+SharedArrayBuffer —
-  vše PASS. 150 souběžných procesů (python/node/perl/rust/C) 0 selhání,
-  rampa 10→100 lineární. Režie exec: 48 ms přes `$ROOTFS/bin/true` vs 14 ms
-  přímým voláním loaderu vs 10 ms nativní toybox → **námět: cache
-  resolvovaných symbolů per-binárka (BuildID+mtime)**.
-  [postup.md#L3885](postup.md#L3885), threading/mmap
-  [postup.md#L4047](postup.md#L4047).
-  Čtyři nové otevřené nálezy, všechny v cestách exec/argv/path-resolution:
-  - **Vlastní `argv[0]` se při exec zahazuje** (`exec -a`, zsh `ARGV0=`,
-    perlí `exec {} LIST` → přepsáno resolvovanou cestou). Rozbíjí mj.
-    Claude Code `grep`, který se re-execuje jako `ugrep`
-    (`error: unknown option '-G'`); workaround `command grep`.
-    Pozn.: `python3 -c` → `sys.argv[0]=='-c'` je normální sémantika
-    interpretu, ne tento bug — [postup.md#L3939](postup.md#L3939).
-  - **`/proc/self/cmdline` není shimnutý** a leakuje cestu k loaderu
-    (`/proc/self/exe` shimnutý JE a drží). Fix analogický `shim_readlink`
-    — pozor na tutéž TLS past (žádný bionic `snprintf`/`getpid()`, jen raw
-    syscall) — [postup.md#L3973](postup.md#L3973).
-  - **rustc `sysroot == guest(dirname(cwd))`** → každý build `E0463: can't
-    find crate for std`. Root cause NEIZOLOVÁN; měřením vyloučeno: rustup
-    shim, `argv[0]`, `/proc/self/exe`, statické linkování. Workaround
-    `rustc --sysroot $R/root/.rustup/toolchains/stable-aarch64-unknown-linux-gnu`
-    — [postup.md#L3988](postup.md#L3988).
-  - **Binárku mimo `$ROOTFS` nelze spustit** — `shim_execve` nalepí `$ROOTFS`
-    prefix i na už absolutní host cestu mimo rootfs. Nejspíš tatáž vrstva
-    jako neuzavřený nález 2026-10-07 (2) (vnořený `make`), jen z opačné
-    strany (tam prefix chybí, tady přebývá) — řešit najednou.
-    [postup.md#L4029](postup.md#L4029).
+## Mapa postup.md
 
-Průběžný stav otevřených bugů — viz i auto-paměť
-`[[elf-loader-open-bugs]]`.
+| téma | řádky |
+|---|---|
+| build, testy, runtime hodnoty, stav | L8–L92 |
+| IFUNC resolver | L49 |
+| static TLS pro exe, tcbhead | L101 |
+| `strerror`, tunable env override | L121, L139 |
+| bionic static-PIE rebase | L154 |
+| PAGE_SIZE 16K | L189 |
+| NDK cross-compile (Modal), 16K/namespaces | L210, L246, L254 |
+| brk desync / private arena | L279 |
+| TLS blok pod TP | L303 |
+| Magisk modul, `elf` wrapper, `LD_LIBRARY_PATH` | L328, L406 |
+| `linuxsh`, mount propagace, architektura | L558, L598, L605, L731 |
+| fixy #1/#2 (stack_chk, rseq, emutls) | L493, L509 |
+| C++ inity pod bionic TP, apt, nano, TUI | L628, L651, L662, L795, L870 |
+| seccomp filtr, fork veneer | L685, L704, L710 |
+| shell/integrace, `init`, `.elfrc`, `lx`, dw | L2376, L2395, L2425, L2795 |
+| uv/venv, shebang, fstat, test runner, NSS | L2529, L2570, L2606, L2715 |
+| Node saga | L1004–L2272 |
+| `pi`/`pi-starship`, dl_enter_host | L2742 + 2026-10-06 (2)–(6) |
+| Bun, long argv, bionic bridge | L2273 + 2026-10-06 (7), 2026-10-12 |
+| `/proc/self/exe`, `eaccess`, pathops, posix_spawn | 2026-10-07 (2)–(7) |
+| relsym + rootfd | 2026-10-21 |
+| výkon: timing, cache, hash, imgcache, lazy | 2026-10-16, 2026-10-20 |
+| zátěžový test multi-runtime | L3885, L4047 |
+| otevřené nálezy exec/argv | L3939, L3973, L3988, L4029 |
+
+Otevřené bugy též v auto-paměti `[[elf-loader-open-bugs]]`.
