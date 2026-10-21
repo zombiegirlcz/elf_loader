@@ -78,51 +78,56 @@ unsigned l1_path_args(long nr) {
  * Diky tomu nepotrebujeme `gettid` (extra syscall na KAZDY cestovy syscall
  * by L1 zdrazil dvakrat) ani urovne: signal guestu, ktery dorazi uprostred
  * stubu a udela dalsi cestovy syscall, si proste vezme jiny volny slot.
- * Kolize hledani slotu rozprostira start podle adresy ramce. */
+ *
+ * Vlastnici jsou v KOMPAKTNIM poli na vlastni strance a hledani zacina
+ * vzdy od nuly: jednovlaknovy proces tak pouziva jediny slot. Prvni verze
+ * mela vlastnika uvnitr slotu a start odvozeny od adresy ramce - ruzna mista
+ * volani pak sahala na ruzne sloty a RSS narostlo o ~320 KB misto ~90 KB. */
 #define L1_SLOTS 256
 #define L1_NPATH 2
 #define L1_PATHMAX 4096
+#define L1_OWNER_AREA 16384                /* >= stranka i pri 16K strankach */
 
 typedef struct {
-    volatile unsigned long owner;      /* 0 = volny, jinak adresa ramce */
-    unsigned long pad;
     char buf[L1_NPATH][L1_PATHMAX];
 } l1_slot_t;
 
-static l1_slot_t *g_l1_slots = NULL;   /* mmap NORESERVE, lazy stranky */
+static volatile unsigned long *g_l1_owner = NULL;  /* [L1_SLOTS]; 0 = volny */
+static l1_slot_t *g_l1_slots = NULL;               /* mmap NORESERVE, lazy */
 static unsigned long g_l1_miss = 0;    /* kolikrat nebyl volny slot (diagnostika) */
 
-/* Mapuje tabulku slotu. Vola se z main() pod bionickym TP, jednou. */
+/* Mapuje vlastniky + sloty. Vola se z main() pod bionickym TP, jednou. */
 static int l1_slots_init(void) {
     if (g_l1_slots) return 1;
-    size_t sz = sizeof(l1_slot_t) * L1_SLOTS;   /* ~2 MB virtualne */
+    size_t sz = L1_OWNER_AREA + sizeof(l1_slot_t) * L1_SLOTS;   /* ~2 MB virtualne */
     long r = shim_raw_syscall6(222 /* mmap */, 0, (long)sz,
                                0x1 | 0x2 /* RW */,
                                0x20 | 0x02 | 0x4000 /* ANON|PRIVATE|NORESERVE */,
                                -1, 0);
     if (r < 0 && r > -4096) return 0;
-    g_l1_slots = (l1_slot_t *)r;
+    g_l1_owner = (volatile unsigned long *)r;
+    g_l1_slots = (l1_slot_t *)(r + L1_OWNER_AREA);
     return 1;
 }
 
 static l1_slot_t *l1_slot_acquire(unsigned long *frame) {
     if (!g_l1_slots) return NULL;
     unsigned long me = (unsigned long)frame;
-    unsigned start = (unsigned)((me >> 4) % L1_SLOTS);
     for (unsigned i = 0; i < L1_SLOTS; i++) {
-        l1_slot_t *s = &g_l1_slots[(start + i) % L1_SLOTS];
         unsigned long zero = 0;
-        if (s->owner == 0 &&
-            __atomic_compare_exchange_n(&s->owner, &zero, me, 0,
+        if (g_l1_owner[i] == 0 &&
+            __atomic_compare_exchange_n(&g_l1_owner[i], &zero, me, 0,
                                         __ATOMIC_ACQ_REL, __ATOMIC_RELAXED))
-            return s;
+            return &g_l1_slots[i];
     }
     g_l1_miss++;
     return NULL;
 }
 
 static void l1_slot_release(l1_slot_t *s) {
-    if (s) __atomic_store_n(&s->owner, 0UL, __ATOMIC_RELEASE);
+    if (!s || !g_l1_slots) return;
+    unsigned long i = (unsigned long)(s - g_l1_slots);
+    if (i < L1_SLOTS) __atomic_store_n(&g_l1_owner[i], 0UL, __ATOMIC_RELEASE);
 }
 
 /* ── vlastni preklad ─────────────────────────────────────────────────────
