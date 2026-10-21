@@ -2309,8 +2309,23 @@ static void *l1_map_island(uintptr_t anchor, size_t sz) {
 
 #include "l1_emit.h"
 
-/* Hlavni vstup: projde PF_X segmenty modulu, cestova a dynamicka `svc #0`
- * prepise na skok do vlastniho stubu. Idempotentni (m->l1_patched). */
+/* Je misto kandidatem L1? (cestovy syscall se znamym nr, nebo dynamicke x8
+ * tam, kde je povolime) */
+static int l1_is_site(const uint32_t *seg, size_t j, int allow_dyn) {
+    if (seg[j] != 0xd4000001u) return 0;
+    long nr = l1_static_nr(seg, j);
+    return nr < 0 ? allow_dyn : (l1_path_args(nr) != 0);
+}
+
+/* Hlavni vstup: cestova (a v libc i dynamicka) `svc #0` modulu prepise na
+ * skok do vlastniho stubu. Idempotentni (m->l1_patched).
+ *
+ * Seznam mist (link-time vaddr) se cachuje pod BuildID klicem modulu ve
+ * slotu CACHE_NR_L1 (src/cache.h, format v3): bez cache stal sken .text
+ * pri KAZDEM exec ~4 ms (merenim, /bin/true 28,4 -> 32,5 ms). I negativni
+ * vysledek (modul bez mist) se zapise, stejne jako u promptu 02.
+ * Pred patchem se overi, ze na miste opravdu je `svc #0` - zastaraly nebo
+ * cizi zaznam nesmi prepsat jinou instrukci. */
 void elf_l1_patch_module(elf_object_t *m) {
     if (!m || !l1_enabled() || m->l1_patched)
         return;
@@ -2322,76 +2337,104 @@ void elf_l1_patch_module(elf_object_t *m) {
      * openat). Jinde dynamicke `svc` typicky patri runtime s vlastnim
      * zasobnikem (Go: syscall.Syscall na 8 KB goroutine) - tam patri L2. */
     int allow_dyn = m->soname && strcmp(m->soname, "libc.so.6") == 0;
-    /* 1. pruchod: spocitej kandidaty */
-    size_t n_sites = 0, n_dyn = 0;
-    for (int i = 0; i < m->phdr_count; i++) {
-        if (m->phdr[i].p_type != PT_LOAD || !(m->phdr[i].p_flags & PF_X)) continue;
-        uint32_t *seg = (uint32_t *)va(m, m->phdr[i].p_vaddr);
-        size_t n_ins = m->phdr[i].p_memsz / 4;
-        for (size_t j = 0; j < n_ins; j++) {
-            if (seg[j] != 0xd4000001u) continue;
-            long nr = l1_static_nr(seg, j);
-            if (nr < 0) { if (allow_dyn) { n_sites++; n_dyn++; } }
-            else if (l1_path_args(nr)) n_sites++;
+    size_t mbv = map_base_vaddr(m);
+
+    /* 1. seznam mist: z cache, jinak sken */
+    uint32_t *sites = NULL;
+    size_t n_sites = 0;
+    int from_cache = 0, own = 0;
+    cache_module_t *cm = (cache_module_t *)m->cache;
+    int cslot = cache_slot(cm, CACHE_NR_L1);
+    if (cslot >= 0) {
+        sites = cm->list[cslot].off;
+        n_sites = cm->list[cslot].n;
+        from_cache = 1;
+    } else {
+        if (cache_enabled())
+            cache_mark_scanned(m, CACHE_NR_L1);   /* i 0 nalezu se zapise */
+        size_t cap = 0;
+        for (int i = 0; i < m->phdr_count; i++) {
+            if (m->phdr[i].p_type != PT_LOAD || !(m->phdr[i].p_flags & PF_X)) continue;
+            size_t seg_vaddr = m->phdr[i].p_vaddr;
+            uint32_t *seg = (uint32_t *)va(m, seg_vaddr);
+            size_t n_ins = m->phdr[i].p_memsz / 4;
+            for (size_t j = 0; j < n_ins; j++) {
+                if (!l1_is_site(seg, j, allow_dyn)) continue;
+                if (n_sites == cap) {
+                    size_t nc = cap ? cap * 2 : 64;
+                    uint32_t *ns = realloc(sites, nc * sizeof *ns);
+                    if (!ns) { cache_invalidate(m, CACHE_NR_L1); break; }
+                    sites = ns; cap = nc; own = 1;
+                }
+                uint32_t v = (uint32_t)(seg_vaddr + j * 4);
+                sites[n_sites++] = v;
+                if (cache_enabled())
+                    cache_record_site(m, CACHE_NR_L1, v);
+            }
         }
     }
     if (!n_sites) {
         if (trace)
-            fprintf(stderr, "[l1] %s: zadne cestove svc\n",
-                    m->soname ? m->soname : "?");
+            fprintf(stderr, "[l1] %s: zadne cestove svc%s\n",
+                    m->soname ? m->soname : "?", from_cache ? " (cache)" : "");
+        if (own) free(sites);
         return;
     }
 
+    /* 2. ostrov stubu do +-128 MiB od modulu */
     size_t isz = L1_ISLAND_HDR + n_sites * L1_STUB_WORDS * 4;
-    uintptr_t anchor = (uintptr_t)m->base_addr;
-    uint32_t *island = (uint32_t *)l1_map_island(anchor, isz);
+    uint32_t *island = (uint32_t *)l1_map_island((uintptr_t)m->base_addr, isz);
     if (!island) {
         fprintf(stderr, "[l1] %s: ostrov stubu se nevesel do +-128 MiB\n",
                 m->soname ? m->soname : "?");
+        if (own) free(sites);
         return;
     }
     *(uintptr_t *)island = (uintptr_t)&l1_common;        /* literal */
     uintptr_t lit = (uintptr_t)island;
     uint32_t *next = island + L1_ISLAND_HDR / 4;
 
-    /* 2. pruchod: generuj stuby a prepis svc */
+    /* 3. stuby + prepis. Mista jsou serazena (sken i cache drzi poradi),
+     * takze `mprotect` staci jednou na stranku, ne dvakrat na misto. */
     size_t done = 0, failed = 0, pages = 0;
-    uintptr_t last_pg = 0;
-    for (int i = 0; i < m->phdr_count; i++) {
-        if (m->phdr[i].p_type != PT_LOAD || !(m->phdr[i].p_flags & PF_X)) continue;
-        uint32_t *seg = (uint32_t *)va(m, m->phdr[i].p_vaddr);
-        size_t n_ins = m->phdr[i].p_memsz / 4;
-        for (size_t j = 0; j < n_ins; j++) {
-            if (seg[j] != 0xd4000001u) continue;
-            long nr = l1_static_nr(seg, j);
-            if (nr < 0 ? !allow_dyn : !l1_path_args(nr)) continue;
-
-            uintptr_t site = (uintptr_t)&seg[j];
-            uintptr_t stub = (uintptr_t)next;
-            if (!l1_emit_stub(next, stub, site + 4, lit)) { failed++; continue; }
-            long off = (long)(stub - site) / 4;
-            if (off < -(1 << 25) || off >= (1 << 25)) { failed++; continue; }
-
-            uintptr_t pg = site & ~(uintptr_t)(PAGE_SIZE - 1);
-            if (mprotect((void *)pg, PAGE_SIZE,
-                         PROT_READ | PROT_WRITE | PROT_EXEC) != 0) { failed++; continue; }
-            seg[j] = 0x14000000u | ((uint32_t)off & 0x3ffffffu);   /* b stub */
-            __builtin___clear_cache((char *)&seg[j], (char *)&seg[j] + 4);
-            mprotect((void *)pg, PAGE_SIZE, PROT_READ | PROT_EXEC);
-            if (pg != last_pg) { pages++; last_pg = pg; }
-            next += L1_STUB_WORDS;
-            done++;
+    uintptr_t cur_pg = 0;
+    for (size_t k = 0; k < n_sites; k++) {
+        uint32_t *rt = (uint32_t *)((char *)m->base_addr + ((uintptr_t)sites[k] - mbv));
+        uintptr_t site = (uintptr_t)rt;
+        uintptr_t pg = site & ~(uintptr_t)(PAGE_SIZE - 1);
+        if (pg != cur_pg) {
+            if (cur_pg) mprotect((void *)cur_pg, PAGE_SIZE, PROT_READ | PROT_EXEC);
+            cur_pg = 0;
+            if (mprotect((void *)pg, PAGE_SIZE, PROT_READ | PROT_WRITE | PROT_EXEC) != 0) {
+                failed++;
+                continue;
+            }
+            cur_pg = pg;
+            pages++;
         }
+        if (*rt != 0xd4000001u) { failed++; continue; }   /* zastaraly zaznam */
+        uintptr_t stub = (uintptr_t)next;
+        long off = (long)(stub - site) / 4;
+        if (off < -(1 << 25) || off >= (1 << 25) ||
+            !l1_emit_stub(next, stub, site + 4, lit)) { failed++; continue; }
+        *rt = 0x14000000u | ((uint32_t)off & 0x3ffffffu);  /* b stub */
+        __builtin___clear_cache((char *)rt, (char *)rt + 4);
+        next += L1_STUB_WORDS;
+        done++;
     }
-    mprotect(island, ALIGN_UP(isz, PAGE_SIZE), PROT_READ | PROT_EXEC);
+    if (cur_pg) mprotect((void *)cur_pg, PAGE_SIZE, PROT_READ | PROT_EXEC);
     __builtin___clear_cache((char *)island, (char *)island + isz);
+    mprotect(island, ALIGN_UP(isz, PAGE_SIZE), PROT_READ | PROT_EXEC);
+    /* nektere misto selhalo -> nepovazuj cache za uplnou (priste znovu sken) */
+    if (failed && !from_cache)
+        cache_invalidate(m, CACHE_NR_L1);
+    if (own) free(sites);
 
     if (trace)
         fprintf(stderr,
-                "[l1] %s: %zu mist (%zu dynamickych x8) -> ostrov %p, "
-                "COW stranek %zu, selhalo %zu\n",
-                m->soname ? m->soname : "?", done, n_dyn, (void *)island,
-                pages, failed);
+                "[l1] %s: %zu mist%s -> ostrov %p, COW stranek %zu, selhalo %zu\n",
+                m->soname ? m->soname : "?", done, from_cache ? " (cache)" : "",
+                (void *)island, pages, failed);
 }
 
 void elf_patch_syscall_sites_all(elf_object_t *m) {

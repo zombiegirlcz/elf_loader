@@ -22,12 +22,17 @@
  *     skenu (modul pro dane syscall cislo zadny svc-site nema). Bez toho
  *     se moduly bez nalezu (libm, libz, libexpat...) skenovaly pri kazdem
  *     exec znovu - viz postup.md 2026-10-20. */
-#define CACHE_FORMAT_VERSION 2u
+/* v3: sesty slot CACHE_NR_L1 nese seznam mist pro L1 (prompt 04) - cestova
+ *     a povolena dynamicka `svc #0`; strop mist na slot zvednut na 4096
+ *     (L1 ma v libc 58 mist, velke binarky vic). */
+#define CACHE_FORMAT_VERSION 3u
 
-/* Pocet syscall cisel, ktera elf_patch_syscall_sites prebiji (99,151,152,
- * 293,435) a jejichz svc-site offsety se do cache ukladaji. */
-#define CACHE_NR_COUNT 5
-#define CACHE_MAX_SITES 64
+/* Pocet slotu: 5 syscall cisel, ktera elf_patch_syscall_sites prebiji (99,
+ * 151,152,293,435), plus seznam L1 mist (CACHE_NR_L1). */
+#define CACHE_NR_COUNT 6
+#define CACHE_MAX_SITES 4096
+/* Pseudo-cislo slotu se seznamem L1 mist (zadny realny syscall nema >0xffff). */
+#define CACHE_NR_L1 0x10000L
 #define CACHE_KEY_MAX  192
 
 /* Vysledek skenu pro jedno syscall cislo: link-time vaddr instrukci `svc #0`
