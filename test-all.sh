@@ -1431,6 +1431,78 @@ category_relsym() {
     fi
 }
 
+# Prompt 04 (L1): preklad cest na hranici syscallu. Pripady, ktere jmenne
+# hooky historicky MINULY (alias eaccess, glibc-interni volani mkdtemp/remove/
+# glob/nftw/scandir, BTI fstatat u ftok/tempnam), se volaji primo pres ctypes
+# s VYPNUTYMI prislusnymi hooky (F2_SKIP + F2_NO_BTI_HOOK). A/B knobem na
+# teze binarce: bez L1 musi selhat, s ELF_LOADER_L1=1 projit.
+category_l1() {
+    echo ""
+    echo "=== L1: preklad cest na hranici syscallu (prompt 04) ==="
+    local py="$R/usr/bin/python3"
+    if [ ! -x "$py" ]; then
+        echo "SKIP l1: chybi python3"
+        echo "SKIP: l1 - no python3" >> "$SKIP_LOG"
+        ((SKIP_COUNT++)) || true
+        return
+    fi
+    local g="/tmp/l1t.$$" h="$R/tmp/l1t.$$"
+    mkdir -p "$h/sub"
+    echo x > "$h/f"; echo x > "$h/f2"; echo x > "$h/sub/a"; echo x > "$h/sub/b"
+    cat > "$h/t.py" <<'PYEOF'
+import ctypes, os, sys
+libc = ctypes.CDLL("libc.so.6", use_errno=True)
+B = sys.argv[1]
+r = {}
+r["eaccess"] = libc.eaccess(f"{B}/f".encode(), 0) == 0
+t = ctypes.create_string_buffer(f"{B}/dXXXXXX".encode())
+libc.mkdtemp.restype = ctypes.c_char_p
+p = libc.mkdtemp(t)
+r["mkdtemp"] = bool(p) and p.decode().startswith(B + "/d")
+r["remove"] = libc.remove(f"{B}/f2".encode()) == 0
+g = (ctypes.c_char * 256)()
+rc = libc.glob(f"{B}/sub/*".encode(), 0, None, ctypes.byref(g))
+n = ctypes.c_size_t.from_buffer(g, 0).value
+pv = ctypes.cast(ctypes.c_void_p.from_buffer(g, 8).value or 0, ctypes.POINTER(ctypes.c_char_p))
+paths = [pv[i].decode() for i in range(n)] if n else []
+r["glob"] = rc == 0 and n == 2 and all(x.startswith(B + "/sub/") for x in paths)
+seen = []
+CB = ctypes.CFUNCTYPE(ctypes.c_int, ctypes.c_char_p, ctypes.c_void_p, ctypes.c_int, ctypes.c_void_p)
+cb = CB(lambda path, st, fl, ftw: seen.append(path.decode()) or 0)
+rc = libc.nftw(f"{B}/sub".encode(), cb, 8, 0)
+r["nftw"] = rc == 0 and len(seen) == 3 and all(x.startswith(B) for x in seen)
+nl = ctypes.c_void_p()
+r["scandir"] = libc.scandir(f"{B}/sub".encode(), ctypes.byref(nl), None, None) == 4
+r["ftok"] = libc.ftok(f"{B}/f".encode(), 1) != -1
+libc.tempnam.restype = ctypes.c_char_p
+os.environ.pop("TMPDIR", None)   # glibc tempnam dava TMPDIR prednost pred `dir`
+tn = libc.tempnam(B.encode(), b"x")
+r["tempnam"] = bool(tn) and tn.decode().startswith(B + "/x")
+print(" ".join(f"{k}={'OK' if v else 'FAIL'}" for k, v in r.items()))
+PYEOF
+    local skip="F2_SKIP=eaccess,mkdtemp,remove,glob,glob64,nftw,nftw64,ftw,ftw64,__open64_nocancel F2_NO_BTI_HOOK=1"
+    local env="ROOTFS=$R ELF_ROOTFS=$R ELF_LOADER=$L $skip"
+    local on off
+    on=$("$R/usr/bin/timeout" 25 "$R/bin/bash" -c "$env ELF_LOADER_L1=1 $L --ownall $py $g/t.py $g" 2>&1 | tail -1)
+    off=$("$R/usr/bin/timeout" 25 "$R/bin/bash" -c "$env $L --ownall $py $g/t.py $g" 2>&1 | tail -1)
+    rm -rf "$h"
+    local n_on n_off total=8
+    n_on=$(printf '%s' "$on" | grep -oE '=OK' | wc -l)
+    n_off=$(printf '%s' "$off" | grep -oE '=OK' | wc -l)
+    # kriterium: s L1 vsech 8; bez L1 musi aspon jeden spadnout (A/B dukaz,
+    # ze test opravdu meri neco, co bez L1 nefunguje)
+    if [ "$n_on" = "$total" ] && [ "$n_off" -lt "$total" ]; then
+        echo "PASS l1: s L1 $n_on/$total, bez L1 $n_off/$total (hooky vypnute)"
+        echo "  bez L1: $off"
+        echo "PASS: l1 - preklad na hranici syscallu" >> "$PASS_LOG"
+        ((PASS_COUNT++)) || true
+    else
+        echo "FAIL l1: s L1 [$on] | bez L1 [$off]"
+        echo "FAIL: l1 - s L1 $n_on/$total, bez L1 $n_off/$total | on=[$on] off=[$off]" >> "$FAIL_LOG"
+        ((FAIL_COUNT++)) || true
+    fi
+}
+
 # Line vazani JUMP_SLOT (prompt 10 cast B, ELF_LOADER_LAZY=1). Overuje, ze
 # lazy rezim da IDENTICKY vysledek jako eager u binarek, ktere historicky
 # padaly na IFUNC (ls/dir -> memcpy), u interpretu i u shellu - a ze
@@ -1918,6 +1990,10 @@ case "${1:-all}" in
         category_relsym
         print_summary
         ;;
+    l1)
+        category_l1
+        print_summary
+        ;;
     imgcache)
         category_imgcache
         print_summary
@@ -1993,6 +2069,7 @@ case "${1:-all}" in
         category_lazybind
         category_imgcache
         category_relsym
+        category_l1
         category_lxc
         category_dw
         category_elfrc

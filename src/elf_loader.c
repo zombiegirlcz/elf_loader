@@ -2260,6 +2260,8 @@ unsigned l1_path_args(long nr);   /* src/l1.h (vlozeno do main.c) */
 static int l1_enabled(void) {
     static int v = -1;
     if (v < 0) {
+        /* 1 = L1 vedle jmennych hooku, 2 = L1 a hooky "jen preklad" vypnute
+         * (to resi f2_only_match v main.c); patchuje se v obou pripadech */
         const char *e = getenv("ELF_LOADER_L1");
         v = (e && e[0] && e[0] != '0') ? 1 : 0;
     }

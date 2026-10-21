@@ -3404,18 +3404,55 @@ static f2_hook_t g_f2_hooks[] = {
      * od 65. polozky, nikdy nebezely. Registrovat jen explicitne. */
 };
 
-static int f2_only_match(const char *name) {
-    const char *only = getenv("F2_ONLY");
-    if (!only || !only[0]) return 1;
-    const char *p = only;
-    while (*p) {
+/* Je `name` v carkou oddelenem seznamu `list`? */
+static int f2_name_in_list(const char *list, const char *name) {
+    const char *p = list;
+    size_t nl = strlen(name);
+    while (p && *p) {
         const char *c = p;
         while (*c && *c != ',') c++;
         size_t l = (size_t)(c - p);
-        if (l == strlen(name) && strncmp(p, name, l) == 0) return 1;
+        if (l == nl && strncmp(p, name, l) == 0) return 1;
         p = (*c) ? c + 1 : c;
     }
     return 0;
+}
+
+/* Jmenne hooky typu "jen preloz cestu a zavolej original" - pod L1 (prompt
+ * 04) je preklad na urovni syscallu prebira, takze ELF_LOADER_L1=2 je
+ * vubec neinstaluje. Vedome tu NEJSOU hooky s vlastni semantikou: open/stat/
+ * access/fopen (shim_resolve_symlinks - absolutni symlinky v rootfs, dokud
+ * neni rootfs prevedeny tools/relsymlinks.sh), exec a posix_spawn (own-load),
+ * dlopen, realpath, readlink/symlink (relsym, /proc/self/exe), getcwd (Bun),
+ * bind/connect (sockaddr), link (SELinux zakazuje hardlinky -> renameat2),
+ * mkdtemp/remove/glob/nftw (strip vysledku) a set*id/fileno/getrlimit. */
+static const char g_l1_translate_only[] =
+    "chmod,lchmod,fchmodat,chown,lchown,fchownat,utime,utimes,lutimes,futimesat,"
+    "utimensat,truncate,truncate64,mknod,mknodat,mkfifo,mkfifoat,linkat,statfs,"
+    "statfs64,getxattr,lgetxattr,setxattr,lsetxattr,listxattr,llistxattr,"
+    "removexattr,lremovexattr,creat,creat64,pathconf,inotify_add_watch,lstat,"
+    "__lxstat,lstat64,fstatat64,__fxstatat,__xstat64,__lxstat64,__fxstatat64,"
+    "faccessat2,rename,renameat,renameat2,unlink,unlinkat,rmdirat,mkdir,mkdirat,"
+    "rmdir,opendir,chdir";
+
+/* Instalovat jmenny hook `name`? F2_ONLY = allowlist (bisect), F2_SKIP =
+ * denylist, ELF_LOADER_L1=2 = vynech hooky typu "jen preklad". Vola se
+ * mnohokrat (GOT override, inline hooky, BTI smycka), proto env cist jednou. */
+static int f2_only_match(const char *name) {
+    static int init = 0;
+    static const char *only, *skip;
+    static int l1_only;
+    if (!init) {
+        only = getenv("F2_ONLY");
+        skip = getenv("F2_SKIP");
+        const char *l1 = getenv("ELF_LOADER_L1");
+        l1_only = l1 && l1[0] == '2';
+        init = 1;
+    }
+    if (skip && skip[0] && f2_name_in_list(skip, name)) return 0;
+    if (l1_only && f2_name_in_list(g_l1_translate_only, name)) return 0;
+    if (!only || !only[0]) return 1;
+    return f2_name_in_list(only, name);
 }
 
 /* F2 setup: (1) zaregistrujeme symbol-override pro PLT binarky (binary vidi
@@ -3572,7 +3609,8 @@ static void shim_install_hooks(void) {
      * (subprocess/zsh -i). Vypnout lze F2_NO_INTERNAL_HOOK=1.
      * POZOR: musi bezet az po elf_load (scope ma moduly), proto zde a ne
      * v shim_register_overrides. */
-    if (g_shim_scope && !getenv("F2_NO_INTERNAL_HOOK")) {
+    if (g_shim_scope && !getenv("F2_NO_INTERNAL_HOOK") &&
+        f2_only_match("__open64_nocancel")) {
         void *t = elf_scope_lookup(g_shim_scope, "__open64_nocancel");
         if (!t) t = elf_scope_lookup(g_shim_scope, "__open_nocancel");
         if (elf_debug())
@@ -3682,8 +3720,10 @@ static void shim_install_hooks(void) {
  * non-W^X zarizeni (hook uspel) uz je g_orig_* = trampolina, takze preskocime. */
 static void shim_resolve_fallback(void) {
     if (getenv("F2_DISABLE")) return;
+    /* Originaly plnime i pro hooky, ktere F2_ONLY/F2_SKIP/ELF_LOADER_L1=2
+     * vynechaly: jine shimy je volaji (shim_remove -> g_orig_unlink,
+     * shim_mkdtemp -> mkdir...), a NULL by tam znamenal tiche -1. */
     for (size_t i = 0; i < sizeof g_f2_hooks / sizeof g_f2_hooks[0]; i++) {
-        if (!f2_only_match(g_f2_hooks[i].n)) continue;
         if (*g_f2_hooks[i].orig != NULL) continue;   /* uz nastavil inline-hook */
         void *real = elf_scope_lookup(g_shim_scope, g_f2_hooks[i].n);
         if (real) *g_f2_hooks[i].orig = real;
