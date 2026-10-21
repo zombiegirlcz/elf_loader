@@ -12,7 +12,7 @@ v [proot-nahrada.md](proot-nahrada.md) — prompty odkazují na její kapitoly.
 | 02 | [rychlé výhry exec](02-exec-rychle-vyhry.md) | 5.2–5.4 | 01 | implementace | **hotovo** 2026-10-20 |
 | 03 | [relativní symlinky, clamp `..`, rootfd](03-symlinky-a-rootfd.md) | 4.1–4.3 | – | implementace | **hotovo** 2026-10-21 |
 | 04 | [L1 — přepis `svc #0` při načtení](04-L1-prepis-svc.md) | 2.1 | 01 | implementace | **hotovo** 2026-10-21 (default vypnuto) |
-| 05 | [L2 — seccomp TRAP v guest okně](05-L2-sigsys-okno.md) | 2.2 | 04 | implementace | – |
+| 05 | [L2 — seccomp TRAP v guest okně](05-L2-sigsys-okno.md) | 2.2 | 04 | implementace | **hotovo** 2026-10-21 (3) (default vypnuto) |
 | 06 | [tabulka mountů + `mount --bind`](06-mount-tabulka.md) | 3.1 | 04 (doporučeno) | implementace | – |
 | 07 | [virtualizace `/proc` + `argv[0]`](07-proc-a-argv0.md) | 3.4, 3.5 | – | implementace | – |
 | 08 | [fake root + link2symlink](08-fakeroot-l2s.md) | 3.2, 3.3 | 04 (doporučeno) | implementace | – |
@@ -157,6 +157,30 @@ v host testu asm musí registry a NZCV úmyslně ničit, jinak negativní
 kontrola projde; žádné velké buffery na zásobníku v cestě z L1 stubu;
 loader je `-O0`, takže „už pod `$ROOTFS`" testovat před skenem `..`.
 
+**05 — L2, seccomp RET_TRAP záchytná síť.** Hotovo, **default vypnuto**
+(`ELF_LOADER_L2=1`). Pro kód, který L1 nepřepíše (statické binárky, Go, Bun
+raw syscally, JIT): cestové `svc` z **textu guest exe** TRAPnou a
+`sigsys_handler`→`go_handle` cestu přeloží. Je to **zobecněný Go mód** — ten
+dělal přesně tohle, jen pro Go-detekované binárky; `l2_install_range_filter`
+(vyčleněno z `elf_go_mode_setup`) teď slouží oběma a nastavuje `g_go_lo/hi`,
+takže handler se nemění. PIE exe se přesune do pevného okna `0x11_0000_0000`
+(`MAP_FIXED` v `map_elf_segments`), aby text-range nekolidoval s ASLR host
+binárek; ET_EXEC (gh/Bun/static) mají pevnou nízkou adresu.
+
+- Statická glibc (`-static`, `-static -no-pie`, `-static-pie`) i Go (`gh`)
+  pod L2 vidí rootfs (`/etc/os-release` = Parrot). **Otevřený bug „statický
+  glibc SIGSYS RC=159" je pod L2 vyřešený.**
+- Bun (`claude --version`) pod L2 **bez `F2_NO_CWD_STRIP`** — `go_handle` +
+  `getcwd`/`readlinkat` strip vrací guest cesty.
+- Host binárka (`/system/bin/sh`) spuštěná z guestu pod zděděným filtrem
+  běží normálně (ASLR text mimo rozsah).
+- `test-all.sh l2`: statická binárka vidí rootfs **jen pod L2** (A/B přes
+  `ashell -c`, útěk na host — harness běží uvnitř parrot kontextu, jinak
+  maskováno). `all` default **195/0/33** (baseline + `l2`).
+- Líný přepis `svc`→L1 stub (`ELF_LOADER_L2_LAZY=1`, default vyp): náhrada za
+  běhu není ARM-safe souběžně s vykonáváním na jiném jádře; L1 ho dělá
+  bezpečně při načtení.
+
 ### Co z toho plyne pro další prompty
 
 - **11 (soft exec / zygote)** je teď jediná cesta, jak jít pod ~15 ms —
@@ -164,12 +188,15 @@ loader je `-O0`, takže „už pod `$ROOTFS`" testovat před skenem `..`.
   samotného `execve`.
 - Prompt 10 je **uzavřený**, ne „k dodělání": jeho vstupní podmínka
   („relokace/lookupy jsou pořád velký podíl exec") po promptu 02 nedrží.
-- **05 (L2)** může přímo použít generátor stubů z L1: „líný přepis" místa po
-  prvním SIGSYS = `l1_emit_stub` + `b stub` jako při načtení. `l1_common`
-  provádí `svc` z textu loaderu, tedy mimo budoucí guest okno.
-- **06/08** (mount tabulka, fake root) mají v L1 jedno místo, kde se cesta
-  rozhoduje (`l1_before` → `shim_translate`) — rozšiřovat tam, ne v 52
-  jmenných hookách.
+- **05 (L2) hotovo:** líný přepis využívá `l1_emit_stub`+`l1_common` jako
+  předpokládáno; okno ale stačilo jen pro PIE exe (ET_EXEC mají pevnou nízkou
+  adresu, závislosti řeší L1), ne „veškerý guest kód". `l1_common` provádí
+  `svc` z textu loaderu, tedy mimo okno i mimo L2 rozsah → ALLOW.
+- **06/08** (mount tabulka, fake root) mají teď JEDNO místo pro L1
+  (`l1_before` → `shim_translate`) i pro L2 (`go_handle` → `go_translate`/
+  `f2_realpath`) — rozšiřovat tam, ne v 52 jmenných hookách. Pozn.: L1 a L2
+  mají oddělené překladače (`shim_translate` vs `go_translate`), takže
+  mount/fakeroot logika se musí dát do obou nebo sjednotit.
 - Přepnutí L1 na default: nejdřív `ELF_LOADER_L1=2` v běžném provozu
   (lx/dw, těžké binárky); úplné odstranění open/stat hooků s
   `shim_resolve_symlinks` předpokládá celorootfs konverzi z promptu 03.

@@ -39,7 +39,9 @@ Knoby: `ELF_LOADER_TIMING`, `ELF_LOADER_NO_CACHE`, `ELF_LOADER_NO_HASH`,
 `ELF_LOADER_HASH_CHECK`, `ELF_LOADER_LAZY`, `ELF_LOADER_IMGCACHE`,
 `ELF_LOADER_NO_RELSYM`, `ELF_LOADER_NO_BIONIC_BRIDGE`, `ELF_LOADER_EXEC_TRACE`,
 `ELF_LOADER_L1` (`=1`/`=2`), `ELF_LOADER_L1_SCAN`, `F2_SKIP=a,b` (denylist
-jmenných hooků), `F2_ONLY` (allowlist).
+jmenných hooků), `F2_ONLY` (allowlist), `ELF_LOADER_L2` (`=1` záchytná síť),
+`ELF_LOADER_L2_LAZY` (líný přepis, default vyp), `ELF_LOADER_GOMODE=0`
+(vypne Go mód; L2 ho nahrazuje).
 
 **Metodika:** pinování CPU mění čísla o desítky % → měřit při stejné CPU
 politice a A/B dělat knobem na téže binárce, ne dvěma buildy.
@@ -98,6 +100,18 @@ fork veneer (vfork-style clone) [#L685].
   ld.so 9), seznam míst v cache (v3, slot `CACHE_NR_L1`). Cena ~1 % na
   `find`, 0,1 % na python importu, RSS +85 KB. Mimo L1: exec, mount,
   bind/connect. `L1=2 all` = 194/0/33 [2026-10-21 (2)].
+- **L2** (prompt 05, `src/l2.h`): seccomp `RET_TRAP` záchytná síť pro kód,
+  který L1 nepřepíše — statické binárky, Go, Bun (raw syscally), JIT. Cestové
+  `svc` z **textu guest exe** TRAPnou, `sigsys_handler`→`go_handle` přeloží.
+  Zobecněný Go mód (`l2_install_range_filter` sdílí Go mód i L2, nastavuje
+  `g_go_lo/hi`). PIE exe se přesune do pevného okna `0x11_0000_0000`
+  (`MAP_FIXED`), aby text-range nekolidoval s ASLR host binárek; ET_EXEC
+  (gh/Bun/static) mají pevnou nízkou adresu. `go_handle` + `getcwd`/`readlinkat`
+  strip → Bun bez `F2_NO_CWD_STRIP`. **Default vypnuto** (`ELF_LOADER_L2=1`;
+  pod ním se místo Go módu instaluje L2). Lazy přepis `svc`→L1 stub
+  (`ELF_LOADER_L2_LAZY=1`, default vyp — není ARM-safe souběžně). `L2=1`
+  dělá statickou glibc i Go viditelnou do rootfs. `all` default 195/0/33
+  [2026-10-21 (3)].
 
 ## Pravidla a pasti (než sáhneš na kód)
 
@@ -136,10 +150,10 @@ fork veneer (vfork-style clone) [#L685].
 
 ## Otevřené bugy
 
-- **Statický glibc ELF v rootfs končí SIGSYS** (RC=159). Není regrese
-  (`elf_loader.prev` padá stejně). `test-all.sh staticexec` to v `all`
-  maskuje jako SKIP. Hypotéza: RAW `execve` (žádný `PT_INTERP`) → dítě bez
-  svc-patchů i SIGSYS handleru → `set_robust_list`/`rseq` je KILLnut.
+- ~~**Statický glibc ELF v rootfs končí SIGSYS** (RC=159)~~ — **vyřešeno pod
+  L2** (prompt 05, 2026-10-21 (3)): `ELF_LOADER_L2=1` dá statické binárce
+  filtr na její text-range, cestové syscally se přeloží a doběhne (RC=0, vidí
+  rootfs). Bez L2 (default) pořád padá — na default přepnout až s L2.
 - **Vlastní `argv[0]` se při exec zahazuje** (`exec -a`, zsh `ARGV0=`, perlí
   `exec {} LIST`) → rozbíjí Claude Code `grep` (re-exec jako `ugrep`).
   Workaround `command grep` [#L3939].
@@ -187,6 +201,7 @@ fork veneer (vfork-style clone) [#L685].
 | `/proc/self/exe`, `eaccess`, pathops, posix_spawn | 2026-10-07 (2)–(7) |
 | relsym + rootfd | 2026-10-21 |
 | L1 — překlad na hranici syscallu | 2026-10-21 (2) |
+| L2 — seccomp záchytná síť (okno, go_handle) | 2026-10-21 (3) |
 | výkon: timing, cache, hash, imgcache, lazy | 2026-10-16, 2026-10-20 |
 | zátěžový test multi-runtime | L3885, L4047 |
 | otevřené nálezy exec/argv | L3939, L3973, L3988, L4029 |

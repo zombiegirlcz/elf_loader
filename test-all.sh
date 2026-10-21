@@ -1509,6 +1509,84 @@ PYEOF
     fi
 }
 
+# L2 (prompt 05): seccomp RET_TRAP zachytna sit. A/B dukaz, ze STATICKA binarka
+# (zadny PT_INTERP, vlastni baked-in libc -> jmenne hooky ani L1 na jeji raw
+# path syscally nedosahnou) vidi rootfs JEN pod ELF_LOADER_L2=1. Navic overi,
+# ze host binarka spustena z guestu pod zdedenym filtrem bezi normalne.
+category_l2() {
+    echo ""
+    echo "=== L2: seccomp zachytna sit pro guest kod mimo L1 (prompt 05) ==="
+    local env="ROOTFS=$R ELF_ROOTFS=$R ELF_LOADER=$L"
+    if [ ! -x "$R/usr/bin/gcc" ]; then
+        echo "SKIP l2: no gcc"
+        echo "SKIP: l2 - no gcc" >> "$SKIP_LOG"
+        ((SKIP_COUNT++)) || true
+        return
+    fi
+    local dir="$R/tmp/l2t.$$"
+    mkdir -p "$dir"
+    # cte /etc/os-release pres RAW syscally staticke libc; tiskne jen druhe pole
+    # PRETTY_NAME (Parrot) pokud se cesta prelozila do rootfs, jinak selze.
+    cat > "$dir/s.c" <<'CEOF'
+#include <stdio.h>
+#include <string.h>
+int main(void){
+    FILE*f=fopen("/etc/os-release","r");
+    if(!f){printf("NOFILE\n");return 1;}
+    char b[256];int hit=0;
+    while(fgets(b,sizeof b,f))if(!strncmp(b,"PRETTY_NAME=",12)){
+        printf("OSREL=%s",b+12);hit=1;break;}
+    fclose(f);
+    if(!hit)printf("NOPRETTY\n");
+    return 0;
+}
+CEOF
+    # build pod loaderem (gcc je guest), -static -no-pie => zadny PT_INTERP.
+    # gcc nevejde do ashell_out (timeout 2) -> vlastni timeout 60, PATH kvuli `ld`.
+    "$R/usr/bin/timeout" 60 "$R/bin/bash" -c \
+        "$env PATH=/usr/bin:/bin $L --ownall $R/usr/bin/gcc -O1 -static -no-pie -o $dir/s ${dir#$R}/s.c" \
+        >/dev/null 2>&1 || true
+    if [ ! -x "$dir/s" ]; then
+        echo "SKIP l2: static build selhal"
+        echo "SKIP: l2 - static build failed" >> "$SKIP_LOG"
+        ((SKIP_COUNT++)) || true
+        rm -rf "$dir"
+        return
+    fi
+    # KLICOVE: samotny test-all.sh bezi uz UVNITR parrot kontextu (viz hlavicka:
+    # ashell -c "$L --ownall $R/bin/bash test-all.sh"), kde /etc == rootfs pro
+    # vsechno -> A/B viditelnosti rootfs by byl maskovany (stejne jako proot
+    # maskuje path bugy, past 5). Vnitrni loader proto pustime pres `ashell -c`,
+    # cimz unikneme na bionic HOST, kde /etc == Android (os-release neexistuje).
+    local ash="$R/usr/local/bin/ashell"
+    if [ ! -x "$ash" ]; then
+        echo "SKIP l2: chybi ashell (nutny pro utek na host)"
+        echo "SKIP: l2 - no ashell" >> "$SKIP_LOG"
+        ((SKIP_COUNT++)) || true
+        rm -rf "$dir" 2>/dev/null || true
+        return
+    fi
+    local on off
+    on=$("$ash" -c "$env ELF_LOADER_L2=1 $L --ownall $dir/s" 2>&1 | grep OSREL= || true)
+    off=$("$ash" -c "$env ELF_LOADER_L2=0 $L --ownall $dir/s" 2>&1 | grep OSREL= || true)
+    rm -rf "$dir" 2>/dev/null || true
+    local on_parrot=0 off_parrot=0
+    # `|| true`: set -euo pipefail by pri neshode grepu shodil cely skript
+    printf '%s' "$on"  | grep -qi "parrot" && on_parrot=1 || true
+    printf '%s' "$off" | grep -qi "parrot" && off_parrot=1 || true
+    # PASS: staticka binarka (raw syscally, mimo L1 i jmenne hooky) vidi rootfs
+    # JEN pod L2; bez L2 na hostu /etc/os-release neexistuje (NOFILE).
+    if [ "$on_parrot" = 1 ] && [ "$off_parrot" = 0 ]; then
+        echo "PASS l2: staticka binarka vidi rootfs jen pod L2 (on=[$on] off=[$off])"
+        echo "PASS: l2 - seccomp zachytna sit" >> "$PASS_LOG"
+        ((PASS_COUNT++)) || true
+    else
+        echo "FAIL l2: on=[$on] off=[$off] (on_parrot=$on_parrot off_parrot=$off_parrot)"
+        echo "FAIL: l2 - on_parrot=$on_parrot off_parrot=$off_parrot | on=[$on] off=[$off]" >> "$FAIL_LOG"
+        ((FAIL_COUNT++)) || true
+    fi
+}
+
 # Line vazani JUMP_SLOT (prompt 10 cast B, ELF_LOADER_LAZY=1). Overuje, ze
 # lazy rezim da IDENTICKY vysledek jako eager u binarek, ktere historicky
 # padaly na IFUNC (ls/dir -> memcpy), u interpretu i u shellu - a ze
@@ -2000,6 +2078,10 @@ case "${1:-all}" in
         category_l1
         print_summary
         ;;
+    l2)
+        category_l2
+        print_summary
+        ;;
     imgcache)
         category_imgcache
         print_summary
@@ -2076,6 +2158,7 @@ case "${1:-all}" in
         category_imgcache
         category_relsym
         category_l1
+        category_l2
         category_lxc
         category_dw
         category_elfrc

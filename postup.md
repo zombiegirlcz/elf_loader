@@ -5256,3 +5256,89 @@ tedy ~20 stránek, ne 62. Na zařízení `ELF_LOADER_L1_SCAN=1` hlásí totéž
   provozu (lx/dw) a po ověření těžkých binárek přepnout default; úplné
   odstranění open/stat hooků s `shim_resolve_symlinks` předpokládá
   celorootfs konverzi z promptu 03 (čeká na potvrzení).
+
+## 2026-10-21 (3) — prompt 05: L2, seccomp RET_TRAP záchytná síť
+
+**Cíl:** přeložit cesty i v kódu, který L1 nepřepíše — statické binárky, Go
+(svc napříč goroutinami), Bun (raw syscally), musl, JIT.
+
+### Mechanika
+
+L2 je **zobecněný Go mód**: Go mód (`elf_go_mode_setup`) už dělal přesně to,
+co L2 potřebuje — stackovaný seccomp filtr, který cestové syscally TRAPne,
+**jen když `instruction_pointer` leží v textu guest exe**, a SIGSYS handler
+(`go_handle`) cestu přeloží. Rozdíl byl jediný: Go mód to dělal jen pro
+Go-detekované binárky. L2 to dělá pro **jakoukoli** guest exe.
+
+- `l2_install_range_filter(lo, hi, tag)` — vyčleněno z `elf_go_mode_setup`
+  (který ho teď taky volá). Nastavuje `g_go_lo/g_go_hi`, takže **stávající
+  `sigsys_handler` obslouží L2 záchyt beze změny** (větev `if (g_go_hi)` →
+  `go_handle`). Filtr keyuje výhradně na IP: handlerův raw syscall běží
+  z textu loaderu (mimo rozsah) → ALLOW (nezacyklí se), a později forknuté
+  **host binárky** (bionic, ASLR 0x5x/0x7x) nemají IP v rozsahu → filtr se
+  jich netkne, i když ho zdědí a nejde odebrat.
+- `go_handle` + **`getcwd(17)`** a **fixup výsledku `readlinkat(78)`** (strip
+  `$ROOTFS`) → **Bun už nepotřebuje hack `F2_NO_CWD_STRIP`**: Bun dělá getcwd
+  raw syscallem (jmenný hook ho nevidí), L2 ho zachytí a výsledek strpne na
+  guest cestu. Pod L2 se `g_f2_cwd_keep_host` drží 0 (strip pro všechny).
+- **Okno `0x11_0000_0000` (4 GiB, `PROT_NONE` rezervace):** PIE guest exe se
+  do něj přesune (`MAP_FIXED` v `map_elf_segments`, flag `g_l2_want_window`
+  jen pro hlavní exe — závislosti řeší L1). Důvod: PIE by jinak dostala ASLR
+  adresu v 0x7x pásmu, kde by její text-range mohl kolidovat s později
+  forknutou host binárkou. Pevné okno (jedno hi32 pásmo 0x11) kolizi vylučuje
+  a filtr vystačí s jedním hi32 compare. **ET_EXEC** (gh, Bun, statické) mají
+  pevnou nízkou adresu mimo ASLR → do okna je netřeba, filtr použije jejich
+  link-time text-range přímo.
+- **Líný přepis** (`ELF_LOADER_L2_LAZY=1`, **default VYP**): po prvním záchytu
+  přepíše místo na L1 stub (`b l1_common`) → další volání bez signálu. Default
+  vyp, protože náhrada `svc`→`b` za běhu **není** v množině instrukcí, které
+  ARM ARM (B2.3.4) dovoluje měnit souběžně s vykonáváním na jiném jádře (tam
+  jen B/BL/BRK/NOP…) → u vícevláknového guestu UNPREDICTABLE. L1 to dělá
+  bezpečně při načtení (před vlákny). Pro jednovláknové/čtecí zátěže je lazy
+  výhra; měřit až A/B.
+
+### Výsledky
+
+- **Kritérium: statická glibc i Go vidí rootfs pod L2.** `osrel` přeložený
+  `-static`, `-static -no-pie` i `-static-pie` (vše ET_EXEC/ET_DYN):
+  `open("/etc/os-release")` vrátí Parrot. **Dřívější otevřený bug „statický
+  glibc ELF končí SIGSYS (RC=159)" je pod L2 vyřešený** — jeho cestové
+  syscally se přeloží a binárka doběhne (RC=0). `gh` (Go) `--version` OK.
+- **Bun (`claude --version`) pod L2 bez `F2_NO_CWD_STRIP`** → 2.1.306, RC=0.
+- **Host binárka z guestu pod zděděným filtrem** (`/system/bin/sh -c …`
+  z guest bash pod L2) běží normálně (HOSTOK) — její ASLR text není v rozsahu.
+- **`test-all.sh l2`** (A/B): statická binárka (raw syscally, mimo L1 i jmenné
+  hooky) vidí rootfs **jen pod L2** (on=Parrot, off=host-NOFILE). A/B se MUSÍ
+  pouštět přes `ashell -c` (útěk na bionic host), protože sám test-all.sh běží
+  uvnitř parrot kontextu, kde `/etc == rootfs` pro všechno → jinak maskováno
+  (stejná past jako proot, past 5).
+- **`test-all.sh all` default (L2 vyp): PASS 195 / FAIL 0 / SKIP 33**
+  (194 baseline + nová `l2`).
+
+### Pasti
+
+1. **A/B viditelnosti rootfs je uvnitř parrot kontextu maskovaný.** test-all.sh
+   běží jako `$L --ownall $R/bin/bash test-all.sh`, kde `/etc == rootfs` pro
+   všechny procesy. Statická binárka proto i bez L2 „vidí Parrot". Platný test
+   pustí vnitřní loader přes `$R/usr/local/bin/ashell -c` → bionic host, kde
+   `/etc == Android` (os-release neexistuje). Absolutní cesta k ashell nutná —
+   bare `ashell` není na PATH harness kontextu.
+2. **`readlinkat` buffer je x2, ne x1** (dirfd, path, BUF, sz) — fixup výsledku
+   stripuje `a[2]`, ne přeloženou cestu.
+3. **`set -euo pipefail` + `grep … && var=1`** bez nálezu shodí skript
+   (`printf | grep -qi parrot && on_parrot=1` → přidat `|| true`). `rm -rf`
+   cizích (app uid) souborů jako root selže na SELinuxu → `|| true`.
+4. **Okno jen pro hlavní exe.** `g_l2_want_window` nulovat hned po
+   `elf_load(path)` — závislosti (libc/ld.so) do okna nepatří (řeší je L1
+   a plýtvaly by oknem i COW).
+
+### Známé limity / další kroky
+
+- **Dispatch statických dětí** (`shim_execve`/`posix_spawn` dnes bionic/
+  statické binárky raw-execují) zatím beze změny: top-level statická binárka
+  se už own-loaduje, takže kritérium #1 drží. Routing dětí přes own-load
+  za `ELF_LOADER_L2_STATIC` je další krok (opt-in).
+- **L2 jako default vypnuté.** Je to záchytná síť: bez lazy přepisu stojí
+  každé cestové volání z textu exe jeden signál. Na default přepnout až
+  s měřeným lazy nebo po ověření, že těžké binárky nedělají path svc v horké
+  smyčce.

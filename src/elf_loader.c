@@ -2532,10 +2532,17 @@ static void *map_elf_segments(int fd, void *file_map, Elf64_Ehdr *ehdr, size_t *
     /* Obrazova cache potrebuje modul na TOTEZ bazi jako pri ulozeni (obraz
      * obsahuje absolutni adresy). MAP_FIXED_NOREPLACE: kdyz je misto obsazene,
      * mmap selze a jde se standardni cestou (obraz se pak zahodi). */
-    if (g_l2_want_window && ehdr->e_type != ET_EXEC) {
+    /* g_l2_want_window je ONE-SHOT: elf_load mapuje nejdriv exe, pak JEJI
+     * zavislosti (libc, ld.so) tymze map_elf_segments. Okno patri JEN exe -
+     * kdyby tam sla i glibc, jeji syscally by (pres zdedeny filtr rodice po
+     * exec) trapovaly na adrese mimo rozsah potomka -> go_handle je nechyti ->
+     * DENIED/ENOSYS (overeno: timeout sigprocmask). Spotrebujeme flag na prvni
+     * map (exe) a nuluju i pro ET_EXEC vetev, aby ho nesebrala prvni zavislost. */
+    int l2_want = g_l2_want_window;
+    g_l2_want_window = 0;
+    if (l2_want && ehdr->e_type != ET_EXEC) {
         /* L2: PIE guest exe do pevneho okna, aby jeho text-range byl v znamem
-         * pasmu (nekoliduje s ASLR host binarek). Jen hlavni exe (flag nuluje
-         * main.c pred nactenim zavislosti); imgcache se pod L2 nepouziva. */
+         * pasmu (nekoliduje s ASLR host binarek). imgcache se pod L2 nepouziva. */
         g_img_pref_base = 0;
         base = l2_window_alloc(total);
         if (base == MAP_FAILED || !base)
