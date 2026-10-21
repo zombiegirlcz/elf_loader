@@ -1483,12 +1483,14 @@ PYEOF
     local skip="F2_SKIP=eaccess,mkdtemp,remove,glob,glob64,nftw,nftw64,ftw,ftw64,__open64_nocancel F2_NO_BTI_HOOK=1"
     local env="ROOTFS=$R ELF_ROOTFS=$R ELF_LOADER=$L $skip"
     local on off
-    on=$("$R/usr/bin/timeout" 25 "$R/bin/bash" -c "$env ELF_LOADER_L1=1 $L --ownall $py $g/t.py $g" 2>&1 | tail -1)
-    off=$("$R/usr/bin/timeout" 25 "$R/bin/bash" -c "$env $L --ownall $py $g/t.py $g" 2>&1 | tail -1)
+    on=$("$R/usr/bin/timeout" 25 "$R/bin/bash" -c "$env ELF_LOADER_L1=1 $L --ownall $py $g/t.py $g" 2>&1 | tail -1 || true)
+    off=$("$R/usr/bin/timeout" 25 "$R/bin/bash" -c "$env $L --ownall $py $g/t.py $g" 2>&1 | tail -1 || true)
     rm -rf "$h"
     local n_on n_off total=8
-    n_on=$(printf '%s' "$on" | grep -oE '=OK' | wc -l)
-    n_off=$(printf '%s' "$off" | grep -oE '=OK' | wc -l)
+    # `|| true`: set -euo pipefail by pri 0 nalezech grepu shodil cely skript
+    n_on=$(printf '%s' "$on" | grep -oE '=OK' | wc -l || true)
+    n_off=$(printf '%s' "$off" | grep -oE '=OK' | wc -l || true)
+    n_on=${n_on//[^0-9]/}; n_off=${n_off//[^0-9]/}
     # kriterium: s L1 vsech 8; bez L1 musi aspon jeden spadnout (A/B dukaz,
     # ze test opravdu meri neco, co bez L1 nefunguje)
     if [ "$n_on" = "$total" ] && [ "$n_off" -lt "$total" ]; then

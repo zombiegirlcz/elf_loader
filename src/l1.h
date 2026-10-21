@@ -157,8 +157,9 @@ void l1_before(unsigned long *frame, long nr) {
     /* symlinkat: absolutni guest cil zapis relativne (invariant rootfs,
      * src/relsym.h) - jako jmenny shim_symlinkat, aby L1 bez jmennych hooku
      * nedelal nic jineho. Hloubku linku umime jen u AT_FDCWD. */
-    if (nr == 36 && used < L1_NPATH &&
-        (long)L1_ARG(frame, 1) == -100 && L1_ARG(frame, 0)) {
+    if (nr == 36 && used < L1_NPATH && (long)L1_ARG(frame, 1) == -100 &&
+        L1_ARG(frame, 0) && L1_ARG(frame, 2) &&
+        ((const char *)L1_ARG(frame, 2))[0] == '/') {  /* jen absolutni: bez bufferu na zasobniku */
         char *out = s->buf[used];
         if (shim_abs_target_to_rel((const char *)L1_ARG(frame, 0),
                                    (const char *)L1_ARG(frame, 2), out, L1_PATHMAX))
@@ -214,10 +215,19 @@ void l1_after(unsigned long *frame, long nr) {
             }
             ret = l1_strip_root_buf(b, ret, 0);
             /* kanonicky relativni cil -> absolutni (jen AT_FDCWD + absolutni
-             * prelozena cesta linku, jinak hloubku nezname) */
-            if (ret > 0 && b[0] != '/' && (long)frame[0] == -100 &&
-                ((const char *)L1_ARG(frame, 1))[0] == '/')
-                ret = shim_readlink_fixup((const char *)L1_ARG(frame, 1), b, cap, ret);
+             * prelozena cesta linku, jinak hloubku nezname). Cil se kvuli NUL
+             * kopiruje do buf[1] DRZENEHO slotu - jmenny shim_readlink_fixup
+             * by si vzal 8 KB zasobniku. */
+            l1_slot_t *s = (l1_slot_t *)frame[21];
+            const char *lp = (const char *)L1_ARG(frame, 1);
+            if (s && ret > 0 && (size_t)ret < L1_PATHMAX && b[0] != '/' &&
+                (long)frame[0] == -100 && lp && lp[0] == '/' && !g_no_relsym) {
+                char *tgt = s->buf[1];
+                shim_memcpy(tgt, b, (size_t)ret);
+                tgt[ret] = 0;
+                if (shim_rel_target_to_abs(tgt, lp, b, cap))
+                    ret = (long)shim_strlen(b);
+            }
             frame[20] = (unsigned long)ret;
         }
     }

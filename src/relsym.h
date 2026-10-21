@@ -69,6 +69,22 @@ static int shim_abs_host_path(const char *p, char *out, size_t n) {
     return 1;
 }
 
+/* Hloubka adresare linku od guest korene; -1 = link neni pod ROOTFS.
+ * Absolutni cestu NEkopiruje (L1 stub to vola na cizim, treba Go 8 KB
+ * zasobniku - viz src/l1.h); buffer na zasobniku potrebuje jen relativni
+ * cesta linku, kterou je treba slozit s cwd. */
+static int shim_link_depth(const char *host_linkpath) {
+    if (!host_linkpath || !host_linkpath[0]) return -1;
+    if (host_linkpath[0] == '/') {
+        const char *g = shim_guest_of(host_linkpath);
+        return g ? shim_guest_dir_depth(g) : -1;
+    }
+    char hp[8192];
+    if (!shim_abs_host_path(host_linkpath, hp, sizeof hp)) return -1;
+    const char *g = shim_guest_of(hp);
+    return g ? shim_guest_dir_depth(g) : -1;
+}
+
 /* Absolutni guest cil -> kanonicky relativni tvar vuci adresari linku.
  * host_linkpath = jiz prelozena (hostova) cesta linku. 1 = out naplneno. */
 static int shim_abs_target_to_rel(const char *target, const char *host_linkpath,
@@ -81,12 +97,8 @@ static int shim_abs_target_to_rel(const char *target, const char *host_linkpath,
     /* cil uz hostove-absolutni pod ROOTFS (proot .l2s) -> nechat */
     if (shim_strncmp(target, g_shim_root, rl) == 0 &&
         (target[rl] == '/' || target[rl] == 0)) return 0;
-    char hp[8192];
-    if (!shim_abs_host_path(host_linkpath, hp, sizeof hp)) return 0;
-    const char *g = shim_guest_of(hp);
-    if (!g) return 0;                      /* link neni pod ROOTFS */
-    int depth = shim_guest_dir_depth(g);
-    if (depth < 0) return 0;
+    int depth = shim_link_depth(host_linkpath);
+    if (depth < 0) return 0;               /* link neni pod ROOTFS */
     const char *rest = target;
     while (*rest == '/') rest++;
     if ((size_t)depth * 3 + shim_strlen(rest) + 2 > n) return 0;
@@ -104,12 +116,8 @@ static int shim_rel_target_to_abs(const char *target, const char *host_linkpath,
                                   char *out, size_t n) {
     if (g_no_relsym) return 0;
     if (!target || !target[0] || target[0] == '/') return 0;
-    char hp[8192];
-    if (!shim_abs_host_path(host_linkpath, hp, sizeof hp)) return 0;
-    const char *g = shim_guest_of(hp);
-    if (!g) return 0;
-    int depth = shim_guest_dir_depth(g);
-    if (depth <= 0) return 0;              /* hloubka 0 -> nelze rozlisit */
+    int depth = shim_link_depth(host_linkpath);
+    if (depth <= 0) return 0;              /* mimo ROOTFS / hloubka 0 -> nelze rozlisit */
     const char *p = target;
     for (int i = 0; i < depth; i++) {
         if (!(p[0] == '.' && p[1] == '.' && (p[2] == '/' || p[2] == 0))) return 0;
