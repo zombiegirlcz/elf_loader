@@ -6028,8 +6028,8 @@ NOSP static int go_handle(long nr, ucontext_t *ctx) {
             return 1;
         }
         case 49:  pa = 0; break;                 /* chdir */
-        case 56: case 79: case 48: case 78: case 291: case 34: case 35:
-        case 53: case 54: case 88: pa = 1; break;
+        case 56: case 79: case 48: case 439: case 78: case 291: case 34: case 35:
+        case 53: case 54: case 88: pa = 1; break;  /* 439=faccessat2 (glibc 2.33+) */
         case 38: case 276: pa = 1; pb = 3; break; /* renameat(2) */
         case 37:  pa = 1; pb = 3; break;         /* linkat */
         case 36:  pa = 2; break;                 /* symlinkat: jen linkpath */
@@ -6128,9 +6128,10 @@ static int l2_install_range_filter(unsigned long lo, unsigned long hi, const cha
                 tag, lo, hi);
         return 0;
     }
-    /* 17=getcwd (fixup vysledku), 49=chdir, 34/35/48/53/54/56/78/79/88/291=path,
+    /* 17=getcwd (fixup vysledku), 49=chdir, 34/35/48/53/54/56/78/79/88/291/439
+     * =path (439=faccessat2, glibc 2.33+ ho pouziva misto 48!),
      * 36=symlinkat, 37=linkat, 38/276=renameat, 221=execve, 135/134=sig. */
-    static const unsigned nrs[] = { 17, 56, 79, 48, 78, 291, 221, 49, 34, 35, 38,
+    static const unsigned nrs[] = { 17, 56, 79, 48, 439, 78, 291, 221, 49, 34, 35, 38,
                                     276, 53, 54, 88, 37, 36, 135 };
     struct sock_filter prog[64];
     size_t n = 0;
