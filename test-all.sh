@@ -1483,8 +1483,12 @@ PYEOF
     local skip="F2_SKIP=eaccess,mkdtemp,remove,glob,glob64,nftw,nftw64,ftw,ftw64,__open64_nocancel F2_NO_BTI_HOOK=1"
     local env="ROOTFS=$R ELF_ROOTFS=$R ELF_LOADER=$L $skip"
     local on off
+    # Strana "bez L1" musi L1 VYNUTIT na 0: sada se da pustit i cela pod
+    # ELF_LOADER_L1=2 a zdedena hodnota by z A/B udelala L1 vs L1. A `f2`
+    # pred kazdym behem znovu - prvni beh ho `remove` smaze.
     on=$("$R/usr/bin/timeout" 25 "$R/bin/bash" -c "$env ELF_LOADER_L1=1 $L --ownall $py $g/t.py $g" 2>&1 | tail -1 || true)
-    off=$("$R/usr/bin/timeout" 25 "$R/bin/bash" -c "$env $L --ownall $py $g/t.py $g" 2>&1 | tail -1 || true)
+    echo x > "$h/f2"
+    off=$("$R/usr/bin/timeout" 25 "$R/bin/bash" -c "$env ELF_LOADER_L1=0 $L --ownall $py $g/t.py $g" 2>&1 | tail -1 || true)
     rm -rf "$h"
     local n_on n_off total=8
     # `|| true`: set -euo pipefail by pri 0 nalezech grepu shodil cely skript

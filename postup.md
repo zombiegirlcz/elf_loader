@@ -5121,3 +5121,138 @@ Kapitola 4.4 (`openat2`/`RESOLVE_IN_ROOT`) na tomhle zařízení nejde — kerne
   **relativní** link kanonického tvaru (`../../usr/bin/gawk`) vrací ELF
   magic. Relativní linky jsou pro proot neutrální, jak kapitola 4
   předpokládá.
+
+---
+
+## 2026-10-21 (2) — prompt 04: L1, překlad cest na hranici syscallu
+
+Zadání: [docs/nextgen/04-L1-prepis-svc.md](docs/nextgen/04-L1-prepis-svc.md),
+teorie kapitola 2.1 studie. Commity `293c32b` (mechanika), `1f107b0`
+(`ELF_LOADER_L1=2`, `F2_SKIP`, test `l1`), `07d2417` (zásobník), `15132cb`
+(cache v3), `8bda690` (rychlá cesta), `1672b73` (RSS). **Default vypnuto**,
+zapíná `ELF_LOADER_L1=1` (L1 vedle jmenných hooků) nebo `=2` (L1 a hooky
+„jen překlad" vypnuté).
+
+### Výchozí data (změřeno na Parrot glibc 2.41)
+
+Data promptu sedí **přesně**: 411 `svc #0`, 401 s konstantním `x8`, 10
+dynamických, 62 stránek. Nové zjištění: **cestových je jen 48** (+10
+dynamických) na **17** stránkách; ld.so 9 míst na 3 stránkách. COW cena je
+tedy ~20 stránek, ne 62. Na zařízení `ELF_LOADER_L1_SCAN=1` hlásí totéž
+(`libc.so.6: 58 míst`, `COW stránek 17`).
+
+### Mechanika
+
+- **Per-site stub** (`src/l1_emit.h`, 9 instrukcí v „ostrově" do ±128 MiB
+  od modulu): uloží `x16/x17/x30`, zavolá `l1_common` přes literál (loader
+  může být libovolně daleko), skončí `b <místo+4>`. `svc` → `b stub`, ne
+  `bl` — syscall wrappery jsou listové a `bl` by rozbil `x30`.
+- **`l1_common`** (`src/l1_common.S`): obnoví **všechny** registry kromě
+  `x0` (x1–x18, NZCV, celé q0–q31 — horní půlky q8–q15 jsou caller-saved).
+  Rámec drží argumenty **dvakrát**: `frame[0..7]` původní (vrací se guestu),
+  `frame[22..29]` pro jádro (jen ty smí `l1_before` přepsat).
+- **`src/l1.h`** (vkládá se do `main.c`, běží pod guest TP): tabulka
+  cestových syscallů (bitmaska argumentů), překlad přes `shim_translate`
+  (idempotentní → L1 běží souběžně s jmennými hooky), fixup výsledku
+  `getcwd` (strip `$ROOTFS`, výjimka Bun `g_cwd_keep_host`) a `readlinkat`
+  (`.l2s` strip, `/proc/self/exe`, relsym). `symlinkat` převádí absolutní
+  cíl na relativní (parita s promptem 03).
+- **Buffery** v mmap tabulce 256 slotů (`MAP_NORESERVE`), vlastník = adresa
+  rámce: žádný `gettid` na každý syscall a signál uprostřed stubu si vezme
+  jiný slot. Pole vlastníků je kompaktní na vlastní stránce a hledá se od
+  nuly → jednovláknový proces používá jediný slot.
+- **Dynamické `x8` jen v `libc.so.6`** (`syscall()`, `__syscall_cancel_arch`,
+  přes kterou jde i `openat`). Jinde dynamické `svc` typicky patří runtime
+  s vlastním zásobníkem (Go `syscall.Syscall` na 8 KB goroutine) → L2.
+- **Vědomě mimo L1:** `execve`/`execveat` (own-load glibc binárek je
+  sémantika nad syscallem — L3), `mount` (ENOSYS), `bind`/`connect`
+  (kopie `sockaddr`, ne přepis ukazatele).
+- **Seznam míst se cachuje** (formát cache v3, slot `CACHE_NR_L1`, strop
+  64 → 4096 míst) včetně negativního výsledku; před patchem se ověří, že
+  na místě je `svc #0`. `mprotect` jednou na stránku, ne 2× na místo.
+- **`ELF_LOADER_L1=2`** neinstaluje 52 jmenných hooků typu „přelož a zavolej
+  originál" (`g_l1_translate_only` v `main.c`). Zůstávají hooky s vlastní
+  sémantikou: open/stat/access/fopen (`shim_resolve_symlinks` — absolutní
+  symlinky, dokud rootfs není převedený promptem 03), exec, dlopen,
+  realpath, readlink/symlink, getcwd, bind/connect, link, glob/nftw/mkdtemp/
+  remove, set*id. Nový obecný knob **`F2_SKIP=a,b`** (denylist, i pro
+  bisect). `shim_resolve_fallback` plní `g_orig_*` i pro vynechané hooky —
+  jiné shimy je volají (`shim_remove` → `unlink`) a NULL = tiché −1.
+
+### Výsledky
+
+- **`test-all.sh l1`** (A/B knobem): `eaccess`, `mkdtemp`, `remove`, `glob`,
+  `nftw`, `scandir`, `ftok`, `tempnam` přes `ctypes` s **vypnutými**
+  příslušnými hooky (`F2_SKIP=…` + `F2_NO_BTI_HOOK=1`): **s L1 8/8, bez L1
+  0/8**.
+- **`test-all.sh all` na finální binárce (`1672b73`): default PASS 194 /
+  FAIL 0 / SKIP 33, `ELF_LOADER_L1=2` taktéž 194 / 0 / 33** (baseline 193
+  + nová kategorie) — žádný rozdíl k vysvětlování. Test `l1` musí na „off"
+  straně nastavit `ELF_LOADER_L1=0` explicitně (jinak pod `L1=2` zdědí L1
+  a A/B nic neměří) a mezi běhy znovu vytvořit `f2` (běh „on" ho smaže).
+- **Smoke pod `ELF_LOADER_L1=2`:** node (čtení guest `/etc`, cwd `/tmp`),
+  git, gcc compile+run, `pwd`, `claude --version` (Bun, 2.1.306; L1
+  patchne ld.so 9 + libc 58 míst z cache) — vše shodné s `L1=0`.
+- **Cena** (prokládaně, mediány, A/B knobem na téže binárce):
+
+  | stav | `/bin/true` | python import | `find /usr` |
+  |---|---|---|---|
+  | bez cache skenu (L1=0 / 1 / 2) | 28,4 / 32,5 / 35,2 ms | 226,7 / 238,8 / 242,9 | 308,5 / 320,4 / 319,3 |
+  | s cache (L1=0 / 1 / 2) | 32,2 / 32,1 / 32,4 | 230,4 / 226,3 / 229,1 | 296,3 / 316,1 / 317,8 |
+  | + rychlá cesta, běh A | 31,6 / 32,2 / 35,4 | 245,9 / 259,8 / 254,9 | 367,8 / 367,1 / 353,7 |
+  | + rychlá cesta, běh B | 31,2 / 33,8 / 30,2 | 240,6 / 251,8 / 247,6 | 353,1 / 360,6 / 378,7 |
+
+  Po cache už mediány nevykazují konzistentní směr a rozptyly se
+  překrývají (python L1=0 225–271 ms vs L1=1 230–263 ms; mezi běhy se
+  absolutní čísla hýbou o 20 %). Proto rozhoduje **mikro-benchmark ×
+  počet volání**: `test/l1_bench.c` (připnuto `taskset 80`, velké jádro)
+  dává stub **+130 ns** na `fstatat(dirfd, "ls")` a **+350 ns** na absolutní
+  cestu (před rychlou cestou +250 / +870 ns). `strace -c`: `find /usr` má
+  jen **27,6 tisíce** cestových syscallů (díky `d_type` nestatuje položky),
+  python import **765**. Horní mez ceny L1: `find` ≈ 3,6 ms (**~1 %**),
+  python ≈ 0,27 ms (**0,1 %**), start s cache ~0 — pod šumem měření.
+- **RSS** (`smaps_rollup`, python3): L1 přidává **+85 KB** `Private_Dirty`
+  (= 20 COW stránek + ostrovy). První verze +320 KB — viz past 6.
+- **Host testy:** `test/l1_test.c` 17/17 (stub skutečně vygeneruje, patchne
+  a spustí), `test/l1_common_test.c` 16/16 včetně **4 negativních kontrol**
+  (rozbitý `l1_common` bez obnovy `x10` / NZCV / `q0`, nebo s `x1` z
+  přeložených argumentů test shodí), `test/l1_logic_test.c` 28/28 (sloty,
+  zanoření, vyčerpání tabulky, strip, fixupy).
+
+### Pasti (všechny chycené před nasazením nebo testem)
+
+1. **Syscall ABI zachovává vše kromě `x0`.** První návrh obnovoval `x1`
+   z rámce, který `l1_before` přepsal → guest by po `open()` měl v `x1`
+   ukazatel do našeho bufferu. Proto dvě kopie argumentů.
+2. **`stp/ldp` párů X registrů má dosah jen −512..504 B** (Q páry 1008) →
+   X nahoře v rámci, Q dole; rozložení ověřeno skriptem (žádný překryv).
+3. **Mock v host testu musí úmyslně ničit** caller-saved registry a NZCV —
+   triviální mock je nechá být a chybějící obnova projde. A testovací místo
+   nesmí po `svc` dělat `cmp`, jinak NZCV přepíše dřív, než ho test přečte
+   (negativní kontrola NZCV napřed opravdu prošla).
+4. **Velké buffery na zásobníku** — `shim_translate` (můj clamp z promptu
+   03, 4 KB) i relsym helpery (`hp[8192]`, `tgt/abs[4096]`) by na Go
+   goroutine z L1 stubu přetekly. Clamp píše přímo do `out`,
+   `shim_link_depth` absolutní cestu nekopíruje, readlinkat fixup používá
+   buffer slotu.
+5. **Loader se staví s `-O0`** (Makefile i `build.yml`) → bajtové smyčky
+   v shimech nejsou zadarmo: `shim_translate` nad 86znakovou cestou ~600 ns.
+   Pomohlo testovat „už pod `$ROOTFS`" **před** skenem `..` a cachovat délku
+   kořene (zrychlí i jmenné hooky). Přechod celého projektu na `-O2` je
+   samostatné rozhodnutí — clang by mohl smyčky `shim_*` převést na volání
+   bionic `memcpy`/`strlen` pod guest TP.
+6. **Start hledání slotu podle adresy rámce** → různá místa volání sahala
+   na různé 8 KB sloty → RSS +320 KB místo +85 KB.
+7. `set -euo pipefail` + `grep` v `$(…)` bez nálezu shodí celý `test-all.sh`;
+   komentář s `exec*/posix_spawn` obsahuje `*/` a ukončí se.
+
+### Známé limity
+
+- **pthread_cancel** vlákna zablokovaného v cestovém syscallu (např. `open`
+  FIFO) se projeví až po návratu: PC během syscallu leží v `l1_common`,
+  ne v okně `__syscall_cancel_arch`, takže ho glibc SIGCANCEL handler
+  nepozná. Bezpečné (žádná korupce), jen odložené.
+- Default zůstává vypnutý. Další krok: používat `ELF_LOADER_L1=2` v běžném
+  provozu (lx/dw) a po ověření těžkých binárek přepnout default; úplné
+  odstranění open/stat hooků s `shim_resolve_symlinks` předpokládá
+  celorootfs konverzi z promptu 03 (čeká na potvrzení).

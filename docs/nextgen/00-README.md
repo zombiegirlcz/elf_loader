@@ -11,7 +11,7 @@ v [proot-nahrada.md](proot-nahrada.md) — prompty odkazují na její kapitoly.
 | 01 | [měření a fázový profil exec](01-mereni-benchmark.md) | 9, 5.1 | – | měření | **hotovo** 2026-10-16 |
 | 02 | [rychlé výhry exec](02-exec-rychle-vyhry.md) | 5.2–5.4 | 01 | implementace | **hotovo** 2026-10-20 |
 | 03 | [relativní symlinky, clamp `..`, rootfd](03-symlinky-a-rootfd.md) | 4.1–4.3 | – | implementace | **hotovo** 2026-10-21 |
-| 04 | [L1 — přepis `svc #0` při načtení](04-L1-prepis-svc.md) | 2.1 | 01 | implementace | – |
+| 04 | [L1 — přepis `svc #0` při načtení](04-L1-prepis-svc.md) | 2.1 | 01 | implementace | **hotovo** 2026-10-21 (default vypnuto) |
 | 05 | [L2 — seccomp TRAP v guest okně](05-L2-sigsys-okno.md) | 2.2 | 04 | implementace | – |
 | 06 | [tabulka mountů + `mount --bind`](06-mount-tabulka.md) | 3.1 | 04 (doporučeno) | implementace | – |
 | 07 | [virtualizace `/proc` + `argv[0]`](07-proc-a-argv0.md) | 3.4, 3.5 | – | implementace | – |
@@ -131,6 +131,32 @@ nástroji (`/system/bin/cat`, `/system/bin/readlink`) — pod loaderem absolutn�
 cíl zachrání `shim_resolve_symlinks`, takže A/B nedokáže nic (první verze
 testu na to FAILovala).
 
+**04 — L1, překlad cest na hranici syscallu.** Hotovo, **default vypnuto**
+(`ELF_LOADER_L1=1` vedle jmenných hooků, `=2` navíc vypne 52 hooků „jen
+překlad"). Cestová `svc #0` v načtených modulech se přepíší na `b` do
+per-site stubu (`src/l1_emit.h`, 9 instrukcí v ostrově do ±128 MiB), jehož
+tělo `src/l1_common.S` obnoví všechny registry kromě `x0` a mezi
+`l1_before` (překlad) a `l1_after` (fixup `getcwd`/`readlinkat`) provede
+syscall sám. Data promptu sedí přesně (411/401/10/62), ale **cestových je
+jen 48** (+10 dynamických) na **17** stránkách — COW ~20 stránek, ne 62.
+
+- `test-all.sh l1`: osm případů, které jmenné hooky historicky minuly
+  (`eaccess`, `mkdtemp`, `remove`, `glob`, `nftw`, `scandir`, `ftok`,
+  `tempnam`), s **vypnutými** hooky: s L1 8/8, bez L1 0/8.
+- `test-all.sh all` na finální binárce: default i `ELF_LOADER_L1=2` = **194/0/33** (baseline + `l1`); smoke node/git/gcc/Bun pod `L1=2` OK.
+- Cena: bez cache skenu +4 ms na každý exec → seznam míst v cache (v3).
+  Po rychlé cestě stub +130 ns (relativní cesta) / +350 ns (absolutní);
+  `find /usr` má jen 27,6k cestových syscallů → ~1 %, python import 765 →
+  0,1 %, pod šumem. RSS +85 KB.
+- Vědomě mimo L1: exec (own-load je sémantika nad syscallem), `mount`,
+  `bind`/`connect`; dynamické `x8` jen v libc (Go stacky patří L2).
+
+**Pasti z promptu 04:** syscall ABI zachovává i `x1..x7` (guestu se vrací
+původní argumenty, ne přeložené); `stp/ldp` X párů má dosah 504 B; mock
+v host testu asm musí registry a NZCV úmyslně ničit, jinak negativní
+kontrola projde; žádné velké buffery na zásobníku v cestě z L1 stubu;
+loader je `-O0`, takže „už pod `$ROOTFS`" testovat před skenem `..`.
+
 ### Co z toho plyne pro další prompty
 
 - **11 (soft exec / zygote)** je teď jediná cesta, jak jít pod ~15 ms —
@@ -138,7 +164,16 @@ testu na to FAILovala).
   samotného `execve`.
 - Prompt 10 je **uzavřený**, ne „k dodělání": jeho vstupní podmínka
   („relokace/lookupy jsou pořád velký podíl exec") po promptu 02 nedrží.
-- Pro 04–09 se nic nemění, jsou na měření nezávislé.
+- **05 (L2)** může přímo použít generátor stubů z L1: „líný přepis" místa po
+  prvním SIGSYS = `l1_emit_stub` + `b stub` jako při načtení. `l1_common`
+  provádí `svc` z textu loaderu, tedy mimo budoucí guest okno.
+- **06/08** (mount tabulka, fake root) mají v L1 jedno místo, kde se cesta
+  rozhoduje (`l1_before` → `shim_translate`) — rozšiřovat tam, ne v 52
+  jmenných hookách.
+- Přepnutí L1 na default: nejdřív `ELF_LOADER_L1=2` v běžném provozu
+  (lx/dw, těžké binárky); úplné odstranění open/stat hooků s
+  `shim_resolve_symlinks` předpokládá celorootfs konverzi z promptu 03.
+- Pro 06–09 se jinak nic nemění, jsou na měření nezávislé.
 - **rootfd se k ničemu nevrací, dokud nebude exec pod ~1 ms** — stejný závěr
   jako u kandidáta 3 promptu 02. Měřit vždy *kolik* takových volání cíl má,
   ne jen cenu jednoho.

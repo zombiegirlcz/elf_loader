@@ -16,6 +16,9 @@ pouštět distro nástroje přímo v appce bez NDK rebuildu.
 
 gcc 14.2 v prootu, `as` symlink fix [#L8]. Testy: `make test`, `--ownall`
 [#L15]. Ověřené runtime hodnoty (GOT/TLS/arena) [#L76].
+Nasazený loader je NDK clang build **s `-O0`** (Makefile i `build.yml`) —
+bajtové smyčky v shimech nejsou zadarmo. Host unit testy (bez zařízení):
+`test/{cache,relsym,l1,l1_common,l1_logic}_test.c`, build v hlavičce souboru.
 
 ## Výkon — co má a nemá smysl řešit
 
@@ -34,7 +37,9 @@ bez nového měření.
 
 Knoby: `ELF_LOADER_TIMING`, `ELF_LOADER_NO_CACHE`, `ELF_LOADER_NO_HASH`,
 `ELF_LOADER_HASH_CHECK`, `ELF_LOADER_LAZY`, `ELF_LOADER_IMGCACHE`,
-`ELF_LOADER_NO_RELSYM`, `ELF_LOADER_NO_BIONIC_BRIDGE`, `ELF_LOADER_EXEC_TRACE`.
+`ELF_LOADER_NO_RELSYM`, `ELF_LOADER_NO_BIONIC_BRIDGE`, `ELF_LOADER_EXEC_TRACE`,
+`ELF_LOADER_L1` (`=1`/`=2`), `ELF_LOADER_L1_SCAN`, `F2_SKIP=a,b` (denylist
+jmenných hooků), `F2_ONLY` (allowlist).
 
 **Metodika:** pinování CPU mění čísla o desítky % → měřit při stejné CPU
 politice a A/B dělat knobem na téže binárce, ne dvěma buildy.
@@ -81,6 +86,19 @@ App seccomp (kernel 4.14): `clone3` SIGSYS, `close_range`… →
 `install_legacy_syscall_filter()` (RET_ERRNO ENOSYS pro 435/436/437/439),
 fork veneer (vfork-style clone) [#L685].
 
+## Překlad cest — vrstvy
+
+- **L3 jmenné hooky** (`g_f2_hooks`, GOT override + inline/BTI hooky) —
+  default, plné pokrytí sémantiky (exec/own-load, symlinky, getcwd, Bun).
+- **L1** (prompt 04, `src/l1.h`, `src/l1_emit.h`, `src/l1_common.S`):
+  cestová `svc #0` v načtených modulech → `b` do per-site stubu, překlad na
+  hranici syscallu. **Default vypnuto.** `ELF_LOADER_L1=1` = L1 vedle hooků,
+  `=2` = navíc vypne 52 hooků „jen překlad" (`g_l1_translate_only`).
+  Patchuje jen cestová čísla (libc 48 + 10 dynamických `x8` na 17 stránkách,
+  ld.so 9), seznam míst v cache (v3, slot `CACHE_NR_L1`). Cena ~1 % na
+  `find`, 0,1 % na python importu, RSS +85 KB. Mimo L1: exec, mount,
+  bind/connect. `L1=2 all` = 194/0/33 [2026-10-21 (2)].
+
 ## Pravidla a pasti (než sáhneš na kód)
 
 1. **Guest TP vs bionický TLS.** Kód, který běží pod guest (parrot) TP, nesmí
@@ -109,6 +127,12 @@ fork veneer (vfork-style clone) [#L685].
    musí měřit HOST nástroji, jinak ho shim zachrání a A/B nic neprokáže.
 8. **Hardlinky (`link`) zakazuje SELinux app domény** i nativně — platformní
    limit.
+9. **Kód volaný z L1 stubu** (`l1_before/after`, `shim_translate`, relsym)
+   běží pod guest TP **na cizím zásobníku** (Go goroutine 8 KB) → žádné
+   velké buffery na stacku (použít slot). Syscall ABI zachovává **všechny**
+   registry kromě `x0` — i `x1..x7` se guestu vrací původní, ne přeložené.
+   `stp/ldp` X párů má dosah jen 504 B. Host test asm musí mít mock, který
+   caller-saved registry a NZCV úmyslně ničí (jinak negativní kontrola projde).
 
 ## Otevřené bugy
 
@@ -128,6 +152,9 @@ fork veneer (vfork-style clone) [#L685].
   find crate for std`. Root cause neizolován. Workaround
   `--sysroot $R/root/.rustup/toolchains/stable-aarch64-unknown-linux-gnu`
   [#L3988].
+- **L1: `pthread_cancel` vlákna blokovaného v cestovém syscallu** se projeví
+  až po návratu (PC je v `l1_common`, ne v okně `__syscall_cancel_arch`).
+  Bezpečné, jen odložené. Default L1 zatím vypnutý.
 - **Celorootfs konverze absolutních symlinků čeká na potvrzení** (1093 linků,
   1081 převoditelných) — `tools/relsymlinks.sh --dry-run`.
 - Test na reálném 16K Android 15+ (Task 3). `nmap` není v rootfs [#L680];
@@ -159,6 +186,7 @@ fork veneer (vfork-style clone) [#L685].
 | Bun, long argv, bionic bridge | L2273 + 2026-10-06 (7), 2026-10-12 |
 | `/proc/self/exe`, `eaccess`, pathops, posix_spawn | 2026-10-07 (2)–(7) |
 | relsym + rootfd | 2026-10-21 |
+| L1 — překlad na hranici syscallu | 2026-10-21 (2) |
 | výkon: timing, cache, hash, imgcache, lazy | 2026-10-16, 2026-10-20 |
 | zátěžový test multi-runtime | L3885, L4047 |
 | otevřené nálezy exec/argv | L3939, L3973, L3988, L4029 |
