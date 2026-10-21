@@ -5312,8 +5312,24 @@ Go-detekované binárky. L2 to dělá pro **jakoukoli** guest exe.
   pouštět přes `ashell -c` (útěk na bionic host), protože sám test-all.sh běží
   uvnitř parrot kontextu, kde `/etc == rootfs` pro všechno → jinak maskováno
   (stejná past jako proot, past 5).
-- **`test-all.sh all` default (L2 vyp): PASS 195 / FAIL 0 / SKIP 33**
-  (194 baseline + nová `l2`).
+- **`test-all.sh all`: default (L2 vyp) i `ELF_LOADER_L2=1` = PASS 195 /
+  FAIL 0 / SKIP 33** (194 baseline + nová `l2`) — žádná regrese ani s L2
+  globálně zapnutým. `test-all.sh bionic` pod `ELF_LOADER_L2=1`:
+  bridge (libz, vkEnumerateInstanceVersion) PASS — host driver běží mimo
+  guest rozsah, otevírá host cesty (kritérium #4).
+- **Cena záchytu** (50 000× `stat("/etc/hostname")` ze statické binárky,
+  `taskset 80`): L2=0 ~102 ms, L2=1 (trap každý) ~974 ms → **~17 µs/záchyt**
+  (SIGSYS round-trip + překlad + raw syscall). S `ELF_LOADER_L2_LAZY=1`
+  ~24 ms = po prvním záchytu se místo přepíše na L1 stub → ~0,5 µs/volání
+  (~40× rychleji než trap). **Záchyt je drahý → L2 je záchytná síť, ne pro
+  horký path syscall**; lazy ho amortizuje na cenu L1 (ale není souběžně
+  ARM-safe, proto opt-in).
+- **`faccessat2` (439):** glibc 2.33+ volá 439 místo 48; bez něj se
+  `access()` z guest textu netrapoval → šel raw na host cestu. Doplněno do
+  filtru i `go_handle` (L1 ho v `l1_path_args` měl). L2 pokrývá běžné path
+  nr (open/stat/access/getcwd/readlink/rename/link/symlink/chdir); vzácné
+  (xattr, statfs, truncate, chroot, inotify, mknod) zůstávají na L1/jmenných
+  hookách — dá se doplnit.
 
 ### Pasti
 

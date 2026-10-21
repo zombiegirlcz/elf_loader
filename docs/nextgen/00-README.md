@@ -176,10 +176,17 @@ binárek; ET_EXEC (gh/Bun/static) mají pevnou nízkou adresu.
   běží normálně (ASLR text mimo rozsah).
 - `test-all.sh l2`: statická binárka vidí rootfs **jen pod L2** (A/B přes
   `ashell -c`, útěk na host — harness běží uvnitř parrot kontextu, jinak
-  maskováno). `all` default **195/0/33** (baseline + `l2`).
+  maskováno). `all` default i `ELF_LOADER_L2=1` **195/0/33** (bez regrese).
+- `test-all.sh bionic` pod L2: bridge PASS (host driver mimo guest rozsah).
+- **Cena záchytu ~17 µs** (SIGSYS round-trip; 50k× stat: L2=0 ~102 ms vs
+  L2=1 ~974 ms). `ELF_LOADER_L2_LAZY=1` → ~24 ms (po 1. záchytu L1 stub,
+  ~40× rychleji). Záchyt je drahý → L2 je síť, ne pro horký path syscall.
 - Líný přepis `svc`→L1 stub (`ELF_LOADER_L2_LAZY=1`, default vyp): náhrada za
   běhu není ARM-safe souběžně s vykonáváním na jiném jádře; L1 ho dělá
   bezpečně při načtení.
+- Pokrytá path čísla jsou běžná sada (open/stat/access vč. faccessat2 439/
+  getcwd/readlink/rename/link/symlink/chdir); vzácná (xattr, statfs, chroot…)
+  zůstávají na L1/jmenných hookách.
 
 ### Co z toho plyne pro další prompty
 
