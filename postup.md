@@ -4981,3 +4981,143 @@ Parrot `libc`/`ld.so` jsou `-z now`, takže si eager vynutí samy, a po
 Co se změnilo proti (4): **cesta je funkčně hotová a bezpečná** — plná sada
 s oběma částmi dává 192/0/33. Zapnutí přes `ELF_LOADER_LAZY=1` je tedy
 podporované; default vypnutý je volba podle měření, ne kvůli pádu.
+
+---
+
+## 2026-10-21 — prompt 03: absolutní symlinky → relativní, clamp `..`, rootfd
+
+Zadání: [docs/nextgen/03-symlinky-a-rootfd.md](docs/nextgen/03-symlinky-a-rootfd.md),
+teorie kapitola 4 studie. Commit `2af1bf5` (úkoly 1–4), rootfd (úkol 5)
+**zamítnut měřením** — viz níže.
+
+### Problém
+
+Jádro vyhodnocuje absolutní symlink uvnitř `$ROOTFS` proti **host** kořeni:
+`/etc/alternatives/awk -> /usr/bin/mawk` tedy mimo chroot míří na host
+`/usr/bin/mawk`, který neexistuje. Loader to dosud řešil jen za běhu
+(`shim_resolve_symlinks` v open/stat/exec shimech) — tedy za cenu readlinku
+na každou komponentu, a jen tam, kam shim dosáhne.
+
+### Řešení: invariant „v rootfs jsou takové linky relativní"
+
+Absolutní cíl přepsaný na **kanonický relativní tvar** (přesně hloubka ×
+`../` + cesta od guest kořene) vyhodnotí jádro uvnitř rootfs samo a správně,
+**za nulovou cenu za běhu**. Nová `src/relsym.h` (vkládá se přímo do
+`main.c` nad `shim_translate`, protože běží pod guest TP a používá jeho
+TLS-safe primitiva):
+
+- `shim_abs_target_to_rel()` — absolutní guest cíl → `../../usr/bin/mawk`.
+  Host mountpointy (`shim_excluded`: `/system`, `/data`, `/proc`…) a cíle už
+  hostově-absolutní pod `$ROOTFS` (proot `.l2s`) zůstávají absolutní.
+- `shim_rel_target_to_abs()` — zpětný převod pro `readlink`, protože
+  `update-alternatives` cíle **porovnává**. Riziko heuristiky (vědomé):
+  skutečný relativní link přesně tohoto tvaru se ohlásí jako absolutní —
+  uvnitř kořene je to sémanticky totéž.
+- `shim_clamp_dotdot()` — `/..` je v chrootu `/`, ale přeložená cesta by
+  utekla nad `$ROOTFS` do `…/distro`. **Odstraňujeme jen ty `..` komponenty,
+  které by utekly**, ostatní necháváme jádru; plná lexikální normalizace by
+  měnila význam tam, kde je v cestě symlink (`/a/symlink/../b`).
+- `shim_symlink`/`shim_symlinkat` zapisují absolutní cíl rovnou relativně
+  (dpkg, `update-alternatives`, `ln -s /x`). Hloubku linku umíme určit jen
+  u `AT_FDCWD` (u jiného `dirfd` cíl necháváme, jak byl); u relativní cesty
+  linku ji bereme z raw `getcwd` (SYS_getcwd, TLS-safe).
+- `shim_readlink`/`shim_readlinkat` → `shim_readlink_fixup()`. Výjimka
+  `/proc/self/exe` zůstala nedotčená.
+- Knoby: `ELF_LOADER_NO_RELSYM=1`, `ELF_LOADER_NO_DOTDOT_CLAMP=1`.
+
+### `tools/relsymlinks.sh` — jednorázová konverze rootfs
+
+`--dry-run`, `--check`, `--revert <žurnál>`; žurnál je TSV
+`link<TAB>původní cíl<TAB>nový cíl`, takže revert je přesný. Přeskakuje
+`/proc`, `/sys`, `/dev` a host mountpointy uvnitř rootfs (stejný seznam jako
+`shim_excluded`).
+
+**Past ve výkonu:** první verze volala `readlink` na každý symlink =
+fork+exec na desítky tisíc linků → běh **nedokončil ani za 20 minut** pod
+loaderem. Nové čtení přes `find -printf '%p\t%l\n'` zvládne celý rootfs za
+**8 min 45 s** bez jediného forku. Důsledek: `find -printf` je GNU rozšíření,
+host toybox ho nemá → nástroj patří spouštět **v guestu** (proto umí
+`--root /`, tedy běh uvnitř rootfs, kde rootfs už *je* kořen).
+
+**Stav rootfs (`--check`, 2026-10-21):** 1093 absolutních symlinků, z toho
+**1081 převoditelných**, 12 s host cílem (zůstanou absolutní), 0 pod-rootfs.
+**Celorootfs konverze zatím NEPROBĚHLA** — hromadná změna symlinků v živém
+sdíleném rootfs je zásah, který patří potvrdit (pravidlo „`$ROOTFS` není
+izolované testovací prostředí"). Příkaz je:
+
+```
+bash tools/relsymlinks.sh --root / --log /root/relsymlinks-$(date +%F).tsv
+```
+
+Ověřeno proto na **reálných datech v izolované kopii**: `cp -a
+/etc/alternatives` (169 absolutních linků) → konverze 169/169 → čtení přes
+link skončí **uvnitř** kopie (`cat awk` dá obsah cílového souboru v kopii,
+ne živého `/usr/bin/gawk`) → `--revert` vrátí všech 169 původních cílů.
+Invariant mezitím drží shim i bez konverze: `readlink /etc/alternatives/awk`,
+`update-alternatives --display awk`, `awk 'BEGIN{print 6*7}'` = 42,
+`dpkg -L mawk` — vše OK pod loaderem na dnešním (nekonvertovaném) rootfs.
+
+### Úkol 5 (rootfd) — ZAMÍTNUT měřením
+
+Kapitola 4.3 navrhuje držet `O_PATH` fd na `$ROOTFS` a volat
+`*at(rootfd, "usr/lib/…")` místo skládání 8-komponentového prefixu.
+Měření (`test/rootfd_bench.c`, raw `syscall()` mimo shimy, 20 000 iterací,
+5 kol, zařízení):
+
+| varianta | ns / `newfstatat` |
+|---|---|
+| `AT_FDCWD` + plná host cesta (86 B) | **2626** |
+| `rootfd` + guest-relativní cesta (35 B) | **1246** |
+
+Per-syscall zisk je tedy reálný: **−1,38 µs (−52,5 %)**. End-to-end ale
+nemá kam se projevit:
+
+- `python3 -c pass` dělá (strace) **258** path syscallů s plnou cestou
+  → 258 × 1,38 µs = **0,36 ms** z ~17 ms interního totalu = **2 %**, pod
+  šumem (rozptyl exec je ±30 %).
+- Zátěže, které by vydělaly nejvíc (procházení adresářů), **už relativní
+  cesty s `dirfd` používají samy**: `find /usr/share/doc -maxdepth 2` má
+  **3088** path syscallů s `dirfd` proti **36** s `AT_FDCWD`. `fts` otevře
+  adresář a dál jmenuje jen komponenty — žádný prefix se neskládá, takže
+  rootfd tam nemá co ušetřit. (To zároveň vysvětluje, proč je loader na
+  `find /usr` 25× rychlejší než proot a proč dá 3,3 µs na položku.)
+
+Studie v 4.3 předpokládala „import v pythonu dělá tisíce statů"; měření
+říká 258. **Vrátit se k tomu, až bude exec pod ~1 ms** — stejný závěr jako
+u kandidáta 3 promptu 02.
+
+Kapitola 4.4 (`openat2`/`RESOLVE_IN_ROOT`) na tomhle zařízení nejde — kernel
+4.14.
+
+### Testy
+
+- **Host unit test** `test/relsym_test.c` (33 checků, bez zařízení):
+  `cc -Wall -Iinclude -Isrc test/relsym_test.c -o /tmp/rt` → ALL PASS.
+  Pokrývá hloubky 0/1/2, cíl = kořen, host cíle, `.l2s` cíle, relativní
+  linkpath přes `getcwd`, round-trip, ne-kanonické tvary (méně/více `..`
+  než hloubka → nechat) a oba knoby.
+- **A/B na zařízení** `test-all.sh relsym`. Důležité: „co je skutečně na
+  disku" a „zvládne to jádro samo" se **musí** měřit HOST nástroji
+  (`/system/bin/readlink`, `/system/bin/cat`) — pod loaderem by absolutní
+  cíl zachránil `shim_resolve_symlinks` a A/B by nedokázalo nic. První verze
+  testu právě na tohle FAILovala (`[A/B: absolutní link četl přes HOST
+  kořen a přesto uspěl]`), což byl bug testu, ne loaderu. A/B důkaz:
+
+  | link vytvořený | `/system/bin/readlink` | `/system/bin/cat` (bez loaderu) |
+  |---|---|---|
+  | nový (default) | `../../../../tmp/…/target.txt` | `marker` |
+  | starý (`ELF_LOADER_NO_RELSYM=1`) | `/tmp/…/target.txt` | ENOENT |
+
+  Dále: `readlink` pod loaderem vrátí absolutní tvar, host cíl
+  (`/system/bin/sh`) zůstane absolutní, a clamp `cat /../..<guest cesta>`
+  projde jen bez `ELF_LOADER_NO_DOTDOT_CLAMP=1`.
+
+- **Plná sada po změně:** `test-all.sh all` (`ashell -c`, odpinované CPU)
+  **PASS 193 / FAIL 0 / SKIP 33** — baseline byla 192/0/33, přírůstek je
+  právě nová kategorie `relsym`, žádná regrese.
+- **Neutralita pro proot ověřena** (prostředí agenta *je* proot fakeroot,
+  uid 0): `awk 'BEGIN{print 6*7}'` = 42, `update-alternatives --display awk`,
+  `python3 -c 'import numpy, ssl'` = import OK, a čtení přes ručně vytvořený
+  **relativní** link kanonického tvaru (`../../usr/bin/gawk`) vrací ELF
+  magic. Relativní linky jsou pro proot neutrální, jak kapitola 4
+  předpokládá.

@@ -54,8 +54,13 @@ if [ "$MODE" = revert ]; then
 fi
 
 [ -n "$ROOT" ] || { echo "chybi --root (nebo \$ROOTFS/\$R)" >&2; exit 2; }
+# ROOT drzime BEZ koncoveho lomitka; "/" (beh uvnitr rootfs - v prootu nebo
+# pod loaderem, kde uz JE rootfs korenem) tak znamena prazdny prefix.
+# POZOR: `find -printf` je GNU; host toybox ho nema, takze nastroj patri
+# spoustet v guestu (tam je rootfs bud "/" nebo plna cesta).
 ROOT=${ROOT%/}
-[ -d "$ROOT" ] || { echo "rootfs neexistuje: $ROOT" >&2; exit 2; }
+FIND_ROOT=${ROOT:-/}
+[ -d "$FIND_ROOT" ] || { echo "rootfs neexistuje: $FIND_ROOT" >&2; exit 2; }
 
 if [ "$MODE" = convert ] && [ -z "$LOG" ]; then
     LOG="${LX_LOG:-/tmp}/relsymlinks-$(date +%Y%m%d_%H%M%S).tsv"
@@ -79,21 +84,26 @@ is_host_target() {
 PRUNE=(proc sys dev data system apex vendor linkerconfig storage sdcard)
 find_args=()
 for d in "${PRUNE[@]}"; do
-    find_args+=(-path "$ROOT/$d" -prune -o)
+    find_args+=(-path "${ROOT}/$d" -prune -o)
 done
 
 converted=0; skipped_host=0; skipped_rootfs=0; total_abs=0
 [ "$MODE" = convert ] && : > "$LOG"
 
-while IFS= read -r -d '' link; do
-    target=$(readlink "$link") || continue
+# Cteni pres `find -printf '%p\t%l'`: vypise link i jeho cil bez forku.
+# (Puvodni `readlink` na kazdy link znamenal fork+exec na desitky tisic
+# symlinku = desitky minut pod loaderem.)
+while IFS=$'\t' read -r link target; do
+    [ -n "${link:-}" ] || continue
     case "$target" in /*) ;; *) continue ;; esac   # relativni = uz hotovo
     total_abs=$((total_abs + 1))
 
     # cil uz hostove-absolutni pod rootfs (napr. proot link2symlink .l2s)
-    case "$target" in
-        "$ROOT"/*|"$ROOT") skipped_rootfs=$((skipped_rootfs + 1)); continue ;;
-    esac
+    if [ -n "$ROOT" ]; then
+        case "$target" in
+            "$ROOT"/*|"$ROOT") skipped_rootfs=$((skipped_rootfs + 1)); continue ;;
+        esac
+    fi
     if is_host_target "$target"; then
         skipped_host=$((skipped_host + 1))
         continue
@@ -115,7 +125,8 @@ while IFS= read -r -d '' link; do
     [ -n "$rel" ] || rel="."
 
     case "$MODE" in
-        dry|check) say "$guest: $target -> $rel" ;;
+        check) ;;                      # --check jen pocita, nevypisuje
+        dry) say "$guest: $target -> $rel" ;;
         convert)
             ln -sfn "$rel" "$link"
             printf '%s\t%s\t%s\n' "$link" "$target" "$rel" >> "$LOG"
@@ -123,8 +134,10 @@ while IFS= read -r -d '' link; do
             ;;
     esac
     converted=$((converted + 1))
-done < <(find "$ROOT" "${find_args[@]}" -type l -print0 2>/dev/null)
+done < <(find "$FIND_ROOT" "${find_args[@]}" -type l -printf '%p\t%l\n' 2>/dev/null)
 
+# souhrn se tiskne vzdy (i s --quiet)
+say() { printf '%s\n' "$*"; }
 case "$MODE" in
     check) say "absolutnich linku: $total_abs (prevoditelnych $converted, host cilu $skipped_host, pod-rootfs cilu $skipped_rootfs)" ;;
     dry)   say "--dry-run: prevedlo by se $converted z $total_abs absolutnich (host cilu $skipped_host, pod-rootfs cilu $skipped_rootfs)" ;;

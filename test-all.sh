@@ -1375,11 +1375,15 @@ category_relsym() {
     mkdir -p "$h/d1/d2"
     echo marker > "$h/target.txt"
 
-    # 1) `ln -s` s absolutnim guest cilem musi na disk zapsat RELATIVNE.
-    #    "Co je v rootfs" cteme s vypnutym fixupem readlinku (NO_RELSYM).
+    # Pozn.: "co je skutecne na disku" a "zvladne to jadro samo" se MUSI merit
+    # HOST nastroji (/system/bin/readlink, /system/bin/cat) - pod loaderem by
+    # absolutni cil zachranil shim_resolve_symlinks, takze by A/B nic nedokazal.
+    local HR=/system/bin/readlink HC=/system/bin/cat
+
+    # 1) `ln -s` s absolutnim guest cilem musi na disk zapsat RELATIVNE
     ashell_out "$env $L --ownall $R/bin/bash -c '/bin/ln -sfn $g/target.txt $g/d1/d2/link'" >/dev/null 2>&1
     local raw fixed
-    raw=$(ashell_out "$env ELF_LOADER_NO_RELSYM=1 $L --ownall $R/bin/readlink $g/d1/d2/link" 2>&1)
+    raw=$("$HR" "$h/d1/d2/link" 2>&1 || true)
     fixed=$(ashell_out "$env $L --ownall $R/bin/readlink $g/d1/d2/link" 2>&1)
     case "$raw" in
         ../*) ;;
@@ -1388,24 +1392,24 @@ category_relsym() {
     # 2) readlink pod loaderem hlasi kanonicky relativni cil zpet absolutne
     [ "$fixed" = "$g/target.txt" ] || { ok=0; detail="$detail [readlink nevratil '$g/target.txt' ale '$fixed']"; }
 
-    # 3) stat/cteni pres link funguje BEZ exec shimu (resi ho jadro)
+    # 3) cteni pres link zvladne JADRO SAMO (host cat, zadny loader ani shim)
     local via
-    via=$(ashell_out "$env $L --ownall $R/bin/cat $g/d1/d2/link" 2>&1)
-    [ "$via" = marker ] || { ok=0; detail="$detail [cteni pres link: '$via']"; }
+    via=$("$HC" "$h/d1/d2/link" 2>&1 || true)
+    [ "$via" = marker ] || { ok=0; detail="$detail [host cat pres link: '$via']"; }
 
-    # 4) stara verze (NO_RELSYM pri zapisu) ulozi absolutni cil, ktery jadro
-    #    vyhodnoti proti HOST koreni -> cteni pres link selze = A/B dukaz
+    # 4) A/B: stara verze (NO_RELSYM pri zapisu) ulozi absolutni cil, ktery
+    #    jadro vyhodnoti proti HOST koreni -> host cat selze
     ashell_out "$env ELF_LOADER_NO_RELSYM=1 $L --ownall $R/bin/bash -c '/bin/ln -sfn $g/target.txt $g/d1/d2/old'" >/dev/null 2>&1
     local oldraw oldvia
-    oldraw=$(ashell_out "$env ELF_LOADER_NO_RELSYM=1 $L --ownall $R/bin/readlink $g/d1/d2/old" 2>&1)
-    oldvia=$(ashell_out "$env ELF_LOADER_NO_RELSYM=1 $L --ownall $R/bin/cat $g/d1/d2/old" 2>&1)
+    oldraw=$("$HR" "$h/d1/d2/old" 2>&1 || true)
+    oldvia=$("$HC" "$h/d1/d2/old" 2>&1 || true)
     [ "$oldraw" = "$g/target.txt" ] || { ok=0; detail="$detail [A/B: stara verze nezapsala absolutni cil: '$oldraw']"; }
-    [ "$oldvia" = marker ] && { ok=0; detail="$detail [A/B: absolutni link cetl pres HOST koren a presto uspel]"; }
+    [ "$oldvia" = marker ] && { ok=0; detail="$detail [A/B: absolutni link precetlo i jadro samo]"; }
 
     # 5) host cil (/system) musi zustat absolutni
     ashell_out "$env $L --ownall $R/bin/bash -c '/bin/ln -sfn /system/bin/sh $g/hostlink'" >/dev/null 2>&1
     local hl
-    hl=$(ashell_out "$env ELF_LOADER_NO_RELSYM=1 $L --ownall $R/bin/readlink $g/hostlink" 2>&1)
+    hl=$("$HR" "$h/hostlink" 2>&1 || true)
     [ "$hl" = "/system/bin/sh" ] || { ok=0; detail="$detail [host cil nezustal absolutni: '$hl']"; }
 
     # 6) clamp "..": v chrootu je /.. == /, prelozena cesta by utekla nad ROOTFS

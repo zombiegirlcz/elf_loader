@@ -140,6 +140,33 @@ Android appce — bez nutnosti je kompilovat pro bionic/NDK.
   [postup.md#L662](postup.md#L662).
 - **Rootfs absolutní symlinky nefungují mimo chroot** (např.
   `libblas.so.3 -> /etc/alternatives/…`) — [postup.md#L674](postup.md#L674).
+- **Absolutní symlinky → kanonicky relativní + clamp `..` (2026-10-21,
+  prompt 03, commit `2af1bf5`):** jádro vyhodnocuje absolutní link uvnitř
+  `$ROOTFS` proti HOST kořeni; dosud to řešil jen shim za běhu. Nově držíme
+  invariant „v rootfs jsou takové linky relativní v kanonickém tvaru"
+  (hloubka × `../` + cesta od kořene) — jádro je pak vyhodnotí samo, **za
+  nulovou cenu za běhu**. `src/relsym.h` (vkládá se do `main.c`, běží pod
+  guest TP): `shim_abs_target_to_rel` (zápis — `shim_symlink`/`symlinkat`;
+  host mountpointy a `.l2s` cíle zůstávají absolutní), `shim_rel_target_to_abs`
+  (čtení — `readlink` hlásí kanonický tvar zpět absolutně, protože
+  `update-alternatives` cíle porovnává), `shim_clamp_dotdot` (odstraní **jen**
+  ty `..`, které by utekly nad kořen; plná lexikální normalizace by měnila
+  význam u `/a/symlink/../b`). Knoby `ELF_LOADER_NO_RELSYM=1`,
+  `ELF_LOADER_NO_DOTDOT_CLAMP=1`. Konverze rootfs `tools/relsymlinks.sh`
+  (`--dry-run`/`--check`/`--revert`, žurnál TSV): v rootfs je **1093**
+  absolutních linků (1081 převoditelných), **celorootfs konverze čeká na
+  potvrzení** — zásah do živého sdíleného rootfs. Past: `readlink` per link
+  = fork na desítky tisíc linků (>20 min) → `find -printf '%p\t%l\n'`
+  (8 min 45 s, bez forků), ale `-printf` je GNU → nástroj spouštět v guestu.
+  Testy: host unit `test/relsym_test.c` (33/33), A/B `test-all.sh relsym` —
+  a ten **musí** měřit HOST nástroji (`/system/bin/cat`), jinak absolutní cíl
+  zachrání `shim_resolve_symlinks` a A/B nedokáže nic.
+  **rootfd (kapitola 4.3) ZAMÍTNUT měřením:** `test/rootfd_bench.c` dá
+  2626 → 1246 ns na `newfstatat` (−52 %), ale `python3 -c pass` má jen 258
+  path syscallů s plnou cestou (= 0,36 ms, 2 % totalu) a cestově těžké
+  zátěže už jedou přes `dirfd` (`find`: 3088 syscallů s dirfd vs 36
+  s `AT_FDCWD`), takže tam rootfd nemá co ušetřit —
+  [postup.md](postup.md) 2026-10-21.
 - **LOCPATH/LC_ALL/SHELL defaulty natvrdo v `run_ownall`** (dřív ruční env
   před tmuxem/shellem) — [postup.md#L2376](postup.md#L2376).
 - **`elf_loader init zsh`** (shell-integrace vzor jako starship/zoxide,

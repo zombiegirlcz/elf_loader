@@ -10,7 +10,7 @@ v [proot-nahrada.md](proot-nahrada.md) — prompty odkazují na její kapitoly.
 |---|---|---|---|---|---|
 | 01 | [měření a fázový profil exec](01-mereni-benchmark.md) | 9, 5.1 | – | měření | **hotovo** 2026-10-16 |
 | 02 | [rychlé výhry exec](02-exec-rychle-vyhry.md) | 5.2–5.4 | 01 | implementace | **hotovo** 2026-10-20 |
-| 03 | [relativní symlinky, clamp `..`, rootfd](03-symlinky-a-rootfd.md) | 4.1–4.3 | – | implementace | – |
+| 03 | [relativní symlinky, clamp `..`, rootfd](03-symlinky-a-rootfd.md) | 4.1–4.3 | – | implementace | **hotovo** 2026-10-21 |
 | 04 | [L1 — přepis `svc #0` při načtení](04-L1-prepis-svc.md) | 2.1 | 01 | implementace | – |
 | 05 | [L2 — seccomp TRAP v guest okně](05-L2-sigsys-okno.md) | 2.2 | 04 | implementace | – |
 | 06 | [tabulka mountů + `mount --bind`](06-mount-tabulka.md) | 3.1 | 04 (doporučeno) | implementace | – |
@@ -21,9 +21,9 @@ v [proot-nahrada.md](proot-nahrada.md) — prompty odkazují na její kapitoly.
 | 11 | [soft exec / zygote — výzkum](11-soft-exec-zygote.md) | 5.7, 5.8 | 01, 10 | výzkum + prototyp | – |
 | 12 | [nativní ld.so mód — prototyp](12-nativni-ldso.md) | 6 | 04, 05 | výzkum + prototyp | – |
 
-03 a 07 jdou dělat kdykoli, jsou nezávislé.
+07 jde dělat kdykoli, je nezávislý.
 
-## Co je hotové (stav 2026-10-20)
+## Co je hotové (stav 2026-10-21)
 
 **01 — měření a fázový profil.** `ELF_LOADER_TIMING=1` dává fázový profil na
 stderr (raw clock, v defaultu no-op), `tools/bench-nextgen.sh [proot|loader|
@@ -94,6 +94,43 @@ přeskočit celé `elf_relocate` nelze (neproběhne `apply_segment_prots` →
 v RELRO ld.so a `0x706f706364` = ASCII jsou data); úroveň 1 nesmí do paměti
 zapsat vůbec nic.
 
+**03 — absolutní symlinky, clamp `..`, rootfd.** Úkoly 1–4 hotové
+(commit `2af1bf5`), úkol 5 (rootfd) **zamítnut měřením**.
+
+Místo řešení absolutních symlinků shimem za běhu držíme invariant „v rootfs
+jsou takové linky relativní v **kanonickém tvaru**" (přesně hloubka × `../`
++ cesta od guest kořene) — jádro je pak uvnitř rootfs vyhodnotí samo a
+správně, za nulovou cenu za běhu. `src/relsym.h` (vkládá se do `main.c`,
+běží pod guest TP): zápis `shim_abs_target_to_rel` v `symlink`/`symlinkat`
+(host mountpointy a proot `.l2s` cíle zůstávají absolutní), čtení
+`shim_rel_target_to_abs` v `readlink`/`readlinkat` (kanonický tvar se hlásí
+zpět absolutně — `update-alternatives` cíle porovnává), a `shim_clamp_dotdot`,
+který odstraní **jen** ty `..`, co by utekly nad kořen; plná lexikální
+normalizace by měnila význam u `/a/symlink/../b`. Knoby
+`ELF_LOADER_NO_RELSYM`, `ELF_LOADER_NO_DOTDOT_CLAMP`.
+
+Konverze rootfs `tools/relsymlinks.sh` (`--dry-run`/`--check`/`--revert`,
+žurnál TSV). V rootfs je **1093** absolutních linků, z toho **1081
+převoditelných**; **celorootfs běh čeká na potvrzení** (zásah do živého
+sdíleného rootfs), ověřeno zatím na reálné kopii `/etc/alternatives`
+(169/169 + revert). Testy: host unit `test/relsym_test.c` 33/33, A/B
+`test-all.sh relsym`, plná sada **193/0/33** (baseline 192/0/33).
+
+*rootfd* (kapitola 4.3) dává per-syscall **−52 %** (`newfstatat`
+2626 → 1246 ns, `test/rootfd_bench.c`), ale nemá kam se projevit:
+`python3 -c pass` má jen **258** path syscallů s plnou cestou (= 0,36 ms,
+2 % totalu), a zátěže, které by vydělaly nejvíc, **už jedou přes `dirfd`**
+(`find`: 3088 syscallů s `dirfd` vs 36 s `AT_FDCWD`). Studie předpokládala
+„tisíce statů"; měření říká 258. Kapitola 4.4 (`openat2`) na 4.14 nejde.
+
+**Dvě pasti z promptu 03:** (1) konverzní nástroj nesmí volat `readlink` na
+každý link (fork na desítky tisíc linků = >20 min); `find -printf '%p\t%l\n'`
+to zvládne za 8 min 45 s, ale `-printf` je GNU → nástroj patří spouštět
+v guestu, ne pod host toyboxem. (2) A/B test tohohle musí měřit **host**
+nástroji (`/system/bin/cat`, `/system/bin/readlink`) — pod loaderem absolutní
+cíl zachrání `shim_resolve_symlinks`, takže A/B nedokáže nic (první verze
+testu na to FAILovala).
+
 ### Co z toho plyne pro další prompty
 
 - **11 (soft exec / zygote)** je teď jediná cesta, jak jít pod ~15 ms —
@@ -101,7 +138,10 @@ zapsat vůbec nic.
   samotného `execve`.
 - Prompt 10 je **uzavřený**, ne „k dodělání": jeho vstupní podmínka
   („relokace/lookupy jsou pořád velký podíl exec") po promptu 02 nedrží.
-- Pro 03–09 se nic nemění, jsou na měření nezávislé.
+- Pro 04–09 se nic nemění, jsou na měření nezávislé.
+- **rootfd se k ničemu nevrací, dokud nebude exec pod ~1 ms** — stejný závěr
+  jako u kandidáta 3 promptu 02. Měřit vždy *kolik* takových volání cíl má,
+  ne jen cenu jednoho.
 
 ## Společná pravidla (platí pro každý prompt)
 
