@@ -71,6 +71,7 @@ typedef struct {
     size_t    gnu_hash_words;
 
     int   svc_patched; /* elf_patch_syscall_sites_all uz nad modulem probehl */
+    int   l1_patched;  /* elf_l1_patch_module uz nad modulem probehl (prompt 04) */
     int   cache_dirty; /* probehl sken -> cache souboru se musi zapsat */
     void *cache;       /* cache_module_t* - opaque, viz src/cache.h */
 } elf_object_t;
@@ -132,6 +133,8 @@ void elf_patch_syscall_sites(elf_object_t *m, long nr, long err);
 /* Aplikuje vsech 5 (nr,err) paru (99/293/435/151/152) v jednom volani;
  * s platnou cache preskoci linearni sken svc-site. */
 void elf_patch_syscall_sites_all(elf_object_t *m);
+/* L1 (prompt 04): cestove `svc #0` -> skok do per-site stubu (ELF_LOADER_L1=1). */
+void elf_l1_patch_module(elf_object_t *m);
 
 /* ldso_tls.c: vlastní implementace glibc ld.so TLS funkcí (guest ld.so je
  * neinicializovaný, takže jeho _dl_allocate_tls padá na NULL _rtld_global). */

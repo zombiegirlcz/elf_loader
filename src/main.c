@@ -365,9 +365,11 @@ static int shim_excluded(const char *p) {
 static int shim_translate(const char *p, char *out, size_t n) {
     if (!p || p[0] != '/') return 0;
     if (!g_shim_root || !g_shim_root[0]) return 0;
-    char cl[4096];
-    if (shim_clamp_dotdot(p, cl, sizeof cl)) p = cl;
     size_t rl = shim_strlen(g_shim_root);
+    /* Clamp ".." pise PRIMO za misto pro prefix v `out` - zadny buffer na
+     * zasobniku (shim_translate vola i L1 stub na cizim, treba Go 8 KB
+     * zasobniku). `p` pak ukazuje do `out` a prefix se doplni pred nej. */
+    if (n > rl + 2 && shim_clamp_dotdot(p, out + rl, n - rl)) p = out + rl;
     if (shim_strncmp(p, g_shim_root, rl) == 0 && (p[rl] == '/' || p[rl] == 0)) return 0;
     /* /dev/shm na Androidu neexistuje (shm_open/sem_open -> ENOENT) -> guest
      * $R/dev/shm (vytvari shim_register_overrides). Zbytek /dev zustava host. */
@@ -376,7 +378,7 @@ static int shim_translate(const char *p, char *out, size_t n) {
     size_t pl = shim_strlen(p);
     if (rl + pl + 1 > n) return 0;            /* out neni zkraceno -> bezpecne */
     shim_memcpy(out, g_shim_root, rl);
-    shim_memcpy(out + rl, p, pl + 1);
+    if (p != out + rl) shim_memcpy(out + rl, p, pl + 1);
     return 1;
 }
 
@@ -2788,6 +2790,8 @@ static char *shim_get_current_dir_name(void) {
     return g_cwd_keep_host ? r : shim_strip_root(r);
 }
 
+#include "l1.h"
+
 static FILE *shim_fopen(const char *p, const char *mode) {
     char b[8192]; const char *path = p; if (shim_translate(p, b, sizeof b)) path = b;
     char resolved[8192];
@@ -3757,6 +3761,13 @@ static int run_ownall(const char *path, int argc, char **argv, char **envp) {
     g_vmtrace = getenv("ELF_LOADER_VMTRACE") != NULL;
     g_no_relsym = getenv("ELF_LOADER_NO_RELSYM") != NULL;
     g_no_dotdot_clamp = getenv("ELF_LOADER_NO_DOTDOT_CLAMP") != NULL;
+    /* L1 (prompt 04): sloty prekladovych bufferu musi existovat PRED tim, nez
+     * se patchnou moduly - guest kod muze stub zavolat hned po inicializaci. */
+    {
+        const char *l1 = getenv("ELF_LOADER_L1");
+        if (l1 && l1[0] && l1[0] != '0' && !l1_slots_init())
+            fprintf(stderr, "[l1] sloty prekladu se nepodarilo namapovat\n");
+    }
     g_ro_keep_write = getenv("ELF_LOADER_RO_KEEP_WRITE") != NULL;
     elf_scope_t *scope = elf_scope_create();
     if (!scope) {

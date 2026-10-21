@@ -243,6 +243,7 @@ rb_common:
     ret
 .size rb_common, .-rb_common
 
+
 .bss
 .balign 8
 .globl bb_targets

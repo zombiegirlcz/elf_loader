@@ -2231,6 +2231,167 @@ void elf_patch_syscall_sites(elf_object_t *m, long nr, long err) {
                 nr, err, patched, m->soname ? m->soname : "?");
 }
 
+
+/* ===== L1 (prompt 04): prepis cestovych `svc #0` na skok do stubu =========
+ *
+ * Misto NOP/`movn` (to umi elf_patch_syscall_sites pro KILLovane syscally)
+ * prepiseme `svc #0` na `b <per-site stub>`. Proc `b` a ne `bl`: `bl` prepise
+ * x30 a syscall wrappery glibc jsou typicky LISTOVE funkce, takze v x30 lezi
+ * jejich navratova adresa - `bl` by rozbil nasledny `ret`. Navratovou adresu
+ * (misto+4) zna stub staticky.
+ *
+ * Dosah `b` je +-128 MiB, proto kazdy modul dostane vlastni "ostrov stubu"
+ * namapovany do toho okna. Stub sam je 9 instrukci (viz l1_common v entry.S);
+ * adresu l1_common bere z literalu na zacatku ostrova, takze loader muze byt
+ * libovolne daleko.
+ *
+ * Patchujeme JEN misto, jehoz cislo syscallu zna l1_path_args() (merenim:
+ * 48 ze 411 `svc` v libc 2.41), plus 10 mist s DYNAMICKYM x8 (`syscall()`,
+ * centralizovana cancelace) - tam o prekladu rozhodne az l1_before podle
+ * skutecneho x8 za behu. COW cena tim klesla z 62 stranek libc na 17
+ * (+3 z 12 u ld.so).
+ *
+ * Cislo syscallu se do stubu NEvklada: l1_common ho vzdy bere z x8, cimz je
+ * tentyz stub spravny i pro dynamicka mista. */
+
+extern void l1_common(void);      /* src/entry.S */
+unsigned l1_path_args(long nr);   /* src/l1.h (vlozeno do main.c) */
+
+static int l1_enabled(void) {
+    static int v = -1;
+    if (v < 0) {
+        const char *e = getenv("ELF_LOADER_L1");
+        v = (e && e[0] && e[0] != '0') ? 1 : 0;
+    }
+    return v;
+}
+
+/* Vrati cislo syscallu, ktere je staticky videt pred `svc` (movz x8,#imm),
+ * nebo -1 pro dynamicke x8. Stejna disciplina jako v elf_patch_syscall_sites:
+ * zapis do x8 mezi movz a svc znamena, ze patri jinemu volani. */
+static long l1_static_nr(const uint32_t *seg, size_t j) {
+    for (size_t b = 1; b <= 8 && j >= b; b++) {
+        uint32_t ins = seg[j - b];
+        if ((ins & 0xffe0001fu) == 0xd2800008u)      /* movz x8, #imm16 */
+            return (long)((ins >> 5) & 0xffffu);
+        if (ins == 0xd503201fu ||                    /* nop */
+            (ins & 0xffffff1fu) == 0xd503241fu)      /* bti */
+            continue;
+        if ((ins & 0x1fu) == 8u)                     /* jiny zapis do x8 */
+            return -1;
+    }
+    return -1;
+}
+
+/* Namapuje ostrov stubu do +-128 MiB od `anchor` (adresa prvniho patchovaneho
+ * mista). Zkousi adresy pod i nad modulem, zarovnane na stranku. */
+static void *l1_map_island(uintptr_t anchor, size_t sz) {
+    const uintptr_t REACH = 120u << 20;    /* rezerva proti 128 MiB limitu */
+    size_t need = ALIGN_UP(sz, PAGE_SIZE);
+    for (uintptr_t delta = 2u << 20; delta < REACH; delta <<= 1) {
+        for (int dir = 0; dir < 2; dir++) {
+            uintptr_t hint = dir ? anchor + delta : anchor - delta;
+            if (dir == 0 && anchor < delta) continue;
+            void *p = mmap((void *)ALIGN_DOWN(hint, PAGE_SIZE), need,
+                           PROT_READ | PROT_WRITE,
+                           MAP_PRIVATE | MAP_ANONYMOUS, -1, 0);
+            if (p == MAP_FAILED) continue;
+            uintptr_t got = (uintptr_t)p;
+            uintptr_t dist = got > anchor ? got - anchor : anchor - got;
+            if (dist < REACH) return p;
+            munmap(p, need);                /* jadro dalo jinam, zkus dal */
+        }
+    }
+    return NULL;
+}
+
+#include "l1_emit.h"
+
+/* Hlavni vstup: projde PF_X segmenty modulu, cestova a dynamicka `svc #0`
+ * prepise na skok do vlastniho stubu. Idempotentni (m->l1_patched). */
+void elf_l1_patch_module(elf_object_t *m) {
+    if (!m || !l1_enabled() || m->l1_patched)
+        return;
+    m->l1_patched = 1;
+
+    int trace = getenv("ELF_LOADER_L1_SCAN") != NULL || elf_debug();
+    /* Dynamicke x8 jen v libc.so.6, kde jsou overena (syscall() a
+     * centralizovana cancelace __syscall_cancel_arch, pres kterou jde i
+     * openat). Jinde dynamicke `svc` typicky patri runtime s vlastnim
+     * zasobnikem (Go: syscall.Syscall na 8 KB goroutine) - tam patri L2. */
+    int allow_dyn = m->soname && strcmp(m->soname, "libc.so.6") == 0;
+    /* 1. pruchod: spocitej kandidaty */
+    size_t n_sites = 0, n_dyn = 0;
+    for (int i = 0; i < m->phdr_count; i++) {
+        if (m->phdr[i].p_type != PT_LOAD || !(m->phdr[i].p_flags & PF_X)) continue;
+        uint32_t *seg = (uint32_t *)va(m, m->phdr[i].p_vaddr);
+        size_t n_ins = m->phdr[i].p_memsz / 4;
+        for (size_t j = 0; j < n_ins; j++) {
+            if (seg[j] != 0xd4000001u) continue;
+            long nr = l1_static_nr(seg, j);
+            if (nr < 0) { if (allow_dyn) { n_sites++; n_dyn++; } }
+            else if (l1_path_args(nr)) n_sites++;
+        }
+    }
+    if (!n_sites) {
+        if (trace)
+            fprintf(stderr, "[l1] %s: zadne cestove svc\n",
+                    m->soname ? m->soname : "?");
+        return;
+    }
+
+    size_t isz = L1_ISLAND_HDR + n_sites * L1_STUB_WORDS * 4;
+    uintptr_t anchor = (uintptr_t)m->base_addr;
+    uint32_t *island = (uint32_t *)l1_map_island(anchor, isz);
+    if (!island) {
+        fprintf(stderr, "[l1] %s: ostrov stubu se nevesel do +-128 MiB\n",
+                m->soname ? m->soname : "?");
+        return;
+    }
+    *(uintptr_t *)island = (uintptr_t)&l1_common;        /* literal */
+    uintptr_t lit = (uintptr_t)island;
+    uint32_t *next = island + L1_ISLAND_HDR / 4;
+
+    /* 2. pruchod: generuj stuby a prepis svc */
+    size_t done = 0, failed = 0, pages = 0;
+    uintptr_t last_pg = 0;
+    for (int i = 0; i < m->phdr_count; i++) {
+        if (m->phdr[i].p_type != PT_LOAD || !(m->phdr[i].p_flags & PF_X)) continue;
+        uint32_t *seg = (uint32_t *)va(m, m->phdr[i].p_vaddr);
+        size_t n_ins = m->phdr[i].p_memsz / 4;
+        for (size_t j = 0; j < n_ins; j++) {
+            if (seg[j] != 0xd4000001u) continue;
+            long nr = l1_static_nr(seg, j);
+            if (nr < 0 ? !allow_dyn : !l1_path_args(nr)) continue;
+
+            uintptr_t site = (uintptr_t)&seg[j];
+            uintptr_t stub = (uintptr_t)next;
+            if (!l1_emit_stub(next, stub, site + 4, lit)) { failed++; continue; }
+            long off = (long)(stub - site) / 4;
+            if (off < -(1 << 25) || off >= (1 << 25)) { failed++; continue; }
+
+            uintptr_t pg = site & ~(uintptr_t)(PAGE_SIZE - 1);
+            if (mprotect((void *)pg, PAGE_SIZE,
+                         PROT_READ | PROT_WRITE | PROT_EXEC) != 0) { failed++; continue; }
+            seg[j] = 0x14000000u | ((uint32_t)off & 0x3ffffffu);   /* b stub */
+            __builtin___clear_cache((char *)&seg[j], (char *)&seg[j] + 4);
+            mprotect((void *)pg, PAGE_SIZE, PROT_READ | PROT_EXEC);
+            if (pg != last_pg) { pages++; last_pg = pg; }
+            next += L1_STUB_WORDS;
+            done++;
+        }
+    }
+    mprotect(island, ALIGN_UP(isz, PAGE_SIZE), PROT_READ | PROT_EXEC);
+    __builtin___clear_cache((char *)island, (char *)island + isz);
+
+    if (trace)
+        fprintf(stderr,
+                "[l1] %s: %zu mist (%zu dynamickych x8) -> ostrov %p, "
+                "COW stranek %zu, selhalo %zu\n",
+                m->soname ? m->soname : "?", done, n_dyn, (void *)island,
+                pages, failed);
+}
+
 void elf_patch_syscall_sites_all(elf_object_t *m) {
     if (!m)
         return;
@@ -2251,6 +2412,8 @@ void elf_patch_syscall_sites_all(elf_object_t *m) {
     };
     for (size_t s = 0; s < sizeof(kill_syscalls) / sizeof(kill_syscalls[0]); s++)
         elf_patch_syscall_sites(m, kill_syscalls[s].nr, kill_syscalls[s].err);
+    /* L1 az po KILLovanych cislech: ta mista zustavaji NOP/movn, ne stub. */
+    elf_l1_patch_module(m);
 }
 
 static uintptr_t read_tp(void) {
