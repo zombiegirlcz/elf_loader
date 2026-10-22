@@ -48,10 +48,11 @@ static int shim_translate(const char *p, char *out, size_t n) {
 static int shim_is_proc_self_exe(const char *p) { return p && !strcmp(p, "/proc/self/exe"); }
 /* binds (prompt 06), zjednodusene: ro pod /ro/, mountpoint /mnt/b, jehoz
  * host cil je /data/R/srv/b. Plne verze pokryva test-all.sh binds. */
-static long shim_bind_deny(long nr, const unsigned long *a) {
+static int shim_sys_intercept(long nr, const unsigned long *a, long *res) {
     const char *p = (const char *)a[1];
-    if ((nr == 34 || nr == 35) && (long)a[0] == -100 && p && !strncmp(p, "/ro/", 4)) return -30;
-    if (nr == 35 && (long)a[0] == -100 && p && !strcmp(p, "/mnt/b")) return -16;
+    if ((nr == 34 || nr == 35) && (long)a[0] == -100 && p && !strncmp(p, "/ro/", 4)) { *res = -30; return 1; }
+    if (nr == 35 && (long)a[0] == -100 && p && !strcmp(p, "/mnt/b")) { *res = -16; return 1; }
+    if (nr == 56 && p && !strcmp(p, "/proc/self/cmdline")) { *res = 0; return 1; }   /* fd 0 je platny vysledek */
     return 0;
 }
 static size_t bind_reverse_inplace(char *buf, size_t cap) {
@@ -177,6 +178,9 @@ int main(void) {
     mkframe(f, 35, (unsigned long)-100, (unsigned long)"/mnt/b", 0x200, 0);
     dn = l1_before(f, 35);
     CHECK(dn != 0 && (long)f[20] == -16, "unlinkat mountpointu -> -EBUSY");
+    mkframe(f, 56, (unsigned long)-100, (unsigned long)"/proc/self/cmdline", 0, 0);
+    dn = l1_before(f, 56);
+    CHECK(dn != 0 && (long)f[20] == 0 && f[21] == 0, "openat /proc/self/cmdline -> obslouzeno, fd 0 je platny vysledek");
     mkframe(f, 34, (unsigned long)-100, (unsigned long)"/etc/x", 0755, 0);
     dn = l1_before(f, 34);
     CHECK(dn == 0 && !strcmp((const char *)f[23], "/data/R/etc/x"), "mkdirat mimo bind -> preklad");

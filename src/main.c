@@ -191,6 +191,8 @@ static char g_guest_exe_path[8192];
 static const char *g_exec_mode = "--ownall";
 /* --argv0 <s> (prompt 07): argv[0], ktery guest dostane misto cesty k binarce. */
 static const char *g_argv0 = NULL;
+/* kernelova oblast argv z main() = arg_start..arg_end (prompt 07) */
+static char *g_karg_start = NULL, *g_karg_end = NULL;
 static int g_f2_active = 0;  /* 1 = F2 rezim (--shim), povol inline-hooky */
 static elf_scope_t *g_shim_scope = NULL;  /* platny scope behem F2 behu */
 
@@ -1117,7 +1119,7 @@ static int shim_busyfail(const char *p) {
     shim_guest_errno_set(EBUSY);
     return 1;
 }
-/* Totez na hranici syscallu (L1 l1_before, L2 go_handle): jmenne shimy
+/* Totez na hranici syscallu (pres shim_sys_intercept): jmenne shimy
  * s shim_rofail/shim_busyfail pod ELF_LOADER_L1=2 vubec nejsou a raw svc
  * (static/Go) je nikdy nepotka. `a` = argumenty syscallu x0..x5 PRED
  * prekladem. Vraci -EROFS/-EBUSY (syscall se neprovede) nebo 0. Jen
@@ -1163,7 +1165,25 @@ static int shim_bind_remap(const char *in, char *out, size_t n) {
     int ro;
     return bind_translate(in, out, n, &ro) == BIND_REMAP;
 }
+/* prompt 07 (src/procvirt.h): /proc/self/{cmdline,maps,mounts,mountinfo} */
+static int shim_proc_open(const char *p, int flags, long *fd_out);
+static ssize_t shim_readlink_guestify(char *b, size_t n, ssize_t r);
+#define SHIM_PROC_OPEN(p, flags) \
+    do { long _pvfd; if (shim_proc_open((p), (flags), &_pvfd)) return (int)_pvfd; } while (0)
+/* Spolecne misto L1 (l1_before) a L2 (go_handle) pro syscally, ktere se
+ * nemaji provest, jak jsou: ro bind -> EROFS, mountpoint -> EBUSY (prompt
+ * 06), openat /proc/self/{cmdline,maps,mounts,mountinfo} -> memfd (prompt
+ * 07). Vraci 1 a *res = vysledek syscallu (fd i 0, nebo -errno), jinak 0. */
+int shim_sys_intercept(long nr, const unsigned long *a, long *res) {
+    if (nr == 56 && a[1] && ((const char *)a[1])[0] == '/' &&
+        shim_proc_open((const char *)a[1], (int)a[2], res))
+        return 1;
+    long e = shim_bind_deny(nr, a);
+    if (e) { *res = e; return 1; }
+    return 0;
+}
 static int shim_open(const char *p, int flags, ...) {
+    SHIM_PROC_OPEN(p, flags);
     if (shim_open_is_write(flags) && shim_rofail(p)) return -1;
     char buf[8192]; const char *path = p;
     if (shim_translate(p, buf, sizeof buf)) path = buf;
@@ -1180,6 +1200,7 @@ static int shim_open(const char *p, int flags, ...) {
  * (strlen/strncmp/snprintf jsou bez TLS) a vysledek volame pres shim_real,
  * coz je parrot glibc funkce (bezi ve spravnem glibc TLS kontextu). */
 static int shim_open64(const char *p, int flags, ...) {
+    SHIM_PROC_OPEN(p, flags);
     if (shim_open_is_write(flags) && shim_rofail(p)) return -1;
     char buf[8192]; const char *path = p;
     if (shim_translate(p, buf, sizeof buf)) path = buf;
@@ -1190,6 +1211,7 @@ static int shim_open64(const char *p, int flags, ...) {
     return f ? f(path, flags, mode) : -1;
 }
 static int shim_openat(int dfd, const char *p, int flags, ...) {
+    SHIM_PROC_OPEN(p, flags);
     if (dfd == -100 && shim_open_is_write(flags) && shim_rofail(p)) return -1;
     char buf[8192]; const char *path = p;
     if (dfd == -100 && p && p[0] == '/') {
@@ -1202,6 +1224,7 @@ static int shim_openat(int dfd, const char *p, int flags, ...) {
     return f ? f(dfd, path, flags, mode) : -1;
 }
 static int shim_openat64(int dfd, const char *p, int flags, ...) {
+    SHIM_PROC_OPEN(p, flags);
     if (dfd == -100 && shim_open_is_write(flags) && shim_rofail(p)) return -1;
     char buf[8192]; const char *path = p;
     if (dfd == -100 && p && p[0] == '/') {
@@ -2550,7 +2573,9 @@ static ssize_t shim_readlink(const char *p, char *b, size_t n) {
     char x[8192]; const char *path = p; if (shim_translate(p, x, sizeof x)) path = x;
     fp_readlink f = (fp_readlink)g_orig_readlink;
     if (!f) return -1;
-    return shim_readlink_fixup(path, b, n, f(path, b, n));
+    /* absolutni vysledek pod $ROOTFS (/proc/self/fd/N, cwd, .l2s) -> guest */
+    ssize_t r = shim_readlink_guestify(b, n, f(path, b, n));
+    return shim_readlink_fixup(path, b, n, r);
 }
 static ssize_t shim_readlinkat(int d, const char *p, char *b, size_t n) {
     if (d == -100 && shim_is_proc_self_exe(p) && g_guest_exe_path[0]) {
@@ -2563,7 +2588,7 @@ static ssize_t shim_readlinkat(int d, const char *p, char *b, size_t n) {
     if (d == -100 && p && p[0] == '/') { if (shim_translate(p, x, sizeof x)) path = x; }
     fp_readlinkat f = (fp_readlinkat)g_orig_readlinkat;
     if (!f) return -1;
-    ssize_t r = f(d, path, b, n);
+    ssize_t r = shim_readlink_guestify(b, n, f(d, path, b, n));
     if (d != -100) return r;   /* hloubku linku umime urcit jen u AT_FDCWD */
     return shim_readlink_fixup(path, b, n, r);
 }
@@ -3007,6 +3032,7 @@ static int shim_umount2(const char *target, int flags) {
     return -1;
 }
 
+#include "procvirt.h"
 #include "l1.h"
 
 static FILE *shim_fopen(const char *p, const char *mode) {
@@ -3699,6 +3725,7 @@ static long main_raw_syscall4(long nr, long a0, long a1, long a2, long a3) {
  * /etc/nsswitch.conf, /etc/hosts apod. Prelozime cestu pod ROOTFS.
  * Diky tomu NEMUSIME mit seccomp F2 filtr (ktery otravoval fork+exec deti). */
 static int shim_open64_nocancel(const char *p, int flags, ...) {
+    SHIM_PROC_OPEN(p, flags);
     /* Preloz cestu a zavolej ORIGINAL pres trampolinu (g_orig_open64_nocancel).
      * Original nastavi errno spravne (glibc __open64_nocancel semantika) - proto
      * to nerobime raw syscallem, ktery errno neaktualizuje a rozbil
@@ -4149,6 +4176,9 @@ static int run_ownall(const char *path, int argc, char **argv, char **envp) {
     binds_init();
 
     char **argv_pre_shebang = argv;   /* shebang blok argv nahradi -> skript */
+    /* jmeno pro comm: cesta z execve PRED resolvem symlinku (python3, ne
+     * python3.13); u skriptu (shebang nize) skript, jako jadro */
+    const char *path_in = path;
     /* Shebang podpora na urovni loader entry: `lx modal` predava
      * /usr/local/bin/modal (Python skript s #!/usr/bin/python3), elf_load pak
      * hlasi "Not an ELF file". Detekujeme #! v prvnim radku a prepiseme
@@ -4289,7 +4319,7 @@ static int run_ownall(const char *path, int argc, char **argv, char **envp) {
      * L2 filtr, viz go_handle case 17), takze hack F2_NO_CWD_STRIP neni potreba.
      * Jmenne hooky pod L2 bezi soubezne, drz je konzistentni (strip pro vsechny). */
     f2_set_cwd_keep_host(elf_l2_enabled() ? 0 : g_cwd_keep_host);
-    f2_set_bind_hooks(shim_bind_remap, shim_bind_deny, bind_reverse_inplace);
+    f2_set_bind_hooks(shim_bind_remap, shim_sys_intercept, bind_reverse_inplace);
     if (elf_l2_enabled()) g_cwd_keep_host = 0;
     if (elf_debug() && g_cwd_keep_host)
         fprintf(stderr, "[F2] getcwd: host cesta (Bun / F2_NO_CWD_STRIP)\n");
@@ -4614,6 +4644,18 @@ static int run_ownall(const char *path, int argc, char **argv, char **envp) {
     }
     elf_timing_mark("svc_patch");
     elf_install_fault_handlers();
+    /* /proc virtualizace (prompt 07), jeste pod bionic TP: comm = jmeno guest
+     * binarky (ps/pgrep/top misto "elf_loader"; jako jadro z cesty execve,
+     * ne ze symlinku resolvovane) a kernelova oblast argv = guest argv (cte
+     * ji i CIZI proces). Az tady: path_in i guest argv ukazuji do te oblasti. */
+    if (!getenv("ELF_LOADER_NO_PROCVIRT")) {
+        const char *bn = path_in;
+        for (const char *q = path_in; *q; q++) if (*q == '/') bn = q + 1;
+        char comm[16];
+        snprintf(comm, sizeof comm, "%s", bn);
+        prctl(PR_SET_NAME, comm, 0, 0, 0);
+        procvirt_rewrite_argarea(g_karg_start, g_karg_end, argc, argv);
+    }
     g_loader_active = 0;  /* od ted bezi cilova binarka (parrot TLS) */
     elf_tls_ctx_t tls = elf_setup_own_tls(obj, scope);
     elf_timing_mark("tls_done");
@@ -5575,6 +5617,15 @@ static void elf_print_init_bash(int dw) {
 }
 
 int main(int argc, char **argv, char **envp) {
+    /* Kernelova oblast argv (arg_start..arg_end) pro procvirt_rewrite_argarea:
+     * hranice ted, nez se na argv sahne (guest argv je tataz pole). Jen kdyz
+     * jsou retezce souvisle za sebou, jak je jadro polozilo. */
+    if (argc > 0 && argv[0]) {
+        char *e = argv[0];
+        int i = 0;
+        for (; i < argc && argv[i] == e; i++) e += strlen(argv[i]) + 1;
+        if (i == argc) { g_karg_start = argv[0]; g_karg_end = e; }
+    }
     /* ELF_DEBUG → unbuffered stdout, ať trace při SIGSEGV nekončí v bufferu */
     if (getenv("ELF_DEBUG"))
         setvbuf(stdout, NULL, _IONBF, 0);

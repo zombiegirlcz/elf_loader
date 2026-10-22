@@ -72,7 +72,8 @@ Knoby: `ELF_LOADER_TIMING`, `ELF_LOADER_NO_CACHE`, `ELF_LOADER_NO_HASH`,
 `ELF_LOADER_L1` (`=1`/`=2`), `ELF_LOADER_L1_SCAN`, `F2_SKIP=a,b` (denylist
 jmenných hooků), `F2_ONLY` (allowlist), `ELF_LOADER_L2` (`=1` záchytná síť),
 `ELF_LOADER_L2_LAZY` (líný přepis, default vyp), `ELF_LOADER_GOMODE=0`
-(vypne Go mód; L2 ho nahrazuje). Bindy: `LX_BINDS=host:guest[:ro],…`,
+(vypne Go mód; L2 ho nahrazuje), `ELF_LOADER_NO_PROCVIRT` (prompt 07).
+Bindy: `LX_BINDS=host:guest[:ro],…`,
 `$ROOTFS/etc/lx-binds` (fstab), `LX_BINDS_FILE` (sdílená tabulka, vnucuje se
 potomkům; prázdné = nová session).
 
@@ -155,8 +156,17 @@ fork veneer (vfork-style clone) [#L685].
   osiřelé soubory maže GC přes `flock`. Ro → `EROFS`, mountpoint
   `rmdir`/`rename` → `EBUSY`, `getcwd` zpětně (`bind_reverse`). L1 i L2 přes
   `shim_bind_deny` (`l1_before` umí syscall odmítnout) a `go_translate` hook.
-  util-linux `umount` příkaz a `/proc/mounts` čekají na prompt 07
-  [2026-10-22].
+  util-linux `umount`/`findmnt` fungují přes virtualizovaný mountinfo
+  (prompt 07) [2026-10-22].
+- **Virtualizace `/proc`** (prompt 07, `src/procvirt.h`): `open` jen pro
+  čtení na `/proc/self/{cmdline,maps,mounts,mountinfo}` (+ `<můj pid>`,
+  `/proc/mounts`, `/etc/mtab`) → memfd se syntetickým obsahem; cizí
+  `/proc/<pid>/cmdline` bez nulové vycpávky. Jmenné open hooky + L1/L2 přes
+  `shim_sys_intercept`. `run_ownall` před `elf_run` přepíše kernelovou
+  oblast argv na guest argv (`ps` u cizích procesů) a nastaví `comm`.
+  `readlink` výsledky pod `$ROOTFS` → guest. Exec shim předává vlastní
+  `argv[0]` přes `--argv0`. `ELF_LOADER_NO_PROCVIRT=1` vypne comm + přepis
+  oblasti [2026-10-22 (2), (3)].
 
 ## Pravidla a pasti (než sáhneš na kód)
 
@@ -202,8 +212,10 @@ fork veneer (vfork-style clone) [#L685].
 - ~~**Vlastní `argv[0]` se při exec zahazuje**~~ — **vyřešeno** (prompt 07,
   2026-10-22 (2)): exec shim předává `--argv0`, Claude Code `grep`/`find`
   (`ugrep`/`bfs`) funguje bez `command grep`.
-- **`/proc/self/cmdline` není shimnutý** a leakuje cestu k loaderu. Fix
-  analogický `shim_readlink` — pozor na TLS past [#L3973].
+- ~~**`/proc/self/cmdline` není shimnutý**~~ — **vyřešeno** (prompt 07,
+  2026-10-22 (3)): memfd pro vlastní `cmdline`/`maps`/`mounts`/`mountinfo`,
+  přepis kernelové oblasti argv pro cizí čtenáře (`ps`), `comm` přes
+  `PR_SET_NAME`.
 - **Binárku mimo `$ROOTFS` nelze spustit** — `shim_execve` nalepí `$ROOTFS`
   i na absolutní host cestu. Nejspíš táž vrstva jako vnořený `make`
   (postup.md 2026-10-07 (2)) — řešit najednou [#L4029].
@@ -250,6 +262,8 @@ fork veneer (vfork-style clone) [#L685].
 | relsym + rootfd | 2026-10-21 |
 | L1 — překlad na hranici syscallu | 2026-10-21 (2) |
 | L2 — seccomp záchytná síť (okno, go_handle) | 2026-10-21 (3) |
+| tabulka mountů, bindy, incident binds testu | 2026-10-21 (4), 2026-10-22 |
+| `--argv0`, virtualizace `/proc`, comm | 2026-10-22 (2), (3) |
 | výkon: timing, cache, hash, imgcache, lazy | 2026-10-16, 2026-10-20 |
 | zátěžový test multi-runtime | L3885, L4047 |
 | otevřené nálezy exec/argv | L3939, L3973, L3988, L4029 |

@@ -13,8 +13,8 @@ v [proot-nahrada.md](proot-nahrada.md) — prompty odkazují na její kapitoly.
 | 03 | [relativní symlinky, clamp `..`, rootfd](03-symlinky-a-rootfd.md) | 4.1–4.3 | – | implementace | **hotovo** 2026-10-21 |
 | 04 | [L1 — přepis `svc #0` při načtení](04-L1-prepis-svc.md) | 2.1 | 01 | implementace | **hotovo** 2026-10-21 (default vypnuto) |
 | 05 | [L2 — seccomp TRAP v guest okně](05-L2-sigsys-okno.md) | 2.2 | 04 | implementace | **hotovo** 2026-10-21 (3) (default vypnuto) |
-| 06 | [tabulka mountů + `mount --bind`](06-mount-tabulka.md) | 3.1 | 04 (doporučeno) | implementace | **hotovo** 2026-10-22 (`umount` příkaz → 07) |
-| 07 | [virtualizace `/proc` + `argv[0]`](07-proc-a-argv0.md) | 3.4, 3.5 | – | implementace | – |
+| 06 | [tabulka mountů + `mount --bind`](06-mount-tabulka.md) | 3.1 | 04 (doporučeno) | implementace | **hotovo** 2026-10-22 |
+| 07 | [virtualizace `/proc` + `argv[0]`](07-proc-a-argv0.md) | 3.4, 3.5 | – | implementace | **hotovo** 2026-10-22 |
 | 08 | [fake root + link2symlink](08-fakeroot-l2s.md) | 3.2, 3.3 | 04 (doporučeno) | implementace | – |
 | 09 | [proot-kompatibilní CLI + hybrid](09-proot-cli-hybrid.md) | 3.6, 7 | 06, 08 | implementace | – |
 | 10 | [cache obrazů + líné vázání](10-exec-image-cache.md) | 5.5, 5.6 | 01, 02 | implementace | **hotovo** 2026-10-20 |
@@ -207,8 +207,26 @@ L1 (`l1_before` umí syscall odmítnout) i L2 (`go_translate` hook) sdílí
 - **Bezpečnostní nález:** starý `category_binds` je nejpravděpodobnější
   příčina poškození parrotu 2026-10-21 (bind `/tmp/lxbt → /etc` zůstal
   v tabulce harnessu, úklid `rm -rf` pod loaderem smazal `$R/etc`).
-- Mimo 06: util-linux `umount` *příkaz* a `cat /proc/mounts` potřebují
-  virtualizovaný `/proc/self/mountinfo` → prompt 07.
+- util-linux `umount` *příkaz*, `findmnt` a `cat /proc/mounts` fungují od
+  promptu 07 (virtualizovaný mountinfo).
+
+**07 — virtualizace `/proc` + `argv[0]`.** Hotovo 2026-10-22. *Etapa 1:*
+exec shim (`shim_execve`, `posix_spawn`, Go/L2 `go_execve`) předává
+`--argv0 <argv[0] volajícího>`, guest už nedostává resolvovanou host cestu —
+`exec -a`, zsh `ARGV0=`, perl `exec {} LIST` a Claude Code `grep`/`find`
+(`ugrep`/`bfs` přes `exec -a`) fungují; `test-all.sh argv0` stará 0/6, nová
+6/6. *Etapa 2* (`src/procvirt.h`): `open` jen pro čtení na
+`/proc/self/{cmdline,maps,mounts,mountinfo}` → memfd se syntetickým
+obsahem (jmenné hooky + L1/L2 přes `shim_sys_intercept`); cizí procesy přes
+přepis kernelové oblasti argv v `run_ownall` (`ps -o args` = `foo 2`),
+`comm` přes `PR_SET_NAME` (`pgrep -x sleep`), `readlink /proc/self/fd|cwd`
+na guest cesty. `test-all.sh procvirt` stará 0/12, nová 12/12 (i pod L1=2
+a L2=1); util-linux `umount` příkaz a `findmnt` nad bindem fungují.
+
+- Limity: u skriptů zůstávají v argv host cesty interpretu/skriptu,
+  `/proc/self/exe` dál vrací host cestu guest binárky (vědomě), cizí
+  `cmdline` čtený host nástrojem má nulovou vycpávku, `df` přiřadí bind k `/`
+  (syntetické `0:N`).
 
 ### Co z toho plyne pro další prompty
 

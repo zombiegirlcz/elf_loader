@@ -116,7 +116,7 @@ void f2_set_loader(const char *p);      /* Go mod: cesta k loaderu pro re-exec *
 int elf_go_mode_setup(elf_object_t *m); /* Go mod: 1 = Go binarka, filtr aktivni */
 void f2_set_cwd_keep_host(int v);       /* L2/Go: getcwd NEstripovat $ROOTFS */
 void f2_set_bind_hooks(int (*remap)(const char *, char *, size_t),
-                       long (*deny)(long, const unsigned long *),
+                       int (*deny)(long, const unsigned long *, long *),
                        size_t (*rev)(char *, size_t));   /* L2/Go: tabulka bindu (prompt 06) */
 int  elf_l2_enabled(void);              /* L2 (prompt 05): ELF_LOADER_L2 */
 void elf_l2_prepare_exe_load(void);     /* rezervuj okno, PIE exe do nej */

@@ -1824,6 +1824,65 @@ SEOF
     fi
 }
 
+# Virtualizace /proc (prompt 07 ukoly 2-5): guest nema videt loader ani host
+# cesty. cmdline vlastni i cizi (kernelova oblast argv prepsana), comm
+# (ps/pgrep), maps, mounts/mountinfo z tabulky bindu (util-linux findmnt
+# a umount PRIKAZ - akceptace promptu 06) a readlink /proc/self/fd|cwd.
+# BEZPECNOST: zdroj bindu je jednorazovy $dir/src, vlastni tabulka
+# (LX_BINDS_FILE=), uklid hostovym rm na host ceste.
+category_procvirt() {
+    echo ""
+    echo "=== virtualizace /proc + comm (prompt 07) ==="
+    local env="ROOTFS=$R ELF_ROOTFS=$R HOME=$D ELF_LOADER=$L PATH=/usr/bin:/bin LX_BINDS_FILE="
+    if [ ! -x "$R/usr/bin/python3" ] || [ ! -x "$R/usr/bin/findmnt" ]; then
+        echo "SKIP procvirt: chybi python3/findmnt"
+        echo "SKIP: procvirt - no python3/findmnt" >> "$SKIP_LOG"; ((SKIP_COUNT++)) || true
+        return
+    fi
+    local dir="$R/tmp/procvt.$$" g="/tmp/procvt.$$"
+    /system/bin/rm -rf "$dir"
+    /system/bin/mkdir -p "$dir/src" "$dir/mnt"
+    /system/bin/touch "$dir/src/a" "$dir/src/b"
+    cat > "$dir/t.sh" <<SEOF
+G=$g
+SEOF
+    cat >> "$dir/t.sh" <<'SEOF'
+echo "selfcmd=$(python3 -c 'import sys;print(open("/proc/self/cmdline","rb").read()==b"\0".join(a.encode() for a in sys.orig_argv)+b"\0")')"
+echo "cat=$(cat /proc/self/cmdline | tr '\0' ' ')"
+(exec -a foo sleep 2) & p=$!; sleep 0.5
+echo "foreign=$(tr '\0' '|' < /proc/$p/cmdline)"
+echo "comm=$(cat /proc/$p/comm)"
+echo "ps=$(ps -o args= -p $p)"
+echo "pgrep=$(pgrep -x sleep | grep -c "^$p\$")"
+wait
+echo "mapsleak=$(grep -cE 'elf_loader|/data/user/' /proc/self/maps)"
+echo "mapslibc=$(grep -q ' /usr/lib/aarch64-linux-gnu/libc.so.6$' /proc/self/maps && echo 1 || echo 0)"
+mount --bind $G/src $G/mnt
+echo "findmnt=$(findmnt -n -o TARGET $G/mnt)"
+umount $G/mnt; echo "umount=$?:$(ls -A $G/mnt | wc -l)"
+echo "fd=$(python3 -c 'import os;f=open("/etc/hostname");print(os.readlink("/proc/self/fd/%d"%f.fileno()))')"
+echo "cwd=$(python3 -c 'import os;os.chdir("/tmp");print(os.readlink("/proc/self/cwd"))')"
+SEOF
+    local out
+    out=$("$R/usr/bin/timeout" 60 "$R/bin/bash" -c "$env $L --ownall $R/bin/bash $g/t.sh" 2>&1 || true)
+    /system/bin/rm -rf "$dir"
+    local got=0 tot=0 detail="" line
+    for line in "selfcmd=True" "cat=cat /proc/self/cmdline " "foreign=foo|2|" "comm=sleep" \
+                "ps=foo 2" "pgrep=1" "mapsleak=0" "mapslibc=1" "findmnt=$g/mnt" \
+                "umount=0:0" "fd=/etc/hostname" "cwd=/tmp"; do
+        tot=$((tot + 1))
+        if printf '%s\n' "$out" | grep -qxF -- "$line"; then got=$((got + 1))
+        else detail="$detail [${line%%=*}: $(printf '%s\n' "$out" | grep "^${line%%=*}=" | head -1 | head -c 70)]"; fi
+    done
+    if [ "$got" = "$tot" ]; then
+        echo "PASS procvirt: $got/$tot (cmdline vlastni+cizi, comm, ps/pgrep, maps, findmnt+umount, fd/cwd)"
+        echo "PASS: procvirt - /proc virtualizace $got/$tot" >> "$PASS_LOG"; ((PASS_COUNT++)) || true
+    else
+        echo "FAIL procvirt: $got/$tot$detail"
+        echo "FAIL: procvirt - $got/$tot |$detail" >> "$FAIL_LOG"; ((FAIL_COUNT++)) || true
+    fi
+}
+
 # Obrazova cache RELRO stranek (prompt 10 cast A, ELF_LOADER_IMGCACHE=1).
 # Overuje: (a) s cache zapnutou je vystup IDENTICKY jako bez ni (bezpecny
 # fallback), (b) cache odmitne vytvorit obraz, ktery by nesel revalidovat
@@ -2309,6 +2368,10 @@ case "${1:-all}" in
         category_argv0
         print_summary
         ;;
+    procvirt)
+        category_procvirt
+        print_summary
+        ;;
     bigargv)
         category_bigargv
         print_summary
@@ -2381,6 +2444,7 @@ case "${1:-all}" in
         category_imgcache
         category_binds
         category_argv0
+        category_procvirt
         category_relsym
         category_l1
         category_l2

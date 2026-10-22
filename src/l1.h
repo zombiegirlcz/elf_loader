@@ -147,8 +147,9 @@ static void l1_slot_release(l1_slot_t *s) {
 #define L1_NEED_AFTER 1UL
 
 /* Vraci 0 = provest syscall; jinak l1_common `svc` PRESKOCI a volajici dostane
- * frame[20] (odmitnuti ro/mountpoint bindem: -EROFS/-EBUSY, viz
- * shim_bind_deny) - frame[21] pak zustava 0, l1_after se nevola. */
+ * frame[20] (shim_sys_intercept: odmitnuti ro/mountpoint bindem -EROFS/
+ * -EBUSY, memfd pro /proc/self/cmdline...) - frame[21] pak zustava 0,
+ * l1_after se nevola. */
 long l1_before(unsigned long *frame, long nr) {
     unsigned mask = l1_path_args(nr);
     if (nr == 17 || nr == 78) frame[21] = L1_NEED_AFTER;   /* fixup vysledku */
@@ -163,10 +164,10 @@ long l1_before(unsigned long *frame, long nr) {
         if (p && p[0] == '/') { any = 1; break; }
     }
     if (!any) return 0;
-    /* ro bind / mountpoint: rozhoduje se z PUVODNICH (guest) cest */
-    long deny = shim_bind_deny(nr, &L1_ARG(frame, 0));
-    if (deny) {
-        frame[20] = (unsigned long)deny;
+    /* ro bind / mountpoint / virtualni /proc: z PUVODNICH (guest) cest */
+    long res;
+    if (shim_sys_intercept(nr, &L1_ARG(frame, 0), &res)) {
+        frame[20] = (unsigned long)res;
         frame[21] = 0;
         return 1;
     }

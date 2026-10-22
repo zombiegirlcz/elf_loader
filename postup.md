@@ -5509,3 +5509,55 @@ A/B `test-all.sh argv0` (sys.orig_argv[0]): stará `a52a6e9` **0/6**, nová
 Code)` = rozbitý `grep`/`find` v agentově shellu; `bfs 4.1.1` taky).
 `all` 202/1/34 (jediný FAIL `nslookup localhost`, viz výše; +1 SKIP imgcache
 nad kali), parrot po běhu nedotčen.
+
+## 2026-10-22 (3) — prompt 07 etapa 2: virtualizace `/proc` + `comm`
+
+NÁLEZ 2 (`/proc/self/cmdline` leakuje loader) opraven a rozšířen na celé
+zadání promptu 07. Nový `src/procvirt.h` (běží pod guest TP: jen raw
+syscally, pracovní buffer přes `mmap`, žádný snprintf/getpid):
+
+- `open(at)` **jen pro čtení** na `/proc/{self,thread-self,<můj pid>}/
+  {cmdline,maps,mounts,mountinfo}`, `/proc/mounts`, `/etc/mtab` vrátí
+  **memfd** se syntetickým obsahem (`memfd_create` app profil pouští —
+  ověřeno; fallback soubor v `$ROOTFS/tmp` hned unlinknutý). Cokoli selže →
+  skutečný soubor (nikdy hůř než dřív). Napojeno do `open`/`open64`/
+  `openat`/`openat64`/`__open64_nocancel` (fopen „rce", setmntent,
+  pthread_getattr_np) a přes **`shim_sys_intercept`** (zobecněný
+  `shim_bind_deny`, vrací 1 + výsledek, protože fd 0 je platný) do L1
+  `l1_before` i L2 `go_handle`.
+  - `cmdline` = guest argv přesně; `maps` = cesty pod `$ROOTFS` jako guest
+    (remap bind zpětně), segmenty loaderu pod jménem guest exe;
+    `mounts`/`mountinfo` = `lxroot /` + tabulka bindů (identity /proc,
+    /sys, /dev jako proc/sysfs/tmpfs, remap jako `none` se zdrojem),
+    escapování `\040` jako jádro.
+- **Cizí procesy** (`ps`, `pgrep -f` čtou `/proc/<pid>/cmdline` jiného
+  guesta, jádro ho bere z oblasti arg_start..arg_end): `run_ownall` těsně
+  před `elf_run` přepíše kernelovou oblast argv na guest argv a ukazatele
+  guestu přesměruje do ní (setproctitle guestu se projeví jako v Linuxu).
+  Hranice oblasti počítá `main()` hned na začátku — guest argv je **totéž
+  pole** jako argv z `main()`, dosazení `--argv0` rozbilo první verzi
+  kontroly souvislosti. Zbytek oblasti jsou nuly a jádro je vrací; čtenář
+  pod loaderem dostane cizí `cmdline` bez vycpávky (`PV_CMDLINE_OTHER`).
+- **`comm`** = `prctl(PR_SET_NAME, basename(cesta z execve))` — `ps`,
+  `pgrep -x sleep`, `top` už nevidí všude `elf_loader`.
+- `readlink(at)` výsledek pod `$ROOTFS`/remap bindem → guest cesta
+  (`/proc/self/fd/N`, `/proc/self/cwd`, proot `.l2s`), jako L1 `l1_after`.
+- Vypínač `ELF_LOADER_NO_PROCVIRT=1` (jen comm + přepis argv oblasti;
+  memfd větev je vždy, ale padá zpět na skutečný soubor).
+
+**Akceptace promptu 06 teď kompletní:** util-linux `umount /mnt` *příkaz*
+(libmount čte mountinfo) i `findmnt` fungují, `df` bind přiřadí k `/`
+(syntetické `0:N` ≠ st_dev; limit).
+
+A/B `test-all.sh procvirt` (12 kontrol): stará `a847488` **0/12**, nová
+**12/12**, stejně pod `L1=2` i `L2=1`; statická binárka pod L2 (raw svc →
+`go_handle`): `cmdline` bez loaderu, `maps` 0 úniků (stará 8).
+
+**Limity:** host nástroje (mimo loader) vidí v cizím `cmdline` nulovou
+vycpávku; proces, jehož poslední argumenty jsou prázdné řetězce, o ně při
+čtení pod loaderem přijde; u skriptů (shebang) zůstávají interpret a cesta
+skriptu v argv host cestami (stará věc, mimo 07); `/proc/self/exe` dál vrací
+host cestu guest binárky (vědomě beze změny — Bun/cmake na ní stojí);
+`/proc/<pid>/task/*`, `smaps`, `environ` nevirtualizované.
+`all` 203/1/34 (+procvirt; jediný FAIL `nslookup localhost` = prostředí),
+parrot po běhu nedotčen. Host testy l1_logic/l1_common/relsym/cache PASS.

@@ -5887,10 +5887,10 @@ void f2_set_loader(const char *p) { g_go_loader = p; }
  * getcwd. go_translate ma jinak vlastni exclude seznam a bindy by nevidel
  * (Go, staticke binarky pod L2). main.c je registruje pri startu. */
 static int (*g_go_bind_remap)(const char *, char *, size_t);
-static long (*g_go_bind_deny)(long, const unsigned long *);
+static int (*g_go_bind_deny)(long, const unsigned long *, long *);
 static size_t (*g_go_bind_rev)(char *, size_t);
 void f2_set_bind_hooks(int (*remap)(const char *, char *, size_t),
-                       long (*deny)(long, const unsigned long *),
+                       int (*deny)(long, const unsigned long *, long *),
                        size_t (*rev)(char *, size_t)) {
     g_go_bind_remap = remap;
     g_go_bind_deny = deny;
@@ -6058,9 +6058,9 @@ NOSP static int go_handle(long nr, ucontext_t *ctx) {
         case 36:  pa = 2; break;                 /* symlinkat: jen linkpath */
         default: return 0;
     }
-    if (g_go_bind_deny) {                        /* ro bind / mountpoint */
-        long e = g_go_bind_deny(nr, (const unsigned long *)r);
-        if (e) { r[0] = (unsigned long long)e; return 1; }
+    if (g_go_bind_deny) {      /* ro bind / mountpoint / virtualni /proc */
+        long e;
+        if (g_go_bind_deny(nr, (const unsigned long *)r, &e)) { r[0] = (unsigned long long)e; return 1; }
     }
     char ta[4096], tb[4096];
     long a[6] = { (long)r[0], (long)r[1], (long)r[2], (long)r[3], (long)r[4], (long)r[5] };
