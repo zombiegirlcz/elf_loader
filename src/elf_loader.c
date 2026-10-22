@@ -933,6 +933,49 @@ static void ldso_setup(void) {
     }
 }
 
+/* glibc 2.42+ zmensila obe rtld struktury (ld.so 2.43: _rtld_global_ro
+ * 0x2c0 -> 0x190, _rtld_global 0xbe0 -> 0x8e0). Overeno na Debian 2.41 vs
+ * Kali 2.43: RELR relokace funkcni tabulky v ld.so (0x258 -> 0x120),
+ * _dl_get_tls_static_info (0x1d8/0x1e0 -> 0xa0/0xa8), _dl_find_object
+ * (0x2a0 -> 0x168), dl_iterate_phdr (_dl_nns 0xa80 -> 0x780, load_adds
+ * 0xb18 -> 0x818, write_lock 0xab8 -> 0x7b8) a fork/pthread_get_minstack
+ * (seznamy zasobniku -0x300). Zacatek _rtld_global_ro (platform, pagesize,
+ * hwcap 0x60, auxv 0x68) a sizeof(struct pthread)=0x720 se nemeni.
+ * Volano z run_module_init, jakmile je znama verze libc - pred libc init,
+ * IFUNC resolvery ctou jen hwcap (stejny offset). */
+#define LDSO_RO_SHIFT_243  0x138u
+#define LDSO_G_SHIFT_243   0x300u
+static void ldso_apply_glibc_layout(int minor) {
+    static int applied;
+    if (minor < 42 || applied)
+        return;
+    applied = 1;
+    ldso_setup();
+    /* TLS static size/align/surplus (0x1d8..) a funkcni tabulka (0x258..0x2a0)
+     * se posunou jako celek; mezi 0x70 a 0x1d8 nic nevyplnujeme. */
+    uint64_t *g = (uint64_t *)ldso_global;
+    uint64_t tail[(0x2a8 - 0x1d8) / 8];
+    memcpy(tail, ldso_ro + 0x1d8, sizeof tail);
+    memset(ldso_ro + 0x70, 0, LDSO_RO_SIZE - 0x70);
+    memcpy(ldso_ro + 0x1d8 - LDSO_RO_SHIFT_243, tail, sizeof tail);
+    g[(0xa80 - LDSO_G_SHIFT_243) / 8] = 1;      /* _dl_nns */
+    g[(0xb18 - LDSO_G_SHIFT_243) / 8] = 1;      /* dl_load_adds */
+    /* Slot 2.41 _dl_stack_flags (0xb50, PF_* flagy, libc z nich pocita
+     * prot = RW | (PF_X ? EXEC : 0)) je v 2.43 _dl_stack_prot_flags (0x850)
+     * s HOTOVYM prot pro mprotect zasobniku vlakna. 0 = PROT_NONE ->
+     * pthread_create faultuje na prvnim zapisu do struct pthread. */
+    *(uint32_t *)(ldso_global + 0xb50 - LDSO_G_SHIFT_243) = PROT_READ | PROT_WRITE;
+    g[0xa80 / 8] = 0;
+    g[0xb18 / 8] = 0;
+    static const unsigned stack_lists[] = { 0xb98, 0xba8, 0xbb8 };
+    for (size_t i = 0; i < sizeof stack_lists / sizeof stack_lists[0]; i++) {
+        uintptr_t *old = (uintptr_t *)(ldso_global + stack_lists[i]);
+        uintptr_t *head = (uintptr_t *)(ldso_global + stack_lists[i] - LDSO_G_SHIFT_243);
+        old[0] = old[1] = 0;
+        head[0] = head[1] = (uintptr_t)head;
+    }
+}
+
 #define PARROT_HEAP_SIZE 0x40000000u /* 1 GB - node/V8 spotrebuje stovky MB */
 static void *parrot_heap_base;
 static char *parrot_brk_cur;
@@ -3522,6 +3565,13 @@ static size_t g_pending_cap;
  * přímo z own-loadeného libc a voláme pod parrot TP. */
 static void *(*g_libc_uselocale)(void *);
 static void (*g_libc_ctype_init)(void);
+/* glibc >= 2.42: malloc (tcache_key) se inicializuje az v __libc_early_init,
+ * ne line pri prvnim malloc. Bez nej tcache_key == 0 a free() kazdeho chunku
+ * s nulou ve druhem slove bere za mozny double free -> verify -> vynuluje
+ * key -> znovu free -> nekonecna smycka (kali 2.43: ls/python3 visi, 2026-10-22).
+ * Pro takovou libc ho volame skutecne, pod guest TP (elf_run_pending_inits). */
+static void (*g_libc_early_init)(_Bool);
+static int g_libc_minor = 0;      /* GLIBC_2.<minor> z verdef libc.so.6 */
 extern uintptr_t g_tls_new_tp;
 extern uintptr_t g_tls_old_tp;
 
@@ -3532,6 +3582,7 @@ static long raw_syscall6(long nr, long a0, long a1, long a2, long a3, long a4, l
 /* Per-PID diag cesta: vnorene loadery (script -> pi) jinak michaji/truncate
  * jeden sdileny diag.txt. Cache jednou vybudovanou cestu. */
 static char g_diag_path[160];
+static int g_diag_on = 0;   /* ELF_LOADER_DIAG; cachovano pod bionic TP */
 static const char *diag_path(void) {
     if (g_diag_path[0])
         return g_diag_path;
@@ -3549,6 +3600,14 @@ static const char *diag_path(void) {
     return g_diag_path;
 }
 
+/* Rutinni stopy (INITS-*, SETUP, FILTER, JUMP...) jen s ELF_LOADER_DIAG=1 -
+ * jinak kazdy beh nechal diag.<pid>.txt v $D/usr (tisice souboru). Padove
+ * zaznamy (FAULT, FATAL-TRAP, DENIED) jdou dal pres diag_path().
+ * "" -> open() ENOENT -> zapis se tise preskoci. */
+static const char *diag_path_info(void) {
+    return g_diag_on ? diag_path() : "";
+}
+
 /* Volá se z asm (elf_final_jump) pod parrot TP. Žádný bionic kód/malloc. */
 static void install_sigsys_handler_now(void);
 static int g_f2_filter_active = 0;
@@ -3560,7 +3619,7 @@ static int g_skip_locale = 0;
 static int g_keep_handlers = 0;
 
 void elf_run_pending_inits(void) {
-    { int _fd = raw_syscall6(56, (long)0xFFFFFFFFFFFFFF9CL, (long)(unsigned long)diag_path(), 0x441L, 0644L, 0, (long)F2_SENTINEL); if (_fd >= 0) { const char _m[] = "INITS-START\n"; raw_syscall6(64, _fd, (long)(unsigned long)_m, sizeof(_m) - 1, 0, 0, (long)F2_SENTINEL); raw_syscall6(57, _fd, 0, 0, 0, 0, (long)F2_SENTINEL); } }
+    { int _fd = raw_syscall6(56, (long)0xFFFFFFFFFFFFFF9CL, (long)(unsigned long)diag_path_info(), 0x441L, 0644L, 0, (long)F2_SENTINEL); if (_fd >= 0) { const char _m[] = "INITS-START\n"; raw_syscall6(64, _fd, (long)(unsigned long)_m, sizeof(_m) - 1, 0, 0, (long)F2_SENTINEL); raw_syscall6(57, _fd, 0, 0, 0, 0, (long)F2_SENTINEL); } }
     if (g_tls_new_tp) {
         if (!g_skip_locale) {
             if (g_libc_uselocale)
@@ -3568,6 +3627,9 @@ void elf_run_pending_inits(void) {
             if (g_libc_ctype_init)
                 g_libc_ctype_init();         /* ctype_b/tolower sloty pro tento TP */
         }
+        /* glibc >= 2.42: skutecny __libc_early_init (vc. tcache_key) */
+        if (g_libc_early_init)
+            g_libc_early_init(1);
     }
     {
         char _b[48]; int _i = 0; const char *_p = "INITS-RUN n=";
@@ -3577,7 +3639,7 @@ void elf_run_pending_inits(void) {
         while (_n > 0) { _t[_ti++] = (char)('0' + (_n % 10)); _n /= 10; }
         while (_ti > 0) _b[_i++] = _t[--_ti];
         _b[_i++] = '\n';
-        int _fd = (int)raw_syscall6(56, (long)0xFFFFFFFFFFFFFF9CL, (long)(unsigned long)diag_path(), 0x441L, 0644L, 0, (long)F2_SENTINEL);
+        int _fd = (int)raw_syscall6(56, (long)0xFFFFFFFFFFFFFF9CL, (long)(unsigned long)diag_path_info(), 0x441L, 0644L, 0, (long)F2_SENTINEL);
         if (_fd >= 0) { raw_syscall6(64, _fd, (long)(unsigned long)_b, _i, 0, 0, (long)F2_SENTINEL); raw_syscall6(57, _fd, 0, 0, 0, 0, (long)F2_SENTINEL); }
     }
     if (!g_skip_inits)
@@ -3618,7 +3680,7 @@ void elf_run_pending_inits(void) {
             install_sigsys_handler_now();
         }
     }
-    { int _fd = raw_syscall6(56, (long)0xFFFFFFFFFFFFFF9CL, (long)(unsigned long)diag_path(), 0x441L, 0644L, 0, (long)F2_SENTINEL); if (_fd >= 0) { const char _m[] = "INITS-DONE\n"; raw_syscall6(64, _fd, (long)(unsigned long)_m, sizeof(_m) - 1, 0, 0, (long)F2_SENTINEL); raw_syscall6(57, _fd, 0, 0, 0, 0, (long)F2_SENTINEL); } }
+    { int _fd = raw_syscall6(56, (long)0xFFFFFFFFFFFFFF9CL, (long)(unsigned long)diag_path_info(), 0x441L, 0644L, 0, (long)F2_SENTINEL); if (_fd >= 0) { const char _m[] = "INITS-DONE\n"; raw_syscall6(64, _fd, (long)(unsigned long)_m, sizeof(_m) - 1, 0, 0, (long)F2_SENTINEL); raw_syscall6(57, _fd, 0, 0, 0, 0, (long)F2_SENTINEL); } }
 }
 
 static __attribute__((noreturn)) void elf_run_final(void *sp, void *entry, elf_object_t *obj);
@@ -3641,6 +3703,42 @@ static sym_status_t lookup_table(const Elf64_Sym *symtab, const char *strtab,
                                  size_t count, const char *name, void **out_addr,
                                  const elf_object_t *obj);
 
+/* Nejvyssi GLIBC_2.<n> v DT_VERDEF modulu (0 = nezjisteno). Pozna verzi
+ * glibc bez volani do ni (bezi pod bionic TP). */
+static int elf_glibc_minor(const elf_object_t *m) {
+    unsigned long bias = (unsigned long)m->base_addr - map_base_vaddr(m);
+    const Elf64_Dyn *dyn = NULL;
+    for (int i = 0; i < m->phdr_count; i++)
+        if (m->phdr[i].p_type == PT_DYNAMIC)
+            dyn = (const Elf64_Dyn *)(bias + m->phdr[i].p_vaddr);
+    if (!dyn) return 0;
+    unsigned long vd = 0, vdn = 0, str = 0;
+    for (; dyn->d_tag != DT_NULL; dyn++) {
+        if (dyn->d_tag == DT_VERDEF) vd = dyn->d_un.d_ptr;
+        else if (dyn->d_tag == DT_VERDEFNUM) vdn = dyn->d_un.d_val;
+        else if (dyn->d_tag == DT_STRTAB) str = dyn->d_un.d_ptr;
+    }
+    if (!vd || !str) return 0;
+    if (vd < (unsigned long)m->base_addr) vd += bias;
+    if (str < (unsigned long)m->base_addr) str += bias;
+    int best = 0;
+    const Elf64_Verdef *d = (const Elf64_Verdef *)vd;
+    for (unsigned long k = 0; k < vdn && k < 128; k++) {
+        if (d->vd_aux) {
+            const Elf64_Verdaux *a = (const Elf64_Verdaux *)((const char *)d + d->vd_aux);
+            const char *n = (const char *)str + a->vda_name;
+            if (strncmp(n, "GLIBC_2.", 8) == 0) {
+                int v = 0; const char *q = n + 8;
+                while (*q >= '0' && *q <= '9') v = v * 10 + (*q++ - '0');
+                if (*q == 0 && v > best) best = v;
+            }
+        }
+        if (!d->vd_next) break;
+        d = (const Elf64_Verdef *)((const char *)d + d->vd_next);
+    }
+    return best;
+}
+
 static void run_module_init(elf_object_t *m) {
     Elf64_Dyn *dyn = find_dynamic(m);
     if (!dyn)
@@ -3651,6 +3749,22 @@ static void run_module_init(elf_object_t *m) {
      * string. Our loader never runs the real early-init, so we set the flag
      * ourselves to keep strerror/perror output identical to host glibc. */
     if (m->soname && strcmp(m->soname, "libc.so.6") == 0) {
+        g_libc_minor = elf_glibc_minor(m);
+        if (elf_debug())
+            fprintf(stderr, "[dbg] libc.so.6 = glibc 2.%d\n", g_libc_minor);
+        ldso_apply_glibc_layout(g_libc_minor);
+        if (g_libc_minor >= 42) {
+            void *e = NULL;
+            if (lookup_table(m->dynsym, m->dynstr, m->dynsym_count,
+                             "__libc_early_init", &e, m) == SYM_DEFINED && e)
+                g_libc_early_init = (void (*)(_Bool))e;
+        }
+    }
+    /* Natvrdo zapsane offsety nize jsou overene JEN pro glibc 2.41 (Debian,
+     * parrot) -> jen pri == 41; u jine verze by to byly zapisy naslepo do
+     * cizich dat libc (2.43: 0x1be009 je za koncem .bss). glibc >= 2.42 dela
+     * vse skutecny __libc_early_init (vc. default stacksize). */
+    if (m->soname && strcmp(m->soname, "libc.so.6") == 0 && g_libc_minor <= 41) {
         /* Flag byte __libc_early_init: strerror_l čte bit 0 → cesta
          * "Unknown error %d". Skutečné ei(1) volat NEMŮŽEME — sahá na
          * GLRO struktury naší ld.so simulace (SIGSEGV). Hardcoded offset
@@ -3660,7 +3774,7 @@ static void run_module_init(elf_object_t *m) {
         void *ei = NULL;
         if (lookup_table(m->dynsym, m->dynstr, m->dynsym_count,
                          "__libc_early_init", &ei, m) == SYM_DEFINED && ei &&
-            m->total_size > 0x1be009 + 1) {
+            g_libc_minor == 41 && m->total_size > 0x1be009 + 1) {
             *(char *)va(m, 0x1be009) = 1;
         }
         /* glibc 2.41: flag na libc+0x1b02a0 ridi, zda pthread_create pouzije
@@ -3670,7 +3784,7 @@ static void run_module_init(elf_object_t *m) {
          * na clone(): pri hodnote != 1 jde glibc __clone3 rovnou na fallback
          * vetev (disasm: ldr w2,[x19]; cmp w2,#1; b.ne fallback). Offset je
          * specificky pro glibc 2.41; guard: hodnota musi byt presne 1. */
-        if (m->total_size > 0x1b02a4) {
+        if (g_libc_minor == 41 && m->total_size > 0x1b02a4) {
             uint32_t *clone3_ok = (uint32_t *)va(m, 0x1b02a0);
             if (*clone3_ok == 1)
                 *clone3_ok = 0;
@@ -3692,6 +3806,8 @@ static void run_module_init(elf_object_t *m) {
                 fprintf(stderr, "[dbg] default_stacksize set @%p = %zu\n",
                         (char *)keys + 0x4050, *(size_t *)((char *)keys + 0x4050));
         }
+    }
+    if (m->soname && strcmp(m->soname, "libc.so.6") == 0) {
         /* uselocale/__ctype_init pro TLS per-thread state (viz výše) */
         void *a = NULL;
         if (lookup_table(m->dynsym, m->dynstr, m->dynsym_count,
@@ -4682,6 +4798,8 @@ elf_tls_ctx_t elf_setup_own_tls(elf_object_t *exe, elf_scope_t *scope) {
         g_skip_locale = (v && v[0] && v[0] != '0') ? 1 : 0;
         v = getenv("ELF_LOADER_KEEP_HANDLERS");
         g_keep_handlers = (v && v[0] && v[0] != '0') ? 1 : 0;
+        v = getenv("ELF_LOADER_DIAG");
+        g_diag_on = (v && v[0] && v[0] != '0') ? 1 : 0;
         /* Diagnostika do diag.txt (raw, TP-independent) */
         char _b[64]; int _i = 0; const char *_p = "ENV-CACHE skip_inits=";
         while (*_p) _b[_i++] = *_p++;
@@ -4690,7 +4808,7 @@ elf_tls_ctx_t elf_setup_own_tls(elf_object_t *exe, elf_scope_t *scope) {
         while (*_p2) _b[_i++] = *_p2++;
         _b[_i++] = (char)('0' + g_skip_locale);
         _b[_i++] = '\n';
-        int _fd = (int)raw_syscall6(56, (long)0xFFFFFFFFFFFFFF9CL, (long)(unsigned long)diag_path(), 0x441L, 0644L, 0, (long)F2_SENTINEL);
+        int _fd = (int)raw_syscall6(56, (long)0xFFFFFFFFFFFFFF9CL, (long)(unsigned long)diag_path_info(), 0x441L, 0644L, 0, (long)F2_SENTINEL);
         if (_fd >= 0) { raw_syscall6(64, _fd, (long)(unsigned long)_b, _i, 0, 0, (long)F2_SENTINEL); raw_syscall6(57, _fd, 0, 0, 0, 0, (long)F2_SENTINEL); }
     }
 
@@ -4816,7 +4934,7 @@ elf_tls_ctx_t elf_setup_own_tls(elf_object_t *exe, elf_scope_t *scope) {
         for (int sh = 60; sh >= 0; sh -= 4) b[i++] = hx[(new_tp >> sh) & 0xf];
         b[i++] = '\n';
         int fd = (int)raw_syscall6(56, (long)-100L,
-            (long)(unsigned long)diag_path(),
+            (long)(unsigned long)diag_path_info(),
             0x441L, 0644L, 0, (long)F2_SENTINEL);
         if (fd >= 0) {
             raw_syscall6(64, fd, (long)(unsigned long)b, i, 0, 0, (long)F2_SENTINEL);
@@ -5206,6 +5324,20 @@ static void fault_obj_dump(const char *label, unsigned long tagged, int nq)
     b[i++] = '\n';
     sys_write(2, b, (size_t)i);
 }
+/* Bezpecne cteni libovolne adresy ve fault handleru: process_vm_readv na
+ * sebe vrati EFAULT misto druheho SIGSEGV (ten by pri blokovanem SIGSEGV
+ * jadro rovnou zabilo proces a z dumpu by zbylo jen FAULT-ENTER). */
+static unsigned long fault_peek(unsigned long a) {
+    unsigned long v = 0;
+    if (a < 0x1000)
+        return 0;
+    struct iovec l = { &v, sizeof v }, r = { (void *)a, sizeof v };
+    long pid = raw_syscall6(172, 0, 0, 0, 0, 0, (long)F2_SENTINEL);
+    if (raw_syscall6(270 /*process_vm_readv*/, pid, (long)&l, 1, (long)&r, 1,
+                     0) != (long)sizeof v)
+        return 0;
+    return v;
+}
 static void fault_handler(int sig, siginfo_t *si, void *ctx) {
     ucontext_t *uc = (ucontext_t *)ctx;
 
@@ -5295,20 +5427,20 @@ static void fault_handler(int sig, siginfo_t *si, void *ctx) {
             p = " x1="; while (*p) b[i++] = *p++;
             for (int sh = 60; sh >= 0; sh -= 4) b[i++] = hxd[(x1v >> sh) & 0xf];
             p = " [x1]="; while (*p) b[i++] = *p++;
-            unsigned long m0 = (x1v > 0x1000) ? *(volatile unsigned long *)x1v : 0;
+            unsigned long m0 = fault_peek(x1v);
             for (int sh = 60; sh >= 0; sh -= 4) b[i++] = hxd[(m0 >> sh) & 0xf];
             p = " [x1+31]="; while (*p) b[i++] = *p++;
-            unsigned long m1 = (x1v > 0x1000) ? *(volatile unsigned long *)(x1v + 31) : 0;
+            unsigned long m1 = fault_peek(x1v + 31);
             for (int sh = 60; sh >= 0; sh -= 4) b[i++] = hxd[(m1 >> sh) & 0xf];
             /* x5 (=ldur [x1,#31]) je konzistentne nenulove (si_addr=x5+67).
              * Precist [x5] a [x5+7] rozhodne, zda x5 je platny tagged
              * pointer na objekt, nebo ukazuje do kratkeho/zeroveho regionu. */
             unsigned long x5r2 = (unsigned long)uc->uc_mcontext.regs[5];
             p = " [x5]="; while (*p) b[i++] = *p++;
-            unsigned long m2 = (x5r2 > 0x1000) ? *(volatile unsigned long *)x5r2 : 0;
+            unsigned long m2 = fault_peek(x5r2);
             for (int sh = 60; sh >= 0; sh -= 4) b[i++] = hxd[(m2 >> sh) & 0xf];
             p = " [x5+7]="; while (*p) b[i++] = *p++;
-            unsigned long m3 = (x5r2 > 0x1000) ? *(volatile unsigned long *)(x5r2 + 7) : 0;
+            unsigned long m3 = fault_peek(x5r2 + 7);
             for (int sh = 60; sh >= 0; sh -= 4) b[i++] = hxd[(m3 >> sh) & 0xf];
             p = " len="; while (*p) b[i++] = *p++;
             unsigned long lenv = (unsigned long)i;
@@ -5328,7 +5460,7 @@ static void fault_handler(int sig, siginfo_t *si, void *ctx) {
             fault_obj_dump("SFI", x5v2, 12);
             unsigned long sb = x5v2 & ~7UL;
             for (int off = 16; off <= 32; off += 8) {
-                unsigned long fv = *(volatile unsigned long *)(sb + (unsigned long)off);
+                unsigned long fv = fault_peek(sb + (unsigned long)off);
                 if (fv > 0x10000 && (fv & 1)) fault_obj_dump("SFIFIELD", fv, 8);
             }
         }
@@ -5691,7 +5823,7 @@ static void diag_tp_line(const char *tag) {
     for (int sh = 60; sh >= 0; sh -= 4) b[i++] = hx[(tp >> sh) & 0xf];
     b[i++] = '\n';
     int fd = (int)raw_syscall6(56, (long)-100L,
-        (long)(unsigned long)diag_path(),
+        (long)(unsigned long)diag_path_info(),
         0x441L, 0644L, 0, (long)F2_SENTINEL);
     if (fd >= 0) {
         raw_syscall6(64, fd, (long)(unsigned long)b, i, 0, 0, (long)F2_SENTINEL);
@@ -5805,7 +5937,7 @@ static void install_f2_path_filter_impl(void) {
     /* diag: zapsat navratove kody (raw, TP-independent) */
     {
         int fd = (int)raw_syscall6(56, -100L,
-            (long)(unsigned long)diag_path(),
+            (long)(unsigned long)diag_path_info(),
             0x441L, 0644L, 0, (long)F2_SENTINEL);
         if (fd >= 0) {
             char b[96]; int i = 0;
@@ -6325,7 +6457,7 @@ NOSP static void sigsys_handler(int sig, siginfo_t *si, void *uc) {
          * faultu dochainuje ulozeny guest handler. */
         if (_act)
             elf_set_guest_fatal((int)_sig, (const struct sigaction *)_act);
-        { int _fd = (int)raw_syscall6(56, (long)0xFFFFFFFFFFFFFF9CL, (long)(unsigned long)diag_path(), 0x441L, 0644L, 0, (long)F2_SENTINEL);
+        { int _fd = (int)raw_syscall6(56, (long)0xFFFFFFFFFFFFFF9CL, (long)(unsigned long)diag_path_info(), 0x441L, 0644L, 0, (long)F2_SENTINEL);
           if (_fd >= 0) { char b[160]; int i = 0;
             const char *q = "SIGACTION sig="; while (*q) b[i++] = *q++;
             static const char hxd[] = "0123456789abcdef";
@@ -6462,7 +6594,7 @@ void elf_install_fault_handlers(void) {
     struct sigaction sc;
     memset(&sc, 0, sizeof(sc));
     /* DEBUG: potvrdit, ze handler byl nainstalovan - zapis do souboru */
-    { int _fd = raw_syscall6(56, (long)0xFFFFFFFFFFFFFF9CL, (long)(unsigned long)diag_path(), 0x441L, 0644L, 0, (long)F2_SENTINEL); if (_fd >= 0) { const char _m[] = "INSTALLED\n"; raw_syscall6(64, _fd, (long)(unsigned long)_m, 10, 0, 0, (long)F2_SENTINEL); raw_syscall6(57, _fd, 0, 0, 0, 0, (long)F2_SENTINEL); } }
+    { int _fd = raw_syscall6(56, (long)0xFFFFFFFFFFFFFF9CL, (long)(unsigned long)diag_path_info(), 0x441L, 0644L, 0, (long)F2_SENTINEL); if (_fd >= 0) { const char _m[] = "INSTALLED\n"; raw_syscall6(64, _fd, (long)(unsigned long)_m, 10, 0, 0, (long)F2_SENTINEL); raw_syscall6(57, _fd, 0, 0, 0, 0, (long)F2_SENTINEL); } }
     sc.sa_sigaction = sigsys_handler;
     sc.sa_flags = SA_SIGINFO;
     f2_reinstall_sigsys();
@@ -6790,7 +6922,7 @@ static __attribute__((noreturn)) void elf_run_final(void *sp, void *entry,
     if (getenv("ELF_LOADER_SIGSYS_LOCK"))
         elf_install_sigsys_lock();
     fflush(stderr);
-    { int _fd = raw_syscall6(56, (long)0xFFFFFFFFFFFFFF9CL, (long)(unsigned long)diag_path(), 0x441L /*O_WRONLY|O_CREAT|O_APPEND*/, 0644L, 0, (long)F2_SENTINEL); if (_fd >= 0) { const char _m[] = "JUMP\n"; raw_syscall6(64, _fd, (long)(unsigned long)_m, 5, 0, 0, (long)F2_SENTINEL); raw_syscall6(57, _fd, 0, 0, 0, 0, (long)F2_SENTINEL); } }
+    { int _fd = raw_syscall6(56, (long)0xFFFFFFFFFFFFFF9CL, (long)(unsigned long)diag_path_info(), 0x441L /*O_WRONLY|O_CREAT|O_APPEND*/, 0644L, 0, (long)F2_SENTINEL); if (_fd >= 0) { const char _m[] = "JUMP\n"; raw_syscall6(64, _fd, (long)(unsigned long)_m, 5, 0, 0, (long)F2_SENTINEL); raw_syscall6(57, _fd, 0, 0, 0, 0, (long)F2_SENTINEL); } }
     elf_timing_mark("entry");
     extern void elf_final_jump(void *, void *, uintptr_t, void (*)(void));
     elf_final_jump(sp, entry, g_tls_new_tp, elf_run_pending_inits);

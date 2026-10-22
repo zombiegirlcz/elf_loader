@@ -1908,9 +1908,9 @@ category_imgcache() {
 
     rm -rf "$idir" 2>/dev/null || true
     local t
-    # Baseline BEZ cache: kali (glibc 2.43) pod loaderem zatim nedobiha (uname
-    # vypise a visi v exitu, ls ani nevypise - i stara binarka, 2026-10-22).
-    # Bez funkcni baseline neni s cim srovnavat -> SKIP, ne falesny FAIL.
+    # Baseline BEZ cache: s loaderem bez podpory glibc 2.43 kali visi (uname
+    # vypise a visi v exitu - opraveno 2026-10-22 (4)). Bez funkcni baseline
+    # neni s cim srovnavat -> SKIP, ne falesny FAIL.
     for t in "$KR/usr/bin/uname -m" "$KR/bin/ls $KR/tmp"; do
         # -s KILL: visici kali proces SIGTERM od timeoutu ignoruje (osirel)
         if [ -z "$("$R/usr/bin/timeout" -s KILL 3 "$R/bin/bash" -c "$env $L --ownall $t" 2>&1 | head -3)" ]; then

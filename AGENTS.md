@@ -72,7 +72,8 @@ Knoby: `ELF_LOADER_TIMING`, `ELF_LOADER_NO_CACHE`, `ELF_LOADER_NO_HASH`,
 `ELF_LOADER_L1` (`=1`/`=2`), `ELF_LOADER_L1_SCAN`, `F2_SKIP=a,b` (denylist
 jmenných hooků), `F2_ONLY` (allowlist), `ELF_LOADER_L2` (`=1` záchytná síť),
 `ELF_LOADER_L2_LAZY` (líný přepis, default vyp), `ELF_LOADER_GOMODE=0`
-(vypne Go mód; L2 ho nahrazuje), `ELF_LOADER_NO_PROCVIRT` (prompt 07).
+(vypne Go mód; L2 ho nahrazuje), `ELF_LOADER_NO_PROCVIRT` (prompt 07),
+`ELF_LOADER_DIAG=1` (rutinní stopy do `$D/usr/diag.<pid>.txt`; pádové vždy).
 Bindy: `LX_BINDS=host:guest[:ro],…`,
 `$ROOTFS/etc/lx-binds` (fstab), `LX_BINDS_FILE` (sdílená tabulka, vnucuje se
 potomkům; prázdné = nová session).
@@ -228,9 +229,10 @@ fork veneer (vfork-style clone) [#L685].
   Bezpečné, jen odložené. Default L1 zatím vypnutý.
 - **Celorootfs konverze absolutních symlinků čeká na potvrzení** (1093 linků,
   1081 převoditelných) — `tools/relsymlinks.sh --dry-run`.
-- **glibc 2.43 (kali rootfs) pod loaderem visí** — `uname` vypíše a nedokončí
-  exit, `ls` nevypíše nic, SIGTERM ignoruje (i `a2764d6`). Parrot (2.41) OK.
-  `category_imgcache` (běží jen nad kali) do opravy SKIP [2026-10-22].
+- **glibc 2.42+ podpora je odvozená, ne obecná** — layout falešných
+  `_rtld_global(_ro)` je ověřen jen pro 2.41 (parrot) a 2.43 (kali);
+  2.42 dostane layout 2.43 neověřeně. Při další verzi glibc znovu změřit
+  (`ldso_apply_glibc_layout`, postup.md 2026-10-22 (4)).
 - Test na reálném 16K Android 15+ (Task 3). `nmap` není v rootfs [#L680];
   ostatní síťové binárky ověřeny OK.
 - Kosmetika: `src/main.c:149` sign-compare, `\]` escape.

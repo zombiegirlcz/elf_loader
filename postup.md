@@ -5561,3 +5561,67 @@ host cestu guest binárky (vědomě beze změny — Bun/cmake na ní stojí);
 `/proc/<pid>/task/*`, `smaps`, `environ` nevirtualizované.
 `all` 203/1/34 (+procvirt; jediný FAIL `nslookup localhost` = prostředí),
 parrot po běhu nedotčen. Host testy l1_logic/l1_common/relsym/cache PASS.
+
+## 2026-10-22 (4) — glibc 2.43 (kali) stabilní pod loaderem
+
+Uživatel: loader má nahradit proot, takže **musí být stabilní** i po
+upgradu parrotu na glibc 2.43. Prompt 08 odložen.
+
+**Root cause 1 — visení (tcache).** V 2.43 `__libc_early_init` na konci
+volá `tcache_key_initialize`; loader early-init nikdy nevolal → `tcache_key`
+= 0 → `free()` ve verify smyčce double-free nekonečně cyklí (uname vypíše,
+nedokončí exit; ls nevypíše nic). Oprava: `elf_glibc_minor()` čte nejvyšší
+`GLIBC_2.N` z verdef libc; pro ≥ 42 se najde `__libc_early_init` a
+`elf_run_pending_inits` ho volá s `1` pod guest TP (po uselocale/ctype_init).
+Natvrdo zapsané 2.41 offsety (`0x1be009` flag, `0x1b02a0` clone3) jen při
+`== 41` — u jiné verze by to byly zápisy naslepo.
+
+**Root cause 2 — vlákna (layout rtld struktur).** Falešné `_rtld_global_ro`
+a `_rtld_global` měly layout 2.41. ld.so 2.43 je má menší (0x2c0 → 0x190,
+0xbe0 → 0x8e0). Ověřeno na binárkách obou rootfs:
+- RELR relokace ld.so (dekodér ve scratchpadu): funkční tabulka
+  `_dl_debug_printf…_dl_libc_freeres` 0x258 → **0x120**, `_dl_find_object`
+  0x2a0 → 0x168 (libc ho čte na +360);
+- `_dl_get_tls_static_info`: static size/align 0x1d8/0x1e0 → **0xa0/0xa8**
+  (= posun ro −0x138 pro vše od TLS dál; začátek — platform, pagesize 0x18,
+  hwcap 0x60, auxv 0x68 — beze změny);
+- `dl_iterate_phdr`: `_dl_nns` 0xa80 → 0x780, `dl_load_adds` 0xb18 → 0x818,
+  write_lock 0xab8 → 0x7b8; `fork`/`__pthread_get_minstack`: seznamy
+  zásobníků 0xb98/0xba8/0xbb8 → 0x898/0x8a8/0x8b8 (stejný vzor 5/4/2) =
+  posun g **−0x300**;
+- **past:** slot 2.41 `_dl_stack_flags` (0xb50, PF_* flagy, libc z nich
+  počítá `RW | EXEC?`) je v 2.43 `_dl_stack_prot_flags` (0x850) s HOTOVÝM
+  prot pro `mprotect` zásobníku vlákna (ld.so tam ukládá převod PT_GNU_STACK).
+  Nula = PROT_NONE → `pthread_create` faultuje na `str w0,[x3,#1044]` do
+  `struct pthread`. Nastaveno `PROT_READ|PROT_WRITE`.
+- `sizeof(struct pthread)` = 0x720 v obou (dl_iterate_phdr, pthread_create).
+
+`ldso_apply_glibc_layout(minor)` (volá `run_module_init`, jakmile je známa
+verze libc — před libc init; IFUNC resolvery čtou jen hwcap, ten se
+nehýbe) pro ≥ 42 přesune ro tabulku a g pole. 2.42 neověřeno, dostane
+layout 2.43.
+
+**Vedlejší opravy:**
+- `diag.<pid>.txt`: každý běh zapisoval rutinní stopy (INSTALLED, SETUP,
+  JUMP, INITS-*) do `$D/usr` → **8171 souborů**. Teď jen s
+  `ELF_LOADER_DIAG=1` (`diag_path_info()`; `lxfb` ho už nastavuje). Pádové
+  záznamy (FAULT, FATAL-TRAP, DENIED, SIGSYS-LOCK) se píšou dál vždy.
+- Fault handler dereferencoval x1/x5 jako V8 objekty → u jiných pádů
+  druhý SIGSEGV v handleru, jádro proces zabilo a z dumpu zbylo jen
+  `FAULT-ENTER`. Teď `fault_peek()` přes `process_vm_readv` (EFAULT místo
+  pádu) → plný dump (pc, regs, bt, symbol) i pro ne-V8 pády.
+
+**Ověření (kali 2.43, `--ownall`):** threading, `ThreadPoolExecutor(8)`,
+subprocess/popen, `ls`, perl, ssl/hashlib/ctypes, `sort --parallel=4` — vše
+OK (dřív: visení, pak assert `allocatestack.c:479 size != 0`, pak SIGSEGV
+v pthread_create). Pozn.: `subprocess.run(["ls","/"])` v testu vrátil
+„Permission denied" — to je host toybox `ls` (PATH z ashell má
+`/system/bin`), ne loader.
+`test-all.sh all` (parrot 2.41) **204 PASS / 1 FAIL / 33 SKIP** (dřív
+203/1/34; `imgcache` nad kali z SKIP → PASS; jediný FAIL `nslookup
+localhost` = resolv.conf, prostředí). Host testy cache/relsym/l1/l1_common/
+l1_logic PASS. Parrot po běhu nedotčen (mtime `etc`/`usr/bin` 03:20,
+žádný soubor novější než deploy).
+
+Doporučení pro uživatele: dokud tohle není v master, držet v parrotu
+`apt-mark hold libc6 libc-bin`.
