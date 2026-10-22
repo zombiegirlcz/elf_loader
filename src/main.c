@@ -351,6 +351,7 @@ static char **guest_environ(void) {
     return environ;
 }
 #include "binds.h"
+#include "l2s.h"
 /* shim_excluded = "cesta se NEprekladu pod ROOTFS, nechat hostovou" = v tabulce
  * bindu IDENTITY shoda (host==guest). Pred binds_init (g_binds_ready=0) fallback
  * na puvodni natvrdo zapsany seznam, aby brzke volani melo stejne chovani. */
@@ -1256,9 +1257,12 @@ static int shim_resolve_symlinks(const char *path, char *out, size_t outsz);
 
 static int shim_stat(const char *p, struct stat *st) {
     char b[8192]; const char *path = p; if (shim_translate(p, b, sizeof b)) path = b;
+    char raw[8192]; shim_strcpy(raw, sizeof raw, path);
     char resolved[8192];
     if (shim_resolve_symlinks(path, resolved, sizeof(resolved))) path = resolved;
-    fp_stat f = (fp_stat)g_orig_stat; return f ? f(path, st) : -1;
+    fp_stat f = (fp_stat)g_orig_stat; int r = f ? f(path, st) : -1;
+    if (r == 0) l2s_fix_stat(raw, 1, st);
+    return r;
 }
 static int shim_stat64(const char *p, struct stat64 *st) {
     char b[8192]; const char *path = p; if (shim_translate(p, b, sizeof b)) path = b;
@@ -1274,7 +1278,9 @@ static int shim___xstat(int v, const char *p, struct stat *st) {
 }
 static int shim_lstat(const char *p, struct stat *st) {
     char b[8192]; const char *path = p; if (shim_translate(p, b, sizeof b)) path = b;
-    fp_lstat f = (fp_lstat)g_orig_lstat; return f ? f(path, st) : -1;
+    fp_lstat f = (fp_lstat)g_orig_lstat; int r = f ? f(path, st) : -1;
+    if (r == 0) l2s_fix_stat(path, 0, st);
+    return r;
 }
 static int shim___lxstat(int v, const char *p, struct stat *st) {
     char b[8192]; const char *path = p; if (shim_translate(p, b, sizeof b)) path = b;
@@ -1377,7 +1383,9 @@ static int shim_fstatat(int dfd, const char *p, void *st, int flags) {
             if (shim_resolve_symlinks(path, resolved, sizeof(resolved))) path = resolved;
         }
     }
-    fp_fstatat f = (fp_fstatat)g_orig_fstatat; return f ? f(dfd, path, st, flags) : -1;
+    fp_fstatat f = (fp_fstatat)g_orig_fstatat; int r = f ? f(dfd, path, st, flags) : -1;
+    if (r == 0 && dfd == -100) l2s_fix_stat(path, !(flags & 0x100), (struct stat *)st);
+    return r;
 }
 static int shim_newfstatat(int dfd, const char *p, void *st, int flags) {
     char b[8192]; const char *path = p;
@@ -1388,7 +1396,9 @@ static int shim_newfstatat(int dfd, const char *p, void *st, int flags) {
             if (shim_resolve_symlinks(path, resolved, sizeof(resolved))) path = resolved;
         }
     }
-    fp_fstatat f = (fp_fstatat)g_orig_newfstatat; return f ? f(dfd, path, st, flags) : -1;
+    fp_fstatat f = (fp_fstatat)g_orig_newfstatat; int r = f ? f(dfd, path, st, flags) : -1;
+    if (r == 0 && dfd == -100) l2s_fix_stat(path, !(flags & 0x100), (struct stat *)st);
+    return r;
 }
 
 /* Path-mutujici operace: dpkg/ldconfig/apt vytvareji symlinky, mkdir, rename.
@@ -1434,6 +1444,9 @@ static int shim_link(const char *o, const char *n) {
             return 0;
         }
     }
+    int lr = l2s_link(oldp, newp);
+    if (lr == 0) return 0;
+    if (lr == -1) return -1;
     fp_link f = (fp_link)g_orig_link; return f ? f(oldp, newp) : -1;
 }
 typedef int (*fp_rename)(const char *, const char *);
@@ -1470,6 +1483,7 @@ typedef int (*fp_unlink)(const char *);
 static int shim_unlink(const char *p) {
     if (shim_rofail(p) || shim_busyfail(p)) return -1;
     char b[8192]; const char *path = p; if (shim_translate(p, b, sizeof b)) path = b;
+    l2s_unlink(path);
     fp_unlink f = (fp_unlink)g_orig_unlink; return f ? f(path) : -1;
 }
 /* GNU coreutils rm/rmdir volaji unlinkat/rmdirat (NE unlink/rmdir). Bez techto
@@ -1480,6 +1494,7 @@ static int shim_unlinkat(int dfd, const char *p, int flags) {
     if (dfd == -100 && (shim_rofail(p) || shim_busyfail(p))) return -1;
     char b[8192]; const char *path = p;
     if (dfd == -100 && p && p[0] == '/') { if (shim_translate(p, b, sizeof b)) path = b; }
+    if (dfd == -100) l2s_unlink(path);
     fp_unlinkat f = (fp_unlinkat)g_orig_unlinkat; return f ? f(dfd, path, flags) : -1;
 }
 typedef int (*fp_rmdirat)(int, const char *);
@@ -1563,8 +1578,14 @@ static int shim_mkfifoat(int d, const char *p, unsigned int m) { if (d == -100 &
     int (*f)(int, const char *, unsigned int) = g_orig_mkfifoat; return f ? f(d, TP(p), m) : -1; }
 static int shim_linkat(int od, const char *o, int nd, const char *n, int fl) {
     char b1[8192], b2[8192];
+    const char *oldp = shim_tp(o, b1, sizeof b1), *newp = shim_tp(n, b2, sizeof b2);
+    if (od == -100 && nd == -100) {
+        int lr = l2s_link(oldp, newp);
+        if (lr == 0) return 0;
+        if (lr == -1) return -1;
+    }
     int (*f)(int, const char *, int, const char *, int) = g_orig_linkat;
-    return f ? f(od, shim_tp(o, b1, sizeof b1), nd, shim_tp(n, b2, sizeof b2), fl) : -1; }
+    return f ? f(od, oldp, nd, newp, fl) : -1; }
 static int shim_statfs(const char *p, void *buf) { SHIM_PATH_BUF;
     int (*f)(const char *, void *) = g_orig_statfs; return f ? f(TP(p), buf) : -1; }
 static int shim_statfs64(const char *p, void *buf) { SHIM_PATH_BUF;
@@ -4174,6 +4195,7 @@ static int run_ownall(const char *path, int argc, char **argv, char **envp) {
      * + config ($ROOTFS/etc/lx-binds, LX_BINDS). Musi byt PRED prvnim prekladem
      * (shim_translate/shim_excluded ji ctou pres g_binds_ready). */
     binds_init();
+    l2s_init();
 
     char **argv_pre_shebang = argv;   /* shebang blok argv nahradi -> skript */
     /* jmeno pro comm: cesta z execve PRED resolvem symlinku (python3, ne

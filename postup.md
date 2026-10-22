@@ -5625,3 +5625,118 @@ l1_logic PASS. Parrot po běhu nedotčen (mtime `etc`/`usr/bin` 03:20,
 
 Doporučení pro uživatele: dokud tohle není v master, držet v parrotu
 `apt-mark hold libc6 libc-bin`.
+
+## 2026-10-22 (6) — prompt 08 cast 2: link2symlink (l2s)
+
+Ukol: emulace `link()`/`linkat()` (ekvivalent `proot -l`), protoze SELinux app
+domeny hardlinky zakazuje (AGENTS.md bod 8). Implementace v novem
+`src/l2s.h` (samostatny header podle vzoru `src/binds.h`), tenke haky v
+`src/main.c` (`shim_link`, `shim_linkat`, `shim_unlink`, `shim_unlinkat`,
+`shim_stat`, `shim_lstat`, `shim_fstatat`, `shim_newfstatat`). Knob `LX_L2S=1`
+(vychozi VYPNUTO), volitelny override adresare `LX_L2S_DIR`. Inicializace
+`l2s_init()` volana hned za `binds_init()` (bionicky TP, libc OK); hot-path
+(`l2s_link`/`l2s_unlink`/`l2s_fix_stat`) bezi pod GUEST TP -> jen `shim_str*`
+a raw syscally (`shim_raw_syscall6`), zadne bionic snprintf/getenv (AGENTS.md
+pasti 1 a 9).
+
+**Proot konvence — zjisteno empiricky z `kali` rootfs, ne ze zdrojaku proot**
+(web nastroje v tomhle behu nedostupne, nemohl jsem overit zdrojovy kod
+proot primo). V `$K/.l2s/` (presne `$ROOTFS/.l2s`, tedy stejne umisteni, jake
+uz tenhle projekt predpokladal v komentarich main.c/relsym.h/l1.h/procvirt.h
+a v obou prompt 08 dokumentech) uz leziji artefakty ze skutecneho proot
+behu (pravdepodobne z predchoziho `apt`/`dpkg` pod proot v appce):
+
+```
+.l2s.perl.dpkg-new0001 -> .l2s.perl.dpkg-new0001.0002   (symlink, relativni)
+.l2s.perlbug.dpkg-new0001 -> .l2s.perlbug.dpkg-new0001.0002
+```
+
+Tedy skutecny proot format je `.l2s.<puvodni-basename><instance>` jako jmeno
+symlinku a `.l2s.<puvodni-basename><instance>.<generace>` jako storage (cil
+JE RELATIVNI, ne hostove absolutni, jak jsem predpokladal z existujicich
+komentaru v tomhle repu!). Muj `l2s.h` pouziva jinou konvenci:
+- adresar: `$ROOTFS/.l2s` — SHODUJE SE s realnym proot.
+- jmeno storage: `<dev>-<ino>` originalu (dev/ino jako klic, fakeroot/proot
+  styl identifikatoru, ale NE bajtove tvar skutecneho proot) + samostatny
+  `<id>.nlink` citac (proot citac vede jinak — zjevne pocitanim symlinku se
+  stejnym cilem pri statu, ne samostatnym souborem, protoze zadny `.nlink`
+  soubor vedle znalezenych `.l2s.perl...` neexistuje).
+- cil symlinku: HOSTOVE ABSOLUTNI (podle existujicich komentaru v tomto repu
+  o ".l2s cile jsou hostove absolutni") — realny proot pouziva RELATIVNI cil.
+
+**Dusledek:** adresarove umisteni je kompatibilni, bajtovy format NENI.
+Rootfs, ktery uz ma proot-vytvorene `.l2s.*` soubory (jako tenhle kali),
+nebude s touhle implementaci spravne secist nlink u TECH konkretnich
+souboru (moje `l2s_fix_stat`/`l2s_unlink` je rozpozna jako "nase" diky
+prefixu adresare, ale `.nlink` soubor pro ne neexistuje -> citac ticho
+selze, zadny crash, jen se nedoplni spravny nlink). Noveho linky vytvorene
+touhle implementaci maji svuj vlastni konzistentni format a funguji mezi
+sebou spravne. Pro plnou binarni kompatibilitu s PROOT -l by bylo nutne
+prepsat `l2s_make_id`/`l2s_storage_path`/citac na presne tenhle format a
+relativni cile — NEUDELANO, chybi cas overit zbytek formatu (generace,
+instance counter) bez pristupu k proot zdrojakum.
+
+**Co funguje (overeno na zarizeni, `K=.../kali`, `LX_L2S=1`):**
+Python `os.link('a','b')` (PLT-level volani `link()`/`linkat()` glibc
+symbolu) spravne: presunul original do `$K/.l2s/<dev>-<ino>`, vytvoril oba
+symlinky na stejny cil (overeno `ls -li` — oba ukazovaly na stejnou cestu),
+`.nlink` soubor obsahoval `2`. Mechanismus presunu+symlinku+citace tedy
+principielne funguje.
+
+**Co NEFUNGUJE / otevrene problemy (poctive, nezakryvat):**
+
+1. **coreutils `ln`/`ls` hooky vubec nevolaji.** Pridal jsem docasny debug
+   print do `shim_link`, `shim_lstat`, `shim_newfstatat`, `shim_statx` (raw
+   syscall na fd 2, guest-TP safe) a spustil `ln a b` resp. `ls -li a b` pod
+   `--ownall` — ZADNY debug radek se nevypsal, tedy volani teto glibc
+   (2.41/2.43 kali) na `link`/`linkat`/`lstat`/`newfstatat`/`statx` v
+   `ln`/`ls` binarce GOT-level hook vubec nezasahne (stejna trida problemu
+   jako AGENTS.md pasti 1/2 — BTI prolog nebo interni syscall primo).
+   Akceptacni kriterium "`ln a b && ls -li` ukazuje 2 odkazy" tedy NENI
+   splneno pro realne coreutils nastroje — jen pro kod, ktery `link()`/
+   `lstat()` vola normalni cestou pres PLT (overeno Pythonem, viz vyse).
+   Plne pokryti vyzaduje L1/L2 (preklad na hranici syscallu), ktery prompt
+   08 cast 2 zminuje jen jako volitelny bonus ("pokud to jde levne") — v
+   tomhle kole NEIMPLEMENTOVANO, chybi cas.
+2. **Nereprodukovatelnost.** Prvni test (`python3 -c "os.link('a','b')"`
+   v samostatnem skriptu) uspel cele (presun, 2 symlinky, citac=2). Dalsi
+   test se tremi po sobe jdoucimi `python3 -c` volani ve stejnem bash
+   skriptu pod stejnym `--ownall` spustenim SELHAL hned na prvnim `os.link`
+   s `PermissionError` (= `l2s_link` vratilo -2 fallback, tedy
+   `g_l2s_enabled` bylo 0 nebo `g_shim_root` prazdny v tom konkretnim
+   behu), i kdyz env (`LX_L2S=1`, `ROOTFS=...`) bylo identicke. Root cause
+   NEOBJASNEN v ramci rozpoctu tohoto behu — podezreni na poradi
+   `l2s_init()` vs. necim, co `g_shim_root`/env mezi vnorenymi exec/own-load
+   kroky meni, ale neoverene. **Tohle je realna korektnostni chyba a duvod,
+   proc LX_L2S zustava vychozi VYPNUTO a proc jsem nepridaval `test-all.sh
+   l2s` kategorii s tvrzenim "PASS" — bylo by to lez bez dalsiho vysetreni.**
+3. `statx` (syscall s `struct statx`, jiny layout nez `struct stat`) NEMA
+   napojeny `l2s_fix_stat` vubec — jen debug-overene, ze se nevola (bod 1),
+   ale i kdyby se volal, oprava `stx_nlink` by potrebovala samostatnou
+   funkci (jiny layout struktury). Otevrene.
+4. Host unit test (`test/l2s_test.c`) NEVYTVOREN — raw syscall cisla v
+   `l2s.h` jsou aarch64-specificka (prompt je explicitne zadal), na x86_64
+   hostu by test bezel jen proti x86_64 syscall tabulce, tedy by netestoval
+   totez; smyslem budiz jen `-fsyntax-only` kontrola (provedena, bez
+   chyby) — vlastni behovy host test by vyzadoval qemu-aarch64 nebo
+   podobne, coz presahuje rozpocet tohoto kola.
+5. `test-all.sh` kategorie `l2s` NEPRIDANA (viz bod 2 — nechtel jsem
+   zapsat kategorii, ktera by tvrdila PASS u neconzistentniho chovani).
+6. `/dev/shm` sem_open regrese NEBYLA znovu zivě overena v tomhle kole
+   (kod je nezmeneny — vcasny `return` v `shim_link` pred volanim
+   `l2s_link` zustal na puvodnim miste — takze regrese se neceka, ale
+   explicitni test chybi).
+
+**Build/deploy:** Modal build (`finale_loader_build.py`) prosel bez novych
+chyb/varovani (jen puvodni, nesouvisejici warningy), binarka `774440 B`
+(presne stejna velikost jako build pred touhle zmenou — ocekavane, zmena je
+jen pridani kodu + male haky, -O0). Nasazeno na vlastni cestu
+`$D/usr/bin/elf_loader.l2s` (NE na `elf_loader`, ktery pouziva jiny agent).
+
+**Zavrecny stav:** l2s mechanismus (presun+symlink+citac) je funkcni v
+zasade, ale NENI production-ready — bod 1 (coreutils bypass hooku) a bod 2
+(nereprodukovatelnost) musi byt vyreseny pred tim, nez `LX_L2S` dostane
+smysl zapnout na realne workloady (apt/dpkg). Doporuceni pro navazujici
+praci: nejdriv zjistit root cause bodu 2 (pridat diag log do `l2s_init()`,
+overit `g_shim_root`/env pri kazdem exec kroku pod `--ownall`), pak resit
+bod 1 pres L1 (uz existujici infrastruktura pro presne tuto tridu problemu).

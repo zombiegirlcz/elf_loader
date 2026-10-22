@@ -77,6 +77,15 @@ jmenných hooků), `F2_ONLY` (allowlist), `ELF_LOADER_L2` (`=1` záchytná síť
 Bindy: `LX_BINDS=host:guest[:ro],…`,
 `$ROOTFS/etc/lx-binds` (fstab), `LX_BINDS_FILE` (sdílená tabulka, vnucuje se
 potomkům; prázdné = nová session).
+`LX_L2S=1` (default vypnuto, prompt 08 část 2 — link2symlink/`src/l2s.h`;
+`link()`/`linkat()` přesunou originál do `$ROOTFS/.l2s/<dev>-<ino>` a obě
+jména se stanou symlinky s počítadlem v `<id>.nlink`; `LX_L2S_DIR` override
+adresáře). **Nehotové:** coreutils `ln`/`ls` obcházejí named hooky úplně
+(stejná třída jako pasti 1/2 níže — ověřeno debug tiskem, 0 zásahů), funguje
+jen přes PLT `link()`/`lstat()` (ověřeno Pythonem); navíc nereprodukovatelné
+selhání při více `python3 -c` voláních v jednom běhu (viz postup.md
+2026-10-22 (6)). Proto zůstává default vypnuto a bez `test-all.sh l2s`
+kategorie.
 
 **Metodika:** pinování CPU mění čísla o desítky % → měřit při stejné CPU
 politice a A/B dělat knobem na téže binárce, ne dvěma buildy.
