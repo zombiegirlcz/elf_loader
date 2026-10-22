@@ -35,6 +35,14 @@ případné poškození nic nezlomí; parrot ber v testech jen read-only.
 dpkg DB přežila, obnova šla z `dpkg --get-selections`. Viz i bezpečnostní
 pravidla v kořenovém `CLAUDE.md` (bootloop 2026-08-23).
 
+**Bindy (prompt 06) jsou stejně nebezpečné:** `rm -rf <mountpoint>` pod
+loaderem maže **zdroj** bindu (jako v Linuxu). Pravděpodobná skutečná příčina
+incidentu: starý `category_binds` nechal bind `/tmp/lxbt → /etc` v tabulce
+harnessu a úklid `rm -rf /tmp/lxbt` pod loaderem smazal `$R/etc` (postup.md
+2026-10-22). V testech: zdroj bindu **jen jednorázový adresář**, pod-testy
+s `LX_BINDS_FILE=` (vlastní tabulka), úklid **hostovými** nástroji
+(`/system/bin/*`) na host cestách.
+
 ## Build a prostředí
 
 gcc 14.2 v prootu, `as` symlink fix [#L8]. Testy: `make test`, `--ownall`
@@ -64,7 +72,9 @@ Knoby: `ELF_LOADER_TIMING`, `ELF_LOADER_NO_CACHE`, `ELF_LOADER_NO_HASH`,
 `ELF_LOADER_L1` (`=1`/`=2`), `ELF_LOADER_L1_SCAN`, `F2_SKIP=a,b` (denylist
 jmenných hooků), `F2_ONLY` (allowlist), `ELF_LOADER_L2` (`=1` záchytná síť),
 `ELF_LOADER_L2_LAZY` (líný přepis, default vyp), `ELF_LOADER_GOMODE=0`
-(vypne Go mód; L2 ho nahrazuje).
+(vypne Go mód; L2 ho nahrazuje). Bindy: `LX_BINDS=host:guest[:ro],…`,
+`$ROOTFS/etc/lx-binds` (fstab), `LX_BINDS_FILE` (sdílená tabulka, vnucuje se
+potomkům; prázdné = nová session).
 
 **Metodika:** pinování CPU mění čísla o desítky % → měřit při stejné CPU
 politice a A/B dělat knobem na téže binárce, ne dvěma buildy.
@@ -86,8 +96,9 @@ review. Před synchronizací `git pull origin dev`, pak `master` ← `dev` (ff).
   do global NS) [#L605]. Architektura spouštění [#L598], [#L731].
 - `bzsh` — bundled bionic zsh 5.9.2, instaluje se do `/data/adb/` stejně jako
   `linuxsh` (Magisk mount není vidět v app namespace).
-- **`mount(2)` je v app doméně ENOSYS** (seccomp) — `mount --bind` v rootfs
-  nejde, použít symlink.
+- **`mount(2)` je v app doméně ENOSYS** (seccomp) — pod loaderem `mount
+  --bind` emuluje tabulka bindů (prompt 06, viz „Překlad cest"); mimo loader
+  (proot, host) použít symlink.
 
 ## Shelly: `lx`, `init`, double world
 
@@ -135,6 +146,17 @@ fork veneer (vfork-style clone) [#L685].
   (`ELF_LOADER_L2_LAZY=1`, default vyp — není ARM-safe souběžně). `L2=1`
   dělá statickou glibc i Go viditelnou do rootfs. `all` default 195/0/33
   [2026-10-21 (3)].
+- **Tabulka mountů** (prompt 06, `src/binds.h`): longest-prefix
+  `guest → host [ro]`, default = bývalý `shim_excluded` (identity) + remap
+  `/dev/shm`. MAP_SHARED soubor (`$LX_LOG/binds.*.tab`, jinak
+  `$ROOTFS/tmp/.lxbinds.*.tab`) sdílený session přes `LX_BINDS_FILE`;
+  `shim_mount`/`umount2` = runtime `mount --bind` (cross-process). Jiné
+  `LX_BINDS` → soukromá kopie (`unshare -m`), jiný `ROOTFS` → nová tabulka;
+  osiřelé soubory maže GC přes `flock`. Ro → `EROFS`, mountpoint
+  `rmdir`/`rename` → `EBUSY`, `getcwd` zpětně (`bind_reverse`). L1 i L2 přes
+  `shim_bind_deny` (`l1_before` umí syscall odmítnout) a `go_translate` hook.
+  util-linux `umount` příkaz a `/proc/mounts` čekají na prompt 07
+  [2026-10-22].
 
 ## Pravidla a pasti (než sáhneš na kód)
 
@@ -194,6 +216,9 @@ fork veneer (vfork-style clone) [#L685].
   Bezpečné, jen odložené. Default L1 zatím vypnutý.
 - **Celorootfs konverze absolutních symlinků čeká na potvrzení** (1093 linků,
   1081 převoditelných) — `tools/relsymlinks.sh --dry-run`.
+- **glibc 2.43 (kali rootfs) pod loaderem visí** — `uname` vypíše a nedokončí
+  exit, `ls` nevypíše nic, SIGTERM ignoruje (i `a2764d6`). Parrot (2.41) OK.
+  `category_imgcache` (běží jen nad kali) do opravy SKIP [2026-10-22].
 - Test na reálném 16K Android 15+ (Task 3). `nmap` není v rootfs [#L680];
   ostatní síťové binárky ověřeny OK.
 - Kosmetika: `src/main.c:149` sign-compare, `\]` escape.

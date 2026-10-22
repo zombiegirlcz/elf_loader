@@ -13,7 +13,7 @@ v [proot-nahrada.md](proot-nahrada.md) — prompty odkazují na její kapitoly.
 | 03 | [relativní symlinky, clamp `..`, rootfd](03-symlinky-a-rootfd.md) | 4.1–4.3 | – | implementace | **hotovo** 2026-10-21 |
 | 04 | [L1 — přepis `svc #0` při načtení](04-L1-prepis-svc.md) | 2.1 | 01 | implementace | **hotovo** 2026-10-21 (default vypnuto) |
 | 05 | [L2 — seccomp TRAP v guest okně](05-L2-sigsys-okno.md) | 2.2 | 04 | implementace | **hotovo** 2026-10-21 (3) (default vypnuto) |
-| 06 | [tabulka mountů + `mount --bind`](06-mount-tabulka.md) | 3.1 | 04 (doporučeno) | implementace | – |
+| 06 | [tabulka mountů + `mount --bind`](06-mount-tabulka.md) | 3.1 | 04 (doporučeno) | implementace | **hotovo** 2026-10-22 (`umount` příkaz → 07) |
 | 07 | [virtualizace `/proc` + `argv[0]`](07-proc-a-argv0.md) | 3.4, 3.5 | – | implementace | – |
 | 08 | [fake root + link2symlink](08-fakeroot-l2s.md) | 3.2, 3.3 | 04 (doporučeno) | implementace | – |
 | 09 | [proot-kompatibilní CLI + hybrid](09-proot-cli-hybrid.md) | 3.6, 7 | 06, 08 | implementace | – |
@@ -23,7 +23,7 @@ v [proot-nahrada.md](proot-nahrada.md) — prompty odkazují na její kapitoly.
 
 07 jde dělat kdykoli, je nezávislý.
 
-## Co je hotové (stav 2026-10-21)
+## Co je hotové (stav 2026-10-22)
 
 **01 — měření a fázový profil.** `ELF_LOADER_TIMING=1` dává fázový profil na
 stderr (raw clock, v defaultu no-op), `tools/bench-nextgen.sh [proot|loader|
@@ -187,6 +187,28 @@ binárek; ET_EXEC (gh/Bun/static) mají pevnou nízkou adresu.
 - Pokrytá path čísla jsou běžná sada (open/stat/access vč. faccessat2 439/
   getcwd/readlink/rename/link/symlink/chdir); vzácná (xattr, statfs, chroot…)
   zůstávají na L1/jmenných hookách.
+
+**06 — tabulka mountů + `mount --bind`.** Hotovo (stage 1 `99ae043`,
+stage 2 `a2764d6`, dokončení 2026-10-22). `src/binds.h`: longest-prefix
+tabulka `guest → host [ro]` nahradila natvrdo zapsaný `shim_excluded`
+(default identita = dnešní chování), konfigurace `$ROOTFS/etc/lx-binds`
++ `LX_BINDS`, runtime `mount --bind`/`umount2` přes `shim_mount` do sdílené
+MAP_SHARED tabulky (sourozenci i potomci session vidí okamžitě). Ro bindy
+`EROFS`, mountpoint `EBUSY`, zpětné `getcwd`. Jiné `LX_BINDS` uvnitř session
+= soukromá kopie (`unshare -m`), osiřelé tabulky uklízí GC přes `flock`.
+L1 (`l1_before` umí syscall odmítnout) i L2 (`go_translate` hook) sdílí
+`shim_bind_deny`.
+
+- `test-all.sh binds` 6/0 (stará binárka 2 PASS + 4 nálezy), totéž pod
+  `L1=2` i `L2=1`; `test-all.sh l2` + statická binárka vidí bind jen s novou.
+  `all` 201 PASS; 2 FAIL nesouvisí (`nslookup localhost` → NXDOMAIN od
+  8.8.8.8 po obnově parrotu, stejně se starou binárkou; imgcache nad kali,
+  kde glibc 2.43 pod loaderem visí → nově SKIP).
+- **Bezpečnostní nález:** starý `category_binds` je nejpravděpodobnější
+  příčina poškození parrotu 2026-10-21 (bind `/tmp/lxbt → /etc` zůstal
+  v tabulce harnessu, úklid `rm -rf` pod loaderem smazal `$R/etc`).
+- Mimo 06: util-linux `umount` *příkaz* a `cat /proc/mounts` potřebují
+  virtualizovaný `/proc/self/mountinfo` → prompt 07.
 
 ### Co z toho plyne pro další prompty
 

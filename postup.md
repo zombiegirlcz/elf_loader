@@ -5418,3 +5418,75 @@ NASAZENO na zařízení jako NDK run 39566370453):**
 (virtualizace /proc)**, nezávislý. Mechanismus odebrání bindu
 (`umount2`→`bind_remove`) je hotový už v 06. Autor promptu 06 to sám
 bracketuje („cat /proc/mounts — pokud prompt 07 hotový").
+
+## 2026-10-22 — prompt 06 dokončen (bezpečný test, fork tabulky, GC, EBUSY, L1/L2)
+
+**Skutečná pravděpodobná příčina incidentu 2026-10-21 je `category_binds`,
+ne imgcache.** Stará verze testu: (1) `mount --bind /etc /tmp/lxbt` zapsal
+bind do tabulky **harnessu** (zděděná `LX_BINDS_FILE`), (2) odebrání přes
+util-linux `umount` vždy selže (chybí `/proc/self/mountinfo` → prompt 07),
+takže bind zůstal, a úklid `$L --ownall rm -rf /tmp/lxbt` pod loaderem pak
+prošel bindem: obsah `$R/etc` smazán a nakonec `rmdir` samotného `$R/etc`.
+Ruční ověření `mount --bind /usr …` + úklid stejným vzorem by zasáhlo `/usr`
+= `bin`/`lib` v merged-usr. To přesně sedí na „poškozené bin/lib/etc, dpkg
+DB přežila". Imgcache zapisuje jen do `cache_dir()`; i tak je nově
+přesměrovaná na kali (pravidlo zůstává).
+
+**Opravy testů:**
+- `category_binds`: zdroj bindu jen jednorázový `/tmp/lxbsrc` (3 soubory),
+  pod-testy s `LX_BINDS_FILE=` (vlastní čerstvá tabulka, bind do harnessu
+  neunikne), příprava/úklid **hostovými** nástroji (`/system/bin/*`) na host
+  cestách, mountpointy jen `rmdir`. `|| true` u sub-testů, které záměrně
+  končí nenulově (`set -e` jinak tiše ukončil harness).
+- `category_imgcache`: běží nad kali (`ELF_TEST_KALI`, default
+  `…/nh/distro/kali`, `LX_LOG` v kali `/tmp`), bez kali SKIP — nikdy fallback
+  na `$R`.
+
+**Opravy loaderu (`src/binds.h`, `main.c`, `l1.h`, `l1_common.S`,
+`elf_loader.c`):**
+1. *Vnořené `LX_BINDS` se ignorovalo.* `shim_child_envp` vnucuje
+   `LX_BINDS_FILE`, takže `LX_BINDS=… elf_loader` uvnitř session se jen
+   připojil k zděděné tabulce. Tabulka (magic `LXB2`) nese `root`/`cfg`
+   (FNV hash `ROOTFS`/`LX_BINDS`): shoda → attach, jiné `LX_BINDS` → soukromá
+   kopie zděděné + nové bindy (sémantika `unshare -m`; rodič změnu nevidí),
+   jiný `ROOTFS` → čistá nová tabulka. Cizí tabulku nikdy nepřepisuje
+   (dřív reset magic na místě).
+2. *Soubory tabulek se hromadily* (~50 KB na každé top-level spuštění,
+   v `$D/.cache/lx` 14 za pár hodin, v `$R/tmp` 12). Každý proces drží na
+   svém souboru `flock(LOCK_SH)` (fd `O_CLOEXEC`), založení nové tabulky
+   smaže soubory bez držitele starší 5 s (`LOCK_EX|LOCK_NB`). Jméno
+   `<pid>.<ns>.tab` + `O_EXCL` — nikdy `O_TRUNC` cizí živé tabulky.
+3. *Mountpoint jako v jádře:* `rmdir`/`unlink(at)`/`rename(at,at2)` přesně
+   na guest prefixu remap bindu → `EBUSY` (`shim_busyfail`). Obsah bindem
+   smazat jde (jako Linux), samotný zdroj ne.
+4. *`getcwd(NULL, 0)`* (coreutils `pwd -P`) ignoroval `bind_reverse` →
+   vracel zdroj `/tmp/lxbsrc` místo `/tmp/lxbt`.
+5. *L1/L2 bindy neznaly ro/EBUSY a L2 ani remap.* `shim_bind_deny(nr, args)`
+   = jedno místo pro obě vrstvy: `l1_before` teď vrací `long` a `!= 0`
+   znamená „`svc` přeskočit, výsledek je ve `frame[20]`" (asm `cbnz x0, 2f`);
+   `go_handle` vrátí chybu bez syscallu. `go_translate` dostal hook na remap
+   (`f2_set_bind_hooks`), `getcwd` v L1/L2 `bind_reverse_inplace`.
+
+**A/B (zařízení, `test-all.sh binds`):** stará `a2764d6` = 2 PASS + FAIL
+[getcwd `/tmp/lxbsrc`, LX_BINDS ignorováno, rmdir „not empty", 12 tabulek];
+nová = **6/0/0**, stejně pod `ELF_LOADER_L1=2` (jmenné hooky rmdir/rename
+vypnuté → EBUSY z `l1_before`) i `ELF_LOADER_L2=1`. `test-all.sh l2` nový
+sub-test (statická binárka, `LX_BINDS=…:/etc:ro`): stará FAIL (čte rootfs),
+nová PASS. Host testy: `l1_logic_test` + `l1_common_test` ALL PASS (nové
+případy odmítnutí/getcwd), negativní kontrola bez `cbnz` FAIL.
+
+**Build:** Modal skript `finale_loader_build.py` neměl `src/l1_common.S`
+(od promptu 04 jen v `build.yml`) → link error `l1_common`; doplněno.
+
+**Zbývá na 07:** util-linux `umount` *příkaz* a `cat /proc/mounts`
+potřebují virtualizovaný `/proc/self/mountinfo`.
+
+**Regrese `all` (nová binárka, parrot, imgcache → kali):** 201 PASS / 2 FAIL
+/ 33 SKIP (baseline 195/0/33 + binds 6 + l2 bind 1 − nslookup). Oba FAILy
+nesouvisí a padají stejně se starou `a2764d6`: `nslookup localhost` →
+NXDOMAIN (resolv.conf po obnově parrotu = 8.8.8.8, ten localhost nezná)
+a imgcache nad kali — **kali má glibc 2.43 a ta pod loaderem visí** (`uname`
+vypíše a nedokončí exit, `ls` nevypíše nic, SIGTERM ignoruje → osiřelé
+procesy). Imgcache teď při nefunkční kali baseline SKIP (`timeout -s KILL`).
+Parrot po běhu ověřen: počty `etc`/`usr/bin`/`usr/lib`/`usr/sbin` beze
+změny, žádný soubor novější než značka před během.

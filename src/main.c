@@ -2895,8 +2895,21 @@ static char *shim_getcwd(char *buf, size_t size) {
     if (!f) return NULL;
     if (g_cwd_keep_host) return f(buf, size);
     size_t rl = (g_shim_root && g_shim_root[0]) ? shim_strlen(g_shim_root) : 0;
-    /* buf==NULL: glibc alokuje; rezerva na prefix $R, zkraceni probehne na miste. */
-    if (!buf) return shim_strip_root(f(NULL, size ? size + rl : 0));
+    /* buf==NULL: glibc alokuje; rezerva na prefix $R, zkraceni probehne na miste.
+     * Pod remap bindem (coreutils pwd -> getcwd(NULL, 0)) je guest cesta i delsi
+     * nez host: nech glibc alokovat dost velky buffer a prepis ho. */
+    if (!buf) {
+        char ht[8192], gv[8192];
+        if (g_binds_ready && f(ht, sizeof ht) && bind_reverse(ht, gv, sizeof gv)) {
+            size_t need = shim_strlen(gv) + 1, hl = shim_strlen(ht) + 1;
+            if (size && need > size) { shim_guest_errno_set(ERANGE); return NULL; }
+            char *m = f(NULL, need > hl ? need : hl);
+            if (!m) return NULL;
+            shim_memcpy(m, gv, need);
+            return m;
+        }
+        return shim_strip_root(f(NULL, size ? size + rl : 0));
+    }
     if (!size) return f(buf, size);            /* EINVAL od glibc */
     char tmp[8192];
     char *r = f(tmp, sizeof tmp);

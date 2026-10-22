@@ -1569,7 +1569,23 @@ CEOF
     local on off
     on=$("$ash" -c "$env ELF_LOADER_L2=1 $L --ownall $dir/s" 2>&1 | grep OSREL= || true)
     off=$("$ash" -c "$env ELF_LOADER_L2=0 $L --ownall $dir/s" 2>&1 | grep OSREL= || true)
+    # Bind pod L2 (prompt 06): go_translate ma vlastni exclude seznam, bindy
+    # mu dava hook z binds.h. /etc -> JEDNORAZOVY $dir/fe (ro, jen cteni) ->
+    # staticka binarka musi cist jeho os-release, ne rootfs.
+    mkdir -p "$dir/fe"
+    echo 'PRETTY_NAME="lxbind-l2"' > "$dir/fe/os-release"
+    local bnd
+    bnd=$("$ash" -c "$env ELF_LOADER_L2=1 LX_BINDS_FILE= LX_BINDS=$dir/fe:/etc:ro $L --ownall $dir/s" 2>&1 | grep OSREL= || true)
     rm -rf "$dir" 2>/dev/null || true
+    if printf '%s' "$bnd" | grep -q "lxbind-l2"; then
+        echo "PASS l2: bind (LX_BINDS /etc -> tmp) viditelny staticke binarce pod L2"
+        echo "PASS: l2 - bind pres go_translate" >> "$PASS_LOG"
+        ((PASS_COUNT++)) || true
+    else
+        echo "FAIL l2: bind pod L2 neviditelny (bnd=[$bnd])"
+        echo "FAIL: l2 - bind pres go_translate | bnd=[$bnd]" >> "$FAIL_LOG"
+        ((FAIL_COUNT++)) || true
+    fi
     local on_parrot=0 off_parrot=0
     # `|| true`: set -euo pipefail by pri neshode grepu shodil cely skript
     printf '%s' "$on"  | grep -qi "parrot" && on_parrot=1 || true
@@ -1640,62 +1656,112 @@ category_lazybind() {
 category_binds() {
     echo ""
     echo "=== uzivatelska tabulka bindu + mount --bind (prompt 06) ==="
+    # BEZPECNOST (incident 2026-10-21): zdrojem bindu je VZDY jednorazovy
+    # adresar $S, nikdy systemovy (/etc, /usr). Bind, ktery zustane v tabulce,
+    # + uklid `rm -rf <mountpoint>` pod loaderem smaze ZDROJ bindu (drive
+    # /tmp/lxbt -> /etc). Proto: (a) pod-testy bezi s LX_BINDS_FILE= = vlastni
+    # cerstva tabulka, bind do tabulky harnessu neunikne; (b) priprava a uklid
+    # jen HOSTOVYMI nastroji na host cestach (zadny preklad, zadny bind),
+    # mountpointy jen rmdir.
     local env="ROOTFS=$R ELF_ROOTFS=$R HOME=$D ELF_LOADER=$L"
+    local fresh="$env LX_BINDS_FILE="
     local ok=1 detail=""
-    local T=/tmp/lxbt T2=/tmp/lxbtro
-    local mnt="$R/bin/mount" ls="$R/bin/ls"
-    local mk="$R/bin/mkdir" tc="$R/bin/touch"
+    local S=/tmp/lxbsrc T=/tmp/lxbt T2=/tmp/lxbtro T3=/tmp/lxbt2
+    local mnt="$R/bin/mount" ls="$R/bin/ls" tc="$R/bin/touch"
     local TO="$R/usr/bin/timeout 25 $R/bin/bash -c"
+    local HB=/system/bin
+    local x n
 
-    # Referencni obsah zdroje /etc (pod loaderem -> $R/etc).
-    local src a b ro
-    src=$($TO "$env $L --ownall $ls -A /etc" 2>&1 | sort)
-    local srcn; srcn=$(printf '%s\n' "$src" | grep -c . || true)
+    $HB/rmdir "$R$T" "$R$T2" "$R$T3" 2>/dev/null || true
+    $HB/rm -rf "$R$S"
+    $HB/mkdir -p "$R$S" "$R$T" "$R$T2"
+    $HB/touch "$R$S/a" "$R$S/b" "$R$S/c"
 
-    # (1) runtime mount --bind: cil ukaze obsah zdroje. `mount` a `ls` jsou
-    # sourozenci (deti vnitrniho bash) -> bind zapsany procesem `mount` vidi
-    # proces `ls` pres sdilenou MAP_SHARED tabulku = cross-process.
-    a=$($TO "$env $L --ownall $R/bin/bash -c '$mk -p $T; $mnt --bind /etc $T && $ls -A $T'" 2>&1 | sort)
-    if [ "${srcn:-0}" -gt 0 ] && [ "$a" = "$src" ]; then
-        echo "PASS binds: mount --bind /etc $T ukaze obsah /etc ($srcn polozek, cross-process)"
+    # (1) runtime mount --bind, cross-process: `mount` a `ls` jsou sourozenci
+    # (deti vnitrniho bash) -> bind vidi pres sdilenou MAP_SHARED tabulku.
+    x=$($TO "$fresh $L --ownall $R/bin/bash -c '$mnt --bind $S $T && $ls -A $T'" 2>&1 | sort | tr '\n' ' ' || true)
+    if [ "$x" = "a b c " ]; then
+        echo "PASS binds: mount --bind $S $T ukaze obsah zdroje (cross-process)"
         echo "PASS: binds - runtime mount --bind cross-process" >> "$PASS_LOG"; ((PASS_COUNT++)) || true
     else
-        ok=0; detail="$detail [mount --bind: cil($(printf '%s\n' "$a"|grep -c .||true))!=zdroj($srcn)]"
+        ok=0; detail="$detail [mount --bind: '$x']"
     fi
 
-    # (2) umount2() odebere bind ze sdilene tabulky -> cil zase prazdny.
-    # POZN: util-linux `umount` COMMAND potrebuje /proc/self/mountinfo (nas
-    # virtualni bind tam neni -> "not mounted") = prompt 07 (virtualizace
-    # /proc). Mechanismus odebrani (umount2 -> shim_umount2 -> bind_remove) je
-    # ale hotovy uz zde, testujeme ho primym umount2() pres ctypes. Python kod
-    # bere cil z argv (zadne jednoduche uvozovky -> bez quote kolize).
+    # (2) zpetne mapovani getcwd: cwd pod bindem se hlasi guest mountpointem
+    # (coreutils pwd -P = getcwd(NULL,0), python os.getcwd = getcwd(buf,n)).
+    x=$($TO "$fresh $L --ownall $R/bin/bash -c '$mnt --bind $S $T && cd $T && $R/bin/pwd -P && $R/usr/bin/python3 -c \"import os;print(os.getcwd())\"'" 2>&1 | tr '\n' ' ' || true)
+    if [ "$x" = "$T $T " ]; then
+        echo "PASS binds: getcwd pod bindem -> $T (pwd -P i python)"
+        echo "PASS: binds - getcwd zpetne mapovani" >> "$PASS_LOG"; ((PASS_COUNT++)) || true
+    else
+        ok=0; detail="$detail [getcwd: '$x']"
+    fi
+
+    # (3) umount2() odebere bind -> cil zase prazdny. util-linux `umount`
+    # COMMAND potrebuje /proc/self/mountinfo = prompt 07; mechanismus
+    # (umount2 -> shim_umount2 -> bind_remove) testujeme primo pres ctypes.
     if [ -x "$R/usr/bin/python3" ]; then
         local U2='import ctypes,sys;ctypes.CDLL(None).umount2(sys.argv[1].encode(),0)'
-        b=$($TO "$env $L --ownall $R/bin/bash -c \"$mk -p $T; $mnt --bind /etc $T >/dev/null 2>&1; $R/usr/bin/python3 -c '$U2' $T; $ls -A $T\"" 2>&1 | sort)
-        local bn; bn=$(printf '%s\n' "$b" | grep -c . || true)
-        if [ "${bn:-1}" -eq 0 ]; then
+        n=$($TO "$fresh $L --ownall $R/bin/bash -c \"$mnt --bind $S $T >/dev/null 2>&1; $R/usr/bin/python3 -c '$U2' $T; $ls -A $T\"" 2>&1 | grep -c . || true)
+        if [ "${n:-1}" -eq 0 ]; then
             echo "PASS binds: umount2() odebere bind ($T zase prazdny)"
             echo "PASS: binds - umount2 odebere bind" >> "$PASS_LOG"; ((PASS_COUNT++)) || true
         else
-            ok=0; detail="$detail [umount2: cil neprazdny ($bn)]"
+            ok=0; detail="$detail [umount2: cil neprazdny ($n)]"
         fi
     else
         echo "SKIP binds: umount2 test (chybi python3)"
         echo "SKIP: binds - umount2 (no python3)" >> "$SKIP_LOG"; ((SKIP_COUNT++)) || true
     fi
 
-    # (3) ro bind: zapis -> EROFS (LX_BINDS host=$R/tmp aby pripadny prusak
-    # nepolutoval /etc). touch pres open(O_WRONLY|O_CREAT) -> shim_rofail.
-    ro=$($TO "$env LX_BINDS=$R/tmp:$T2:ro $L --ownall $R/bin/bash -c '$tc $T2/lxro_probe 2>&1; echo rc=\$?'" 2>&1)
-    if printf '%s' "$ro" | grep -qiE 'read-only|erofs'; then
-        echo "PASS binds: ro bind -> touch EROFS"
-        echo "PASS: binds - ro bind EROFS" >> "$PASS_LOG"; ((PASS_COUNT++)) || true
+    # (4) LX_BINDS uvnitr existujici session (zdedena tabulka harnessu, BEZ
+    # LX_BINDS_FILE=) -> soukroma kopie s novym bindem; ro -> EROFS a zdroj
+    # nedotcen; rodicovska tabulka bind NEvidi. Stara binarka LX_BINDS pri
+    # pripojeni k zdedene tabulce tise ignorovala.
+    x=$($TO "$env LX_BINDS=$R$S:$T2:ro $L --ownall $ls -A $T2" 2>&1 | sort | tr '\n' ' ' || true)
+    local w
+    w=$($TO "$env LX_BINDS=$R$S:$T2:ro $L --ownall $tc $T2/lxro_probe" 2>&1 || true)
+    n=$($TO "$env $L --ownall $ls -A $T2" 2>&1 | grep -c . || true)
+    if [ "$x" = "a b c " ] && printf '%s' "$w" | grep -qiE 'read-only|erofs' &&
+       [ ! -e "$R$S/lxro_probe" ] && [ "${n:-1}" -eq 0 ]; then
+        echo "PASS binds: vnorene LX_BINDS (ro) -> soukroma kopie, touch EROFS, rodic bind nevidi"
+        echo "PASS: binds - vnorene LX_BINDS + ro EROFS" >> "$PASS_LOG"; ((PASS_COUNT++)) || true
     else
-        ok=0; detail="$detail [ro: touch neselhalo EROFS: $(printf '%s' "$ro" | head -c 80)]"
+        ok=0; detail="$detail [LX_BINDS/ro: ls='$x' touch='$(printf '%s' "$w" | head -c 60)' rodic=$n]"
     fi
 
-    # uklid (pod loaderem - rootfs rm je glibc binarka)
-    $TO "$env $L --ownall $R/bin/rm -rf $T $T2 $R/tmp/lxro_probe" >/dev/null 2>&1 || true
+    # (5) mountpoint jako jadro: rmdir/rename -> EBUSY, zdroj zustane. Bez
+    # toho rmdir hlasil "not empty" a mv presunul ZDROJ.
+    x=$($TO "$fresh $L --ownall $R/bin/bash -c '$mnt --bind $S $T && { $R/bin/rmdir $T; $R/bin/mv $T $T3; } 2>&1'" 2>&1 || true)
+    n=$(printf '%s\n' "$x" | grep -ciE 'busy' || true)
+    if [ "${n:-0}" -ge 2 ] && [ -e "$R$S/a" ] && [ ! -e "$R$T3" ]; then
+        echo "PASS binds: rmdir/mv mountpointu -> EBUSY, zdroj nedotcen"
+        echo "PASS: binds - mountpoint EBUSY" >> "$PASS_LOG"; ((PASS_COUNT++)) || true
+    else
+        ok=0; detail="$detail [EBUSY: $(printf '%s' "$x" | tr '\n' ' ' | head -c 100)]"
+    fi
+
+    # (6) uklid souboru tabulek: bez drzitele flocku a starsi 5 s se smaze pri
+    # zakladani dalsi tabulky -> nehromadi se (drive 1 soubor / top-level beh).
+    local gdir gre
+    if [ -n "${LX_LOG:-}" ]; then gdir=$LX_LOG; gre='^binds\..*\.tab$'
+    else gdir=$R/tmp; gre='^\.lxbinds\..*\.tab$'; fi
+    for x in 1 2 3; do $TO "$fresh $L --ownall $R/bin/true" >/dev/null 2>&1 || true; done
+    sleep 6
+    $TO "$fresh $L --ownall $R/bin/true" >/dev/null 2>&1 || true
+    n=$($HB/ls -a "$gdir" | grep -cE "$gre" || true)
+    if [ "${n:-99}" -le 3 ]; then
+        echo "PASS binds: osirele tabulky uklizeny ($n souboru v $gdir)"
+        echo "PASS: binds - GC tabulek" >> "$PASS_LOG"; ((PASS_COUNT++)) || true
+    else
+        ok=0; detail="$detail [GC: $n tabulek v $gdir]"
+    fi
+
+    # uklid: hostove nastroje, host cesty, mountpointy jen rmdir (probe
+    # zustane jen se starou binarkou, ktera LX_BINDS ignorovala)
+    $HB/rm -f "$R$T2/lxro_probe"
+    $HB/rmdir "$R$T" "$R$T2" 2>/dev/null || true
+    $HB/rm -rf "$R$S" "$R$T3"
 
     if [ "$ok" != 1 ]; then
         echo "FAIL binds:$detail"
@@ -1729,6 +1795,17 @@ category_imgcache() {
 
     rm -rf "$idir" 2>/dev/null || true
     local t
+    # Baseline BEZ cache: kali (glibc 2.43) pod loaderem zatim nedobiha (uname
+    # vypise a visi v exitu, ls ani nevypise - i stara binarka, 2026-10-22).
+    # Bez funkcni baseline neni s cim srovnavat -> SKIP, ne falesny FAIL.
+    for t in "$KR/usr/bin/uname -m" "$KR/bin/ls $KR/tmp"; do
+        # -s KILL: visici kali proces SIGTERM od timeoutu ignoruje (osirel)
+        if [ -z "$("$R/usr/bin/timeout" -s KILL 3 "$R/bin/bash" -c "$env $L --ownall $t" 2>&1 | head -3)" ]; then
+            echo "SKIP imgcache: kali baseline '${t##*/}' pod loaderem nedobehne (glibc 2.43)"
+            echo "SKIP: imgcache - kali baseline nedobehne" >> "$SKIP_LOG"; ((SKIP_COUNT++)) || true
+            return 0
+        fi
+    done
     for t in "$KR/usr/bin/uname -m" "$KR/bin/ls $KR/tmp"; do
         local a b
         a=$(ashell_out "$env $L --ownall $t" 2>&1 | head -3)
