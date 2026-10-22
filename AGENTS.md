@@ -74,6 +74,14 @@ jmenných hooků), `F2_ONLY` (allowlist), `ELF_LOADER_L2` (`=1` záchytná síť
 `ELF_LOADER_L2_LAZY` (líný přepis, default vyp), `ELF_LOADER_GOMODE=0`
 (vypne Go mód; L2 ho nahrazuje), `ELF_LOADER_NO_PROCVIRT` (prompt 07),
 `ELF_LOADER_DIAG=1` (rutinní stopy do `$D/usr/diag.<pid>.txt`; pádové vždy).
+`LX_FAKEROOT=1` (prompt 08 cast 1, `src/fakeroot.h`): fake root
+(ekvivalent `proot -0`) — `getuid`/`geteuid`/`getgid`/`getegid`/
+`getresuid`/`getresgid`/`getgroups` hlasi 0; `stat`/`lstat`/`fstat`/
+`fstatat`/`statx` hlasi vlastnika app uid jako 0:0; `chown`/`chmod` se
+setuid/setgid bity a `mknod` zarizeni se emuluji pres xattr
+`user.lxfakeroot` na inode (f2fs na `/data` user.* xattry povoluje,
+overeno). link2symlink (`link`/`linkat`/`st_nlink`) je samostatna cast
+promptu 08, zatim neimplementovana.
 Bindy: `LX_BINDS=host:guest[:ro],…`,
 `$ROOTFS/etc/lx-binds` (fstab), `LX_BINDS_FILE` (sdílená tabulka, vnucuje se
 potomkům; prázdné = nová session).

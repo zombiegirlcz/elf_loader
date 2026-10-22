@@ -1968,6 +1968,66 @@ category_imgcache() {
     fi
 }
 
+category_fakeroot() {
+    echo ""
+    echo "=== fake root (LX_FAKEROOT, prompt 08 cast 1) ==="
+    local KR=${ELF_TEST_KALI:-$D/nh/distro/kali}
+    if [ "$KR" = "$R" ] || [ ! -x "$KR/usr/bin/stat" ] || [ ! -x "$KR/bin/chmod" ]; then
+        echo "SKIP fakeroot: destruktivni test jen nad kali ($KR nedostupny)"
+        echo "SKIP: fakeroot - neni kali rootfs" >> "$SKIP_LOG"; ((SKIP_COUNT++)) || true
+        return 0
+    fi
+    local env="ROOTFS=$KR ELF_ROOTFS=$KR ELF_LOADER=$L"
+    local tdir="$KR/tmp/lx-fr-test"
+    mkdir -p "$tdir"
+    local f="$tdir/f" dev="$tdir/dev0"
+    local ok=1 detail=""
+
+    # A: bez LX_FAKEROOT - chovani nesmi byt ovlivnene (regrese)
+    "$R/usr/bin/timeout" 10 "$R/bin/bash" -c "$env $L --ownall $KR/bin/touch $f" >/dev/null 2>&1
+    local id_plain
+    id_plain=$(ashell_out "$env $L --ownall $KR/usr/bin/id -u" 2>&1)
+    [ "$id_plain" != "0" ] || { ok=0; detail="$detail [bez LX_FAKEROOT uz hlasi uid 0 - regrese]"; }
+
+    # B: s LX_FAKEROOT=1
+    local fenv="$env LX_FAKEROOT=1"
+    local id_fr
+    id_fr=$(ashell_out "$fenv $L --ownall $KR/usr/bin/id -u" 2>&1)
+    [ "$id_fr" = "0" ] || { ok=0; detail="$detail [getuid: '$id_fr' != 0]"; }
+
+    rm -f "$f"
+    "$R/usr/bin/timeout" 10 "$R/bin/bash" -c "$fenv $L --ownall $KR/bin/touch $f" >/dev/null 2>&1
+    local owner
+    owner=$(ashell_out "$fenv $L --ownall $KR/usr/bin/stat -c %U:%G $f" 2>&1)
+    [ "$owner" = "root:root" ] || { ok=0; detail="$detail [vlastnik noveho souboru: '$owner' != root:root]"; }
+
+    "$R/usr/bin/timeout" 10 "$R/bin/bash" -c "$fenv $L --ownall $KR/bin/chown 1234:5 $f" >/dev/null 2>&1
+    local cg
+    cg=$(ashell_out "$fenv $L --ownall $KR/usr/bin/stat -c %u:%g $f" 2>&1)
+    [ "$cg" = "1234:5" ] || { ok=0; detail="$detail [chown: '$cg' != 1234:5]"; }
+
+    "$R/usr/bin/timeout" 10 "$R/bin/bash" -c "$fenv $L --ownall $KR/bin/chmod 4755 $f" >/dev/null 2>&1
+    local mo
+    mo=$(ashell_out "$fenv $L --ownall $KR/usr/bin/stat -c %A $f" 2>&1)
+    case "$mo" in -rws*) ;; *) ok=0; detail="$detail [chmod setuid: '$mo']" ;; esac
+
+    rm -f "$dev"
+    "$R/usr/bin/timeout" 10 "$R/bin/bash" -c "$fenv $L --ownall $KR/bin/mknod $dev c 1 3" >/dev/null 2>&1
+    local ft
+    ft=$(ashell_out "$fenv $L --ownall $KR/usr/bin/stat -c %F $dev" 2>&1)
+    [ "$ft" = "character special file" ] || { ok=0; detail="$detail [mknod: '$ft']"; }
+
+    if [ "$ok" = 1 ]; then
+        echo "PASS fakeroot: getuid=0, chown/chmod setuid/mknod pres xattr DB, bez LX_FAKEROOT beze zmeny"
+        echo "PASS: fakeroot - LX_FAKEROOT" >> "$PASS_LOG"
+        ((PASS_COUNT++)) || true
+    else
+        echo "FAIL fakeroot:$detail"
+        echo "FAIL: fakeroot - LX_FAKEROOT |$detail" >> "$FAIL_LOG"
+        ((FAIL_COUNT++)) || true
+    fi
+}
+
 category_timing() {
     echo ""
     echo "=== fázový profil exec (ELF_LOADER_TIMING) ==="
@@ -2360,6 +2420,10 @@ case "${1:-all}" in
         category_imgcache
         print_summary
         ;;
+    fakeroot)
+        category_fakeroot
+        print_summary
+        ;;
     binds)
         category_binds
         print_summary
@@ -2442,6 +2506,7 @@ case "${1:-all}" in
         category_symhash
         category_lazybind
         category_imgcache
+        category_fakeroot
         category_binds
         category_argv0
         category_procvirt

@@ -351,6 +351,7 @@ static char **guest_environ(void) {
     return environ;
 }
 #include "binds.h"
+#include "fakeroot.h"
 /* shim_excluded = "cesta se NEprekladu pod ROOTFS, nechat hostovou" = v tabulce
  * bindu IDENTITY shoda (host==guest). Pred binds_init (g_binds_ready=0) fallback
  * na puvodni natvrdo zapsany seznam, aby brzke volani melo stejne chovani. */
@@ -1258,27 +1259,37 @@ static int shim_stat(const char *p, struct stat *st) {
     char b[8192]; const char *path = p; if (shim_translate(p, b, sizeof b)) path = b;
     char resolved[8192];
     if (shim_resolve_symlinks(path, resolved, sizeof(resolved))) path = resolved;
-    fp_stat f = (fp_stat)g_orig_stat; return f ? f(path, st) : -1;
+    fp_stat f = (fp_stat)g_orig_stat; int r = f ? f(path, st) : -1;
+    if (r == 0) fakeroot_fix_stat(path, 1, st);
+    return r;
 }
 static int shim_stat64(const char *p, struct stat64 *st) {
     char b[8192]; const char *path = p; if (shim_translate(p, b, sizeof b)) path = b;
     char resolved[8192];
     if (shim_resolve_symlinks(path, resolved, sizeof(resolved))) path = resolved;
-    fp_stat64 f = (fp_stat64)g_orig_stat64; return f ? f(path, st) : -1;
+    fp_stat64 f = (fp_stat64)g_orig_stat64; int r = f ? f(path, st) : -1;
+    if (r == 0) fakeroot_fix_stat(path, 1, (struct stat *)st);
+    return r;
 }
 static int shim___xstat(int v, const char *p, struct stat *st) {
     char b[8192]; const char *path = p; if (shim_translate(p, b, sizeof b)) path = b;
     char resolved[8192];
     if (shim_resolve_symlinks(path, resolved, sizeof(resolved))) path = resolved;
-    fp_xstat f = (fp_xstat)g_orig___xstat; return f ? f(v, path, st) : -1;
+    fp_xstat f = (fp_xstat)g_orig___xstat; int r = f ? f(v, path, st) : -1;
+    if (r == 0) fakeroot_fix_stat(path, 1, st);
+    return r;
 }
 static int shim_lstat(const char *p, struct stat *st) {
     char b[8192]; const char *path = p; if (shim_translate(p, b, sizeof b)) path = b;
-    fp_lstat f = (fp_lstat)g_orig_lstat; return f ? f(path, st) : -1;
+    fp_lstat f = (fp_lstat)g_orig_lstat; int r = f ? f(path, st) : -1;
+    if (r == 0) fakeroot_fix_stat(path, 0, st);
+    return r;
 }
 static int shim___lxstat(int v, const char *p, struct stat *st) {
     char b[8192]; const char *path = p; if (shim_translate(p, b, sizeof b)) path = b;
-    fp_lxstat f = (fp_lxstat)g_orig___lxstat; return f ? f(v, path, st) : -1;
+    fp_lxstat f = (fp_lxstat)g_orig___lxstat; int r = f ? f(v, path, st) : -1;
+    if (r == 0) fakeroot_fix_stat(path, 0, st);
+    return r;
 }
 /* glibc >= 2.33 na aarch64 exportuje realne LFS symboly lstat64/stat64/fstat64.
  * lstat64 chybel v g_f2_hooks -> git importoval neprelozeny lstat64 proti
@@ -1286,15 +1297,21 @@ static int shim___lxstat(int v, const char *p, struct stat *st) {
  * ZAMERNE neresi symlinky (lstat nesmi nasledovat posledni symlink). */
 static int shim_lstat64(const char *p, struct stat64 *st) {
     char b[8192]; const char *path = p; if (shim_translate(p, b, sizeof b)) path = b;
-    fp_lstat64 f = (fp_lstat64)g_orig_lstat64; return f ? f(path, st) : -1;
+    fp_lstat64 f = (fp_lstat64)g_orig_lstat64; int r = f ? f(path, st) : -1;
+    if (r == 0) fakeroot_fix_stat(path, 0, (struct stat *)st);
+    return r;
 }
 static int shim_fstat64(int fd, struct stat64 *st) {
-    fp_fstat64 f = (fp_fstat64)g_orig_fstat64; return f ? f(fd, st) : -1;
+    fp_fstat64 f = (fp_fstat64)g_orig_fstat64; int r = f ? f(fd, st) : -1;
+    if (r == 0) fakeroot_fix_stat_fd(fd, (struct stat *)st);
+    return r;
 }
 static int shim_fstatat64(int dfd, const char *p, struct stat64 *st, int flags) {
     char b[8192]; const char *path = p;
     if (dfd == -100 && p && p[0] == '/') { if (shim_translate(p, b, sizeof b)) path = b; }
-    fp_fstatat64 f = (fp_fstatat64)g_orig_fstatat64; return f ? f(dfd, path, st, flags) : -1;
+    fp_fstatat64 f = (fp_fstatat64)g_orig_fstatat64; int r = f ? f(dfd, path, st, flags) : -1;
+    if (r == 0 && dfd == -100 && p && p[0] == '/') fakeroot_fix_stat(path, !(flags & 0x100), (struct stat *)st);
+    return r;
 }
 static int shim_statvfs(const char *p, struct statvfs *st) {
     char b[8192]; const char *path = p; if (shim_translate(p, b, sizeof b)) path = b;
@@ -1365,7 +1382,37 @@ static int shim_statx(int dfd, const char *p, int flags, unsigned int mask, void
             if (shim_resolve_symlinks(path, resolved, sizeof(resolved))) path = resolved;
         }
     }
-    fp_statx f = (fp_statx)g_orig_statx; return f ? f(dfd, path, flags, mask, stx) : -1;
+    fp_statx f = (fp_statx)g_orig_statx; int r = f ? f(dfd, path, flags, mask, stx) : -1;
+    if (r == 0 && g_fakeroot_on && dfd == -100 && p && p[0] == '/' && stx) {
+        /* struct statx (linux/stat.h, overeno proti kernel headru): stx_mask
+         * u32@0, stx_blksize u32@4, stx_attributes u64@8, stx_nlink u32@16,
+         * stx_uid u32@20, stx_gid u32@24, stx_mode u16@28, stx_rdev_major
+         * u32@128, stx_rdev_minor u32@132. Patchujeme primo offsety, aby kod
+         * nezavisel na pritomnosti hlavicky struct statx v build prostredi. */
+        unsigned char *b2 = (unsigned char *)stx;
+        unsigned short *mode_p = (unsigned short *)(b2 + 28);
+        unsigned int *uid_p = (unsigned int *)(b2 + 20);
+        unsigned int *gid_p = (unsigned int *)(b2 + 24);
+        unsigned int *rmaj_p = (unsigned int *)(b2 + 128);
+        unsigned int *rmin_p = (unsigned int *)(b2 + 132);
+        lxfr_rec_t rec;
+        if (fakeroot_xattr_get(path, !(flags & 0x100), &rec) == 0) {
+            *uid_p = rec.uid; *gid_p = rec.gid;
+            if (rec.mode_extra & (S_IFCHR | S_IFBLK)) {
+                unsigned short perm = *mode_p & 07777;
+                *mode_p = (unsigned short)((rec.mode_extra & (S_IFCHR | S_IFBLK)) | perm |
+                           (rec.mode_extra & (S_ISUID | S_ISGID | S_ISVTX)));
+                *rmaj_p = rec.rdev_major; *rmin_p = rec.rdev_minor;
+            } else {
+                *mode_p = (unsigned short)((*mode_p & ~(unsigned short)(S_ISUID | S_ISGID | S_ISVTX)) |
+                           (rec.mode_extra & (S_ISUID | S_ISGID | S_ISVTX)));
+            }
+        } else if (*uid_p == g_fakeroot_app_uid) {
+            *uid_p = 0;
+            if (*gid_p == g_fakeroot_app_gid) *gid_p = 0;
+        }
+    }
+    return r;
 }
 typedef int (*fp_fstatat)(int, const char *, void *, int);
 static int shim_fstatat(int dfd, const char *p, void *st, int flags) {
@@ -1377,7 +1424,9 @@ static int shim_fstatat(int dfd, const char *p, void *st, int flags) {
             if (shim_resolve_symlinks(path, resolved, sizeof(resolved))) path = resolved;
         }
     }
-    fp_fstatat f = (fp_fstatat)g_orig_fstatat; return f ? f(dfd, path, st, flags) : -1;
+    fp_fstatat f = (fp_fstatat)g_orig_fstatat; int r = f ? f(dfd, path, st, flags) : -1;
+    if (r == 0 && dfd == -100 && p && p[0] == '/') fakeroot_fix_stat(path, !(flags & 0x100), (struct stat *)st);
+    return r;
 }
 static int shim_newfstatat(int dfd, const char *p, void *st, int flags) {
     char b[8192]; const char *path = p;
@@ -1388,7 +1437,9 @@ static int shim_newfstatat(int dfd, const char *p, void *st, int flags) {
             if (shim_resolve_symlinks(path, resolved, sizeof(resolved))) path = resolved;
         }
     }
-    fp_fstatat f = (fp_fstatat)g_orig_newfstatat; return f ? f(dfd, path, st, flags) : -1;
+    fp_fstatat f = (fp_fstatat)g_orig_newfstatat; int r = f ? f(dfd, path, st, flags) : -1;
+    if (r == 0 && dfd == -100 && p && p[0] == '/') fakeroot_fix_stat(path, !(flags & 0x100), (struct stat *)st);
+    return r;
 }
 
 /* Path-mutujici operace: dpkg/ldconfig/apt vytvareji symlinky, mkdir, rename.
@@ -1525,19 +1576,45 @@ static void *g_orig_chmod, *g_orig_lchmod, *g_orig_fchmodat, *g_orig_chown, *g_o
             *g_orig_listxattr, *g_orig_llistxattr, *g_orig_removexattr, *g_orig_lremovexattr,
             *g_orig_creat, *g_orig_creat64, *g_orig_pathconf, *g_orig_inotify_add_watch,
             *g_orig_bind, *g_orig_connect;
+/* fakeroot: setuid/setgid/sticky bity v chmod a libovolny chown se za
+ * LX_FAKEROOT ulozi do xattr DB (viz fakeroot.h) a hlasi se jako uspech;
+ * realny chmod se zavola BEZ techto bitu (realny chown se vubec nevola -
+ * app proces nemuze chownovat na cizi uid a neni to potreba). */
 static int shim_chmod(const char *p, unsigned int m) { if (shim_rofail(p)) return -1; SHIM_PATH_BUF;
-    int (*f)(const char *, unsigned int) = g_orig_chmod; return f ? f(TP(p), m) : -1; }
+    const char *tp = TP(p);
+    if (g_fakeroot_on) {
+        unsigned int extra = m & (S_ISUID | S_ISGID | S_ISVTX);
+        int (*f)(const char *, unsigned int) = g_orig_chmod;
+        int r = f ? f(tp, m & ~(unsigned int)(S_ISUID | S_ISGID)) : -1;
+        if (r == 0) fakeroot_xattr_merge(tp, 1, NULL, NULL, &extra, NULL, NULL);
+        return r;
+    }
+    int (*f)(const char *, unsigned int) = g_orig_chmod; return f ? f(tp, m) : -1; }
 static int shim_lchmod(const char *p, unsigned int m) { if (shim_rofail(p)) return -1; SHIM_PATH_BUF;
     int (*f)(const char *, unsigned int) = g_orig_lchmod; return f ? f(TP(p), m) : -1; }
 static int shim_fchmodat(int d, const char *p, unsigned int m, int fl) { SHIM_PATH_BUF;
-    int (*f)(int, const char *, unsigned int, int) = g_orig_fchmodat; return f ? f(d, TP(p), m, fl) : -1; }
+    const char *tp = TP(p);
+    if (g_fakeroot_on && d == -100) {
+        unsigned int extra = m & (S_ISUID | S_ISGID | S_ISVTX);
+        int (*f)(int, const char *, unsigned int, int) = g_orig_fchmodat;
+        int r = f ? f(d, tp, m & ~(unsigned int)(S_ISUID | S_ISGID), fl) : -1;
+        if (r == 0) fakeroot_xattr_merge(tp, !(fl & 0x100), NULL, NULL, &extra, NULL, NULL);
+        return r;
+    }
+    int (*f)(int, const char *, unsigned int, int) = g_orig_fchmodat; return f ? f(d, tp, m, fl) : -1; }
 static int shim_chown(const char *p, unsigned int u, unsigned int g) { if (shim_rofail(p)) return -1; SHIM_PATH_BUF;
-    int (*f)(const char *, unsigned int, unsigned int) = g_orig_chown; return f ? f(TP(p), u, g) : -1; }
+    const char *tp = TP(p);
+    if (g_fakeroot_on) { return fakeroot_xattr_merge(tp, 1, &u, &g, NULL, NULL, NULL); }
+    int (*f)(const char *, unsigned int, unsigned int) = g_orig_chown; return f ? f(tp, u, g) : -1; }
 static int shim_lchown(const char *p, unsigned int u, unsigned int g) { if (shim_rofail(p)) return -1; SHIM_PATH_BUF;
-    int (*f)(const char *, unsigned int, unsigned int) = g_orig_lchown; return f ? f(TP(p), u, g) : -1; }
+    const char *tp = TP(p);
+    if (g_fakeroot_on) { return fakeroot_xattr_merge(tp, 0, &u, &g, NULL, NULL, NULL); }
+    int (*f)(const char *, unsigned int, unsigned int) = g_orig_lchown; return f ? f(tp, u, g) : -1; }
 static int shim_fchownat(int d, const char *p, unsigned int u, unsigned int g, int fl) { SHIM_PATH_BUF;
+    const char *tp = TP(p);
+    if (g_fakeroot_on && d == -100) { return fakeroot_xattr_merge(tp, !(fl & 0x100), &u, &g, NULL, NULL, NULL); }
     int (*f)(int, const char *, unsigned int, unsigned int, int) = g_orig_fchownat;
-    return f ? f(d, TP(p), u, g, fl) : -1; }
+    return f ? f(d, tp, u, g, fl) : -1; }
 static int shim_utime(const char *p, const void *t) { SHIM_PATH_BUF;
     int (*f)(const char *, const void *) = g_orig_utime; return f ? f(TP(p), t) : -1; }
 static int shim_utimes(const char *p, const void *t) { if (shim_rofail(p)) return -1; SHIM_PATH_BUF;
@@ -1553,10 +1630,37 @@ static int shim_truncate(const char *p, long l) { if (shim_rofail(p)) return -1;
     int (*f)(const char *, long) = g_orig_truncate; return f ? f(TP(p), l) : -1; }
 static int shim_truncate64(const char *p, long l) { if (shim_rofail(p)) return -1; SHIM_PATH_BUF;
     int (*f)(const char *, long) = g_orig_truncate64; return f ? f(TP(p), l) : -1; }
+/* fakeroot: mknod zarizeni (S_IFCHR/S_IFBLK) nejde v app domene (EPERM) ->
+ * vytvorime obycejny prazdny soubor a typ+major/minor ulozime do xattr; stat
+ * pak hlasi spravny S_IFCHR/S_IFBLK a st_rdev (viz fakeroot_fix_stat). */
 static int shim_mknod(const char *p, unsigned int m, unsigned long dev) { if (shim_rofail(p)) return -1; SHIM_PATH_BUF;
-    int (*f)(const char *, unsigned int, unsigned long) = g_orig_mknod; return f ? f(TP(p), m, dev) : -1; }
+    const char *tp = TP(p);
+    if (g_fakeroot_on && (m & S_IFMT) != S_IFDIR && ((m & S_IFMT) == S_IFCHR || (m & S_IFMT) == S_IFBLK)) {
+        int (*creatf)(const char *, unsigned int) = g_orig_creat;
+        int fd = creatf ? creatf(tp, m & 0777) : -1;
+        if (fd < 0) return -1;
+        shim_raw_syscall6(57 /* close */, fd, 0, 0, 0, 0, 0);
+        unsigned int extra = (m & S_IFMT) | (m & (S_ISUID | S_ISGID | S_ISVTX));
+        unsigned int rmaj = (unsigned int)((dev >> 8) & 0xfff) | (unsigned int)((dev >> 32) & ~0xfffu);
+        unsigned int rmin = (unsigned int)(dev & 0xff) | (unsigned int)((dev >> 12) & ~0xffu);
+        fakeroot_xattr_merge(tp, 1, NULL, NULL, &extra, &rmaj, &rmin);
+        return 0;
+    }
+    int (*f)(const char *, unsigned int, unsigned long) = g_orig_mknod; return f ? f(tp, m, dev) : -1; }
 static int shim_mknodat(int d, const char *p, unsigned int m, unsigned long dev) { if (d == -100 && shim_rofail(p)) return -1; SHIM_PATH_BUF;
-    int (*f)(int, const char *, unsigned int, unsigned long) = g_orig_mknodat; return f ? f(d, TP(p), m, dev) : -1; }
+    const char *tp = TP(p);
+    if (g_fakeroot_on && d == -100 && ((m & S_IFMT) == S_IFCHR || (m & S_IFMT) == S_IFBLK)) {
+        int (*creatf)(const char *, unsigned int) = g_orig_creat;
+        int fd = creatf ? creatf(tp, m & 0777) : -1;
+        if (fd < 0) return -1;
+        shim_raw_syscall6(57 /* close */, fd, 0, 0, 0, 0, 0);
+        unsigned int extra = (m & S_IFMT) | (m & (S_ISUID | S_ISGID | S_ISVTX));
+        unsigned int rmaj = (unsigned int)((dev >> 8) & 0xfff) | (unsigned int)((dev >> 32) & ~0xfffu);
+        unsigned int rmin = (unsigned int)(dev & 0xff) | (unsigned int)((dev >> 12) & ~0xffu);
+        fakeroot_xattr_merge(tp, 1, NULL, NULL, &extra, &rmaj, &rmin);
+        return 0;
+    }
+    int (*f)(int, const char *, unsigned int, unsigned long) = g_orig_mknodat; return f ? f(d, tp, m, dev) : -1; }
 static int shim_mkfifo(const char *p, unsigned int m) { if (shim_rofail(p)) return -1; SHIM_PATH_BUF;
     int (*f)(const char *, unsigned int) = g_orig_mkfifo; return f ? f(TP(p), m) : -1; }
 static int shim_mkfifoat(int d, const char *p, unsigned int m) { if (d == -100 && shim_rofail(p)) return -1; SHIM_PATH_BUF;
@@ -1595,6 +1699,58 @@ static int shim_inotify_add_watch(int fd, const char *p, unsigned int mask) { SH
     int (*f)(int, const char *, unsigned int) = g_orig_inotify_add_watch; return f ? f(fd, TP(p), mask) : -1; }
 #undef TP
 #undef SHIM_PATH_BUF
+
+/* fakeroot: identita procesu + fd-only chown/chmod/stat (viz fakeroot.h) */
+static void *g_orig_getuid, *g_orig_geteuid, *g_orig_getgid, *g_orig_getegid,
+            *g_orig_getresuid, *g_orig_getresgid, *g_orig_getgroups,
+            *g_orig_fchown, *g_orig_fchmod, *g_orig_fstat;
+static unsigned int shim_fr_getuid(void) { if (g_fakeroot_on) return 0;
+    unsigned int (*f)(void) = (unsigned int (*)(void))g_orig_getuid; return f ? f() : 0; }
+static unsigned int shim_fr_geteuid(void) { if (g_fakeroot_on) return 0;
+    unsigned int (*f)(void) = (unsigned int (*)(void))g_orig_geteuid; return f ? f() : 0; }
+static unsigned int shim_fr_getgid(void) { if (g_fakeroot_on) return 0;
+    unsigned int (*f)(void) = (unsigned int (*)(void))g_orig_getgid; return f ? f() : 0; }
+static unsigned int shim_fr_getegid(void) { if (g_fakeroot_on) return 0;
+    unsigned int (*f)(void) = (unsigned int (*)(void))g_orig_getegid; return f ? f() : 0; }
+static int shim_fr_getresuid(unsigned int *ru, unsigned int *eu, unsigned int *su) {
+    int (*f)(unsigned int *, unsigned int *, unsigned int *) = g_orig_getresuid;
+    int r = f ? f(ru, eu, su) : -1;
+    if (r == 0 && g_fakeroot_on) { if (ru) *ru = 0; if (eu) *eu = 0; if (su) *su = 0; }
+    return r;
+}
+static int shim_fr_getresgid(unsigned int *rg, unsigned int *eg, unsigned int *sg) {
+    int (*f)(unsigned int *, unsigned int *, unsigned int *) = g_orig_getresgid;
+    int r = f ? f(rg, eg, sg) : -1;
+    if (r == 0 && g_fakeroot_on) { if (rg) *rg = 0; if (eg) *eg = 0; if (sg) *sg = 0; }
+    return r;
+}
+static int shim_fr_getgroups(int n, unsigned int *list) {
+    if (g_fakeroot_on) {
+        if (n > 0 && list) list[0] = 0;
+        return n > 0 ? 1 : 0;
+    }
+    int (*f)(int, unsigned int *) = g_orig_getgroups; return f ? f(n, list) : -1;
+}
+static int shim_fr_fchown(int fd, unsigned int u, unsigned int g) {
+    if (g_fakeroot_on) return fakeroot_xattr_fmerge(fd, &u, &g, NULL, NULL, NULL);
+    int (*f)(int, unsigned int, unsigned int) = g_orig_fchown; return f ? f(fd, u, g) : -1;
+}
+static int shim_fr_fchmod(int fd, unsigned int m) {
+    if (g_fakeroot_on) {
+        unsigned int extra = m & (S_ISUID | S_ISGID | S_ISVTX);
+        int (*f)(int, unsigned int) = g_orig_fchmod;
+        int r = f ? f(fd, m & ~(unsigned int)(S_ISUID | S_ISGID)) : -1;
+        if (r == 0) fakeroot_xattr_fmerge(fd, NULL, NULL, &extra, NULL, NULL);
+        return r;
+    }
+    int (*f)(int, unsigned int) = g_orig_fchmod; return f ? f(fd, m) : -1;
+}
+static int shim_fr_fstat(int fd, struct stat *st) {
+    int (*f)(int, struct stat *) = g_orig_fstat;
+    int r = f ? f(fd, st) : -1;
+    if (r == 0) fakeroot_fix_stat_fd(fd, st);
+    return r;
+}
 
 /* mkdtemp: glibc ji implementuje pres interni __mkdir (mimo GOT, BTI prolog
  * -> bez inline hooku), takze guest sablona /tmp/x/dXXXXXX koncila ENOENT na
@@ -3051,11 +3207,15 @@ static FILE *shim_fopen64(const char *p, const char *mode) {
 }
 static int shim___xstat64(int v, const char *p, void *st) {
     char b[8192]; const char *path = p; if (shim_translate(p, b, sizeof b)) path = b;
-    fp_xstat f = (fp_xstat)g_orig___xstat64; return f ? f(v, path, st) : -1;
+    fp_xstat f = (fp_xstat)g_orig___xstat64; int r = f ? f(v, path, st) : -1;
+    if (r == 0) fakeroot_fix_stat(path, 1, (struct stat *)st);
+    return r;
 }
 static int shim___lxstat64(int v, const char *p, void *st) {
     char b[8192]; const char *path = p; if (shim_translate(p, b, sizeof b)) path = b;
-    fp_lxstat f = (fp_lxstat)g_orig___lxstat64; return f ? f(v, path, st) : -1;
+    fp_lxstat f = (fp_lxstat)g_orig___lxstat64; int r = f ? f(v, path, st) : -1;
+    if (r == 0) fakeroot_fix_stat(path, 0, (struct stat *)st);
+    return r;
 }
 /* __fxstatat64 / __fxstatat: STARY ABI s verzi jako PRVNIM argumentem:
  *   int __fxstatat64(int ver, int fd, const char *file, struct stat64 *buf, int flag);
@@ -3071,13 +3231,17 @@ static int shim___fxstatat64(int ver, int dfd, const char *p, void *st, int flag
     char b[8192]; const char *path = p;
     if (dfd == -100 && p && p[0] == '/') { if (shim_translate(p, b, sizeof b)) path = b; }
     fp_fxstatat f = (fp_fxstatat)g_orig___fxstatat64;
-    return f ? f(ver, dfd, path, st, flags) : -1;
+    int r = f ? f(ver, dfd, path, st, flags) : -1;
+    if (r == 0 && dfd == -100 && p && p[0] == '/') fakeroot_fix_stat(path, !(flags & 0x100), (struct stat *)st);
+    return r;
 }
 static int shim___fxstatat(int ver, int dfd, const char *p, void *st, int flags) {
     char b[8192]; const char *path = p;
     if (dfd == -100 && p && p[0] == '/') { if (shim_translate(p, b, sizeof b)) path = b; }
     fp_fxstatat f = (fp_fxstatat)g_orig___fxstatat;
-    return f ? f(ver, dfd, path, st, flags) : -1;
+    int r = f ? f(ver, dfd, path, st, flags) : -1;
+    if (r == 0 && dfd == -100 && p && p[0] == '/') fakeroot_fix_stat(path, !(flags & 0x100), (struct stat *)st);
+    return r;
 }
 static int shim_faccessat2(int dfd, const char *p, int m, int ff) {
     char b[8192]; const char *path = p;
@@ -3314,6 +3478,10 @@ static int shim_setfsgid(unsigned int gid) { (void)gid; return (int)main_raw_sys
 static void *g_orig_setuid, *g_orig_setgid, *g_orig_seteuid, *g_orig_setegid;
 static void *g_orig_setreuid, *g_orig_setregid, *g_orig_setresuid, *g_orig_setresgid;
 static int shim_id_same(long nr, unsigned int v) {
+    /* LX_FAKEROOT: proces vidi sebe jako uid/gid 0 (fakeroot_init) -> zmena
+     * na 0 (nebo na skutecny app uid) musi uspet beze zmeny (apt/dpkg behem
+     * instalace drop/restore privileges mezi "root" a "_apt"). */
+    if (g_fakeroot_on && v == 0) return 1;
     return v == (unsigned int)-1 || v == (unsigned int)main_raw_syscall4(nr, 0, 0, 0, 0);
 }
 static int shim_setid_ret(int ok) {
@@ -3336,6 +3504,16 @@ static int shim_setresuid(unsigned int r, unsigned int e, unsigned int s) {
 }
 static int shim_setresgid(unsigned int r, unsigned int e, unsigned int s) {
     return shim_setid_ret(shim_id_same(176, r) && shim_id_same(177, e) && shim_id_same(177, s));
+}
+/* setgroups: Android seccomp vraci ENOSYS (apt/dpkg behem drop/restore
+ * privilegii pri instalaci - "_apt" <-> "root"). Pod LX_FAKEROOT vzdy
+ * uspech beze zmeny (proot -0 dela totez). Bez fakeroot puvodni chovani
+ * (realny syscall, typicky ENOSYS na tomto kernelu). */
+static void *g_orig_setgroups;
+static int shim_setgroups(int n, const unsigned int *list) {
+    if (g_fakeroot_on) return 0;
+    int (*f)(int, const unsigned int *) = g_orig_setgroups;
+    return f ? f(n, list) : -1;
 }
 
 /* ===== MAP_FIXED_NOREPLACE emulace (kernel 4.14) =====
@@ -3618,6 +3796,12 @@ static f2_hook_t g_f2_hooks[] = {
     {"setresuid",(void*)shim_setresuid,&g_orig_setresuid},{"setresgid",(void*)shim_setresgid,&g_orig_setresgid},
     {"chmod",(void*)shim_chmod,&g_orig_chmod},{"lchmod",(void*)shim_lchmod,&g_orig_lchmod},
     {"fchmodat",(void*)shim_fchmodat,&g_orig_fchmodat},
+    {"getuid",(void*)shim_fr_getuid,&g_orig_getuid},{"geteuid",(void*)shim_fr_geteuid,&g_orig_geteuid},
+    {"getgid",(void*)shim_fr_getgid,&g_orig_getgid},{"getegid",(void*)shim_fr_getegid,&g_orig_getegid},
+    {"getresuid",(void*)shim_fr_getresuid,&g_orig_getresuid},{"getresgid",(void*)shim_fr_getresgid,&g_orig_getresgid},
+    {"getgroups",(void*)shim_fr_getgroups,&g_orig_getgroups},{"setgroups",(void*)shim_setgroups,&g_orig_setgroups},
+    {"fchown",(void*)shim_fr_fchown,&g_orig_fchown},{"fchmod",(void*)shim_fr_fchmod,&g_orig_fchmod},
+    {"fstat",(void*)shim_fr_fstat,&g_orig_fstat},
     {"chown",(void*)shim_chown,&g_orig_chown},{"lchown",(void*)shim_lchown,&g_orig_lchown},
     {"fchownat",(void*)shim_fchownat,&g_orig_fchownat},
     {"utime",(void*)shim_utime,&g_orig_utime},{"utimes",(void*)shim_utimes,&g_orig_utimes},
@@ -4174,6 +4358,7 @@ static int run_ownall(const char *path, int argc, char **argv, char **envp) {
      * + config ($ROOTFS/etc/lx-binds, LX_BINDS). Musi byt PRED prvnim prekladem
      * (shim_translate/shim_excluded ji ctou pres g_binds_ready). */
     binds_init();
+    fakeroot_init();
 
     char **argv_pre_shebang = argv;   /* shebang blok argv nahradi -> skript */
     /* jmeno pro comm: cesta z execve PRED resolvem symlinku (python3, ne
