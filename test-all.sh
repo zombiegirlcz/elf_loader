@@ -1770,6 +1770,60 @@ category_binds() {
     fi
 }
 
+# Vlastni argv[0] pres exec (prompt 07 ukol 1, postup.md NALEZ 1): exec
+# shim drive argv[0] zahazoval a guest dostal resolvovanou HOST cestu.
+# Claude Code tim padal: grep/find jsou `ARGV0=ugrep`/`exec -a bfs` nad
+# vlastni binarkou -> "unknown option '-G'". Stara binarka 0 z 6.
+category_argv0() {
+    echo ""
+    echo "=== vlastni argv[0] pres exec (prompt 07) ==="
+    local env="ROOTFS=$R ELF_ROOTFS=$R HOME=$D ELF_LOADER=$L PATH=/usr/bin:/bin"
+    if [ ! -x "$R/usr/bin/python3" ] || [ ! -x "$R/usr/bin/perl" ]; then
+        echo "SKIP argv0: chybi python3/perl"
+        echo "SKIP: argv0 - no python3/perl" >> "$SKIP_LOG"; ((SKIP_COUNT++)) || true
+        return
+    fi
+    local dir="$R/tmp/argv0t.$$"
+    mkdir -p "$dir"
+    # sys.orig_argv[0] = presne argv[0] od jadra (python 3.10+)
+    cat > "$dir/t.sh" <<'SEOF'
+P='import sys;print(sys.orig_argv[0])'
+echo "execa=$( (exec -a FAKE0 /usr/bin/python3 -c "$P") 2>&1)"
+echo "plain=$(/usr/bin/python3 -c "$P" 2>&1)"
+echo "path=$(python3 -c "$P" 2>&1)"
+echo "perl=$(/usr/bin/perl -e 'exec {"/usr/bin/python3"} "FAKE2", "-c", "import sys;print(sys.orig_argv[0])"' 2>&1)"
+echo "zsh=$(/usr/bin/zsh -c 'ARGV0=FAKE1 /usr/bin/python3 -c "import sys;print(sys.orig_argv[0])"' 2>/dev/null)"
+SEOF
+    local out
+    out=$("$R/usr/bin/timeout" 60 "$R/bin/bash" -c "$env $L --ownall $R/bin/bash ${dir#$R}/t.sh" 2>&1 || true)
+    local want="execa=FAKE0 plain=/usr/bin/python3 path=python3 perl=FAKE2"
+    [ -x "$R/usr/bin/zsh" ] && want="$want zsh=FAKE1"
+    local w got=0 tot=0 detail=""
+    for w in $want; do
+        tot=$((tot + 1))
+        if printf '%s\n' "$out" | grep -qxF "$w"; then got=$((got + 1))
+        else detail="$detail [$w: $(printf '%s\n' "$out" | grep "^${w%%=*}=" | head -1)]"; fi
+    done
+    # Claude Code: ugrep/bfs jsou tataz Bun binarka, rezim podle argv[0]
+    local cb
+    cb=$(ls -t "$R"/root/.local/share/claude/versions/* 2>/dev/null | head -1 || true)
+    if [ -n "$cb" ] && [ -x "$cb" ]; then
+        local g=${cb#$R} u
+        u=$("$R/usr/bin/timeout" 60 "$R/bin/bash" -c "$env $L --ownall $R/bin/bash -c '(exec -a ugrep $g --version) 2>&1 | head -1'" 2>&1 || true)
+        tot=$((tot + 1))
+        if printf '%s' "$u" | grep -q '^ugrep '; then got=$((got + 1))
+        else detail="$detail [claude ugrep: $(printf '%s' "$u" | head -c 60)]"; fi
+    fi
+    rm -rf "$dir"
+    if [ "$got" = "$tot" ]; then
+        echo "PASS argv0: $got/$tot (exec -a, perl exec {}, zsh ARGV0, bez host cesty, claude ugrep)"
+        echo "PASS: argv0 - vlastni argv[0] $got/$tot" >> "$PASS_LOG"; ((PASS_COUNT++)) || true
+    else
+        echo "FAIL argv0: $got/$tot$detail"
+        echo "FAIL: argv0 - $got/$tot |$detail" >> "$FAIL_LOG"; ((FAIL_COUNT++)) || true
+    fi
+}
+
 # Obrazova cache RELRO stranek (prompt 10 cast A, ELF_LOADER_IMGCACHE=1).
 # Overuje: (a) s cache zapnutou je vystup IDENTICKY jako bez ni (bezpecny
 # fallback), (b) cache odmitne vytvorit obraz, ktery by nesel revalidovat
@@ -2251,6 +2305,10 @@ case "${1:-all}" in
         category_binds
         print_summary
         ;;
+    argv0)
+        category_argv0
+        print_summary
+        ;;
     bigargv)
         category_bigargv
         print_summary
@@ -2322,6 +2380,7 @@ case "${1:-all}" in
         category_lazybind
         category_imgcache
         category_binds
+        category_argv0
         category_relsym
         category_l1
         category_l2

@@ -199,9 +199,9 @@ fork veneer (vfork-style clone) [#L685].
   L2** (prompt 05, 2026-10-21 (3)): `ELF_LOADER_L2=1` dá statické binárce
   filtr na její text-range, cestové syscally se přeloží a doběhne (RC=0, vidí
   rootfs). Bez L2 (default) pořád padá — na default přepnout až s L2.
-- **Vlastní `argv[0]` se při exec zahazuje** (`exec -a`, zsh `ARGV0=`, perlí
-  `exec {} LIST`) → rozbíjí Claude Code `grep` (re-exec jako `ugrep`).
-  Workaround `command grep` [#L3939].
+- ~~**Vlastní `argv[0]` se při exec zahazuje**~~ — **vyřešeno** (prompt 07,
+  2026-10-22 (2)): exec shim předává `--argv0`, Claude Code `grep`/`find`
+  (`ugrep`/`bfs`) funguje bez `command grep`.
 - **`/proc/self/cmdline` není shimnutý** a leakuje cestu k loaderu. Fix
   analogický `shim_readlink` — pozor na TLS past [#L3973].
 - **Binárku mimo `$ROOTFS` nelze spustit** — `shim_execve` nalepí `$ROOTFS`

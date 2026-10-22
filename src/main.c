@@ -189,6 +189,8 @@ static const char *g_shim_loader = NULL;
  * shim_readlinkat tohle prepisuji na g_guest_exe_path. */
 static char g_guest_exe_path[8192];
 static const char *g_exec_mode = "--ownall";
+/* --argv0 <s> (prompt 07): argv[0], ktery guest dostane misto cesty k binarce. */
+static const char *g_argv0 = NULL;
 static int g_f2_active = 0;  /* 1 = F2 rezim (--shim), povol inline-hooky */
 static elf_scope_t *g_shim_scope = NULL;  /* platny scope behem F2 behu */
 
@@ -2363,6 +2365,11 @@ static int shim_execve(const char *p, char *const argv[], char *const envp[]) {
     const char *mode_str = g_exec_mode ? g_exec_mode : "--ownall";
 
     na[narg++] = (char *)loader_bin;
+    /* vlastni argv[0] volajiciho (exec -a); u skriptu ho jadro zahodi taky */
+    if (!(is_script && interp[0]) && argv && argv[0]) {
+        na[narg++] = (char *)"--argv0";
+        na[narg++] = argv[0];
+    }
     na[narg++] = (char *)mode_str;
 
     if (is_script && interp[0]) {
@@ -2851,6 +2858,10 @@ static int shim_posix_spawnp(pid_t *pid, const char *p, const void *fa,
     char *na[512];
     int narg = 0;
     na[narg++] = (char *)loader_bin;
+    if (argv && argv[0]) {                     /* vlastni argv[0] (prompt 07) */
+        na[narg++] = (char *)"--argv0";
+        na[narg++] = argv[0];
+    }
     na[narg++] = (char *)(g_exec_mode ? g_exec_mode : "--ownall");
     na[narg++] = resolved;
     for (int i = 1; argv && argv[i] && narg < 510; i++)
@@ -4137,6 +4148,7 @@ static int run_ownall(const char *path, int argc, char **argv, char **envp) {
      * (shim_translate/shim_excluded ji ctou pres g_binds_ready). */
     binds_init();
 
+    char **argv_pre_shebang = argv;   /* shebang blok argv nahradi -> skript */
     /* Shebang podpora na urovni loader entry: `lx modal` predava
      * /usr/local/bin/modal (Python skript s #!/usr/bin/python3), elf_load pak
      * hlasi "Not an ELF file". Detekujeme #! v prvnim radku a prepiseme
@@ -4214,6 +4226,14 @@ static int run_ownall(const char *path, int argc, char **argv, char **envp) {
             }
         }
     }
+
+    /* Vlastni argv[0] (--argv0, prompt 07): `exec -a`, zsh `ARGV0=`, perl
+     * `exec {prog} LIST`. Exec shim ho predava zvlast, protoze na jeho miste
+     * stoji cesta k binarce pro loader. U skriptu ne - jadro tam argv[0]
+     * taky nahradi interpretem. argv je pole main() / new_argv (zapisovatelne),
+     * elf_init_argv na nej ukazuje. */
+    if (g_argv0 && argv == argv_pre_shebang && argc > 0)
+        argv[0] = (char *)g_argv0;
 
     shim_register_overrides();
     elf_timing_mark("overrides_reg");
@@ -5612,10 +5632,19 @@ int main(int argc, char **argv, char **envp) {
             lazy_was_set = 1;
         }
     }
-    while (ai + 1 < argc && strcmp(argv[ai], "--lazy") == 0) {
-        elf_set_lazy(1);
-        lazy_was_set = 1;
-        ai++;
+    /* --lazy a --argv0 <s> (prompt 07, predava ho exec shim) v libovolnem
+     * poradi pred rezimem. */
+    for (;;) {
+        if (ai + 1 < argc && strcmp(argv[ai], "--lazy") == 0) {
+            elf_set_lazy(1);
+            lazy_was_set = 1;
+            ai++;
+        } else if (ai + 2 < argc && strcmp(argv[ai], "--argv0") == 0) {
+            g_argv0 = argv[ai + 1];
+            ai += 2;
+        } else {
+            break;
+        }
     }
     if (lazy_was_set)
         if (elf_debug())

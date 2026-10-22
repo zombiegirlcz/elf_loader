@@ -5490,3 +5490,22 @@ vypíše a nedokončí exit, `ls` nevypíše nic, SIGTERM ignoruje → osiřelé
 procesy). Imgcache teď při nefunkční kali baseline SKIP (`timeout -s KILL`).
 Parrot po běhu ověřen: počty `etc`/`usr/bin`/`usr/lib`/`usr/sbin` beze
 změny, žádný soubor novější než značka před během.
+
+## 2026-10-22 (2) — prompt 07 etapa 1: vlastní `argv[0]` (`--argv0`)
+
+NÁLEZ 1 (postup.md „vlastní `argv[0]` se zahazuje") opraven. Exec shim stavěl
+`[loader, --ownall, chkpath, argv[1..]]` a guest dostal jako `argv[0]`
+resolvovanou **host** cestu (`$R/usr/bin/python3`) — i bez `exec -a` (únik
+host cesty). Nově všechny tři exec cesty (`shim_execve`, `posix_spawn`,
+Go/L2 `go_execve`) předají `--argv0 <argv[0] volajícího>` před režimem;
+`main()` ho parsuje spolu s `--lazy` (libovolné pořadí), `run_ownall` ho
+dosadí do `argv[0]` guestu. U skriptů ne (jádro tam `argv[0]` taky nahradí
+interpretem). Top-level `elf_loader --ownall X` beze změny.
+
+A/B `test-all.sh argv0` (sys.orig_argv[0]): stará `a52a6e9` **0/6**, nová
+**6/6** — `exec -a FAKE0`, perl `exec {prog} LIST`, zsh `ARGV0=`, běžný exec
+`/usr/bin/python3` (dřív host cesta), PATH lookup `python3`, a Claude Code:
+`(exec -a ugrep <claude> --version)` → `ugrep 7.8.4` (dřív `2.1.308 (Claude
+Code)` = rozbitý `grep`/`find` v agentově shellu; `bfs 4.1.1` taky).
+`all` 202/1/34 (jediný FAIL `nslookup localhost`, viz výše; +1 SKIP imgcache
+nad kali), parrot po běhu nedotčen.

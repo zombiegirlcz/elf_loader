@@ -5974,6 +5974,10 @@ NOSP static long go_execve(const char *p, char *const *argv, char *const *envp) 
     char *na[256];
     int k = 0;
     na[k++] = (char *)ld;
+    if (!interp[0] && argv && argv[0]) {        /* vlastni argv[0] (prompt 07) */
+        na[k++] = (char *)"--argv0";
+        na[k++] = argv[0];
+    }
     na[k++] = (char *)"--ownall";
     if (interp[0]) {
         na[k++] = interp;
