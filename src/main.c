@@ -1363,15 +1363,17 @@ static int shim_faccessat(int dfd, const char *p, int m, int ff) {
  * Bez tohoto hooku zustane statx netranslatovany -> ENOENT na hostu. */
 typedef int (*fp_statx)(int, const char *, int, unsigned int, void *);
 static int shim_statx(int dfd, const char *p, int flags, unsigned int mask, void *stx) {
-    char b[8192]; const char *path = p;
+    char b[8192]; const char *path = p; char raw[8192]; shim_strcpy(raw, sizeof raw, p ? p : "");
     if (dfd == -100 && p && p[0] == '/') {
-        if (shim_translate(p, b, sizeof b)) path = b;
+        if (shim_translate(p, b, sizeof b)) { path = b; shim_strcpy(raw, sizeof raw, path); }
         if (!(flags & 0x100 /* AT_SYMLINK_NOFOLLOW */)) {
             char resolved[8192];
             if (shim_resolve_symlinks(path, resolved, sizeof(resolved))) path = resolved;
         }
     }
-    fp_statx f = (fp_statx)g_orig_statx; return f ? f(dfd, path, flags, mask, stx) : -1;
+    fp_statx f = (fp_statx)g_orig_statx; int r = f ? f(dfd, path, flags, mask, stx) : -1;
+    if (r == 0 && dfd == -100) l2s_fix_statx(raw, !(flags & 0x100), dfd, mask, stx);
+    return r;
 }
 typedef int (*fp_fstatat)(int, const char *, void *, int);
 static int shim_fstatat(int dfd, const char *p, void *st, int flags) {
@@ -3943,11 +3945,21 @@ static void shim_install_hooks(void) {
     elf_timing_mark("hooks_spawn");
     if (g_shim_scope && !getenv("F2_NO_BTI_HOOK")) {
         static const struct { const char *n; void *shim; } bh[] = {
-            { "fstatat", (void *)shim_fstatat },
-            { "unlink",  (void *)shim_unlink },
-            { "mkdir",   (void *)shim_mkdir },
-            { "rmdir",   (void *)shim_rmdir },
-            { "link",    (void *)shim_link },     /* sem_open -> link() */
+            { "fstatat",    (void *)shim_fstatat },
+            { "unlink",     (void *)shim_unlink },
+            { "mkdir",      (void *)shim_mkdir },
+            { "rmdir",      (void *)shim_rmdir },
+            { "link",       (void *)shim_link },     /* sem_open -> link() */
+            /* prompt 08 cast 2 (l2s): coreutils `ln` vola jen linkat (ne
+             * link), `ls -li` jen statx (ne lstat/fstatat) - bez tehle
+             * trojice named hooky nikdy nezasahnou, l2s zustane neviditelny
+             * pro realne nastroje, i kdyz by jmenne GOT haky byly spravne. */
+            { "linkat",     (void *)shim_linkat },
+            { "unlinkat",   (void *)shim_unlinkat },
+            { "statx",      (void *)shim_statx },
+            { "stat",       (void *)shim_stat },
+            { "lstat",      (void *)shim_lstat },
+            { "newfstatat", (void *)shim_newfstatat },
         };
         /* Adresy vsech jmen z g_f2_hooks resolvuj JEDNOU dopredu. Driv se
          * `elf_scope_lookup` volal v zanorene smycce, tedy 5 x 118 = 590x

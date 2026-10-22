@@ -78,14 +78,16 @@ Bindy: `LX_BINDS=host:guest[:ro],…`,
 `$ROOTFS/etc/lx-binds` (fstab), `LX_BINDS_FILE` (sdílená tabulka, vnucuje se
 potomkům; prázdné = nová session).
 `LX_L2S=1` (default vypnuto, prompt 08 část 2 — link2symlink/`src/l2s.h`;
-`link()`/`linkat()` přesunou originál do `$ROOTFS/.l2s/<dev>-<ino>` a obě
-jména se stanou symlinky s počítadlem v `<id>.nlink`; `LX_L2S_DIR` override
-adresáře). **Nehotové:** coreutils `ln`/`ls` obcházejí named hooky úplně
-(stejná třída jako pasti 1/2 níže — ověřeno debug tiskem, 0 zásahů), funguje
-jen přes PLT `link()`/`lstat()` (ověřeno Pythonem); navíc nereprodukovatelné
-selhání při více `python3 -c` voláních v jednom běhu (viz postup.md
-2026-10-22 (6)). Proto zůstává default vypnuto a bez `test-all.sh l2s`
-kategorie.
+formát PŘESNĚ podle proot (`.l2s.<basename><NNNN>` + `.<MMMM>` = aktuální
+nlink, `$ROOTFS/.l2s`, hostově absolutní cíle — kompatibilní i se soubory,
+které v rootfs vytvořil skutečný proot). `ln`/`ls` fungují (coreutils volají
+jen `linkat`/`statx`, ne `link`/`lstat` — doplněno do existujícího
+`hook_inline_prologue` fallbacku pro BTI prolog vedle `fstatat`/`unlink`/
+`mkdir`/`rmdir`/`link`). `test-all.sh l2s` (destruktivní, jen kali) PASS.
+**Otevřené:** obecný (na l2s nezávislý) bug — cesty se v některých
+child-exec-pod-`--ownall` scénářích nepřekládají pod ROOTFS (zachyceno na
+holém `cat`/`ls`, vzácné/časové, ne 100% reprodukovatelné) — proto `LX_L2S`
+zůstává default vypnuto. Detaily postup.md 2026-10-22 (6) a (7).
 
 **Metodika:** pinování CPU mění čísla o desítky % → měřit při stejné CPU
 politice a A/B dělat knobem na téže binárce, ne dvěma buildy.

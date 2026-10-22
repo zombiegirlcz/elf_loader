@@ -1,40 +1,49 @@
-/* src/l2s.h — prompt 08 (cast 2): link2symlink (ekvivalent proot -l).
+/* src/l2s.h — prompt 08 cast 2: link2symlink (ekvivalent proot -l).
  *
- * SELinux app domeny zakazuje hardlinky (AGENTS.md bod 8, "Hardlinky zakazuje
- * SELinux app domeny" — platformni limit). link()/linkat() tedy nelze delat
- * doslovne. Proot resi stejny problem pod -l: puvodni soubor presune do
- * skryteho uloziste a z OBOU jmen udela symlinky na nej; pocitadlo odkazu se
- * vede vedle (proot: PROOT_L2S_DIR). Tenhle header dela totez.
+ * SELinux app domeny zakazuje hardlinky (AGENTS.md bod 8). Format PRESNE
+ * prevzaty z proot (termux/proot, src/extension/link2symlink/link2symlink.c,
+ * non-USERLAND vetev — PREFIX ".l2s."), overeno jak proti zdrojovemu kodu,
+ * tak proti REALNYM artefaktum, ktere uz v `kali` rootfs lezely z drivejsiho
+ * ostreho proot behu (`$ROOTFS/.l2s/.l2s.perl.dpkg-new0001` apod.):
  *
- * Konvence (viz existujici komentare main.c/relsym.h/l1.h/procvirt.h, ktere
- * uz s ".l2s" cili pocitaly): skryty adresar "$ROOTFS/.l2s", cil symlinku je
- * HOSTOVE ABSOLUTNI cesta do nej (ne rootfs-relativni) — presne jako proot
- * .l2s cile, ktere uz loader umel cist (main.c shim_resolve_symlinks,
- * relsym.h, procvirt.h, l1.h). Pocitadlo odkazu je v "$ROOTFS/.l2s/<id>.nlink"
- * (textove desitkove cislo), jak zadava prompt 08 cast 2 a 08-fakeroot-l2s.md.
+ *   original (kdekoli v rootfs) --symlink--> intermediate --symlink--> final
  *
- * POZNAMKA K PROOT KOMPATIBILITE (cestne priznani, nebyl cas verifikovat
- * binarne proti zdrojum proot bez pristupu k internetu v tomhle behu):
- * - presny nazev/format proot skryteho souboru (PROOT_L2S_DIR, pripadne
- *   soubor vedle originalu) NENI overen proti zdrojovym kodum proot (ENOENT
- *   na WebFetch/web nastroje v tomto behu). Prevzal jsem konvenci, kterou uz
- *   TENHLE projekt ocekaval (host-absolutni .l2s cile, viz komentare vyse) —
- *   to je jedina cast, kde je kompatibilita jista (loader uz umi CIST takove
- *   proot symlinky, protoze stejny tvar generujeme).
- * - Adresar: default "$ROOTFS/.l2s" (ne PROOT_L2S_DIR env, protoze ten by
- *   mohl ukazovat mimo rootfs a loader pracuje vyhradne pod ROOTFS). Pokud
- *   bude treba byt binarne kompatibilni s konkretni proot instalaci v appce,
- *   je potreba zjistit jeji skutecny PROOT_L2S_DIR (pripadne ho respektovat
- *   jako override — viz l2s_dir() nize, ktera cte LX_L2S_DIR env).
- * - id generujeme z (dev,ino) originalu v dekadickem tvaru "<dev>-<ino>",
- *   coz je proot-like (fakeroot/proot pouzivaji (dev,ino) jako klic), ale
- *   NENI to zaruceno byt bajtove tvar, ktery pouziva skutecny proot binary.
+ *   intermediate = "$L2S_DIR/" PREFIX <basename-original> <NNNN>
+ *   final        = intermediate "." <MMMM>
  *
- * Hot-path (l2s_link/l2s_unlink/l2s_fix_stat) bezi pod GUEST TP -> jen
- * shim_str-funkce a raw syscally (shim_raw_syscall6), zadne bionic
- * snprintf/getenv/velke buffery na stacku (AGENTS.md pasti 1 a 9).
- * l2s_init() bezi pri
- * startu pod bionickym TP (libc OK, vzor binds_init()).
+ * NNNN (4 cislice) je jen jednoznacny slot pro dany basename (hleda se od
+ * 0001, prvni volny). MMMM (4 cislice, ODDELENE TECKOU od NNNN) je AKTUALNI
+ * POCET ODKAZU (nlink) — NENI to generace. Potvrzeno ze zdrojoveho kodu
+ * proot (`finalStat.st_nlink = atoi(final + strlen(final) - 4)` v
+ * `handle_sysexit_end`, stejne v `link2symlink_handle_statx`). Kazdy dalsi
+ * `link()` na existujici l2s jmeno: precte final, MMMM+1, `rename(final,
+ * novy_final)`, prepise symlink intermediate->novy_final. `unlink` dela
+ * presny opak (MMMM-1; na 0 smaze intermediate i final).
+ *
+ * `L2S_DIR` = `$ROOTFS/.l2s` (viz `$D/usr/bin/boot`: `export
+ * PROOT_L2S_DIR="$ROOTFS/.l2s"` — presne umisteni, ktere uz tenhle projekt
+ * predpokladal v komentarich main.c/relsym.h/l1.h/procvirt.h). Cile symlinku
+ * jsou HOSTOVE ABSOLUTNI (overeno `readlink` na realnych proot artefaktech
+ * v kali — `.l2s.perl.dpkg-new0001` -> `/data/.../kali/.l2s/.l2s.perl.dpkg-
+ * new0001.0002`, plna hostova cesta). Diky tomu je tahle implementace
+ * schopna cist i soubory, ktere uz v rootfs vytvoril skutecny proot (a
+ * naopak) — format je ted bajtove stejny, ne jen adresarove.
+ *
+ * Co se NEPORTOVALO (mimo rozpocet, proot ma navic): dir_fd-vazana ochrana
+ * L2S_DIR proti prepsani symlinkem (proot to resi kvuli bezpecnosti vuci
+ * tracee, ktery muze menit vlastni rootfs mezi syscally — u nas neni
+ * zvlastni hrozba navic oproti existujicimu modelu), fd_cache +
+ * readlink_proc_fd (/proc/<pid>/fd/N na l2s souboru hlasi jmeno intermediate
+ * misto final — kosmeticke), execve_proc_exe (argv[0]/exe pro multi-call
+ * binarky spoustene pres l2s jmeno), handle_linkat_from_proc_fd (specialni
+ * /proc/X/fd/Y linkat trik). Tyto chybejici casti jsou neskodne (nejhorsi
+ * dusledek: drobna kosmeticka odchylka v /proc, ne spatna data).
+ *
+ * Hot-path bezi pod GUEST TP -> jen shim_str-funkce a raw syscally
+ * (shim_raw_syscall6), zadne bionic snprintf/getenv/velke buffery na
+ * stacku L1 stubu (AGENTS.md pasti 1 a 9; tyhle funkce ale bezi z named
+ * hooku, ne z L1 stubu, takze normalni stack buffery 4 KB jsou v poradku).
+ * l2s_init() bezi pri startu pod bionickym TP (libc OK, vzor binds_init()).
  */
 #ifndef ELF_LOADER_L2S_H
 #define ELF_LOADER_L2S_H
@@ -47,23 +56,15 @@
 #ifndef AT_SYMLINK_NOFOLLOW
 #define AT_SYMLINK_NOFOLLOW 0x100
 #endif
-#ifndef RENAME_NOREPLACE
-#define RENAME_NOREPLACE 1
-#endif
 
-/* raw syscall numbers (aarch64) pouzite v tomhle headeru */
 #define L2S_SYS_UNLINKAT   35
 #define L2S_SYS_SYMLINKAT  36
-#define L2S_SYS_LINKAT     37
 #define L2S_SYS_RENAMEAT2  276
 #define L2S_SYS_READLINKAT 78
 #define L2S_SYS_NEWFSTATAT 79
-#define L2S_SYS_OPENAT     56
-#define L2S_SYS_CLOSE      57
-#define L2S_SYS_READ       63
-#define L2S_SYS_WRITE      64
-#define L2S_SYS_MKDIRAT    34
-#define L2S_SYS_FTRUNCATE  46
+
+#define L2S_PREFIX     ".l2s."
+#define L2S_PREFIX_LEN 5
 
 static long shim_raw_syscall6(long nr, long a0, long a1, long a2, long a3, long a4, long a5);
 static void shim_guest_errno_set(int v);
@@ -71,16 +72,15 @@ static size_t shim_strlen(const char *s);
 static int shim_strncmp(const char *a, const char *b, size_t n);
 static void shim_memcpy(void *d, const void *s, size_t n);
 
-/* --- globalni stav, nastaveny jen v l2s_init() (bionicky TP) --- */
 static int g_l2s_enabled = 0;           /* LX_L2S=1 */
 static char g_l2s_dir[4096];            /* "$ROOTFS/.l2s", bez koncoveho '/' */
 static int g_l2s_dir_len = 0;
 
-/* Ceti env pri startu (bionicky TP, libc OK). Vzor binds_init(). */
 static void l2s_init(void) {
     const char *v = getenv("LX_L2S");
     g_l2s_enabled = (v && v[0] == '1') ? 1 : 0;
     if (!g_l2s_enabled) return;
+    extern const char *g_shim_root;
     const char *root = g_shim_root;
     if (!root || !root[0]) { g_l2s_enabled = 0; return; }
     const char *override = getenv("LX_L2S_DIR");
@@ -94,222 +94,292 @@ static void l2s_init(void) {
     mkdir(g_l2s_dir, 0700);
 }
 
-/* --- pomocne raw-syscall primitivy (guest TP safe) --- */
+/* --- male retezcove pomocniky (guest TP safe, zadny snprintf) --- */
 
-/* Manualni unsigned->decimal, bez snprintf. Pise do buf[0..], vraci delku
- * (bez NUL). buf musi mit >= 20 bajtu. */
-static int l2s_u64_to_str(unsigned long v, char *buf) {
-    char tmp[20]; int i = 0;
-    if (v == 0) { buf[0] = '0'; return 1; }
-    while (v > 0 && i < 20) { tmp[i++] = (char)('0' + (v % 10)); v /= 10; }
-    int len = i;
-    for (int k = 0; k < len; k++) buf[k] = tmp[len - 1 - k];
-    return len;
+static const char *l2s_basename(const char *p) {
+    const char *b = p, *s = p;
+    while (*s) { if (*s == '/') b = s + 1; s++; }
+    return b;
 }
-static int l2s_str_to_u64(const char *s, int len, unsigned long *out) {
-    unsigned long v = 0;
-    for (int i = 0; i < len; i++) {
-        if (s[i] < '0' || s[i] > '9') return 0;
-        v = v * 10 + (unsigned long)(s[i] - '0');
+static int l2s_has_prefix(const char *name) {
+    return shim_strncmp(name, L2S_PREFIX, L2S_PREFIX_LEN) == 0;
+}
+/* posledni 4 znaky retezce (delky len) jsou cislice -> vrat jejich hodnotu,
+ * jinak -1. */
+static int l2s_last4_to_int(const char *s, size_t len) {
+    if (len < 4) return -1;
+    int v = 0;
+    for (int i = 0; i < 4; i++) {
+        char c = s[len - 4 + i];
+        if (c < '0' || c > '9') return -1;
+        v = v * 10 + (c - '0');
     }
-    *out = v;
-    return 1;
+    return v;
+}
+static void l2s_fmt4(int v, char *out) {
+    if (v < 0) v = 0;
+    if (v > 9999) v = 9999;
+    out[0] = (char)('0' + (v / 1000) % 10);
+    out[1] = (char)('0' + (v / 100) % 10);
+    out[2] = (char)('0' + (v / 10) % 10);
+    out[3] = (char)('0' + v % 10);
+}
+/* prepise posledni 4 znaky retezce "s" (delky len) hodnotou v (in place). */
+static void l2s_set_last4(char *s, size_t len, int v) {
+    if (len < 4) return;
+    l2s_fmt4(v, s + len - 4);
 }
 
-/* id = "<dev>-<ino>" originalniho souboru (dev,ino jako klic, proot/fakeroot
- * styl). buf >= 64 bajtu. Vraci delku. */
-static int l2s_make_id(unsigned long dev, unsigned long ino, char *buf, size_t bufsz) {
-    (void)bufsz;
-    int i = 0;
-    i += l2s_u64_to_str(dev, buf + i);
-    buf[i++] = '-';
-    i += l2s_u64_to_str(ino, buf + i);
-    buf[i] = 0;
-    return i;
-}
-
-/* storage cesta "$g_l2s_dir/<id>" do out (>= 4096). */
-static void l2s_storage_path(const char *id, int idlen, char *out) {
-    shim_memcpy(out, g_l2s_dir, (size_t)g_l2s_dir_len);
-    out[g_l2s_dir_len] = '/';
-    shim_memcpy(out + g_l2s_dir_len + 1, id, (size_t)idlen);
-    out[g_l2s_dir_len + 1 + idlen] = 0;
-}
-/* counter cesta "$g_l2s_dir/<id>.nlink" do out (>= 4096+6). */
-static void l2s_counter_path(const char *id, int idlen, char *out) {
-    l2s_storage_path(id, idlen, out);
-    int l = g_l2s_dir_len + 1 + idlen;
-    static const char suf[] = ".nlink";
-    shim_memcpy(out + l, suf, sizeof(suf)); /* vc. NUL */
-}
-
-/* precte dekadicke cislo z maleho souboru (raw syscally). Vraci 1 pri
- * uspechu. Pouziva staticky buffer (slot) — bezpecne vuci AGENTS.md bod 9
- * (zadny buffer na STACKU zasobniku l1 stubu; tohle je ale volano jen z
- * jmennych hooku v main.c, ne z L1 stubu primo). */
-static int l2s_counter_read(const char *path, unsigned long *out) {
-    long fd = shim_raw_syscall6(L2S_SYS_OPENAT, AT_FDCWD, (long)(unsigned long)path, 0 /*O_RDONLY*/, 0, 0, 0);
-    if (fd < 0) return 0;
-    char buf[32];
-    long n = shim_raw_syscall6(L2S_SYS_READ, fd, (long)(unsigned long)buf, sizeof(buf) - 1, 0, 0, 0);
-    shim_raw_syscall6(L2S_SYS_CLOSE, fd, 0, 0, 0, 0, 0);
-    if (n <= 0) return 0;
-    /* osekat pripadny trailing newline */
-    while (n > 0 && (buf[n - 1] == '\n' || buf[n - 1] == '\r')) n--;
-    return l2s_str_to_u64(buf, (int)n, out);
-}
-static int l2s_counter_write(const char *path, unsigned long v) {
-    long fd = shim_raw_syscall6(L2S_SYS_OPENAT, AT_FDCWD, (long)(unsigned long)path,
-                                 0101 /* O_WRONLY|O_CREAT (octal 0101 = 0x41) */, 0600, 0, 0);
-    if (fd < 0) return 0;
-    shim_raw_syscall6(L2S_SYS_FTRUNCATE, fd, 0, 0, 0, 0, 0);
-    char buf[24];
-    int len = l2s_u64_to_str(v, buf);
-    long w = shim_raw_syscall6(L2S_SYS_WRITE, fd, (long)(unsigned long)buf, len, 0, 0, 0);
-    shim_raw_syscall6(L2S_SYS_CLOSE, fd, 0, 0, 0, 0, 0);
-    return w == len;
-}
-
-/* Je "path" (uz host-prelozena cesta pod ROOTFS) symlink smerujici do
- * g_l2s_dir? Pokud ano a target_out != NULL, zkopiruje cil (host-absolutni)
- * a vrati jeho delku; jinak 0. target_out musi mit >= 4096 bajtu. */
-static int l2s_readlink_is_ours(const char *path, char *target_out) {
-    if (!g_l2s_enabled || !g_l2s_dir_len) return 0;
-    char tgt[4096];
+static long l2s_readlink(const char *path, char *out, size_t outsz) {
     long n = shim_raw_syscall6(L2S_SYS_READLINKAT, AT_FDCWD, (long)(unsigned long)path,
-                                (long)(unsigned long)tgt, sizeof(tgt) - 1, 0, 0);
-    if (n <= 0) return 0;
-    tgt[n] = 0;
-    if (shim_strncmp(tgt, g_l2s_dir, (size_t)g_l2s_dir_len) != 0) return 0;
-    if (tgt[g_l2s_dir_len] != '/') return 0;
-    if (target_out) shim_memcpy(target_out, tgt, (size_t)n + 1);
-    return (int)n;
+                                (long)(unsigned long)out, outsz - 1, 0, 0);
+    if (n > 0) out[n] = 0;
+    return n;
+}
+static long l2s_lstat_exists(const char *path) {
+    struct stat st;
+    return shim_raw_syscall6(L2S_SYS_NEWFSTATAT, AT_FDCWD, (long)(unsigned long)path,
+                              (long)(unsigned long)&st, AT_SYMLINK_NOFOLLOW, 0, 0);
 }
 
-/* --- hlavni operace, volane z main.c hooku --- */
+/* --- hlavni operace --- */
 
-/* link()/linkat() emulace. oldp/newp JSOU UZ host-prelozene cesty (po
- * shim_translate), presne jako vstup do g_orig_link. Vraci 0 pri uspechu
- * (volajici potom NEMA volat original — uz je hotovo), -1 + guest errno pri
- * chybe emulace samotne (volajici vrati -1 primo), nebo -2 kdyz se ma
- * pouzit puvodni cesta (l2s vypnuty / nepouzitelny — fallback na
- * g_orig_link, ktery stejne pod SELinuxem skonci EACCES — zachovava presne
- * puvodni chovani pri LX_L2S=0). */
+/* link()/linkat() emulace. oldp/newp jsou uz host-prelozene cesty. Vraci 0
+ * (hotovo), -1 (chyba, guest errno nastaven), nebo -2 (LX_L2S vypnuty nebo
+ * se nejedna o regularni soubor/l2s jmeno -> volajici ma zavolat original). */
 static int l2s_link(const char *oldp, const char *newp) {
     if (!g_l2s_enabled) return -2;
 
-    char existing_tgt[4096];
-    int tl = l2s_readlink_is_ours(oldp, existing_tgt);
-    if (tl > 0) {
-        /* oldp uz je l2s jmeno -> novy symlink na stejny cil, nlink++ */
-        long r = shim_raw_syscall6(L2S_SYS_SYMLINKAT, (long)(unsigned long)existing_tgt,
-                                    AT_FDCWD, (long)(unsigned long)newp, 0, 0, 0);
-        if (r < 0) { shim_guest_errno_set((int)-r); return -1; }
-        /* counter cesta = existing_tgt + ".nlink" */
-        char cnt[4096 + 8];
-        size_t el = shim_strlen(existing_tgt);
-        shim_memcpy(cnt, existing_tgt, el);
-        static const char suf[] = ".nlink";
-        shim_memcpy(cnt + el, suf, sizeof(suf));
-        unsigned long v = 1;
-        l2s_counter_read(cnt, &v);
-        l2s_counter_write(cnt, v + 1);
-        return 0;
-    }
-
-    /* oldp je (predpokladem) obycejny soubor. Zjisti dev/ino. */
+    char intermediate[4096];
     struct stat st;
     long r = shim_raw_syscall6(L2S_SYS_NEWFSTATAT, AT_FDCWD, (long)(unsigned long)oldp,
                                 (long)(unsigned long)&st, AT_SYMLINK_NOFOLLOW, 0, 0);
     if (r < 0) { shim_guest_errno_set((int)-r); return -1; }
-    if ((st.st_mode & S_IFMT) != S_IFREG) return -2; /* jen regularni soubory */
+    if ((st.st_mode & S_IFMT) == S_IFDIR) { shim_guest_errno_set(EPERM); return -1; }
 
-    char id[64];
-    int idlen = l2s_make_id((unsigned long)st.st_dev, (unsigned long)st.st_ino, id, sizeof id);
-    char storage[4096];
-    l2s_storage_path(id, idlen, storage);
-    char counter[4096 + 8];
-    l2s_counter_path(id, idlen, counter);
-
-    /* presun originalu do uloziste (renameat2, bez prepsani) */
-    r = shim_raw_syscall6(L2S_SYS_RENAMEAT2, AT_FDCWD, (long)(unsigned long)oldp,
-                           AT_FDCWD, (long)(unsigned long)storage, RENAME_NOREPLACE, 0);
-    if (r < 0) { shim_guest_errno_set((int)-r); return -1; }
-
-    /* oldp -> symlink na storage (host-absolutni cil) */
-    r = shim_raw_syscall6(L2S_SYS_SYMLINKAT, (long)(unsigned long)storage,
-                           AT_FDCWD, (long)(unsigned long)oldp, 0, 0, 0);
-    if (r < 0) {
-        /* best-effort rollback: vrat original zpet */
-        shim_raw_syscall6(L2S_SYS_RENAMEAT2, AT_FDCWD, (long)(unsigned long)storage,
-                           AT_FDCWD, (long)(unsigned long)oldp, RENAME_NOREPLACE, 0);
-        shim_guest_errno_set((int)-r); return -1;
+    int is_relink = 0;
+    if ((st.st_mode & S_IFMT) == S_IFLNK) {
+        long n = l2s_readlink(oldp, intermediate, sizeof intermediate);
+        if (n <= 0) return -2;
+        if (!l2s_has_prefix(l2s_basename(intermediate))) return -2; /* cizi symlink, nechat original */
+        is_relink = 1;
+    } else if ((st.st_mode & S_IFMT) != S_IFREG) {
+        return -2; /* jen regularni soubory a existujici l2s jmena */
     }
-    /* newp -> symlink na storage */
-    r = shim_raw_syscall6(L2S_SYS_SYMLINKAT, (long)(unsigned long)storage,
+
+    char final[4096];
+    if (is_relink) {
+        long n = l2s_readlink(intermediate, final, sizeof final);
+        if (n <= 0) return -2; /* rozbity l2s link - nechat na originalu */
+        size_t fl = (size_t)n;
+        int cnt = l2s_last4_to_int(final, fl);
+        if (cnt < 0) return -2;
+        cnt++;
+        char new_final[4096];
+        shim_memcpy(new_final, final, fl + 1);
+        l2s_set_last4(new_final, fl, cnt);
+        r = shim_raw_syscall6(L2S_SYS_RENAMEAT2, AT_FDCWD, (long)(unsigned long)final,
+                               AT_FDCWD, (long)(unsigned long)new_final, 0, 0);
+        if (r < 0) { shim_guest_errno_set((int)-r); return -1; }
+        shim_raw_syscall6(L2S_SYS_UNLINKAT, AT_FDCWD, (long)(unsigned long)intermediate, 0, 0, 0, 0);
+        r = shim_raw_syscall6(L2S_SYS_SYMLINKAT, (long)(unsigned long)new_final,
+                               AT_FDCWD, (long)(unsigned long)intermediate, 0, 0, 0);
+        if (r < 0) { shim_guest_errno_set((int)-r); return -1; }
+    } else {
+        /* prvni link: najdi volny slot NNNN pro basename(oldp) v L2S_DIR */
+        const char *name = l2s_basename(oldp);
+        size_t namelen = shim_strlen(name);
+        if ((size_t)g_l2s_dir_len + L2S_PREFIX_LEN + namelen + 11 >= sizeof intermediate)
+            { shim_guest_errno_set(ENAMETOOLONG); return -1; }
+        size_t pos = 0;
+        shim_memcpy(intermediate, g_l2s_dir, (size_t)g_l2s_dir_len); pos += (size_t)g_l2s_dir_len;
+        intermediate[pos++] = '/';
+        shim_memcpy(intermediate + pos, L2S_PREFIX, L2S_PREFIX_LEN); pos += L2S_PREFIX_LEN;
+        shim_memcpy(intermediate + pos, name, namelen); pos += namelen;
+        size_t base_pos = pos;
+        int slot;
+        for (slot = 1; slot < 1000; slot++) {
+            l2s_fmt4(slot, intermediate + base_pos);
+            intermediate[base_pos + 4] = 0;
+            if (l2s_lstat_exists(intermediate) < 0) break; /* volny slot */
+        }
+        if (slot >= 1000) { shim_guest_errno_set(ENOSPC); return -1; }
+
+        shim_memcpy(final, intermediate, base_pos + 4);
+        final[base_pos + 4] = '.';
+        l2s_fmt4(2, final + base_pos + 5);
+        final[base_pos + 9] = 0;
+
+        r = shim_raw_syscall6(L2S_SYS_RENAMEAT2, AT_FDCWD, (long)(unsigned long)oldp,
+                               AT_FDCWD, (long)(unsigned long)final, 0, 0);
+        if (r < 0) { shim_guest_errno_set((int)-r); return -1; }
+        r = shim_raw_syscall6(L2S_SYS_SYMLINKAT, (long)(unsigned long)final,
+                               AT_FDCWD, (long)(unsigned long)intermediate, 0, 0, 0);
+        if (r < 0) {
+            shim_raw_syscall6(L2S_SYS_RENAMEAT2, AT_FDCWD, (long)(unsigned long)final,
+                               AT_FDCWD, (long)(unsigned long)oldp, 0, 0);
+            shim_guest_errno_set((int)-r); return -1;
+        }
+        r = shim_raw_syscall6(L2S_SYS_SYMLINKAT, (long)(unsigned long)intermediate,
+                               AT_FDCWD, (long)(unsigned long)oldp, 0, 0, 0);
+        if (r < 0) { shim_guest_errno_set((int)-r); return -1; }
+    }
+
+    r = shim_raw_syscall6(L2S_SYS_SYMLINKAT, (long)(unsigned long)intermediate,
                            AT_FDCWD, (long)(unsigned long)newp, 0, 0, 0);
     if (r < 0) { shim_guest_errno_set((int)-r); return -1; }
-
-    l2s_counter_write(counter, 2);
     return 0;
 }
 
 /* unlink()/unlinkat() hak: ma se zavolat PRED normalnim unlink() te same
- * cesty. Pokud "path" je l2s jmeno, snizi pocitadlo a pri 0 smaze i data +
- * counter soubor (samotne jmeno/symlink stejne pak smaze normalni unlink,
- * ktery nasleduje v puvodnim shim_unlink/shim_unlinkat — tenhle hak jen
- * udrzuje uloziste konzistentni). Nikdy nevraci chybu volajicimu — pri
- * jakekoli nejasnosti se jen nic neudela a normalni unlink probehne, jak
- * byl. */
+ * cesty. Nikdy nevraci chybu volajicimu (viz l2s_unlink v proot - skipuje
+ * ticho na rozbitem retezci). */
 static void l2s_unlink(const char *path) {
     if (!g_l2s_enabled) return;
-    char tgt[4096];
-    int tl = l2s_readlink_is_ours(path, tgt);
-    if (tl <= 0) return;
-    size_t el = (size_t)tl;
-    char cnt[4096 + 8];
-    shim_memcpy(cnt, tgt, el);
-    static const char suf[] = ".nlink";
-    shim_memcpy(cnt + el, suf, sizeof(suf));
-    unsigned long v = 1;
-    if (!l2s_counter_read(cnt, &v) || v == 0) return;
-    if (v <= 1) {
-        shim_raw_syscall6(L2S_SYS_UNLINKAT, AT_FDCWD, (long)(unsigned long)tgt, 0, 0, 0, 0);
-        shim_raw_syscall6(L2S_SYS_UNLINKAT, AT_FDCWD, (long)(unsigned long)cnt, 0, 0, 0, 0);
+    struct stat st;
+    long r = shim_raw_syscall6(L2S_SYS_NEWFSTATAT, AT_FDCWD, (long)(unsigned long)path,
+                                (long)(unsigned long)&st, AT_SYMLINK_NOFOLLOW, 0, 0);
+    if (r < 0 || (st.st_mode & S_IFMT) != S_IFLNK) return;
+
+    char intermediate[4096];
+    long n = l2s_readlink(path, intermediate, sizeof intermediate);
+    if (n <= 0) return;
+    if (!l2s_has_prefix(l2s_basename(intermediate))) return;
+
+    char final[4096];
+    n = l2s_readlink(intermediate, final, sizeof final);
+    if (n <= 0) return; /* rozbity l2s link, nic delat */
+    size_t fl = (size_t)n;
+    int cnt = l2s_last4_to_int(final, fl);
+    if (cnt < 0) return;
+    cnt--;
+
+    if (cnt > 0) {
+        char new_final[4096];
+        shim_memcpy(new_final, final, fl + 1);
+        l2s_set_last4(new_final, fl, cnt);
+        shim_raw_syscall6(L2S_SYS_RENAMEAT2, AT_FDCWD, (long)(unsigned long)final,
+                           AT_FDCWD, (long)(unsigned long)new_final, 0, 0);
+        shim_raw_syscall6(L2S_SYS_UNLINKAT, AT_FDCWD, (long)(unsigned long)intermediate, 0, 0, 0, 0);
+        shim_raw_syscall6(L2S_SYS_SYMLINKAT, (long)(unsigned long)new_final,
+                           AT_FDCWD, (long)(unsigned long)intermediate, 0, 0, 0);
     } else {
-        l2s_counter_write(cnt, v - 1);
+        shim_raw_syscall6(L2S_SYS_UNLINKAT, AT_FDCWD, (long)(unsigned long)intermediate, 0, 0, 0, 0);
+        shim_raw_syscall6(L2S_SYS_UNLINKAT, AT_FDCWD, (long)(unsigned long)final, 0, 0, 0, 0);
     }
 }
 
-/* stat/lstat/fstatat/statx oprava: "path" je host-prelozena cesta, "st" uz
- * obsahuje vysledek PUVODNIHO (originalniho) syscallu nad "path" s danymi
- * flags. follow = 1 znamena "puvodni volani symlink nasledovalo" (stat,
- * fstatat bez AT_SYMLINK_NOFOLLOW, statx bez stejneho flagu) — v tom pripade
- * uz kernel dosel na storage soubor sam (host-absolutni cil), takze
- * st_mode/st_size jsou spravne a staci jen prepsat st_nlink z citace.
- * follow = 0 (lstat, *at s AT_SYMLINK_NOFOLLOW) — "st" popisuje SYMLINK
- * samotny (S_IFLNK); l2s jmeno ale ma vypadat jako regularni soubor s danym
- * nlink, presne jako skutecny hardlink by vypadal — proto v tomhle pripade
- * musime stat zavolat znovu, tentokrat nad cilem, a to nahradit. */
+/* stat/lstat/fstatat/newfstatat oprava. "path" je host-prelozena, NEresolvnuta
+ * cesta (presne ta, co by sel kernel lstat). follow=1 = puvodni volani
+ * symlink nasledovalo (stat, fstatat bez AT_SYMLINK_NOFOLLOW) -> "st" uz
+ * obsahuje atributy FINAL souboru (kernel prosel oba symlink hopy sam),
+ * staci dopocitat nlink. follow=0 = "st" popisuje SYMLINK samotny; musime
+ * rucne dojit na final a cely st prepsat. */
 static void l2s_fix_stat(const char *path, int follow, struct stat *st) {
     if (!g_l2s_enabled || !st) return;
-    char tgt[4096];
-    int tl = l2s_readlink_is_ours(path, tgt);
-    if (tl <= 0) return;
+
+    const char *bn = l2s_basename(path);
+    char intermediate[4096], final[4096];
+    long n;
+
+    if (l2s_has_prefix(bn)) {
+        /* "path" uz je sam intermediate nebo final jmeno v L2S_DIR */
+        if ((st->st_mode & S_IFMT) == S_IFLNK || !follow) {
+            /* over, jestli jde o intermediate (symlink na final) */
+            struct stat st2;
+            long r = shim_raw_syscall6(L2S_SYS_NEWFSTATAT, AT_FDCWD, (long)(unsigned long)path,
+                                        (long)(unsigned long)&st2, AT_SYMLINK_NOFOLLOW, 0, 0);
+            if (r < 0) return;
+            if ((st2.st_mode & S_IFMT) == S_IFLNK) {
+                n = l2s_readlink(path, final, sizeof final);
+                if (n <= 0) return;
+            } else {
+                shim_memcpy(final, path, shim_strlen(path) + 1);
+            }
+        } else {
+            shim_memcpy(final, path, shim_strlen(path) + 1);
+        }
+    } else {
+        /* obycejne jmeno (hardlink-emulovane) - musi byt symlink na
+         * intermediate */
+        struct stat st2;
+        long r = shim_raw_syscall6(L2S_SYS_NEWFSTATAT, AT_FDCWD, (long)(unsigned long)path,
+                                    (long)(unsigned long)&st2, AT_SYMLINK_NOFOLLOW, 0, 0);
+        if (r < 0 || (st2.st_mode & S_IFMT) != S_IFLNK) return;
+        n = l2s_readlink(path, intermediate, sizeof intermediate);
+        if (n <= 0) return;
+        if (!l2s_has_prefix(l2s_basename(intermediate))) return;
+        n = l2s_readlink(intermediate, final, sizeof final);
+        if (n <= 0) return;
+    }
+
+    size_t fl = shim_strlen(final);
+    int cnt = l2s_last4_to_int(final, fl);
+    if (cnt < 0) return;
+
     if (!follow) {
         struct stat real;
-        long r = shim_raw_syscall6(L2S_SYS_NEWFSTATAT, AT_FDCWD, (long)(unsigned long)tgt,
+        long r = shim_raw_syscall6(L2S_SYS_NEWFSTATAT, AT_FDCWD, (long)(unsigned long)final,
                                     (long)(unsigned long)&real, 0, 0, 0);
-        if (r < 0) return; /* nech puvodni (symlink) stat, lepsi nez nic */
+        if (r < 0) return;
         *st = real;
     }
-    size_t el = (size_t)tl;
-    char cnt[4096 + 8];
-    shim_memcpy(cnt, tgt, el);
-    static const char suf[] = ".nlink";
-    shim_memcpy(cnt + el, suf, sizeof(suf));
-    unsigned long v;
-    if (l2s_counter_read(cnt, &v) && v > 0) st->st_nlink = (nlink_t)v;
+    st->st_nlink = (nlink_t)cnt;
+}
+
+/* statx() ma jiny ABI layout nez struct stat (kernel struct statx, stabilni
+ * od zavedeni syscallu) -> samostatna oprava jen pro stx_nlink (offset 16,
+ * u32) a stx_mask (offset 0, u32, bit STATX_NLINK=0x4). "stx" je surovy
+ * buffer predany do statx(2). follow ma stejny vyznam jako u l2s_fix_stat. */
+#define L2S_STATX_SYS       291
+#define L2S_STATX_NLINK_OFF 16
+#define L2S_STATX_MASK_BIT  0x00000004u
+static void l2s_fix_statx(const char *path, int follow, int dfd, unsigned int mask, void *stx) {
+    if (!g_l2s_enabled || !stx) return;
+    unsigned int smask;
+    shim_memcpy(&smask, stx, 4);
+    if (!(smask & L2S_STATX_MASK_BIT)) return;
+
+    const char *bn = l2s_basename(path);
+    char intermediate[4096], final[4096];
+    long n;
+
+    if (l2s_has_prefix(bn)) {
+        struct stat st2;
+        long r = shim_raw_syscall6(L2S_SYS_NEWFSTATAT, AT_FDCWD, (long)(unsigned long)path,
+                                    (long)(unsigned long)&st2, AT_SYMLINK_NOFOLLOW, 0, 0);
+        if (r < 0) return;
+        if ((st2.st_mode & S_IFMT) == S_IFLNK) {
+            n = l2s_readlink(path, final, sizeof final);
+            if (n <= 0) return;
+        } else {
+            shim_memcpy(final, path, shim_strlen(path) + 1);
+        }
+    } else {
+        struct stat st2;
+        long r = shim_raw_syscall6(L2S_SYS_NEWFSTATAT, AT_FDCWD, (long)(unsigned long)path,
+                                    (long)(unsigned long)&st2, AT_SYMLINK_NOFOLLOW, 0, 0);
+        if (r < 0 || (st2.st_mode & S_IFMT) != S_IFLNK) return;
+        n = l2s_readlink(path, intermediate, sizeof intermediate);
+        if (n <= 0) return;
+        if (!l2s_has_prefix(l2s_basename(intermediate))) return;
+        n = l2s_readlink(intermediate, final, sizeof final);
+        if (n <= 0) return;
+    }
+
+    size_t fl = shim_strlen(final);
+    int cnt = l2s_last4_to_int(final, fl);
+    if (cnt < 0) return;
+
+    if (!follow) {
+        /* refresh cely buffer statx(2) syscallem nad final, aby ostatni
+         * pole (mode/size/ino...) odpovidala realnemu souboru, ne symlinku */
+        shim_raw_syscall6(L2S_STATX_SYS, dfd == -100 ? AT_FDCWD : dfd,
+                           (long)(unsigned long)final, 0 /* flags */, mask,
+                           (long)(unsigned long)stx, 0);
+    }
+    unsigned int nlink32 = (unsigned int)cnt;
+    shim_memcpy((char *)stx + L2S_STATX_NLINK_OFF, &nlink32, 4);
 }
 
 #endif /* ELF_LOADER_L2S_H */

@@ -5740,3 +5740,116 @@ smysl zapnout na realne workloady (apt/dpkg). Doporuceni pro navazujici
 praci: nejdriv zjistit root cause bodu 2 (pridat diag log do `l2s_init()`,
 overit `g_shim_root`/env pri kazdem exec kroku pod `--ownall`), pak resit
 bod 1 pres L1 (uz existujici infrastruktura pro presne tuto tridu problemu).
+
+## 2026-10-22 (7) — prompt 08 cast 2 (l2s): presny proot format + oprava hooku + test-all.sh
+
+Navazuje na (6). Koordinator vratil praci se 4 body, vysledky:
+
+**1) Presny proot format (ziskano ze zdrojoveho kodu, `git clone --depth 1
+https://github.com/termux/proot` do scratch, `src/extension/link2symlink/
+link2symlink.c`):** PREFIX je `.l2s.` (non-USERLAND vetev). Format:
+`original -> intermediate -> final`, kde `intermediate = "$L2S_DIR/" PREFIX
+<basename-original> <NNNN>` (NNNN = 4-cislicovy volny slot pro dany
+basename, hleda se od 0001) a `final = intermediate "." <MMMM>` (MMMM = 4
+cislice, ODDELENE TECKOU, = AKTUALNI POCET ODKAZU — NENI generace; potvrzeno
+`finalStat.st_nlink = atoi(final + strlen(final) - 4)` v
+`handle_sysexit_end` a v `link2symlink_handle_statx`). `$L2S_DIR` =
+`$ROOTFS/.l2s` (potvrzeno v `$D/usr/bin/boot`: `export
+PROOT_L2S_DIR="$ROOTFS/.l2s"` — presne umisteni, ktere tenhle projekt uz
+predpokladal). Cile symlinku jsou HOSTOVE ABSOLUTNI (overeno `readlink` na
+realnych proot artefaktech v kali: `.l2s.perl.dpkg-new0001` ->
+`/data/.../kali/.l2s/.l2s.perl.dpkg-new0001.0002`, plna hostova cesta — moje
+puvodni formulace "relativni cil" v zapisu (6) byla chyba cteni `ls -la`
+vystupu, ne realna vlastnost proot).
+
+`src/l2s.h` prepsano na presne tenhle format (`<dev>-<ino>` schema ze zapisu
+(6) ZAHOZENO). `l2s_link`/`l2s_unlink`/`l2s_fix_stat`/`l2s_fix_statx`
+(novy — kernel `struct statx` ma jiny layout nez `struct stat`, oprava jen
+`stx_nlink`/`stx_mask` offsetem). Co se NEPORTOVALO z proot (mimo rozpocet,
+neskodne): dir_fd-vazana ochrana L2S_DIR, fd_cache/readlink_proc_fd,
+execve_proc_exe (argv[0] pres l2s jmeno u multi-call binarek),
+handle_linkat_from_proc_fd (/proc/X/fd/Y trik). Dusledek: implementace je
+ted schopna cist/pocitat i existujici proot `.l2s.*` artefakty v kali
+rootfs (overeno - stare `.l2s.perl.dpkg-new0001*` zustaly nedotcene po celem
+testovani).
+
+**2) coreutils `ln`/`ls` hooky - NALEZENO A OPRAVENO.** `nm -D
+--undefined-only $K/bin/ln` ukazal `linkat@GLIBC_2.17` (ne `link`), `ls`
+ukazal jen `statx@GLIBC_2.28` (ne `lstat`/`fstatat`/`newfstatat`). `ELF_DEBUG=1`
+na realnem behu potvrdil: `hook_install` (GOT-thunk cesta) `linkat`/`statx`/
+`stat`/`lstat`/`unlinkat` preskakuje (`ins0=d503245f` = `BTI c`, presne
+AGENTS.md past 2), ALE uz existujici fallback `hook_inline_prologue` (ten,
+co uz resil `fstatat`/`unlink`/`mkdir`/`rmdir`/`link` pro presne tuhle
+tridu problemu) tyhle symboly vubec nezkousel. Oprava: `shim_install_hooks`
+(`src/main.c`, tabulka `bh[]`) rozsirena o `linkat`, `unlinkat`, `statx`,
+`stat`, `lstat`. `ELF_DEBUG=1` po oprave hlasi `[hook] linkat inline (BTI)
+OK` / `[hook] statx inline (BTI) OK` atd. (14 inline-patchnutych funkci
+celkem, drive 9).
+
+**3) Nereprodukovatelnost (python `os.link` jednou projde, podruhe EACCES)
+- ROOT CAUSE NALEZEN, ALE JE TO JINY, OBECNY BUG, NE L2S-SPECIFICKY.**
+Zjisteno: `cat`/`ls` na existujici soubor spustene jako DITE jineho
+`--ownall` behu (napr. `bash script.sh` kde `script.sh` dela `cat
+/tmp/x/a`) obcas vraci ENOENT na cestu, ktera prokazatelne existuje (overeno
+`ls -la` zvenku) — TOTO SE DEJE I BEZ LX_L2S VUBEC (overeno holym
+`cat`/`ls` bez jakekoli l2s logiky). Tedy: cesty se v nekterych
+child-exec-pod---ownall scenarich neprekladaji spravne pod ROOTFS (host
+cesta se zkousi primo, ENOENT). Prime top-level `--ownall` volani (`elf_loader
+--ownall ln ...` jako prvni/jediny exec) je VZDY spravne. Tenhle bug je
+mimo rozsah prompt 08 (obecny problem exec/own-load retezce, ne link2symlink)
+a NEBYL opraven - jen zdokumentovan. Prakticky: `test-all.sh` kategorie
+(nize) pouziva presne tenhle vzor jako `category_imgcache` (kazdy prikaz
+samostatny top-level `--ownall` beh pod `ashell_out`) a BEZELA SPRAVNE a
+OPAKOVANE (2x) bez jedine chyby — takze ten child-exec bug je zjevne
+RIDKY/casovy (ne 100% reprodukovatelny), ale realny (zachycen 2x
+samostatne na holem `cat`/`ls`).
+
+**4) `statx` oprava + `test-all.sh l2s` + `/dev/shm` regrese.**
+`l2s_fix_statx` doplnen (viz bod 1), zavolan ze `shim_statx`. Kategorie
+`category_l2s` v `test-all.sh` (vzor `category_imgcache`, destruktivni jen
+na kali): A (bez `LX_L2S` - musi zustat `EACCES` jako drive), B (s
+`LX_L2S=1` - `ln` projde, `ls -li` ukaze STEJNY inode a `nlink=2` u obou
+jmen, `rm a` necha `b` citelny, `rm b` uvolni data i `.l2s/.l2s.a*`
+uloziste). `multiprocessing.Lock()` (python, `/dev/shm/sem.*`) pod
+`LX_L2S=1` funguje (`"lock ok"`, rc=0) - zadna regrese `/dev/shm`
+special-case (vcasny `return` v `shim_link` pred `l2s_link` zustal
+nezmeneny).
+
+**Presne vysledky testu (z realneho behu, `ashell -c "... test-all.sh
+l2s"`, 2x za sebou):**
+```
+=== link2symlink (LX_L2S) ===
+PASS l2s: bez LX_L2S nezmeneno (EACCES), s LX_L2S ln+ls-li+rm spravne (nlink 2->1->0, data uvolnena)
+
+=== SUMMARY ===
+PASS: 1
+FAIL: 0
+SKIP: 0
+```
+Rucni doplnkovy test (presne akceptacni kriterium z promptu, top-level
+`--ownall`):
+```
+$ ln a b              -> rc=0 (bez LX_L2S: "Permission denied", regrese OK)
+$ ls -li a b          -> "2058437 -rw-------. 2 daemon daemon 6 ... a"
+                          "2058437 -rw-------. 2 daemon daemon 6 ... b"
+                          (stejny inode, nlink=2 u obou)
+$ rm a; cat b         -> "hello" (data pristupna po rm a)
+$ ls -li b            -> nlink=1 (spravne snizeno)
+$ rm b                -> .l2s/.l2s.a0001 i .l2s.a0001.0002 zmizely (0 zbytku)
+```
+Regresni kategorie `symlink` a `fstat` (`test-all.sh symlink`, `test-all.sh
+fstat`) na novem binary beze zmeny (3/3 PASS, 1/1 PASS) - pridani 5 novych
+inline-BTI hooku (`linkat`/`unlinkat`/`statx`/`stat`/`lstat`) nerozbilo
+existujici funkcnost.
+
+**Build/deploy:** Modal, binarka nasazena na `$D/usr/bin/elf_loader.l2s`
+(vlastni cesta, `elf_loader` nedotceny). `md5sum` overen shodny mezi
+`/tmp/elf_loader_l2s` a nasazenym souborem pred testem.
+
+**Zavrecny stav:** l2s mechanismus (vc. presneho proot formatu) a hookovani
+coreutils jsou OPRAVENY a OVERENY — akceptacni kriterium promptu 08 cast 2
+je SPLNENO pro top-level `--ownall` pouziti. `LX_L2S` ZUSTAVA VYCHOZI
+VYPNUTO (konzervativni volba, protoze bod 3 - obecny child-exec path bug -
+neni vyresen a muze se teoreticky projevit i pri realnem pouziti `apt`/
+`dpkg`, byt v testech nezasahnul). Doporuceni: pred zapnutim defaultu najit
+root cause bodu 3 (mimo rozsah tohoto promptu).
