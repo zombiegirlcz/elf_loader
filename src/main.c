@@ -1726,8 +1726,12 @@ static int shim_fr_getresgid(unsigned int *rg, unsigned int *eg, unsigned int *s
 }
 static int shim_fr_getgroups(int n, unsigned int *list) {
     if (g_fakeroot_on) {
+        /* vzdy jedna skupina (root/0) - n==0 je dotaz na pocet (glibc
+         * getgroups(0,NULL) pred alokaci bufferu), musi vratit 1, ne 0,
+         * jinak si volajici (python os.getgroups) alokuje prazdny buffer
+         * a vysledek je [] misto [0]. */
         if (n > 0 && list) list[0] = 0;
-        return n > 0 ? 1 : 0;
+        return 1;
     }
     int (*f)(int, unsigned int *) = g_orig_getgroups; return f ? f(n, list) : -1;
 }
