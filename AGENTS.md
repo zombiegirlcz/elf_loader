@@ -74,17 +74,28 @@ jmenných hooků), `F2_ONLY` (allowlist), `ELF_LOADER_L2` (`=1` záchytná síť
 `ELF_LOADER_L2_LAZY` (líný přepis, default vyp), `ELF_LOADER_GOMODE=0`
 (vypne Go mód; L2 ho nahrazuje), `ELF_LOADER_NO_PROCVIRT` (prompt 07),
 `ELF_LOADER_DIAG=1` (rutinní stopy do `$D/usr/diag.<pid>.txt`; pádové vždy).
-`LX_FAKEROOT=1` (prompt 08 cast 1, `src/fakeroot.h`): fake root
-(ekvivalent `proot -0`) — `getuid`/`geteuid`/`getgid`/`getegid`/
-`getresuid`/`getresgid`/`getgroups` hlasi 0; `stat`/`lstat`/`fstat`/
-`fstatat`/`statx` hlasi vlastnika app uid jako 0:0; `chown`/`chmod` se
-setuid/setgid bity a `mknod` zarizeni se emuluji pres xattr
-`user.lxfakeroot` na inode (f2fs na `/data` user.* xattry povoluje,
-overeno). link2symlink (`link`/`linkat`/`st_nlink`) je samostatna cast
-promptu 08, zatim neimplementovana.
+`LX_FAKEROOT=1` (prompt 08, `src/fakeroot.h`, ekvivalent `proot -0`):
+uid/gid funkce → 0, `stat` rodina hlásí app uid jako 0:0, `chown`/setuid
+`chmod`/`mknod` zařízení se ukládají do xattru `user.lxfakeroot` na inode
+(f2fs `/data` user.* povoluje; xattr chce právo zápisu/čtení → při EACCES
+dočasné u+w/u+r). `LX_L2S=1` (prompt 08, `src/l2s.h`, ekvivalent `proot -l`):
+`link`/`linkat` → symlinky do `$ROOTFS/.l2s`, formát přesně jako proot
+(`.l2s.<jméno><NNNN>` + `.<nlink>`), rootfs funguje pod oběma. Oba default
+vypnuté; apt/dpkg potřebuje **oba** (dpkg zálohuje hardlinkem).
 Bindy: `LX_BINDS=host:guest[:ro],…`,
 `$ROOTFS/etc/lx-binds` (fstab), `LX_BINDS_FILE` (sdílená tabulka, vnucuje se
 potomkům; prázdné = nová session).
+`LX_L2S=1` (default vypnuto, prompt 08 část 2 — link2symlink/`src/l2s.h`;
+formát PŘESNĚ podle proot (`.l2s.<basename><NNNN>` + `.<MMMM>` = aktuální
+nlink, `$ROOTFS/.l2s`, hostově absolutní cíle — kompatibilní i se soubory,
+které v rootfs vytvořil skutečný proot). `ln`/`ls` fungují (coreutils volají
+jen `linkat`/`statx`, ne `link`/`lstat` — doplněno do existujícího
+`hook_inline_prologue` fallbacku pro BTI prolog vedle `fstatat`/`unlink`/
+`mkdir`/`rmdir`/`link`). `test-all.sh l2s` (destruktivní, jen kali) PASS.
+**Otevřené:** obecný (na l2s nezávislý) bug — cesty se v některých
+child-exec-pod-`--ownall` scénářích nepřekládají pod ROOTFS (zachyceno na
+holém `cat`/`ls`, vzácné/časové, ne 100% reprodukovatelné) — proto `LX_L2S`
+zůstává default vypnuto. Detaily postup.md 2026-10-22 (6) a (7).
 
 **Metodika:** pinování CPU mění čísla o desítky % → měřit při stejné CPU
 politice a A/B dělat knobem na téže binárce, ne dvěma buildy.
@@ -241,6 +252,11 @@ fork veneer (vfork-style clone) [#L685].
   `_rtld_global(_ro)` je ověřen jen pro 2.41 (parrot) a 2.43 (kali);
   2.42 dostane layout 2.43 neověřeně. Při další verzi glibc znovu změřit
   (`ldso_apply_glibc_layout`, postup.md 2026-10-22 (4)).
+- **Prompt 08 mezery:** fakeroot/l2s jen přes jmenné hooky (ne L1/L2 →
+  statické/Go binárky je nevidí); `rename` přes l2s jméno nesnižuje počítadlo
+  (zbytky v `.l2s`); `lstat` symlinku hlásí velikost šifrovaného cíle (fscrypt
+  na 4.14, i nativně → dpkg varuje „size has changed“). Agent hlásil vzácné
+  ENOENT u dítěte pod `--ownall` i bez knobů — neověřeno (postup.md 2026-10-22 (7)).
 - Test na reálném 16K Android 15+ (Task 3). `nmap` není v rootfs [#L680];
   ostatní síťové binárky ověřeny OK.
 - Kosmetika: `src/main.c:149` sign-compare, `\]` escape.

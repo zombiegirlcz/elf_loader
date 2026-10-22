@@ -87,18 +87,64 @@ static void fakeroot_init(void) {
 #define __NR_fgetxattr 10
 #endif
 
+/* user.* xattr kernel povoli jen s pravem ZAPISU na inode (i vlastnikovi).
+ * dpkg zaklada .dpkg-new s modem 0 a teprve pak fchown/fchmod; chown na 0444
+ * soubor je bezny -> pri EACCES docasne pridame u+w, zapiseme, vratime mode.
+ * Symlink user.* xattr nema (EPERM) -> lchown symlinku tise uspeje, jako
+ * fakeroot/proot -0. aarch64: newfstatat=79, fstat=80, fchmod=52, fchmodat=53. */
 static int fakeroot_xattr_set(const char *path, int follow, const lxfr_rec_t *rec) {
     long nr = follow ? __NR_setxattr : __NR_lsetxattr;
     long r = shim_raw_syscall6(nr, (long)path, (long)LXFR_XATTR_NAME,
                                 (long)rec, (long)sizeof(*rec), 0, 0);
+    if (r == -13 /* EACCES */) {
+        struct stat st;
+        if (shim_raw_syscall6(79, -100, (long)path, (long)&st, follow ? 0 : 0x100, 0, 0) == 0 &&
+            !S_ISLNK(st.st_mode) && !(st.st_mode & 0200) &&
+            shim_raw_syscall6(53, -100, (long)path, (long)((st.st_mode & 07777) | 0200), 0, 0, 0) == 0) {
+            r = shim_raw_syscall6(nr, (long)path, (long)LXFR_XATTR_NAME,
+                                  (long)rec, (long)sizeof(*rec), 0, 0);
+            shim_raw_syscall6(53, -100, (long)path, (long)(st.st_mode & 07777), 0, 0, 0);
+        }
+    } else if (r == -1 /* EPERM */ && !follow) {
+        struct stat st;
+        if (shim_raw_syscall6(79, -100, (long)path, (long)&st, 0x100, 0, 0) == 0 && S_ISLNK(st.st_mode))
+            return 0;
+    }
     if (r < 0) { shim_guest_errno_set((int)-r); return -1; }
     return 0;
+}
+
+/* xattr syscally nemaji *at variantu -> dirfd-relativni cestu prevedeme na
+ * /proc/self/fd/<d>/<p> (magic link adresare). AT_FDCWD/absolutni beze zmeny. */
+static const char *fakeroot_at_path(int d, const char *p, char *buf, size_t n) {
+    if (d == -100 || !p || p[0] == '/' || d < 0) return p;
+    static const char pre[] = "/proc/self/fd/";
+    char num[16]; int k = 0; unsigned int v = (unsigned int)d;
+    do { num[k++] = (char)('0' + v % 10); v /= 10; } while (v && k < 15);
+    size_t pl = shim_strlen(p), need = sizeof pre - 1 + (size_t)k + 1 + pl + 1;
+    if (need > n) return p;
+    size_t o = 0;
+    shim_memcpy(buf, pre, sizeof pre - 1); o = sizeof pre - 1;
+    while (k) buf[o++] = num[--k];
+    if (pl) buf[o++] = '/';   /* "" (AT_EMPTY_PATH) -> /proc/self/fd/<d> */
+    shim_memcpy(buf + o, p, pl + 1);
+    return buf;
 }
 
 static int fakeroot_xattr_get(const char *path, int follow, lxfr_rec_t *rec) {
     long nr = follow ? __NR_getxattr : __NR_lgetxattr;
     long r = shim_raw_syscall6(nr, (long)path, (long)LXFR_XATTR_NAME,
                                 (long)rec, (long)sizeof(*rec), 0, 0);
+    if (r == -13 /* EACCES: cteni xattr chce pravo cteni (mode 0 .dpkg-new) */) {
+        struct stat st;
+        if (shim_raw_syscall6(79, -100, (long)path, (long)&st, follow ? 0 : 0x100, 0, 0) == 0 &&
+            !S_ISLNK(st.st_mode) && !(st.st_mode & 0400) &&
+            shim_raw_syscall6(53, -100, (long)path, (long)((st.st_mode & 07777) | 0400), 0, 0, 0) == 0) {
+            r = shim_raw_syscall6(nr, (long)path, (long)LXFR_XATTR_NAME,
+                                  (long)rec, (long)sizeof(*rec), 0, 0);
+            shim_raw_syscall6(53, -100, (long)path, (long)(st.st_mode & 07777), 0, 0, 0);
+        }
+    }
     if (r != (long)sizeof(*rec) || rec->magic != LXFR_MAGIC) return -1;
     return 0;
 }
@@ -203,14 +249,18 @@ static int fakeroot_xattr_fmerge(int fd, const unsigned int *uid, const unsigned
     if (rmin) rec.rdev_minor = *rmin;
     r = shim_raw_syscall6(__NR_fsetxattr, fd, (long)LXFR_XATTR_NAME,
                            (long)&rec, (long)sizeof(rec), 0, 0);
+    if (r == -13 /* EACCES: mode bez u+w, viz fakeroot_xattr_set */) {
+        struct stat st;
+        if (shim_raw_syscall6(80, fd, (long)&st, 0, 0, 0, 0) == 0 && !(st.st_mode & 0200) &&
+            shim_raw_syscall6(52, fd, (long)((st.st_mode & 07777) | 0200), 0, 0, 0, 0) == 0) {
+            r = shim_raw_syscall6(__NR_fsetxattr, fd, (long)LXFR_XATTR_NAME,
+                                  (long)&rec, (long)sizeof(rec), 0, 0);
+            shim_raw_syscall6(52, fd, (long)(st.st_mode & 07777), 0, 0, 0, 0);
+        }
+    }
     if (r < 0) { shim_guest_errno_set((int)-r); return -1; }
     return 0;
 }
 
-/* --- identita procesu: getuid/geteuid/... -> 0 za LX_FAKEROOT ---------- */
-static uid_t fakeroot_getuid(void)  { return g_fakeroot_on ? 0 : getuid(); }
-static uid_t fakeroot_geteuid(void) { return g_fakeroot_on ? 0 : geteuid(); }
-static gid_t fakeroot_getgid(void)  { return g_fakeroot_on ? 0 : getgid(); }
-static gid_t fakeroot_getegid(void) { return g_fakeroot_on ? 0 : getegid(); }
 
 #endif /* ELF_LOADER_FAKEROOT_H */

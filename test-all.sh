@@ -1888,6 +1888,78 @@ SEOF
 # fallback), (b) cache odmitne vytvorit obraz, ktery by nesel revalidovat
 # (RELRO ld.so/libc drzi pointery do mallocovane pameti loaderu -> obraz
 # se nevytvori), (c) na disku nezustane zadny .tmp.
+# link2symlink (prompt 08 cast 2, LX_L2S, src/l2s.h). DESTRUKTIVNI (zapisy
+# pod --ownall) -> jen nad kali, NIKDY nad $R (stejne pravidlo jako imgcache
+# nize). A/B: bez LX_L2S musi `ln` dopadnout stejne jako drive (EACCES -
+# SELinux hardlinky zakazuje), s LX_L2S=1 musi projit a `ls -li` ukazat
+# nlink podle poctu jmen. POZOR: testuje se KAZDY prikaz jako SAMOSTATNY
+# top-level `--ownall` beh (presne jako imgcache vyse) - `ln`/`ls` spustene
+# jako DITE jineho --ownall bash skriptu naraz na jiny, na l2s nezavisly bug
+# (cesty se v child-exec pod --ownall nekdy neprekladaji, viz postup.md
+# 2026-10-22 (7)); tohle neni limit l2s, je to limit test harnessu.
+category_l2s() {
+    echo ""
+    echo "=== link2symlink (LX_L2S) ==="
+    local KR=${ELF_TEST_KALI:-$D/nh/distro/kali}
+    if [ "$KR" = "$R" ] || [ ! -x "$KR/bin/ln" ] || [ ! -x "$KR/bin/ls" ]; then
+        echo "SKIP l2s: destruktivni test jen nad kali ($KR nedostupny)"
+        echo "SKIP: l2s - neni kali rootfs" >> "$SKIP_LOG"; ((SKIP_COUNT++)) || true
+        return 0
+    fi
+    local dir="$KR/tmp/lx-l2stest"
+    local env="ROOTFS=$KR ELF_ROOTFS=$KR ELF_LOADER=$L"
+    local ok=1 detail=""
+
+    "$R/system/bin/rm" -rf "$dir" 2>/dev/null || true
+    mkdir -p "$dir"
+    echo hello > "$dir/a"
+
+    # A: bez LX_L2S - chovani se nesmi zmenit (SELinux EACCES, jako drive).
+    local without
+    without=$(ashell_out "$env $L --ownall $KR/bin/ln /tmp/lx-l2stest/a /tmp/lx-l2stest/b" 2>&1)
+    printf '%s' "$without" | grep -qi "permission denied" \
+        || { ok=0; detail="$detail [bez LX_L2S: ln nehlasi EACCES - regrese: '$without']"; }
+
+    # B: s LX_L2S=1 - ln musi projit a ls -li ukazat nlink podle poctu jmen.
+    local ln_out
+    ln_out=$(ashell_out "$env LX_L2S=1 $L --ownall $KR/bin/ln /tmp/lx-l2stest/a /tmp/lx-l2stest/b" 2>&1)
+    [ -z "$ln_out" ] || { ok=0; detail="$detail [ln: '$ln_out']"; }
+
+    local ls1
+    ls1=$(ashell_out "$env LX_L2S=1 $L --ownall $KR/bin/ls -li /tmp/lx-l2stest/a /tmp/lx-l2stest/b" 2>&1)
+    local ino_a ino_b nl_a nl_b
+    ino_a=$(printf '%s\n' "$ls1" | awk '/\/a$/{print $1}')
+    ino_b=$(printf '%s\n' "$ls1" | awk '/\/b$/{print $1}')
+    nl_a=$(printf '%s\n' "$ls1" | awk '/\/a$/{print $3}')
+    nl_b=$(printf '%s\n' "$ls1" | awk '/\/b$/{print $3}')
+    [ -n "$ino_a" ] && [ "$ino_a" = "$ino_b" ] || { ok=0; detail="$detail [a/b nemaji stejny inode: '$ls1']"; }
+    [ "$nl_a" = "2" ] && [ "$nl_b" = "2" ] || { ok=0; detail="$detail [nlink != 2: '$ls1']"; }
+
+    # rm a -> b musi zustat cely citelny.
+    ashell_out "$env LX_L2S=1 $L --ownall $KR/bin/rm /tmp/lx-l2stest/a" >/dev/null 2>&1
+    local cat_b
+    cat_b=$(ashell_out "$env LX_L2S=1 $L --ownall $KR/bin/cat /tmp/lx-l2stest/b" 2>&1)
+    [ "$cat_b" = "hello" ] || { ok=0; detail="$detail [po rm a: cat b='$cat_b']"; }
+
+    # rm b -> uloziste v .l2s musi zmizet (0 soubory s timto basename).
+    ashell_out "$env LX_L2S=1 $L --ownall $KR/bin/rm /tmp/lx-l2stest/b" >/dev/null 2>&1
+    local leftover
+    leftover=$(ls "$KR/.l2s" 2>/dev/null | grep -c '^\.l2s\.a[0-9]' || true)
+    [ "${leftover:-0}" = 0 ] || { ok=0; detail="$detail [po rm b: $leftover zbytku v .l2s]"; }
+
+    "$R/system/bin/rm" -rf "$dir" 2>/dev/null || true
+
+    if [ "$ok" = 1 ]; then
+        echo "PASS l2s: bez LX_L2S nezmeneno (EACCES), s LX_L2S ln+ls-li+rm spravne (nlink 2->1->0, data uvolnena)"
+        echo "PASS: l2s - link2symlink" >> "$PASS_LOG"
+        ((PASS_COUNT++)) || true
+    else
+        echo "FAIL l2s:$detail"
+        echo "FAIL: l2s - link2symlink |$detail" >> "$FAIL_LOG"
+        ((FAIL_COUNT++)) || true
+    fi
+}
+
 # DESTRUKTIVNI kategorie (IMGCACHE + --ownall) -> NIKDY nad zivym parrotem
 # ($R), jen nad nepouzivanym kali rootfs (AGENTS.md "Bezpecnost", incident
 # 2026-10-21). Bez kali -> SKIP, ne fallback na $R.
@@ -2424,6 +2496,10 @@ case "${1:-all}" in
         category_fakeroot
         print_summary
         ;;
+    l2s)
+        category_l2s
+        print_summary
+        ;;
     binds)
         category_binds
         print_summary
@@ -2507,6 +2583,7 @@ case "${1:-all}" in
         category_lazybind
         category_imgcache
         category_fakeroot
+        category_l2s
         category_binds
         category_argv0
         category_procvirt

@@ -352,6 +352,7 @@ static char **guest_environ(void) {
 }
 #include "binds.h"
 #include "fakeroot.h"
+#include "l2s.h"
 /* shim_excluded = "cesta se NEprekladu pod ROOTFS, nechat hostovou" = v tabulce
  * bindu IDENTITY shoda (host==guest). Pred binds_init (g_binds_ready=0) fallback
  * na puvodni natvrdo zapsany seznam, aby brzke volani melo stejne chovani. */
@@ -1257,10 +1258,12 @@ static int shim_resolve_symlinks(const char *path, char *out, size_t outsz);
 
 static int shim_stat(const char *p, struct stat *st) {
     char b[8192]; const char *path = p; if (shim_translate(p, b, sizeof b)) path = b;
+    char raw[8192]; shim_strcpy(raw, sizeof raw, path);
     char resolved[8192];
     if (shim_resolve_symlinks(path, resolved, sizeof(resolved))) path = resolved;
     fp_stat f = (fp_stat)g_orig_stat; int r = f ? f(path, st) : -1;
     if (r == 0) fakeroot_fix_stat(path, 1, st);
+    if (r == 0) l2s_fix_stat(raw, 1, st);
     return r;
 }
 static int shim_stat64(const char *p, struct stat64 *st) {
@@ -1283,6 +1286,7 @@ static int shim_lstat(const char *p, struct stat *st) {
     char b[8192]; const char *path = p; if (shim_translate(p, b, sizeof b)) path = b;
     fp_lstat f = (fp_lstat)g_orig_lstat; int r = f ? f(path, st) : -1;
     if (r == 0) fakeroot_fix_stat(path, 0, st);
+    if (r == 0) l2s_fix_stat(path, 0, st);
     return r;
 }
 static int shim___lxstat(int v, const char *p, struct stat *st) {
@@ -1310,7 +1314,7 @@ static int shim_fstatat64(int dfd, const char *p, struct stat64 *st, int flags) 
     char b[8192]; const char *path = p;
     if (dfd == -100 && p && p[0] == '/') { if (shim_translate(p, b, sizeof b)) path = b; }
     fp_fstatat64 f = (fp_fstatat64)g_orig_fstatat64; int r = f ? f(dfd, path, st, flags) : -1;
-    if (r == 0 && dfd == -100 && p && p[0] == '/') fakeroot_fix_stat(path, !(flags & 0x100), (struct stat *)st);
+    if (r == 0 && p) { char ab[8192]; if ((flags & 0x1000) && !p[0]) fakeroot_fix_stat_fd(dfd, (struct stat *)st); else fakeroot_fix_stat(fakeroot_at_path(dfd, path, ab, sizeof ab), !(flags & 0x100), (struct stat *)st); }
     return r;
 }
 static int shim_statvfs(const char *p, struct statvfs *st) {
@@ -1374,16 +1378,18 @@ static int shim_faccessat(int dfd, const char *p, int m, int ff) {
  * Bez tohoto hooku zustane statx netranslatovany -> ENOENT na hostu. */
 typedef int (*fp_statx)(int, const char *, int, unsigned int, void *);
 static int shim_statx(int dfd, const char *p, int flags, unsigned int mask, void *stx) {
-    char b[8192]; const char *path = p;
+    char b[8192]; const char *path = p; char raw[8192]; shim_strcpy(raw, sizeof raw, p ? p : "");
     if (dfd == -100 && p && p[0] == '/') {
-        if (shim_translate(p, b, sizeof b)) path = b;
+        if (shim_translate(p, b, sizeof b)) { path = b; shim_strcpy(raw, sizeof raw, path); }
         if (!(flags & 0x100 /* AT_SYMLINK_NOFOLLOW */)) {
             char resolved[8192];
             if (shim_resolve_symlinks(path, resolved, sizeof(resolved))) path = resolved;
         }
     }
     fp_statx f = (fp_statx)g_orig_statx; int r = f ? f(dfd, path, flags, mask, stx) : -1;
-    if (r == 0 && g_fakeroot_on && dfd == -100 && p && p[0] == '/' && stx) {
+    char frab[8192];
+    if (r == 0 && g_fakeroot_on && p && stx) {
+        const char *frp = fakeroot_at_path(dfd, path, frab, sizeof frab);
         /* struct statx (linux/stat.h, overeno proti kernel headru): stx_mask
          * u32@0, stx_blksize u32@4, stx_attributes u64@8, stx_nlink u32@16,
          * stx_uid u32@20, stx_gid u32@24, stx_mode u16@28, stx_rdev_major
@@ -1396,7 +1402,7 @@ static int shim_statx(int dfd, const char *p, int flags, unsigned int mask, void
         unsigned int *rmaj_p = (unsigned int *)(b2 + 128);
         unsigned int *rmin_p = (unsigned int *)(b2 + 132);
         lxfr_rec_t rec;
-        if (fakeroot_xattr_get(path, !(flags & 0x100), &rec) == 0) {
+        if (fakeroot_xattr_get(frp, !(flags & 0x100), &rec) == 0) {
             *uid_p = rec.uid; *gid_p = rec.gid;
             if (rec.mode_extra & (S_IFCHR | S_IFBLK)) {
                 unsigned short perm = *mode_p & 07777;
@@ -1412,6 +1418,7 @@ static int shim_statx(int dfd, const char *p, int flags, unsigned int mask, void
             if (*gid_p == g_fakeroot_app_gid) *gid_p = 0;
         }
     }
+    if (r == 0 && dfd == -100) l2s_fix_statx(raw, !(flags & 0x100), dfd, mask, stx);
     return r;
 }
 typedef int (*fp_fstatat)(int, const char *, void *, int);
@@ -1425,7 +1432,8 @@ static int shim_fstatat(int dfd, const char *p, void *st, int flags) {
         }
     }
     fp_fstatat f = (fp_fstatat)g_orig_fstatat; int r = f ? f(dfd, path, st, flags) : -1;
-    if (r == 0 && dfd == -100 && p && p[0] == '/') fakeroot_fix_stat(path, !(flags & 0x100), (struct stat *)st);
+    if (r == 0 && p) { char ab[8192]; if ((flags & 0x1000) && !p[0]) fakeroot_fix_stat_fd(dfd, (struct stat *)st); else fakeroot_fix_stat(fakeroot_at_path(dfd, path, ab, sizeof ab), !(flags & 0x100), (struct stat *)st); }
+    if (r == 0 && dfd == -100) l2s_fix_stat(path, !(flags & 0x100), (struct stat *)st);
     return r;
 }
 static int shim_newfstatat(int dfd, const char *p, void *st, int flags) {
@@ -1438,7 +1446,8 @@ static int shim_newfstatat(int dfd, const char *p, void *st, int flags) {
         }
     }
     fp_fstatat f = (fp_fstatat)g_orig_newfstatat; int r = f ? f(dfd, path, st, flags) : -1;
-    if (r == 0 && dfd == -100 && p && p[0] == '/') fakeroot_fix_stat(path, !(flags & 0x100), (struct stat *)st);
+    if (r == 0 && p) { char ab[8192]; if ((flags & 0x1000) && !p[0]) fakeroot_fix_stat_fd(dfd, (struct stat *)st); else fakeroot_fix_stat(fakeroot_at_path(dfd, path, ab, sizeof ab), !(flags & 0x100), (struct stat *)st); }
+    if (r == 0 && dfd == -100) l2s_fix_stat(path, !(flags & 0x100), (struct stat *)st);
     return r;
 }
 
@@ -1485,6 +1494,9 @@ static int shim_link(const char *o, const char *n) {
             return 0;
         }
     }
+    int lr = l2s_link(oldp, newp);
+    if (lr == 0) return 0;
+    if (lr == -1) return -1;
     fp_link f = (fp_link)g_orig_link; return f ? f(oldp, newp) : -1;
 }
 typedef int (*fp_rename)(const char *, const char *);
@@ -1521,6 +1533,7 @@ typedef int (*fp_unlink)(const char *);
 static int shim_unlink(const char *p) {
     if (shim_rofail(p) || shim_busyfail(p)) return -1;
     char b[8192]; const char *path = p; if (shim_translate(p, b, sizeof b)) path = b;
+    l2s_unlink(path);
     fp_unlink f = (fp_unlink)g_orig_unlink; return f ? f(path) : -1;
 }
 /* GNU coreutils rm/rmdir volaji unlinkat/rmdirat (NE unlink/rmdir). Bez techto
@@ -1531,6 +1544,7 @@ static int shim_unlinkat(int dfd, const char *p, int flags) {
     if (dfd == -100 && (shim_rofail(p) || shim_busyfail(p))) return -1;
     char b[8192]; const char *path = p;
     if (dfd == -100 && p && p[0] == '/') { if (shim_translate(p, b, sizeof b)) path = b; }
+    if (dfd == -100) l2s_unlink(path);
     fp_unlinkat f = (fp_unlinkat)g_orig_unlinkat; return f ? f(dfd, path, flags) : -1;
 }
 typedef int (*fp_rmdirat)(int, const char *);
@@ -1594,11 +1608,13 @@ static int shim_lchmod(const char *p, unsigned int m) { if (shim_rofail(p)) retu
     int (*f)(const char *, unsigned int) = g_orig_lchmod; return f ? f(TP(p), m) : -1; }
 static int shim_fchmodat(int d, const char *p, unsigned int m, int fl) { SHIM_PATH_BUF;
     const char *tp = TP(p);
-    if (g_fakeroot_on && d == -100) {
+    if (g_fakeroot_on) {
         unsigned int extra = m & (S_ISUID | S_ISGID | S_ISVTX);
         int (*f)(int, const char *, unsigned int, int) = g_orig_fchmodat;
         int r = f ? f(d, tp, m & ~(unsigned int)(S_ISUID | S_ISGID), fl) : -1;
-        if (r == 0) fakeroot_xattr_merge(tp, !(fl & 0x100), NULL, NULL, &extra, NULL, NULL);
+        char ab[8192];
+        if (r == 0) fakeroot_xattr_merge(fakeroot_at_path(d, tp, ab, sizeof ab), !(fl & 0x100),
+                                         NULL, NULL, &extra, NULL, NULL);
         return r;
     }
     int (*f)(int, const char *, unsigned int, int) = g_orig_fchmodat; return f ? f(d, tp, m, fl) : -1; }
@@ -1612,7 +1628,12 @@ static int shim_lchown(const char *p, unsigned int u, unsigned int g) { if (shim
     int (*f)(const char *, unsigned int, unsigned int) = g_orig_lchown; return f ? f(tp, u, g) : -1; }
 static int shim_fchownat(int d, const char *p, unsigned int u, unsigned int g, int fl) { SHIM_PATH_BUF;
     const char *tp = TP(p);
-    if (g_fakeroot_on && d == -100) { return fakeroot_xattr_merge(tp, !(fl & 0x100), &u, &g, NULL, NULL, NULL); }
+    if (g_fakeroot_on) {
+        /* AT_EMPTY_PATH (0x1000) s "" = fchown(d) */
+        if ((fl & 0x1000) && (!p || !p[0])) return fakeroot_xattr_fmerge(d, &u, &g, NULL, NULL, NULL);
+        char ab[8192];
+        return fakeroot_xattr_merge(fakeroot_at_path(d, tp, ab, sizeof ab), !(fl & 0x100), &u, &g, NULL, NULL, NULL);
+    }
     int (*f)(int, const char *, unsigned int, unsigned int, int) = g_orig_fchownat;
     return f ? f(d, tp, u, g, fl) : -1; }
 static int shim_utime(const char *p, const void *t) { SHIM_PATH_BUF;
@@ -1667,8 +1688,14 @@ static int shim_mkfifoat(int d, const char *p, unsigned int m) { if (d == -100 &
     int (*f)(int, const char *, unsigned int) = g_orig_mkfifoat; return f ? f(d, TP(p), m) : -1; }
 static int shim_linkat(int od, const char *o, int nd, const char *n, int fl) {
     char b1[8192], b2[8192];
+    const char *oldp = shim_tp(o, b1, sizeof b1), *newp = shim_tp(n, b2, sizeof b2);
+    if (od == -100 && nd == -100) {
+        int lr = l2s_link(oldp, newp);
+        if (lr == 0) return 0;
+        if (lr == -1) return -1;
+    }
     int (*f)(int, const char *, int, const char *, int) = g_orig_linkat;
-    return f ? f(od, shim_tp(o, b1, sizeof b1), nd, shim_tp(n, b2, sizeof b2), fl) : -1; }
+    return f ? f(od, oldp, nd, newp, fl) : -1; }
 static int shim_statfs(const char *p, void *buf) { SHIM_PATH_BUF;
     int (*f)(const char *, void *) = g_orig_statfs; return f ? f(TP(p), buf) : -1; }
 static int shim_statfs64(const char *p, void *buf) { SHIM_PATH_BUF;
@@ -3236,7 +3263,7 @@ static int shim___fxstatat64(int ver, int dfd, const char *p, void *st, int flag
     if (dfd == -100 && p && p[0] == '/') { if (shim_translate(p, b, sizeof b)) path = b; }
     fp_fxstatat f = (fp_fxstatat)g_orig___fxstatat64;
     int r = f ? f(ver, dfd, path, st, flags) : -1;
-    if (r == 0 && dfd == -100 && p && p[0] == '/') fakeroot_fix_stat(path, !(flags & 0x100), (struct stat *)st);
+    if (r == 0 && p) { char ab[8192]; if ((flags & 0x1000) && !p[0]) fakeroot_fix_stat_fd(dfd, (struct stat *)st); else fakeroot_fix_stat(fakeroot_at_path(dfd, path, ab, sizeof ab), !(flags & 0x100), (struct stat *)st); }
     return r;
 }
 static int shim___fxstatat(int ver, int dfd, const char *p, void *st, int flags) {
@@ -3244,7 +3271,7 @@ static int shim___fxstatat(int ver, int dfd, const char *p, void *st, int flags)
     if (dfd == -100 && p && p[0] == '/') { if (shim_translate(p, b, sizeof b)) path = b; }
     fp_fxstatat f = (fp_fxstatat)g_orig___fxstatat;
     int r = f ? f(ver, dfd, path, st, flags) : -1;
-    if (r == 0 && dfd == -100 && p && p[0] == '/') fakeroot_fix_stat(path, !(flags & 0x100), (struct stat *)st);
+    if (r == 0 && p) { char ab[8192]; if ((flags & 0x1000) && !p[0]) fakeroot_fix_stat_fd(dfd, (struct stat *)st); else fakeroot_fix_stat(fakeroot_at_path(dfd, path, ab, sizeof ab), !(flags & 0x100), (struct stat *)st); }
     return r;
 }
 static int shim_faccessat2(int dfd, const char *p, int m, int ff) {
@@ -4110,11 +4137,21 @@ static void shim_install_hooks(void) {
     elf_timing_mark("hooks_spawn");
     if (g_shim_scope && !getenv("F2_NO_BTI_HOOK")) {
         static const struct { const char *n; void *shim; } bh[] = {
-            { "fstatat", (void *)shim_fstatat },
-            { "unlink",  (void *)shim_unlink },
-            { "mkdir",   (void *)shim_mkdir },
-            { "rmdir",   (void *)shim_rmdir },
-            { "link",    (void *)shim_link },     /* sem_open -> link() */
+            { "fstatat",    (void *)shim_fstatat },
+            { "unlink",     (void *)shim_unlink },
+            { "mkdir",      (void *)shim_mkdir },
+            { "rmdir",      (void *)shim_rmdir },
+            { "link",       (void *)shim_link },     /* sem_open -> link() */
+            /* prompt 08 cast 2 (l2s): coreutils `ln` vola jen linkat (ne
+             * link), `ls -li` jen statx (ne lstat/fstatat) - bez tehle
+             * trojice named hooky nikdy nezasahnou, l2s zustane neviditelny
+             * pro realne nastroje, i kdyz by jmenne GOT haky byly spravne. */
+            { "linkat",     (void *)shim_linkat },
+            { "unlinkat",   (void *)shim_unlinkat },
+            { "statx",      (void *)shim_statx },
+            { "stat",       (void *)shim_stat },
+            { "lstat",      (void *)shim_lstat },
+            { "newfstatat", (void *)shim_newfstatat },
         };
         /* Adresy vsech jmen z g_f2_hooks resolvuj JEDNOU dopredu. Driv se
          * `elf_scope_lookup` volal v zanorene smycce, tedy 5 x 118 = 590x
@@ -4363,6 +4400,7 @@ static int run_ownall(const char *path, int argc, char **argv, char **envp) {
      * (shim_translate/shim_excluded ji ctou pres g_binds_ready). */
     binds_init();
     fakeroot_init();
+    l2s_init();
 
     char **argv_pre_shebang = argv;   /* shebang blok argv nahradi -> skript */
     /* jmeno pro comm: cesta z execve PRED resolvem symlinku (python3, ne
