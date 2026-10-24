@@ -430,9 +430,10 @@ static void *g_orig_open = NULL, *g_orig_open64 = NULL, *g_orig_openat = NULL,
             *g_orig_openat64 = NULL;
 static void *g_orig_open64_nocancel = NULL;  /* interni glibc open pro DNS/NSS */
 static void *g_orig_mount = NULL, *g_orig_umount = NULL, *g_orig_umount2 = NULL;
-/* fakeroot: proot fake_id0 ma PR_chroot/PR_capset/PR_sethostname/PR_setdomainname
- * - pod -0 tam EPERM meni na uspech. Tady stejne (viz fr_perm_ok). */
-static void *g_orig_chroot = NULL, *g_orig_capset = NULL,
+/* fakeroot: proot fake_id0 ma PR_capset/PR_sethostname/PR_setdomainname
+ * - pod -0 tam EPERM meni na uspech. Tady stejne (viz fr_perm_ok).
+ * chroot zamerne NENI (viz komentar u shim_capset). */
+static void *g_orig_capset = NULL,
             *g_orig_sethostname = NULL, *g_orig_setdomainname = NULL;
 static void *g_orig_stat = NULL, *g_orig_stat64 = NULL, *g_orig___xstat = NULL,
             *g_orig_lstat = NULL, *g_orig___lxstat = NULL;
@@ -3236,32 +3237,11 @@ static int shim_umount2(const char *target, int flags) {
     return -1;
 }
 
-/* LX_FAKEROOT: proot umi chroot jen kdyz novy rootfs == current rootfs
- * (fake_id0 handle_sysexit_end: realpath + compare_paths). Tady stejna
- * politika; jiny cil = EPERM jako u skutecneho neprivilegovaneho procesu. */
-static int shim_chroot(const char *p) {
-    if (!g_fakeroot_on) {
-        int (*f)(const char *) = (void *)g_orig_chroot;
-        return f ? f(p) : -1;
-    }
-    if (!p || !p[0]) { shim_guest_errno_set(EPERM); return -1; }
-    char b[8192];
-    const char *tp = shim_translate(p, b, sizeof b) ? b : p;
-    char resolved[8192];
-    const char *rc = shim_resolve_symlinks(tp, resolved, sizeof resolved) ? resolved : tp;
-    const char *root = g_shim_root;
-    /* shim_translate("/") vraci "<root>/" (trailing slash), takze porovnat
-     * i s root + "/" - jinak by chroot / nikdy neproslo. */
-    size_t rl = root ? shim_strlen(root) : 0;
-    int same = root && root[0] &&
-               (shim_strcmp(rc, root) == 0 ||
-                (shim_strncmp(rc, root, rl) == 0 && rc[rl] == '/' && rc[rl + 1] == 0));
-    if (!same) {
-        shim_guest_errno_set(EPERM);
-        return -1;
-    }
-    return 0;
-}
+/* POZOR: chroot se ZAMERNE neshimuje. Projekt stoji na tom, ze rootfs
+ * neni skutecny root - cestu preklada loader (--ownall / --shim) a zadny
+ * chroot neni potreba. Shimovany chroot (proot fake_id0) by tuhle hranici
+ * rozmazal a z projektu udelal jen dalsi chroot wrapper. Volani chroot()
+ * v guestu proto zustava na realnem syscallu (v app domene EPERM/ENOSYS). */
 /* capset: app seccomp/SELinux ho vetsinou odmitne; pod fakerootem proot vraci
  * uspech (test-setcap-fake-id.sh: setcap cap_setuid+ep pod -0 projde). */
 static int shim_capset(void *hdr, const void *data) {
@@ -3918,7 +3898,7 @@ static f2_hook_t g_f2_hooks[] = {
     {"glob",(void*)shim_glob,&g_orig_glob},{"glob64",(void*)shim_glob64,&g_orig_glob64},
     {"mount",(void*)shim_mount,&g_orig_mount},
     {"umount",(void*)shim_umount,&g_orig_umount},{"umount2",(void*)shim_umount2,&g_orig_umount2},
-    {"chroot",(void*)shim_chroot,&g_orig_chroot},
+    /* chroot: zamerne bez shimu (viz komentar u shim_capset) */
     {"capset",(void*)shim_capset,&g_orig_capset},
     {"sethostname",(void*)shim_sethostname,&g_orig_sethostname},
     {"setdomainname",(void*)shim_setdomainname,&g_orig_setdomainname},
@@ -4215,12 +4195,11 @@ static void shim_install_hooks(void) {
             { "stat",       (void *)shim_stat },
             { "lstat",      (void *)shim_lstat },
             { "newfstatat", (void *)shim_newfstatat },
-            /* LX_FAKEROOT: glibc chroot/capset/sethostname/setdomainname
-             * maji BTI prolog -> GOT hook je nepatchuje a Python os.chroot
-             * vola primo glibc symbol (ne pres PLT resolvovatelny na override)
-             * -> realny syscall v app domene vrati EPERM. Inline hook to
-             * resi stejne jako stat/statx vyse. */
-            { "chroot",        (void *)shim_chroot },
+            /* LX_FAKEROOT: glibc capset/sethostname/setdomainname maji BTI
+             * prolog -> GOT hook je nepatchuje a Python vola primo glibc
+             * symbol (ne pres PLT resolvovatelny na override) -> realny
+             * syscall v app domene vrati EPERM. Inline hook to resi stejne
+             * jako stat/statx vyse. chroot zamerne NENI (viz shim_capset). */
             { "capset",        (void *)shim_capset },
             { "sethostname",   (void *)shim_sethostname },
             { "setdomainname", (void *)shim_setdomainname },
