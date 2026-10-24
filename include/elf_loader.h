@@ -122,6 +122,11 @@ int  elf_l2_enabled(void);              /* L2 (prompt 05): ELF_LOADER_L2 */
 void elf_l2_prepare_exe_load(void);     /* rezervuj okno, PIE exe do nej */
 void elf_l2_after_exe_load(void);       /* zavislosti uz do okna nechceme */
 int  elf_l2_mode_setup(elf_object_t *m);/* instaluj L2 filtr pro guest exe */
+
+/* LX_FAKEROOT=1 (src/fakeroot.h): fake uid/gid 0. elf_loader.c ho potrebuje
+ * pro AT_UID/AT_EUID/AT_GID/AT_EGID v auxv - staticke binarky a getauxval()
+ * jinak vidi realna ID (proot fake_id0 to resi v adjust_elf_auxv). */
+int  elf_fakeroot_active(void);
 int elf_has_verdef_prefix(const elf_object_t *m, const char *pfx); /* DT_VERDEF jmeno s prefixem */
 elf_tls_ctx_t elf_setup_own_tls(elf_object_t *exe, elf_scope_t *scope);
 void elf_teardown_own_tls(elf_tls_ctx_t *ctx);

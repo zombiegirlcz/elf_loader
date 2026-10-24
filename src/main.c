@@ -430,6 +430,10 @@ static void *g_orig_open = NULL, *g_orig_open64 = NULL, *g_orig_openat = NULL,
             *g_orig_openat64 = NULL;
 static void *g_orig_open64_nocancel = NULL;  /* interni glibc open pro DNS/NSS */
 static void *g_orig_mount = NULL, *g_orig_umount = NULL, *g_orig_umount2 = NULL;
+/* fakeroot: proot fake_id0 ma PR_chroot/PR_capset/PR_sethostname/PR_setdomainname
+ * - pod -0 tam EPERM meni na uspech. Tady stejne (viz fr_perm_ok). */
+static void *g_orig_chroot = NULL, *g_orig_capset = NULL,
+            *g_orig_sethostname = NULL, *g_orig_setdomainname = NULL;
 static void *g_orig_stat = NULL, *g_orig_stat64 = NULL, *g_orig___xstat = NULL,
             *g_orig_lstat = NULL, *g_orig___lxstat = NULL;
 static void *g_orig_lstat64 = NULL, *g_orig_fstat64 = NULL, *g_orig_fstatat64 = NULL,
@@ -1096,6 +1100,17 @@ static int g_loader_active = 0;        /* 1 = loaderuv vlastni kod (bionic TLS) 
 typedef int (*fp_openat)(int, const char *, int, ...);
 static int shim_resolve_symlinks(const char *path, char *out, size_t outsz);
 static void shim_guest_errno_set(int v);
+static int *shim_guest_errno(void);
+/* LX_FAKEROOT: proot fake_id0 (handle_sysexit_end) meni -EPERM na 0 pro
+ * chmod/chown/*at/mknod/setxattr/sethostname/setdomainname/capset, protoze
+ * v app domene (SELinux + seccomp) ty operace realne neprojdou, ale program
+ * si mysli, ze selhal. Tady stejna politika: jen kdyz je fakeroot zapnuty. */
+static int fr_perm_ok(int r) {
+    if (!g_fakeroot_on || r >= 0) return r;
+    int *e = shim_guest_errno();
+    if (e && *e == EPERM) { *e = 0; return 0; }
+    return r;
+}
 /* 1 (+ EROFS) kdyz guest `p` spada pod ro bind (prompt 06 task 4). Vola se na
  * zacatku zapisujicich shimu. Bezi pod GUEST TP -> shim_guest_errno_set, nikdy
  * bionicke errno. Jen absolutni cesty (relativni pod ro bind bounded miss). */
@@ -1603,7 +1618,7 @@ static int shim_chmod(const char *p, unsigned int m) { if (shim_rofail(p)) retur
         if (r == 0) fakeroot_xattr_merge(tp, 1, NULL, NULL, &extra, NULL, NULL);
         return r;
     }
-    int (*f)(const char *, unsigned int) = g_orig_chmod; return f ? f(tp, m) : -1; }
+    int (*f)(const char *, unsigned int) = g_orig_chmod; return fr_perm_ok(f ? f(tp, m) : -1); }
 static int shim_lchmod(const char *p, unsigned int m) { if (shim_rofail(p)) return -1; SHIM_PATH_BUF;
     int (*f)(const char *, unsigned int) = g_orig_lchmod; return f ? f(TP(p), m) : -1; }
 static int shim_fchmodat(int d, const char *p, unsigned int m, int fl) { SHIM_PATH_BUF;
@@ -1617,7 +1632,7 @@ static int shim_fchmodat(int d, const char *p, unsigned int m, int fl) { SHIM_PA
                                          NULL, NULL, &extra, NULL, NULL);
         return r;
     }
-    int (*f)(int, const char *, unsigned int, int) = g_orig_fchmodat; return f ? f(d, tp, m, fl) : -1; }
+    int (*f)(int, const char *, unsigned int, int) = g_orig_fchmodat; return fr_perm_ok(f ? f(d, tp, m, fl) : -1); }
 static int shim_chown(const char *p, unsigned int u, unsigned int g) { if (shim_rofail(p)) return -1; SHIM_PATH_BUF;
     const char *tp = TP(p);
     if (g_fakeroot_on) { return fakeroot_xattr_merge(tp, 1, &u, &g, NULL, NULL, NULL); }
@@ -1667,7 +1682,7 @@ static int shim_mknod(const char *p, unsigned int m, unsigned long dev) { if (sh
         fakeroot_xattr_merge(tp, 1, NULL, NULL, &extra, &rmaj, &rmin);
         return 0;
     }
-    int (*f)(const char *, unsigned int, unsigned long) = g_orig_mknod; return f ? f(tp, m, dev) : -1; }
+    int (*f)(const char *, unsigned int, unsigned long) = g_orig_mknod; return fr_perm_ok(f ? f(tp, m, dev) : -1); }
 static int shim_mknodat(int d, const char *p, unsigned int m, unsigned long dev) { if (d == -100 && shim_rofail(p)) return -1; SHIM_PATH_BUF;
     const char *tp = TP(p);
     if (g_fakeroot_on && d == -100 && ((m & S_IFMT) == S_IFCHR || (m & S_IFMT) == S_IFBLK)) {
@@ -1681,7 +1696,7 @@ static int shim_mknodat(int d, const char *p, unsigned int m, unsigned long dev)
         fakeroot_xattr_merge(tp, 1, NULL, NULL, &extra, &rmaj, &rmin);
         return 0;
     }
-    int (*f)(int, const char *, unsigned int, unsigned long) = g_orig_mknodat; return f ? f(d, tp, m, dev) : -1; }
+    int (*f)(int, const char *, unsigned int, unsigned long) = g_orig_mknodat; return fr_perm_ok(f ? f(d, tp, m, dev) : -1); }
 static int shim_mkfifo(const char *p, unsigned int m) { if (shim_rofail(p)) return -1; SHIM_PATH_BUF;
     int (*f)(const char *, unsigned int) = g_orig_mkfifo; return f ? f(TP(p), m) : -1; }
 static int shim_mkfifoat(int d, const char *p, unsigned int m) { if (d == -100 && shim_rofail(p)) return -1; SHIM_PATH_BUF;
@@ -1705,9 +1720,9 @@ static ssize_t shim_getxattr(const char *p, const char *nm, void *v, size_t s) {
 static ssize_t shim_lgetxattr(const char *p, const char *nm, void *v, size_t s) { SHIM_PATH_BUF;
     ssize_t (*f)(const char *, const char *, void *, size_t) = g_orig_lgetxattr; return f ? f(TP(p), nm, v, s) : -1; }
 static int shim_setxattr(const char *p, const char *nm, const void *v, size_t s, int fl) { SHIM_PATH_BUF;
-    int (*f)(const char *, const char *, const void *, size_t, int) = g_orig_setxattr; return f ? f(TP(p), nm, v, s, fl) : -1; }
+    int (*f)(const char *, const char *, const void *, size_t, int) = g_orig_setxattr; return fr_perm_ok(f ? f(TP(p), nm, v, s, fl) : -1); }
 static int shim_lsetxattr(const char *p, const char *nm, const void *v, size_t s, int fl) { SHIM_PATH_BUF;
-    int (*f)(const char *, const char *, const void *, size_t, int) = g_orig_lsetxattr; return f ? f(TP(p), nm, v, s, fl) : -1; }
+    int (*f)(const char *, const char *, const void *, size_t, int) = g_orig_lsetxattr; return fr_perm_ok(f ? f(TP(p), nm, v, s, fl) : -1); }
 static ssize_t shim_listxattr(const char *p, char *l, size_t s) { SHIM_PATH_BUF;
     ssize_t (*f)(const char *, char *, size_t) = g_orig_listxattr; return f ? f(TP(p), l, s) : -1; }
 static ssize_t shim_llistxattr(const char *p, char *l, size_t s) { SHIM_PATH_BUF;
@@ -1733,6 +1748,8 @@ static void *g_orig_getuid, *g_orig_geteuid, *g_orig_getgid, *g_orig_getegid,
             *g_orig_fchown, *g_orig_fchmod, *g_orig_fstat;
 static unsigned int shim_fr_getuid(void) { if (g_fakeroot_on) return 0;
     unsigned int (*f)(void) = (unsigned int (*)(void))g_orig_getuid; return f ? f() : 0; }
+/* elf_loader.c (auxv) potrebuje videt, jestli je fakeroot zapnuty. */
+int elf_fakeroot_active(void) { return g_fakeroot_on; }
 static unsigned int shim_fr_geteuid(void) { if (g_fakeroot_on) return 0;
     unsigned int (*f)(void) = (unsigned int (*)(void))g_orig_geteuid; return f ? f() : 0; }
 static unsigned int shim_fr_getgid(void) { if (g_fakeroot_on) return 0;
@@ -3219,6 +3236,48 @@ static int shim_umount2(const char *target, int flags) {
     return -1;
 }
 
+/* LX_FAKEROOT: proot umi chroot jen kdyz novy rootfs == current rootfs
+ * (fake_id0 handle_sysexit_end: realpath + compare_paths). Tady stejna
+ * politika; jiny cil = EPERM jako u skutecneho neprivilegovaneho procesu. */
+static int shim_chroot(const char *p) {
+    if (!g_fakeroot_on) {
+        int (*f)(const char *) = (void *)g_orig_chroot;
+        return f ? f(p) : -1;
+    }
+    if (!p || !p[0]) { shim_guest_errno_set(EPERM); return -1; }
+    char b[8192];
+    const char *tp = shim_translate(p, b, sizeof b) ? b : p;
+    char resolved[8192];
+    const char *rc = shim_resolve_symlinks(tp, resolved, sizeof resolved) ? resolved : tp;
+    const char *root = g_shim_root;
+    /* shim_translate("/") vraci "<root>/" (trailing slash), takze porovnat
+     * i s root + "/" - jinak by chroot / nikdy neproslo. */
+    size_t rl = root ? shim_strlen(root) : 0;
+    int same = root && root[0] &&
+               (shim_strcmp(rc, root) == 0 ||
+                (shim_strncmp(rc, root, rl) == 0 && rc[rl] == '/' && rc[rl + 1] == 0));
+    if (!same) {
+        shim_guest_errno_set(EPERM);
+        return -1;
+    }
+    return 0;
+}
+/* capset: app seccomp/SELinux ho vetsinou odmitne; pod fakerootem proot vraci
+ * uspech (test-setcap-fake-id.sh: setcap cap_setuid+ep pod -0 projde). */
+static int shim_capset(void *hdr, const void *data) {
+    if (g_fakeroot_on) return 0;
+    int (*f)(void *, const void *) = (void *)g_orig_capset;
+    return f ? f(hdr, data) : -1;
+}
+static int shim_sethostname(const char *n, size_t l) {
+    int (*f)(const char *, size_t) = (void *)g_orig_sethostname;
+    return fr_perm_ok(f ? f(n, l) : -1);
+}
+static int shim_setdomainname(const char *n, size_t l) {
+    int (*f)(const char *, size_t) = (void *)g_orig_setdomainname;
+    return fr_perm_ok(f ? f(n, l) : -1);
+}
+
 #include "procvirt.h"
 #include "l1.h"
 
@@ -3859,6 +3918,10 @@ static f2_hook_t g_f2_hooks[] = {
     {"glob",(void*)shim_glob,&g_orig_glob},{"glob64",(void*)shim_glob64,&g_orig_glob64},
     {"mount",(void*)shim_mount,&g_orig_mount},
     {"umount",(void*)shim_umount,&g_orig_umount},{"umount2",(void*)shim_umount2,&g_orig_umount2},
+    {"chroot",(void*)shim_chroot,&g_orig_chroot},
+    {"capset",(void*)shim_capset,&g_orig_capset},
+    {"sethostname",(void*)shim_sethostname,&g_orig_sethostname},
+    {"setdomainname",(void*)shim_setdomainname,&g_orig_setdomainname},
     /* close/flockfile/mprotect jsou diagnosticke shimy (Node ladeni) a
      * prlimit64 mel spatnou signaturu - dokud MAX_OVERRIDES=64 zahazoval vse
      * od 65. polozky, nikdy nebezely. Registrovat jen explicitne. */
@@ -4152,6 +4215,15 @@ static void shim_install_hooks(void) {
             { "stat",       (void *)shim_stat },
             { "lstat",      (void *)shim_lstat },
             { "newfstatat", (void *)shim_newfstatat },
+            /* LX_FAKEROOT: glibc chroot/capset/sethostname/setdomainname
+             * maji BTI prolog -> GOT hook je nepatchuje a Python os.chroot
+             * vola primo glibc symbol (ne pres PLT resolvovatelny na override)
+             * -> realny syscall v app domene vrati EPERM. Inline hook to
+             * resi stejne jako stat/statx vyse. */
+            { "chroot",        (void *)shim_chroot },
+            { "capset",        (void *)shim_capset },
+            { "sethostname",   (void *)shim_sethostname },
+            { "setdomainname", (void *)shim_setdomainname },
         };
         /* Adresy vsech jmen z g_f2_hooks resolvuj JEDNOU dopredu. Driv se
          * `elf_scope_lookup` volal v zanorene smycce, tedy 5 x 118 = 590x
@@ -5444,6 +5516,9 @@ static const char LX_DW_ZSH[] =
     "# cd na cestu mimo rootfs skončí tamtéž na hostu. exit/Ctrl-D = zpět, odkud\n"
     "# jsi do rootfs vstoupil. Proměnné: LX_DW_SHELL (guest shell, cesta v rootfs),\n"
     "# LX_DW_RC (rc guest shellu místo ~/.zshrc v rootfs).\n"
+    "# LX_DW_FAKEROOT (default 1): guest shell dostane LX_FAKEROOT=1 ->\n"
+    "# fakeroot (uid 0, stat 0:0, chown do xattr), takze apt/dpkg projde.\n"
+    "# LX_DW_FAKEROOT=0 pro realnou identitu v guestu.\n"
     "_lx_dw_inside() { [[ $1 == $R || $1 == $R/* ]] }\n"
     "\n"
     "lxdw() {\n"
@@ -5496,7 +5571,7 @@ static const char LX_DW_ZSH[] =
     "      print -r -- \"[ -r \\\"\\${LX_DW_RC:-\\$HOME/.bashrc}\\\" ] && . \\\"\\${LX_DW_RC:-\\$HOME/.bashrc}\\\"; eval \\\"\\$($L init bash)\\\"\" > $rc/bashrc\n"
     "      set -- --rcfile $rc/bashrc -i\n"
     "    fi\n"
-    "    env LX_WORLD=rootfs LX_DW=1 LX_DW_MARK=$mark ZDOTDIR=$rc HOME=/root SHELL=$sh PWD=${${PWD#$R}:-/} \\\n"
+    "    env LX_WORLD=rootfs LX_DW=1 LX_FAKEROOT=${LX_DW_FAKEROOT:-1} LX_DW_MARK=$mark ZDOTDIR=$rc HOME=/root SHELL=$sh PWD=${${PWD#$R}:-/} \\\n"
     "        PATH=/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin:/system/bin \\\n"
     "        LC_ALL=${LC_ALL:-C.UTF-8} $L --ownall $R$sh \"$@\"\n"
     "    [[ -s $mark ]] && t=$(<$mark) || t=$back\n"
@@ -5577,7 +5652,7 @@ static const char LX_DW_BASH[] =
     "      printf '%s\\n' \"[ -r \\\"\\${LX_DW_RC:-\\$HOME/.bashrc}\\\" ] && . \\\"\\${LX_DW_RC:-\\$HOME/.bashrc}\\\"; eval \\\"\\$($L init bash)\\\"\" > \"$rc/bashrc\"\n"
     "      a=(--rcfile \"$rc/bashrc\" -i)\n"
     "    fi\n"
-    "    env LX_WORLD=rootfs LX_DW=1 LX_DW_MARK=\"$mark\" ZDOTDIR=\"$rc\" HOME=/root SHELL=\"$sh\" PWD=\"${v:-/}\" \\\n"
+    "    env LX_WORLD=rootfs LX_DW=1 LX_FAKEROOT=\"${LX_DW_FAKEROOT:-1}\" LX_DW_MARK=\"$mark\" ZDOTDIR=\"$rc\" HOME=/root SHELL=\"$sh\" PWD=\"${v:-/}\" \\\n"
     "        PATH=/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin:/system/bin \\\n"
     "        LC_ALL=\"${LC_ALL:-C.UTF-8}\" \"$L\" --ownall \"$R$sh\" \"${a[@]}\"\n"
     "    if [ -s \"$mark\" ]; then t=$(<\"$mark\"); else t=$back; fi\n"

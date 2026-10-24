@@ -6840,8 +6840,15 @@ int elf_run(elf_object_t *obj, int argc, char **argv, char **envp) {
     a = auxv_append(a, AT_PAGESZ, (uint64_t)sysconf(_SC_PAGESIZE));
     a = auxv_append(a, AT_ENTRY, (uint64_t)obj->entry_point);
     a = auxv_append(a, AT_BASE, (uint64_t)obj->base_addr);
-    a = auxv_append(a, AT_UID, (uint64_t)getuid());
-    a = auxv_append(a, AT_GID, (uint64_t)getgid());
+    /* LX_FAKEROOT: staticke binarky a getauxval() jinak vidi realna app ID.
+     * proot to resi v adjust_elf_auxv (fake_id0) - vcetne AT_EUID/AT_EGID. */
+    {
+        int fr_on = elf_fakeroot_active();
+        a = auxv_append(a, AT_UID,  fr_on ? 0 : (uint64_t)getuid());
+        a = auxv_append(a, AT_EUID, fr_on ? 0 : (uint64_t)geteuid());
+        a = auxv_append(a, AT_GID,  fr_on ? 0 : (uint64_t)getgid());
+        a = auxv_append(a, AT_EGID, fr_on ? 0 : (uint64_t)getegid());
+    }
     a = auxv_append(a, AT_SECURE, 0);
     a = auxv_append(a, AT_RANDOM, (uint64_t)rand_bytes);
     a = auxv_append(a, AT_HWCAP, (uint64_t)getauxval(AT_HWCAP));
