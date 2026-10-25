@@ -3585,6 +3585,19 @@ static int shim_setgroups(int n, const unsigned int *list) {
     int (*f)(int, const unsigned int *) = g_orig_setgroups;
     return f ? f(n, list) : -1;
 }
+/* initgroups: zsh ho importuje a glibc initgroups vola setgroups INTERNE pres
+ * `bl` (mimo PLT) -> GOT shim setgroups se nezavola a syscall dojde do seccomu
+ * (ENOSYS). Pod fakerootem zsh vidi euid 0, takze `unsetopt privileged` zkusi
+ * zahodit privilegia -> "can't drop privileges; failed to set supplementary
+ * group list: function not implemented", a pri plnem rc to shodi cely shell
+ * na SIGSYS. Shimujeme proto initgroups jako cely (proot to dela na urovni
+ * syscallu, my na urovni symbolu). */
+static void *g_orig_initgroups;
+static int shim_initgroups(const char *user, unsigned int gid) {
+    if (g_fakeroot_on) return 0;
+    int (*f)(const char *, unsigned int) = g_orig_initgroups;
+    return f ? f(user, gid) : -1;
+}
 
 /* ===== MAP_FIXED_NOREPLACE emulace (kernel 4.14) =====
  * Android kernel 4.14 flag MAP_FIXED_NOREPLACE (0x100000) NEZNA -> ignoruje
@@ -3870,6 +3883,7 @@ static f2_hook_t g_f2_hooks[] = {
     {"getgid",(void*)shim_fr_getgid,&g_orig_getgid},{"getegid",(void*)shim_fr_getegid,&g_orig_getegid},
     {"getresuid",(void*)shim_fr_getresuid,&g_orig_getresuid},{"getresgid",(void*)shim_fr_getresgid,&g_orig_getresgid},
     {"getgroups",(void*)shim_fr_getgroups,&g_orig_getgroups},{"setgroups",(void*)shim_setgroups,&g_orig_setgroups},
+    {"initgroups",(void*)shim_initgroups,&g_orig_initgroups},
     {"fchown",(void*)shim_fr_fchown,&g_orig_fchown},{"fchmod",(void*)shim_fr_fchmod,&g_orig_fchmod},
     {"fstat",(void*)shim_fr_fstat,&g_orig_fstat},
     {"chown",(void*)shim_chown,&g_orig_chown},{"lchown",(void*)shim_lchown,&g_orig_lchown},
