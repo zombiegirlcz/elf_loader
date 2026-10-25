@@ -470,7 +470,8 @@ static int g_exec_trace = 0;  /* ELF_LOADER_EXEC_TRACE: raw-syscall trace v exec
  * SharedFunctionInfo, ktery po sealu lezi v r--p strance -> SIGSEGV. */
 static int g_ro_keep_write = 0;
 static void *g_orig_opendir = NULL, *g_orig_readlink = NULL, *g_orig_readlinkat = NULL,
-            *g_orig_realpath = NULL, *g_orig_dlopen = NULL, *g_orig_chdir = NULL;
+            *g_orig_realpath = NULL, *g_orig_dlopen = NULL, *g_orig_chdir = NULL,
+            *g_orig_spawn_addchdir_np = NULL;
 
 typedef struct f2_hook { const char *n; void *shim; void **orig; } f2_hook_t;
 
@@ -3140,6 +3141,23 @@ static int shim_chdir(const char *p) {
     char b[8192]; const char *path = p; if (shim_translate(p, b, sizeof b)) path = b;
     fp_chdir f = (fp_chdir)g_orig_chdir; return f ? f(path) : -1;
 }
+
+/* posix_spawn_file_actions_addchdir_np(fa, guest_cesta)
+ *
+ * uv (Rust std) tim nastavuje cwd ditete na guest cestu (napr. /root/...).
+ * file_actions zpracuje KERNEL ve chvili spawnu - chdir na hostu, kde /root
+ * neexistuje -> posix_spawn vrati ENOENT a uv to hlasi jako
+ *   "Failed to run `/root/.../bin/python` cause: No such file or directory"
+ * i kdyz binarka existuje a je spravne prelozena (spawntrace to ukazoval).
+ * Cestu proto prekladame uz tady, pri plneni file_actions. */
+typedef int (*fp_addchdir_np)(void *, const char *);
+static int shim_spawn_addchdir_np(void *fa, const char *p) {
+    char b[8192];
+    const char *path = p;
+    if (p && p[0] == '/' && shim_translate(p, b, sizeof b)) path = b;
+    fp_addchdir_np f = (fp_addchdir_np)g_orig_spawn_addchdir_np;
+    return f ? f(fa, path) : -1;
+}
 /* chdir("/tmp/x") jde do $R/tmp/x, takze kernel getcwd vraci $R/tmp/x. Program
  * (cmake, git, Python os.getcwd) ma videt guest pohled jako v proot. Jen GOT
  * override: glibc-interni __getcwd (realpath relativni cesty) musi dal dostat
@@ -3888,6 +3906,7 @@ static f2_hook_t g_f2_hooks[] = {
     {"readlink",(void*)shim_readlink,&g_orig_readlink},{"readlinkat",(void*)shim_readlinkat,&g_orig_readlinkat},
     {"realpath",(void*)shim_realpath,&g_orig_realpath},{"dlopen",(void*)shim_dlopen,&g_orig_dlopen},
     {"chdir",(void*)shim_chdir,&g_orig_chdir},
+    {"posix_spawn_file_actions_addchdir_np",(void*)shim_spawn_addchdir_np,&g_orig_spawn_addchdir_np},
     {"getcwd",(void*)shim_getcwd,&g_orig_getcwd},{"getwd",(void*)shim_getwd,&g_orig_getwd},
     {"get_current_dir_name",(void*)shim_get_current_dir_name,&g_orig_get_current_dir_name},
     {"fopen",(void*)shim_fopen,&g_orig_fopen},{"fopen64",(void*)shim_fopen64,&g_orig_fopen64},
@@ -4241,6 +4260,11 @@ static void shim_install_hooks(void) {
             { "capset",        (void *)shim_capset },
             { "sethostname",   (void *)shim_sethostname },
             { "setdomainname", (void *)shim_setdomainname },
+            /* uv (Rust std) nastavuje cwd ditete pres tuto funkci; file_actions
+             * zpracuje kernel pri spawnu, takze guest cesta /root/... skonci
+             * ENOENT. Python ji vola pres dlsym (mimo GOT) -> inline hook. */
+            { "posix_spawn_file_actions_addchdir_np",
+              (void *)shim_spawn_addchdir_np },
         };
         /* Adresy vsech jmen z g_f2_hooks resolvuj JEDNOU dopredu. Driv se
          * `elf_scope_lookup` volal v zanorene smycce, tedy 5 x 118 = 590x
@@ -4264,6 +4288,11 @@ static void shim_install_hooks(void) {
             for (size_t j = 0; j < F2_N; j++)
                 if (!*g_f2_hooks[j].orig && f2_addr[j] == t)
                     *g_f2_hooks[j].orig = tramp;
+            /* addchdir_np neni v g_f2_hooks (dlsym-cesta) - trampolinu si
+             * musime ulozit sami, jinak by shim volal NULL. */
+            if (shim_strcmp(bh[i].n, "posix_spawn_file_actions_addchdir_np") == 0 &&
+                !g_orig_spawn_addchdir_np)
+                g_orig_spawn_addchdir_np = tramp;
             ok++;
             if (elf_debug()) fprintf(stderr, "[hook] %s inline (BTI) OK\n", bh[i].n);
         }
