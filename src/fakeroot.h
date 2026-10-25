@@ -59,12 +59,46 @@ typedef struct {
 static int g_fakeroot_on = 0;
 static unsigned int g_fakeroot_app_uid = 0xFFFFFFFFu;
 static unsigned int g_fakeroot_app_gid = 0xFFFFFFFFu;
+/* Fake identita, kterou guest vidi (ekvivalent proot -i uid:gid; -0 = 0:0).
+ * Default 0:0, ale LX_FAKEROOT=1234:5678 nastavi konkretni ID - proto se
+ * nikde v kodu nepouziva natvrdo 0, ale tyhle dve promenne. */
+static unsigned int g_fakeroot_uid = 0;
+static unsigned int g_fakeroot_gid = 0;
 
-/* fakeroot_init bezi PRED prvnim execem guest kodu, pod bionickym TP
- * (stejne misto jako binds_init v main.c) - normalni getenv/getuid OK. */
+/* Parsovani LX_FAKEROOT:
+ *   (nebo prazdne)  -> vypnuto
+ *   0 / off / no    -> vypnuto
+ *   1 / on / yes    -> zapnuto jako 0:0
+ *   uid:gid         -> zapnuto s danym fake ID (i 0:0) */
 static void fakeroot_init(void) {
     const char *v = getenv("LX_FAKEROOT");
-    g_fakeroot_on = (v && v[0] && v[0] != '0') ? 1 : 0;
+    const char *colon = NULL;
+    const char *q;
+
+    g_fakeroot_on = 0;
+    g_fakeroot_uid = 0;
+    g_fakeroot_gid = 0;
+    if (!v || !v[0]) return;
+
+    for (q = v; *q; q++)
+        if (*q == ':') { colon = q; break; }
+
+    if (colon != NULL) {
+        unsigned int u = 0, g = 0;
+        for (q = v; q < colon && *q >= '0' && *q <= '9'; q++)
+            u = u * 10u + (unsigned int)(*q - '0');
+        if (q != colon) return;            /* neciselny uid -> radeji vypnout */
+        for (q = colon + 1; *q >= '0' && *q <= '9'; q++)
+            g = g * 10u + (unsigned int)(*q - '0');
+        g_fakeroot_uid = u;
+        g_fakeroot_gid = g;
+        g_fakeroot_on = 1;
+    } else if (v[0] != '0') {
+        g_fakeroot_uid = 0;
+        g_fakeroot_gid = 0;
+        g_fakeroot_on = 1;
+    }
+
     if (g_fakeroot_on) {
         g_fakeroot_app_uid = (unsigned int)getuid();
         g_fakeroot_app_gid = (unsigned int)getgid();
@@ -200,10 +234,10 @@ static void fakeroot_fix_stat(const char *path, int follow, struct stat *st) {
                           (rec.mode_extra & (S_ISUID | S_ISGID | S_ISVTX));
         }
     } else if (st->st_uid == g_fakeroot_app_uid) {
-        /* zadny xattr override - vlastnik je app uid -> hlasime root:root
-         * (vychozi proot -0 chovani pro soubory, ktere jsme sami vytvorili) */
-        st->st_uid = 0;
-        if (st->st_gid == g_fakeroot_app_gid) st->st_gid = 0;
+        /* zadny xattr override - vlastnik je app uid -> hlasime fake identitu
+         * (vychozi 0:0 = proot -0; LX_FAKEROOT=uid:gid = proot -i) */
+        st->st_uid = g_fakeroot_uid;
+        if (st->st_gid == g_fakeroot_app_gid) st->st_gid = g_fakeroot_gid;
     }
 }
 
@@ -227,8 +261,8 @@ static void fakeroot_fix_stat_fd(int fd, struct stat *st) {
                           (rec.mode_extra & (S_ISUID | S_ISGID | S_ISVTX));
         }
     } else if (st->st_uid == g_fakeroot_app_uid) {
-        st->st_uid = 0;
-        if (st->st_gid == g_fakeroot_app_gid) st->st_gid = 0;
+        st->st_uid = g_fakeroot_uid;
+        if (st->st_gid == g_fakeroot_app_gid) st->st_gid = g_fakeroot_gid;
     }
 }
 

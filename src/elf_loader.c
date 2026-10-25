@@ -6844,10 +6844,12 @@ int elf_run(elf_object_t *obj, int argc, char **argv, char **envp) {
      * proot to resi v adjust_elf_auxv (fake_id0) - vcetne AT_EUID/AT_EGID. */
     {
         int fr_on = elf_fakeroot_active();
-        a = auxv_append(a, AT_UID,  fr_on ? 0 : (uint64_t)getuid());
-        a = auxv_append(a, AT_EUID, fr_on ? 0 : (uint64_t)geteuid());
-        a = auxv_append(a, AT_GID,  fr_on ? 0 : (uint64_t)getgid());
-        a = auxv_append(a, AT_EGID, fr_on ? 0 : (uint64_t)getegid());
+        uint64_t fu = fr_on ? (uint64_t)elf_fakeroot_uid() : 0;
+        uint64_t fg = fr_on ? (uint64_t)elf_fakeroot_gid() : 0;
+        a = auxv_append(a, AT_UID,  fr_on ? fu : (uint64_t)getuid());
+        a = auxv_append(a, AT_EUID, fr_on ? fu : (uint64_t)geteuid());
+        a = auxv_append(a, AT_GID,  fr_on ? fg : (uint64_t)getgid());
+        a = auxv_append(a, AT_EGID, fr_on ? fg : (uint64_t)getegid());
     }
     a = auxv_append(a, AT_SECURE, 0);
     a = auxv_append(a, AT_RANDOM, (uint64_t)rand_bytes);

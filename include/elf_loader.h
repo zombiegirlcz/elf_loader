@@ -127,6 +127,10 @@ int  elf_l2_mode_setup(elf_object_t *m);/* instaluj L2 filtr pro guest exe */
  * pro AT_UID/AT_EUID/AT_GID/AT_EGID v auxv - staticke binarky a getauxval()
  * jinak vidi realna ID (proot fake_id0 to resi v adjust_elf_auxv). */
 int  elf_fakeroot_active(void);
+/* Fake ID pro auxv (LX_FAKEROOT=uid:gid; default 0:0). Platne jen kdyz je
+ * elf_fakeroot_active() != 0. */
+unsigned int elf_fakeroot_uid(void);
+unsigned int elf_fakeroot_gid(void);
 int elf_has_verdef_prefix(const elf_object_t *m, const char *pfx); /* DT_VERDEF jmeno s prefixem */
 elf_tls_ctx_t elf_setup_own_tls(elf_object_t *exe, elf_scope_t *scope);
 void elf_teardown_own_tls(elf_tls_ctx_t *ctx);

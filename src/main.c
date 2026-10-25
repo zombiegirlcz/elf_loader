@@ -1747,26 +1747,30 @@ static int shim_inotify_add_watch(int fd, const char *p, unsigned int mask) { SH
 static void *g_orig_getuid, *g_orig_geteuid, *g_orig_getgid, *g_orig_getegid,
             *g_orig_getresuid, *g_orig_getresgid, *g_orig_getgroups,
             *g_orig_fchown, *g_orig_fchmod, *g_orig_fstat;
-static unsigned int shim_fr_getuid(void) { if (g_fakeroot_on) return 0;
+/* LX_FAKEROOT=uid:gid: fake identita je g_fakeroot_uid/gid (default 0:0).
+ * Nikde neni natvrdo 0, aby fungoval i `lxdw on --uid 1234:5678`. */
+static unsigned int shim_fr_getuid(void) { if (g_fakeroot_on) return g_fakeroot_uid;
     unsigned int (*f)(void) = (unsigned int (*)(void))g_orig_getuid; return f ? f() : 0; }
 /* elf_loader.c (auxv) potrebuje videt, jestli je fakeroot zapnuty. */
 int elf_fakeroot_active(void) { return g_fakeroot_on; }
-static unsigned int shim_fr_geteuid(void) { if (g_fakeroot_on) return 0;
+unsigned int elf_fakeroot_uid(void) { return g_fakeroot_uid; }
+unsigned int elf_fakeroot_gid(void) { return g_fakeroot_gid; }
+static unsigned int shim_fr_geteuid(void) { if (g_fakeroot_on) return g_fakeroot_uid;
     unsigned int (*f)(void) = (unsigned int (*)(void))g_orig_geteuid; return f ? f() : 0; }
-static unsigned int shim_fr_getgid(void) { if (g_fakeroot_on) return 0;
+static unsigned int shim_fr_getgid(void) { if (g_fakeroot_on) return g_fakeroot_gid;
     unsigned int (*f)(void) = (unsigned int (*)(void))g_orig_getgid; return f ? f() : 0; }
-static unsigned int shim_fr_getegid(void) { if (g_fakeroot_on) return 0;
+static unsigned int shim_fr_getegid(void) { if (g_fakeroot_on) return g_fakeroot_gid;
     unsigned int (*f)(void) = (unsigned int (*)(void))g_orig_getegid; return f ? f() : 0; }
 static int shim_fr_getresuid(unsigned int *ru, unsigned int *eu, unsigned int *su) {
     int (*f)(unsigned int *, unsigned int *, unsigned int *) = g_orig_getresuid;
     int r = f ? f(ru, eu, su) : -1;
-    if (r == 0 && g_fakeroot_on) { if (ru) *ru = 0; if (eu) *eu = 0; if (su) *su = 0; }
+    if (r == 0 && g_fakeroot_on) { if (ru) *ru = g_fakeroot_uid; if (eu) *eu = g_fakeroot_uid; if (su) *su = g_fakeroot_uid; }
     return r;
 }
 static int shim_fr_getresgid(unsigned int *rg, unsigned int *eg, unsigned int *sg) {
     int (*f)(unsigned int *, unsigned int *, unsigned int *) = g_orig_getresgid;
     int r = f ? f(rg, eg, sg) : -1;
-    if (r == 0 && g_fakeroot_on) { if (rg) *rg = 0; if (eg) *eg = 0; if (sg) *sg = 0; }
+    if (r == 0 && g_fakeroot_on) { if (rg) *rg = g_fakeroot_gid; if (eg) *eg = g_fakeroot_gid; if (sg) *sg = g_fakeroot_gid; }
     return r;
 }
 static int shim_fr_getgroups(int n, unsigned int *list) {
@@ -1775,7 +1779,7 @@ static int shim_fr_getgroups(int n, unsigned int *list) {
          * getgroups(0,NULL) pred alokaci bufferu), musi vratit 1, ne 0,
          * jinak si volajici (python os.getgroups) alokuje prazdny buffer
          * a vysledek je [] misto [0]. */
-        if (n > 0 && list) list[0] = 0;
+        if (n > 0 && list) list[0] = g_fakeroot_gid;
         return 1;
     }
     int (*f)(int, unsigned int *) = g_orig_getgroups; return f ? f(n, list) : -1;
@@ -3548,10 +3552,14 @@ static int shim_setfsgid(unsigned int gid) { (void)gid; return (int)main_raw_sys
 static void *g_orig_setuid, *g_orig_setgid, *g_orig_seteuid, *g_orig_setegid;
 static void *g_orig_setreuid, *g_orig_setregid, *g_orig_setresuid, *g_orig_setresgid;
 static int shim_id_same(long nr, unsigned int v) {
-    /* LX_FAKEROOT: proces vidi sebe jako uid/gid 0 (fakeroot_init) -> zmena
-     * na 0 (nebo na skutecny app uid) musi uspet beze zmeny (apt/dpkg behem
-     * instalace drop/restore privileges mezi "root" a "_apt"). */
-    if (g_fakeroot_on && v == 0) return 1;
+    /* LX_FAKEROOT: proces vidi sebe jako fake uid/gid (default 0:0) -> zmena
+     * na fake ID (nebo na skutecny app uid) musi uspet beze zmeny (apt/dpkg
+     * behem instalace drop/restore privileges mezi "root" a "_apt").
+     * nr 174/176 = getuid/getgid, 175/177 = geteuid/getegid - vsechny ctyri
+     * vraceji fake ID pod fakerootem, takze staci srovnat s jednim z nich. */
+    if (g_fakeroot_on &&
+        (v == g_fakeroot_uid || v == g_fakeroot_gid))
+        return 1;
     return v == (unsigned int)-1 || v == (unsigned int)main_raw_syscall4(nr, 0, 0, 0, 0);
 }
 static int shim_setid_ret(int ok) {
@@ -5515,15 +5523,35 @@ static const char LX_DW_ZSH[] =
     "# takze nektere skripty z rc mohou skoncit 'permission denied'.\n"
     "_lx_dw_inside() { [[ $1 == $R || $1 == $R/* ]] }\n"
     "\n"
+    "# lxdw on [--root | --uid U:G | --no-root]\n"
+    "#   --root     guest shell pod fake rootem (uid 0:0, ekvivalent proot -0)\n"
+    "#   --uid U:G  guest shell pod konkretni fake identitou (proot -i U:G)\n"
+    "#   --no-root  fakeroot vypnout (default)\n"
+    "# Fake ID se predava jako LX_FAKEROOT do loaderu; plati i pro vsechny\n"
+    "# potomky spustene z guest shellu (dedi se pres env).\n"
     "lxdw() {\n"
     "  case ${1:-status} in\n"
-    "    on)  export LX_DW=1 ;;\n"
+    "    on)  export LX_DW=1; shift\n"
+    "         while (( $# )); do\n"
+    "           case $1 in\n"
+    "             --root) export LX_DW_FAKEROOT=0:0 ;;\n"
+    "             --uid)  if [[ -n $2 ]]; then export LX_DW_FAKEROOT=$2; shift\n"
+    "                     else print -u2 'lxdw on --uid: chybi uid:gid'; return 2; fi ;;\n"
+    "             --uid=*) export LX_DW_FAKEROOT=${1#--uid=} ;;\n"
+    "             --no-root|--nofakeroot) export LX_DW_FAKEROOT=0 ;;\n"
+    "             *) print -u2 \"lxdw on: nezname: $1\"; return 2 ;;\n"
+    "           esac\n"
+    "           shift\n"
+    "         done ;;\n"
     "    off) export LX_DW=0\n"
     "         [[ $LX_WORLD == rootfs ]] && { : > $LX_DW_MARK.off; _lx_dw_leave $R${PWD%/} } ;;\n"
     "    status) if [[ $LX_WORLD == rootfs ]]; then print \"dw: zapnuto, rootfs svět ($R)\"\n"
     "            elif [[ $LX_DW == 1 ]]; then print \"dw: zapnuto, host svět\"\n"
-    "            else print \"dw: vypnuto\"; fi ;;\n"
-    "    *) print -u2 'použití: lxdw [on|off|status]'; return 2 ;;\n"
+    "            else print \"dw: vypnuto\"; fi\n"
+    "            if [[ -n $LX_DW_FAKEROOT && $LX_DW_FAKEROOT != 0 ]]; then\n"
+    "              print \"  fakeroot: $LX_DW_FAKEROOT\"\n"
+    "            else print \"  fakeroot: vypnuto\"; fi ;;\n"
+    "    *) print -u2 'použití: lxdw [on [--root|--uid U:G|--no-root] | off | status]'; return 2 ;;\n"
     "  esac\n"
     "}\n"
     "\n"
@@ -5599,15 +5627,30 @@ static const char LX_DW_BASH[] =
     "# Stejné chování jako zsh varianta: viz `elf_loader init zsh` / lxdw.\n"
     "_lx_dw_inside() { [[ $1 == \"$R\" || $1 == \"$R\"/* ]]; }\n"
     "\n"
+    "# lxdw on [--root | --uid U:G | --no-root] - viz zsh varianta.\n"
     "lxdw() {\n"
     "  case ${1:-status} in\n"
-    "    on)  export LX_DW=1 ;;\n"
+    "    on)  export LX_DW=1; shift\n"
+    "         while [ $# -gt 0 ]; do\n"
+    "           case $1 in\n"
+    "             --root) export LX_DW_FAKEROOT=0:0 ;;\n"
+    "             --uid)  if [ -n \"$2\" ]; then export LX_DW_FAKEROOT=\"$2\"; shift\n"
+    "                     else printf 'lxdw on --uid: chybi uid:gid\\n' >&2; return 2; fi ;;\n"
+    "             --uid=*) export LX_DW_FAKEROOT=\"${1#--uid=}\" ;;\n"
+    "             --no-root|--nofakeroot) export LX_DW_FAKEROOT=0 ;;\n"
+    "             *) printf 'lxdw on: nezname: %s\\n' \"$1\" >&2; return 2 ;;\n"
+    "           esac\n"
+    "           shift\n"
+    "         done ;;\n"
     "    off) export LX_DW=0\n"
     "         [ \"$LX_WORLD\" = rootfs ] && { : > \"$LX_DW_MARK.off\"; _lx_dw_leave \"$R${PWD%/}\"; } ;;\n"
     "    status) if [ \"$LX_WORLD\" = rootfs ]; then printf 'dw: zapnuto, rootfs svět (%s)\\n' \"$R\"\n"
     "            elif [ \"$LX_DW\" = 1 ]; then printf 'dw: zapnuto, host svět\\n'\n"
-    "            else printf 'dw: vypnuto\\n'; fi ;;\n"
-    "    *) printf 'použití: lxdw [on|off|status]\\n' >&2; return 2 ;;\n"
+    "            else printf 'dw: vypnuto\\n'; fi\n"
+    "            if [ -n \"$LX_DW_FAKEROOT\" ] && [ \"$LX_DW_FAKEROOT\" != 0 ]; then\n"
+    "              printf '  fakeroot: %s\\n' \"$LX_DW_FAKEROOT\"\n"
+    "            else printf '  fakeroot: vypnuto\\n'; fi ;;\n"
+    "    *) printf 'použití: lxdw [on [--root|--uid U:G|--no-root] | off | status]\\n' >&2; return 2 ;;\n"
     "  esac\n"
     "}\n"
     "\n"
