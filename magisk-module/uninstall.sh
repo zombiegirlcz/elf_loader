@@ -1,8 +1,9 @@
 #!/system/bin/sh
-# Parrot ELF Loader - uninstall cleanup.
+# ELF Loader - uninstall cleanup.
+#
+# /data/adb/elf_loader_root se ZAMERNE nechava - reinstalace tak zachova
+# stejnou konfiguraci rootfs.
+rm -f /data/adb/zsh /data/adb/bzsh 2>/dev/null
+rm -rf /data/adb/zsh-bionic 2>/dev/null
 
-# restore the /lib interpreter mount we created (best effort)
-umount /lib/ld-linux-aarch64.so.1 2>/dev/null
-
-# keep /data/adb/parrot_root so a reinstall keeps the same rootfs config
 exit 0

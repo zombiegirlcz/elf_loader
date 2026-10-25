@@ -1,56 +1,39 @@
 #!/bin/bash
-# Build the Magisk module zip for the parrot ELF loader.
-# Requires: aarch64-linux-gnu-gcc (cross glibc), zip, and the elf_loader sources.
+# Build the ELF Loader Magisk module zip.
 #
-# Produces: parrot_elf_loader-vX.zip  (flash in Magisk Manager / recovery)
+# Produces: elf_loader.zip (flash in Magisk Manager / recovery)
+#
+# Obsah modulu:
+#   /system/bin/elf_loader   own-loading glibc loader (bionic NDK build)
+#   /system/bin/zsh          bionic-native zsh 5.9.2 (host shell)
+#   /system/bin/bzsh         launcher pro ten zsh (ZDOTDIR/TERMINFO)
+#   /system/etc/zsh-bionic/  terminfo + zshrc (eval "$(elf_loader init zsh)")
 set -e
 
 HERE="$(cd "$(dirname "$0")" && pwd)"
-ROOT="$(dirname "$HERE")"
 OUT="$HERE/out"
-ZIP="$HERE/parrot_elf_loader.zip"
+ZIP="$HERE/elf_loader.zip"
 
-echo "[0/4] staging dirs..."
+echo "[1/3] staging dirs..."
 rm -rf "$OUT"
-mkdir -p "$OUT/system/bin" "$OUT/system/lib" "$OUT/META-INF/com/google/android"
+mkdir -p "$OUT/system/bin" "$OUT/system/etc" "$OUT/META-INF/com/google/android"
 
-echo "[1/4] using prebuilt bionic elf_loader..."
-# Use prebuilt bionic binary (built via modal NDK cross-compile)
+echo "[2/3] staging binaries + support files..."
 cp "$HERE/system/bin/elf_loader" "$OUT/system/bin/elf_loader"
+cp "$HERE/system/bin/zsh"        "$OUT/system/bin/zsh"
+cp "$HERE/system/bin/bzsh"       "$OUT/system/bin/bzsh"
+cp -r "$HERE/system/etc/zsh-bionic" "$OUT/system/etc/zsh-bionic"
 
-echo "[1b/4] staging bundled bionic zsh (host shell)..."
-if [ -f "$HERE/system/bin/zsh" ]; then
-    mkdir -p "$OUT/system/etc"
-    cp "$HERE/system/bin/zsh" "$HERE/system/bin/bzsh" "$OUT/system/bin/"
-    cp -r "$HERE/system/etc/zsh-bionic" "$OUT/system/etc/zsh-bionic"
-    chmod +x "$OUT/system/bin/zsh" "$OUT/system/bin/bzsh"
-fi
-
-echo "[2/4] cross-building static interpreter bridge..."
-aarch64-linux-gnu-gcc -nostdlib -static -O2 -s -fno-builtin \
-    -o "$OUT/system/lib/ld-linux-aarch64.so.1" \
-    "$HERE/src/interp_wrapper.c" "$HERE/src/interp_wrapper.S"
-
-echo "[2b/4] cross-building PT_INTERP patcher..."
-aarch64-linux-gnu-gcc -static -O2 -s \
-    -o "$OUT/system/bin/patchelf_interp" \
-    "$HERE/src/patchelf_interp.c"
-
-echo "[3/4] staging module tree..."
-cp "$HERE/module.prop" "$OUT/"
-cp "$HERE/customize.sh" "$HERE/service.sh" "$HERE/post-fs-data.sh" "$HERE/uninstall.sh" "$OUT/"
-cp "$HERE/system/bin/parrot" "$HERE/system/bin/parrot-sh" "$HERE/system/bin/parrot-fix-exec" \
-   "$HERE/system/bin/elf" "$HERE/system/bin/linuxsh" "$HERE/system/bin/linuxsh-root" \
-   "$OUT/system/bin/"
+echo "[3/3] staging module scripts + zip..."
+cp "$HERE/module.prop" "$HERE/customize.sh" "$HERE/service.sh" \
+   "$HERE/post-fs-data.sh" "$HERE/uninstall.sh" "$OUT/"
 chmod +x "$OUT/customize.sh" "$OUT/service.sh" "$OUT/post-fs-data.sh" "$OUT/uninstall.sh"
-chmod +x "$OUT/system/bin/parrot" "$OUT/system/bin/parrot-sh" "$OUT/system/bin/parrot-fix-exec" \
-         "$OUT/system/bin/elf" "$OUT/system/bin/linuxsh" "$OUT/system/bin/linuxsh-root" \
-         "$OUT/system/bin/elf_loader" "$OUT/system/bin/patchelf_interp"
+chmod +x "$OUT/system/bin/elf_loader" "$OUT/system/bin/zsh" "$OUT/system/bin/bzsh"
 
-# Magisk module zip layout: META-INF + module root
-rm -f "$ZIP"
 cp "$HERE/META-INF/com/google/android/update-binary" "$OUT/META-INF/com/google/android/"
 cp "$HERE/META-INF/com/google/android/updater-script" "$OUT/META-INF/com/google/android/"
+
+rm -f "$ZIP"
 if command -v zip >/dev/null 2>&1; then
     ( cd "$OUT" && zip -qr "$ZIP" . )
 else
@@ -65,5 +48,5 @@ with zipfile.ZipFile(zpath, "w", zipfile.ZIP_DEFLATED) as z:
 EOF
 fi
 
-echo "[4/4] done: $ZIP"
+echo "done: $ZIP"
 ls -la "$ZIP"

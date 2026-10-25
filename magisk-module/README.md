@@ -1,132 +1,93 @@
-# Parrot Linux ELF Loader — Magisk module
+# ELF Loader — Magisk module
 
-Runs parrot / Debian / generic **aarch64 Linux** binaries on Android **without
-proot, qemu or a full chroot**. The kernel is shared; the parrot `libc` and all
-dependencies are loaded and relocated by the bundled own-loading glibc loader
-(`/system/bin/elf_loader`), which emulates just enough of the glibc
-`ld.so`-private state (`_rtld_global`, `_rtld_global_ro`, fake link-maps,
-`_dl_find_dso_for_object`) that own-loaded libc and the backported
-`_dl_find_object` machinery work.
+Runs aarch64 **glibc (Linux)** binaries from a rootfs directly on Android —
+no proot, no qemu, no chroot. The kernel is shared; the guest `libc` and all
+its dependencies are loaded and relocated by the bundled own-loading loader
+(`/system/bin/elf_loader`). Path translation happens inside the loader, so
+nothing is bind-mounted into `/system` or `/lib`.
 
 ## What gets installed
 
 | path | purpose |
 |------|---------|
-| `/system/bin/elf_loader` | own-loading glibc loader (aarch64 PIE) |
-| `/system/bin/parrot` | run any parrot binary: `parrot <cmd> [args...]` |
-| `/system/bin/parrot-sh` | interactive parrot shell (`parrot-sh`) |
-| `/system/bin/parrot-fix-exec` | enable fork/exec on verity devices |
-| `/system/bin/patchelf_interp` | PT_INTERP rewrite tool used by the above |
-| `/lib/ld-linux-aarch64.so.1` | experimental interpreter bridge (bind-mount) so `fork/exec` of parrot binaries from inside a parrot shell also works |
-| `/data/adb/parrot_root` | config: path to the parrot rootfs |
-| `/system/bin/zsh` + `bzsh` | bundled bionic-native zsh 5.9.2 (NDK build) — a **host** shell, not a guest glibc shell |
-| `/system/etc/zsh-bionic/` | its terminfo (xterm/screen/tmux/linux/vt100) + zshrc/plugins |
+| `/system/bin/elf_loader` | own-loading glibc loader (aarch64, bionic NDK build) |
+| `/system/bin/zsh` | bundled bionic-native zsh 5.9.2 — a **host** shell |
+| `/system/bin/bzsh` | launcher for it (`ZDOTDIR` / `TERMINFO` → `/data/adb/zsh-bionic`) |
+| `/system/etc/zsh-bionic/` | terminfo (xterm/screen/tmux/linux/vt100) + `zshrc` |
+| `/data/adb/elf_loader_root` | config: path to the glibc rootfs |
+
+Copies under `/data/adb/` (zsh, bzsh, zsh-bionic) exist because the Magisk
+`/system` mount is **not visible inside app/isolated namespaces**.
+
+Nothing else is installed. Older releases shipped `parrot`, `parrot-sh`,
+`parrot-fix-exec`, `patchelf_interp`, `linuxsh` and an interpreter bridge at
+`/lib/ld-linux-aarch64.so.1`; `customize.sh` removes those leftovers on
+upgrade.
 
 ## Usage
 
 ```
-adb shell
-su
-parrot ls -la /etc
-parrot sed -n 2p /etc/passwd
-parrot-sh            # interactive bash from the rootfs
-bzsh                  # interactive bionic-native zsh (no rootfs needed)
+bzsh                       # host shell (bionic zsh), no rootfs needed
+bzsh -c 'lx ls -la /etc'   # guest binary from the rootfs
 ```
+
+Inside `bzsh` the whole guest toolkit is available once a rootfs is
+configured (`lx`, `lxwhich`, `lxdw`, `elf_loader init zsh|bash`).
 
 ## Rootfs
 
-The module does **not** bundle a rootfs. Set the rootfs path:
+The module does **not** bundle a rootfs. `customize.sh` auto-detects one
+(any `/data/{user,data,adb}/*/files/nh/distro/parrot` containing
+`usr/lib/aarch64-linux-gnu/libc.so.6`) and writes it to
+`/data/adb/elf_loader_root`. Otherwise set it yourself:
 
 ```
-echo /path/to/parrot/rootfs > /data/adb/parrot_root
+echo /path/to/rootfs > /data/adb/elf_loader_root
 ```
 
-During install, `customize.sh` auto-detects an existing app-provided rootfs at
-`/data/user/0/com.linux_core/files/nh/distro/parrot` and writes it to
-`/data/adb/parrot_root`. Otherwise it defaults to `/data/adb/parrot`
-(place any Debian/parrot aarch64 rootfs there).
+On upgrade the old `/data/adb/parrot_root` is migrated automatically.
 
 Requirements on the rootfs:
-- `usr/lib/aarch64-linux-gnu/ld-linux-aarch64.so.1`, `libc.so.6`, `libdl.so.2`
-- `bin/` + `usr/bin/` executables (Debian layout)
+- `usr/lib/aarch64-linux-gnu/ld-linux-aarch64.so.1`, `libc.so.6`
+- Debian layout (`bin/`, `usr/bin/`)
 
-## How it works
+## Configuration
 
-`parrot` resolves `<cmd>` under the rootfs, then execs:
+`zshrc` in the module is deliberately tiny — it only evals the loader:
 
-```
-rootfs/usr/lib/aarch64-linux-gnu/ld-linux-aarch64.so.1 \
-    --library-path rootfs/usr/lib/aarch64-linux-gnu \
-    /system/bin/elf_loader --ownall rootfs/bin/<cmd> ...
+```zsh
+eval "$(elf_loader init zsh)"
 ```
 
-`elf_loader` maps the rootfs `libc` + deps, relocates them, patches the parrot
-allocator onto its own private mmap heap (so it never desyncs the process
-`brk`), builds a glibc-shaped TLS region (handles negative TLS offsets), and
-switches `TP` before jumping to `main`.
+That single line sets `D` / `ROOTFS` / `L` / `R` / `LX_LOG`, installs the
+`lx` / `lxwhich` / `lxdw` helpers and, at the end, sources `~/.elfrc`.
 
-## fork/exec (works on this device)
-
-Inside a parrot shell, `fork/exec` of another parrot binary is handled by the
-kernel, which loads the interpreter embedded in the binary. Android's root
-filesystem is read-only (dm-verity), so the kernel cannot open the default
-interpreter path `/lib/ld-linux-aarch64.so.1`.
-
-The module ships a tiny static (libc-free, raw-syscall) interpreter bridge at
-`/system/lib/ld-linux-aarch64.so.1` and a patching tool. Two deployment steps:
-
-1. `parrot-fix-exec` copies the bridge to a writable path
-   (`/data/local/tmp/ldl`) and rewrites the `PT_INTERP` of every rootfs ELF to
-   that path (backups saved as `<file>.interp.bak`; revert with
-   `parrot-fix-exec -r`).  The bridge reads `/data/adb/parrot_root` (rootfs
-   path + loader path), recovers the real target path from `AT_EXECFN` of the
-   auxiliary vector, and re-execs through the real parrot `ld.so` + `elf_loader`
-   (own-loading glibc: private mmap heap, TLS fix, fake link-maps).
+Everything user-facing (starship, zoxide, aliases) belongs in `~/.elfrc`,
+**not** in `~/.zshrc` — the rootfs rc is shared between the host and the
+guest world. Generate a ready-made one:
 
 ```
-su
-parrot-fix-exec        # enable fork/exec
-parrot-fix-exec -r     # revert
+elf_loader init example   # print template
+elf_loader init install   # write ${ELF_RC:-$HOME/.elfrc}
 ```
 
-Validated on a 4.14-perf Android kernel: bash, sed, wc, grep all run via the
-bridge with correct output.  NOTE: the patched rootfs no longer works inside
-a plain Linux chroot.
-
-Without `parrot-fix-exec`, use `parrot <cmd>` to launch each program directly
-(no `/lib` bridge needed).
-
-## Bundled bionic zsh (`bzsh`)
-
-`zsh` here is a plain NDK (bionic) build — it links only `libc.so`/`libm.so`/
-`libdl.so` (Android system libs already present on the device), nothing from
-a glibc rootfs. It runs directly on the bionic host, independent of
-`elf_loader` and of any rootfs being configured.
-
-`bzsh` is a thin wrapper that points `ZDOTDIR`/`TERMINFO` at
-`/data/adb/zsh-bionic` (copied there by `customize.sh`/`service.sh`, same
-reasoning as `linuxsh`: Magisk's `/system` mount isn't visible inside
-app/isolated namespaces, so the binary and support files are also kept under
-`/data/adb`). If an `elf_loader` rootfs is configured
-(`/data/adb/parrot_root`), the bundled `zshrc` also evals
-`elf_loader init zsh`, giving you the full `lx`/`lxwhich`/… guest-shell
-toolkit inside the bionic shell — one shell, both userspaces.
-
-```
-bzsh
-lx python3 --version   # only if a rootfs is configured
-```
+Skip it with `LX_NO_RC=1`.
 
 ## Building
 
 ```
-./build.sh        # needs aarch64-linux-gnu-gcc + zip
-# -> parrot_elf_loader.zip (flash in Magisk Manager or recovery)
+./build.sh        # -> elf_loader.zip
 ```
+
+`build.sh` stages the prebuilt bionic `elf_loader`, the bundled `zsh`/`bzsh`,
+terminfo + `zshrc`, the module scripts and `META-INF`. It needs no
+cross-compiler: both binaries are prebuilt into `system/bin/` (the loader is
+produced by this repo's GitHub Actions NDK build).
 
 ## Caveats
 
-- aarch64 only (matches the own-loader build).
-- Device kernel must be capable of the glibc syscalls used (tested on
-  4.14-perf).
-- Debug output goes to stderr and is quiet on success.
+- aarch64 only.
+- Device kernel must support the glibc syscalls used (tested on 4.14-perf).
+- `hardlink(2)` is denied by SELinux in the app domain — tools that rely on it
+  (`uv` cache persistence, `dpkg` hardlink backups) need `LX_L2S=1` or a
+  workaround.

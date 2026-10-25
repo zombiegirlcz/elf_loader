@@ -1,17 +1,28 @@
-# Bionic host zsh (NDK build) — minimal rc, no Termux/com.linux_core
-# path assumptions. Everything is driven by env vars the `bzsh` launcher
-# sets ($ZSH_SUPPORT, $PREFIX), same pattern as `elf_loader init zsh`.
+# ELF Loader - bionic host zsh (NDK build) rc.
+#
+# Tohle je HOST shell (bzsh): bezi primo na bionic, zadny glibc, zadny loader.
+# Kdyz je nakonfigurovany rootfs, `elf_loader init zsh` doda cely guest
+# toolkit (lx, lxwhich, lxdw, init env) a nakonec nacte ~/.elfrc, kde jsou
+# starship / zoxide / vlastni aliasy.
 
 [[ "$PS1" == '%m%# ' ]] && PS1='%# '
 
 : ${ZSH_SUPPORT:=/data/adb/zsh-bionic}
-if [ -f "$ZSH_SUPPORT/zsh-plugins.zshrc" ]; then
-    source "$ZSH_SUPPORT/zsh-plugins.zshrc"
+export ZSH_SUPPORT
+
+# loader: /system/bin (Magisk mount) -> /data/adb (kopie, vidi ji i app ns)
+if [ -x /system/bin/elf_loader ]; then
+    _el=/system/bin/elf_loader
+elif [ -x /data/adb/elf_loader ]; then
+    _el=/data/adb/elf_loader
+else
+    _el=$(command -v elf_loader 2>/dev/null)
 fi
 
-# elf_loader guest env, if a rootfs is configured (see elf_loader init zsh)
-if [ -x /system/bin/elf_loader ] && [ -f /data/adb/parrot_root ]; then
-    eval "$(/system/bin/elf_loader init zsh 2>/dev/null)"
+if [ -n "$_el" ] && [ -x "$_el" ]; then
+    # eval init: D/ROOTFS/L/R/LX_LOG + lx/lxwhich/lxdw + ~/.elfrc (starship/zoxide)
+    eval "$("$_el" init zsh 2>/dev/null)"
 fi
+unset _el
 
 # vim: set noet ft=zsh tw=4 sw=4 ff=unix
