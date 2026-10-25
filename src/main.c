@@ -2518,6 +2518,22 @@ static int shim_execve(const char *p, char *const argv[], char *const envp[]) {
         }
     }
 
+    /* execvp/execvpe nam predkladaji kazdeho PATH kandidata zvlast. Kdyz
+     * soubor NEEXISTUJE, musime vratit ENOENT - jinak spustime loader, ten
+     * spadne na open() a cely proces umre driv, nez glibc zkusi dalsi PATH
+     * polozku. Presne to rozbíjelo `subprocess.run(["uname","-rs"])` v
+     * pipu/distro: PATH zacina /usr/local/sbin, tam uname neni, a misto
+     * pokracovani na /usr/bin/uname prisel exit 1 s "[-] open(...uname):
+     * No such file or directory". Host binarky (excluded vetev) sem
+     * nedojdou - ty uz vyse skoncily v realnem execve. */
+    if (!force_redirect) {
+        const char *ex = resolved[0] ? resolved : p;
+        if (raw_access(ex, 0 /* F_OK */) != 0 && !raw_path_exists(ex)) {
+            shim_guest_errno_set(ENOENT);
+            return -1;
+        }
+    }
+
     /* Bionic / staticka glibc binarka (zadny PT_INTERP) se NESMI own-loadovat.
      * Vetev "uz pod ROOTFS" to resi vys; tady to pokryva guest-absolutni
      * (/usr/local/bin/x), relativni i bare-name cesty - bez toho napr.
