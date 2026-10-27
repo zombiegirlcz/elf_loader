@@ -1133,6 +1133,17 @@ typedef int (*fp_openat)(int, const char *, int, ...);
 static int shim_resolve_symlinks(const char *path, char *out, size_t outsz);
 static void shim_guest_errno_set(int v);
 static int *shim_guest_errno(void);
+/* Raw syscall vraci -errno; C rozhrani (access/faccessat) musi vratit -1
+ * a nastavit errno. Jinak volajici vidi treba -2 a errno zustane stare
+ * (presne to rozbilo git: ENOTTY z predchoziho ioctl misto ENOENT). */
+static int shim_raw_to_c(long r)
+{
+    if (r < 0 && r > -4096) {
+        shim_guest_errno_set((int)-r);
+        return -1;
+    }
+    return (int)r;
+}
 /* LX_FAKEROOT: proot fake_id0 (handle_sysexit_end) meni -EPERM na 0 pro
  * chmod/chown/*at/mknod/setxattr/sethostname/setdomainname/capset, protoze
  * v app domene (SELinux + seccomp) ty operace realne neprojdou, ale program
@@ -1394,7 +1405,7 @@ static int shim_access(const char *p, int m) {
     /* RAW faccessat(48): bionicky access()/faccessat() jde na Androidu pres
      * faccessat2 (439), ktery app seccomp TRAPuje -> v Go/gh vlakne SIGSYS
      * zabije proces (handler nema sanci, SIGSYS je blokovany). */
-    return (int)shim_raw_syscall6(48, -100L, (long)(unsigned long)path, m, 0, 0, 0);
+    return shim_raw_to_c(shim_raw_syscall6(48, -100L, (long)(unsigned long)path, m, 0, 0, 0));
 }
 static int shim_euidaccess(const char *p, int m) {
     char b[8192]; const char *path = p; if (shim_translate(p, b, sizeof b)) path = b;
@@ -1405,7 +1416,7 @@ static int shim_euidaccess(const char *p, int m) {
         path = resolved;
     }
     /* RAW faccessat(48) s AT_EACCESS (0x200) - viz shim_access. */
-    return (int)shim_raw_syscall6(48, -100L, (long)(unsigned long)path, m, 0x200L, 0, 0);
+    return shim_raw_to_c(shim_raw_syscall6(48, -100L, (long)(unsigned long)path, m, 0x200L, 0, 0));
 }
 static int shim_faccessat(int dfd, const char *p, int m, int ff) {
     if (g_exec_trace) {
@@ -1424,7 +1435,7 @@ static int shim_faccessat(int dfd, const char *p, int m, int ff) {
     }
     /* RAW faccessat(48): bionicky wrapper by sel pres faccessat2(439) a
      * spadl na app seccomp TRAP (viz shim_access). */
-    return (int)shim_raw_syscall6(48, dfd, (long)(unsigned long)path, m, ff, 0, 0);
+    return shim_raw_to_c(shim_raw_syscall6(48, dfd, (long)(unsigned long)path, m, ff, 0, 0));
 }
 
 /* Moderni glibc/coreutils routuji stat/lstat/fstatat pres statx syscall.
@@ -3393,9 +3404,11 @@ static int shim_faccessat2(int dfd, const char *p, int m, int ff) {
     /* faccessat2 (439) app seccomp TRAPuje -> delej to starym faccessat(48).
      * Rozdil je jen v podporovanych flags; AT_EACCESS/AT_SYMLINK_NOFOLLOW
      * umi i 48, AT_EMPTY_PATH (0x1000) ne - pro ten vrat ENOSYS. */
-    if (ff & 0x1000)
-        return -38;   /* -ENOSYS (AT_EMPTY_PATH) */
-    return (int)shim_raw_syscall6(48, dfd, (long)(unsigned long)path, m, ff, 0, 0);
+    if (ff & 0x1000) {
+        shim_guest_errno_set(38);   /* ENOSYS (AT_EMPTY_PATH) */
+        return -1;
+    }
+    return shim_raw_to_c(shim_raw_syscall6(48, dfd, (long)(unsigned long)path, m, ff, 0, 0));
 }
 typedef int (*fp_getrlimit)(int, struct rlimit *);
 static int shim_getrlimit(int resource, struct rlimit *rl) {
