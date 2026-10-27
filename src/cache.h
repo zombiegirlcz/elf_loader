@@ -24,12 +24,16 @@
  *     exec znovu - viz postup.md 2026-10-20. */
 /* v3: sesty slot CACHE_NR_L1 nese seznam mist pro L1 (prompt 04) - cestova
  *     a povolena dynamicka `svc #0`; strop mist na slot zvednut na 4096
- *     (L1 ma v libc 58 mist, velke binarky vic). */
-#define CACHE_FORMAT_VERSION 3u
+ *     (L1 ma v libc 58 mist, velke binarky vic).
+ * v4: sesty syscall slot pro faccessat2 (439). glibc 2.33+ ho vola PRIMO
+ *     z faccessat() (`mov x8,#439; svc`, zadny fallback), app profil ho
+ *     TRAPuje a v Go vlakne (SIGSYS blokovany) je default action kill
+ *     procesu -> `gh` a kazda cgo/Go binarka umrela na SIGSYS. */
+#define CACHE_FORMAT_VERSION 4u
 
-/* Pocet slotu: 5 syscall cisel, ktera elf_patch_syscall_sites prebiji (99,
- * 151,152,293,435), plus seznam L1 mist (CACHE_NR_L1). */
-#define CACHE_NR_COUNT 6
+/* Pocet slotu: 6 syscall cisel, ktera elf_patch_syscall_sites prebiji (99,
+ * 151,152,293,435,439), plus seznam L1 mist (CACHE_NR_L1). */
+#define CACHE_NR_COUNT 7
 #define CACHE_MAX_SITES 4096
 /* Pseudo-cislo slotu se seznamem L1 mist (zadny realny syscall nema >0xffff). */
 #define CACHE_NR_L1 0x10000L

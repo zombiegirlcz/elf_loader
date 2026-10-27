@@ -2497,6 +2497,12 @@ void elf_patch_syscall_sites_all(elf_object_t *m) {
         { 435, 38 },     /* clone3          -> -ENOSYS */
         { 151, 0 },      /* setfsuid        -> NOP */
         { 152, 0 },      /* setfsgid        -> NOP */
+        /* faccessat2 (439): app profil ho TRAPuje. KILL/TRAP nejde prebit
+         * ERRNO filtrem (seccomp bere nejprisnejsi akci), takze v Go vlakne
+         * se SIGSYS handler vubec nespusti a default action zabije proces.
+         * glibc 2.33+ ho vola PRIMO z faccessat() -> patch na -ENOSYS, aby
+         * sel fallback pres fstatat (overeno v objdump: cmp w4,#0x26). */
+        { 439, 38 },     /* faccessat2      -> -ENOSYS */
     };
     for (size_t s = 0; s < sizeof(kill_syscalls) / sizeof(kill_syscalls[0]); s++)
         elf_patch_syscall_sites(m, kill_syscalls[s].nr, kill_syscalls[s].err);
