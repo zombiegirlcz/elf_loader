@@ -1378,7 +1378,10 @@ static int shim_access(const char *p, int m) {
     if (shim_resolve_symlinks(path, resolved, sizeof(resolved))) {
         path = resolved;
     }
-    fp_access f = (fp_access)g_orig_access; return f ? f(path, m) : -1;
+    /* RAW faccessat(48): bionicky access()/faccessat() jde na Androidu pres
+     * faccessat2 (439), ktery app seccomp TRAPuje -> v Go/gh vlakne SIGSYS
+     * zabije proces (handler nema sanci, SIGSYS je blokovany). */
+    return (int)shim_raw_syscall6(48, -100L, (long)(unsigned long)path, m, 0, 0, 0);
 }
 static int shim_euidaccess(const char *p, int m) {
     char b[8192]; const char *path = p; if (shim_translate(p, b, sizeof b)) path = b;
@@ -1388,7 +1391,8 @@ static int shim_euidaccess(const char *p, int m) {
     if (shim_resolve_symlinks(path, resolved, sizeof(resolved))) {
         path = resolved;
     }
-    fp_euidaccess f = (fp_euidaccess)g_orig_euidaccess; return f ? f(path, m) : -1;
+    /* RAW faccessat(48) s AT_EACCESS (0x200) - viz shim_access. */
+    return (int)shim_raw_syscall6(48, -100L, (long)(unsigned long)path, m, 0x200L, 0, 0);
 }
 static int shim_faccessat(int dfd, const char *p, int m, int ff) {
     if (g_exec_trace) {
@@ -1405,7 +1409,9 @@ static int shim_faccessat(int dfd, const char *p, int m, int ff) {
             path = resolved;
         }
     }
-    fp_faccessat f = (fp_faccessat)g_orig_faccessat; return f ? f(dfd, path, m, ff) : -1;
+    /* RAW faccessat(48): bionicky wrapper by sel pres faccessat2(439) a
+     * spadl na app seccomp TRAP (viz shim_access). */
+    return (int)shim_raw_syscall6(48, dfd, (long)(unsigned long)path, m, ff, 0, 0);
 }
 
 /* Moderni glibc/coreutils routuji stat/lstat/fstatat pres statx syscall.
@@ -3371,7 +3377,12 @@ static int shim___fxstatat(int ver, int dfd, const char *p, void *st, int flags)
 static int shim_faccessat2(int dfd, const char *p, int m, int ff) {
     char b[8192]; const char *path = p;
     if (dfd == -100 && p && p[0] == '/') { if (shim_translate(p, b, sizeof b)) path = b; }
-    fp_faccessat f = (fp_faccessat)g_orig_faccessat2; return f ? f(dfd, path, m, ff) : -1;
+    /* faccessat2 (439) app seccomp TRAPuje -> delej to starym faccessat(48).
+     * Rozdil je jen v podporovanych flags; AT_EACCESS/AT_SYMLINK_NOFOLLOW
+     * umi i 48, AT_EMPTY_PATH (0x1000) ne - pro ten vrat ENOSYS. */
+    if (ff & 0x1000)
+        return -38;   /* -ENOSYS (AT_EMPTY_PATH) */
+    return (int)shim_raw_syscall6(48, dfd, (long)(unsigned long)path, m, ff, 0, 0);
 }
 typedef int (*fp_getrlimit)(int, struct rlimit *);
 static int shim_getrlimit(int resource, struct rlimit *rl) {
