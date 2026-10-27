@@ -6208,8 +6208,21 @@ NOSP static int go_handle(long nr, ucontext_t *ctx) {
             return 1;
         }
         case 49:  pa = 0; break;                 /* chdir */
-        case 56: case 79: case 48: case 439: case 78: case 291: case 34: case 35:
-        case 53: case 54: case 88: pa = 1; break;  /* 439=faccessat2 (glibc 2.33+) */
+        /* 439=faccessat2: app seccomp profil ho TRAPuje. NESMIME ho poslat
+         * raw syscallem - beh z textu loaderu je mimo [g_go_lo,g_go_hi), takze
+         * druhy SIGSYS uz handler nezachyti a proces dostane SIGSYS (kill).
+         * Emulujeme -ENOSYS: glibc 2.33+ ma fallback na fstatat (overeno
+         * v objdump: cmp w4,#0x26 -> fstatat), Go runtime fallback na access(). */
+        case 439:
+            r[0] = (unsigned long long)-38L;
+            return 1;
+        /* 435=clone3: app profil ho KILLuje (KILL obchazi handler). -ENOSYS
+         * donuti glibc/Go fallback na clone(). */
+        case 435:
+            r[0] = (unsigned long long)-38L;
+            return 1;
+        case 56: case 79: case 48: case 78: case 291: case 34: case 35:
+        case 53: case 54: case 88: pa = 1; break;
         case 38: case 276: pa = 1; pb = 3; break; /* renameat(2) */
         case 37:  pa = 1; pb = 3; break;         /* linkat */
         case 36:  pa = 2; break;                 /* symlinkat: jen linkpath */

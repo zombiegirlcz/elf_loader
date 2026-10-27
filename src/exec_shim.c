@@ -41,6 +41,8 @@
 #include <errno.h>
 #include <sys/stat.h>
 #include <sys/types.h>
+#include <fcntl.h>
+#include <sys/syscall.h>
 
 extern char **environ;
 
@@ -231,7 +233,10 @@ static int resolve_target(const char *p, char *out, size_t cap, int search_path)
                 } else {
                     snprintf(cand, sizeof cand, "%s/%s", dir, p);
                 }
-                if (access(cand, X_OK) == 0) {
+                /* Raw faccessat(48), NE access(): glibc 2.33+ implementuje
+                 * access() pres faccessat2(439), ktery app seccomp profil
+                 * TRAPuje -> SIGSYS. 48 je v profilu povoleny. */
+                if (syscall(SYS_faccessat, AT_FDCWD, cand, X_OK, 0) == 0) {
                     snprintf(out, cap, "%s", cand);
                     free(pc);
                     return 1;
