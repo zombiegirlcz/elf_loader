@@ -357,6 +357,19 @@ static long shim_raw_syscall6(long nr, long a0, long a1, long a2, long a3, long 
     __asm__ volatile("svc #0" : "+r"(x0) : "r"(x8), "r"(x1), "r"(x2), "r"(x3), "r"(x4), "r"(x5) : "memory", "cc");
     return x0;
 }
+
+/* Hostovsky access() pres RAW faccessat(48).
+ * bionicky access() jde na Androidu pres faccessat2 (439), ktery app seccomp
+ * TRAPuje -> v Go vlakne SIGSYS zabije cely proces (viz elf_access
+ * v elf_loader.c a commit 800204e). */
+static int shim_access_host(const char *path, int mode)
+{
+    if (!path)
+        return -1;
+    return (int)shim_raw_syscall6(48 /* faccessat */, -100L /* AT_FDCWD */,
+                                  (long)(unsigned long)path, mode, 0L, 0L, 0L);
+}
+
 /* Guest environ lookup: prefer glibc's environ (reflects guest setenv calls),
  * fall back to bionic environ. Reading a global pointer is TLS-safe. */
 static char **guest_environ(void) {
@@ -4520,13 +4533,13 @@ static int run_ownall(const char *path, int argc, char **argv, char **envp) {
         char locpath[1024], shellpath[1024];
         int n;
         n = snprintf(locpath, sizeof locpath, "%s/usr/lib/locale", g_shim_root);
-        if (n > 0 && (size_t)n < sizeof locpath && access(locpath, F_OK) == 0)
+        if (n > 0 && (size_t)n < sizeof locpath && shim_access_host(locpath, 0) == 0)
             setenv("LOCPATH", locpath, 0);
         /* C.UTF-8 je vestaveny glibc locale (od 2.35, bez potreby locale-archive
          * dat) - nastavit vzdy, nezavisi na existenci LOCPATH adresare. */
         setenv("LC_ALL", "C.UTF-8", 0);
         n = snprintf(shellpath, sizeof shellpath, "%s/bin/bash", g_shim_root);
-        if (n > 0 && (size_t)n < sizeof shellpath && access(shellpath, X_OK) == 0)
+        if (n > 0 && (size_t)n < sizeof shellpath && shim_access_host(shellpath, 1) == 0)
             setenv("SHELL", shellpath, 0);
     }
     if (!g_shim_loader || !g_shim_loader[0]) {
@@ -5906,7 +5919,7 @@ static int elf_install_elfrc(int force) {
         return 1;
     }
 
-    if (!force && access(path, F_OK) == 0) {
+    if (!force && shim_access_host(path, 0) == 0) {
         fprintf(stderr, "elf_loader: init install: '%s' uz existuje "
                 "(prepis: --force)\n", path);
         return 1;

@@ -22,6 +22,8 @@ extern char **environ;
 #include <linux/seccomp.h>
 #include <sys/wait.h>
 
+static int elf_access(const char *path, int mode);   /* raw faccessat(48), viz sys_write */
+
 /* SENTINEL v x5 (args[5]) pro seccomp path-filter: handlerova emulace raw
  * syscallu nese toto cislo v x5, filtr ji tak pousti (zabrani zacykleni).
  * Definovano zde, aby bylo dostupne i fault_handleru (maps dump). */
@@ -3385,7 +3387,7 @@ static const char *find_distro_root(const char *origin_dir) {
         char test[2048];
         int tl = snprintf(test, sizeof test, "%s/usr/lib/aarch64-linux-gnu", path);
         if (tl < 0 || (size_t)tl >= sizeof test) return NULL;
-        if (access(test, F_OK) == 0) {
+        if (elf_access(test, 0 /* F_OK */) == 0) {
             size_t pl = strlen(path);
             if (pl >= sizeof fbuf) return NULL;
             memcpy(fbuf, path, pl + 1);
@@ -3450,7 +3452,7 @@ static char *find_in_paths(const char *soname, const char *search) {
             memcpy(cand, p, len);
             cand[len] = '/';
             strcpy(cand + len + 1, soname);
-            if (access(cand, R_OK) == 0)
+            if (elf_access(cand, 4 /* R_OK */) == 0)
                 return cand;
             free(cand);
         }
@@ -4179,17 +4181,17 @@ static elf_object_t *ldso_load_new(const char *file) {
      *  b) file je guest-absolutní (/usr/lib/...) -> ROOTFS + file
      *  c) relativní / se '/' -> ROOTFS + file
      *  d) holé soname -> hledat v libdirs */
-    if (access(file, R_OK) == 0) {
+    if (elf_access(file, 4 /* R_OK */) == 0) {
         search = strdup(file);
     } else if (file[0] == '/') {
         snprintf(pbuf, sizeof pbuf, "%s%s", root ? root : "", file);
-        if (access(pbuf, R_OK) == 0)
+        if (elf_access(pbuf, 4 /* R_OK */) == 0)
             search = strdup(pbuf);
         else if (rl && strncmp(file, root, rl) == 0)
             search = strdup(file);
     } else if (strchr(file, '/')) {
         snprintf(pbuf, sizeof pbuf, "%s%s", root ? root : "", file);
-        if (access(pbuf, R_OK) == 0)
+        if (elf_access(pbuf, 4 /* R_OK */) == 0)
             search = strdup(pbuf);
     }
     if (!search) {
@@ -5006,6 +5008,23 @@ static long sys_read(int fd, void *buf, size_t n) {
     __asm__ volatile("svc #0" : "+r"(x0) : "r"(x8), "r"(x1), "r"(x2)
                      : "memory", "cc");
     return x0;
+}
+
+/* access(2) bez bionickeho wrapperu.
+ *
+ * Proc: bionic implementuje access()/faccessat() pres faccessat2 (439), ktery
+ * Android app seccomp profil TRAPuje. ERRNO ho neprebije (seccomp bere
+ * nejprisnejsi akci: KILL < TRAP < ERRNO < ALLOW) a v Go vlakne je SIGSYS
+ * blokovany -> default action = kill procesu. `gh run list` na tom padal.
+ * Stary faccessat(48) app profil povoluje, takze volame RAW svc primo.
+ * F_OK=0, R_OK=4, W_OK=2, X_OK=1 (stejne hodnoty jako access()). */
+static int elf_access(const char *path, int mode)
+{
+    if (!path)
+        return -1;
+    return (int)raw_syscall6(48 /* faccessat */, -100L /* AT_FDCWD */,
+                             (long)(unsigned long)path, mode, 0L, 0L,
+                             (long)F2_SENTINEL);
 }
 
 static void sys_write(int fd, const void *buf, size_t n) {
