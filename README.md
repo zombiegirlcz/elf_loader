@@ -62,14 +62,25 @@ lx gcc hello.c -o hello && lx ./hello   # compile + run inside the guest
 | variable | meaning | default |
 |---|---|---|
 | `D` | app files dir | `$HOME` |
-| `ROOTFS` | guest rootfs (Termux-aware autodetect) | `$D/nh/distro/parrot` |
+| `LX_DISTRO` | distro name used for rootfs autodetect | `parrot` |
+| `LX_GUEST_HOME` | home directory **inside** the rootfs | `/root` |
+| `ROOTFS` | guest rootfs (autodetect) | `$D/nh/distro/$LX_DISTRO` |
 | `R` | alias for `ROOTFS` | `$ROOTFS` |
 | `L` | loader binary (autodetect, incl. `$PREFIX/bin`) | `$D/usr/bin/elf_loader` |
 | `LX_LOG` | log directory | `$HOME/.cache/lx` |
 | `LOCPATH` | guest locale dir (only if it exists) | `$ROOTFS/usr/lib/locale` |
 | `LC_ALL` | locale | `C.UTF-8` |
 
-Overridable from outside: `ROOTFS=/other/rootfs zsh`.
+Nothing is hard-coded to a particular distro. `ROOTFS` is autodetected from
+`$D/nh/distro/$LX_DISTRO`, `$D/$LX_DISTRO`, `$D/.local/share/$LX_DISTRO`, then
+the Termux proot-distro layouts `$PREFIX/var/lib/proot-distro/containers/$LX_DISTRO`
+(proot-distro ≥ 4) and `…/installed-rootfs/$LX_DISTRO` (older).
+
+```sh
+ROOTFS=/other/rootfs zsh                 # explicit rootfs wins
+LX_DISTRO=debian zsh                     # autodetect a different distro
+LX_GUEST_HOME=/home/user lx bash         # non-root guest user
+```
 
 ### `.elfrc` — uživatelská konfigurace
 
@@ -123,6 +134,56 @@ elf_loader init example [zsh|bash]              print example ~/.elfrc
 elf_loader init install [--force]               write example to ${ELF_RC:-$HOME/.elfrc}
 elf_loader <elf>                                introspect (no execution)
 ```
+
+## Environment variables
+
+**Only one is required:** `ROOTFS` for `--ownall` / `--shim` (alias `R`, or
+`ELF_ROOTFS`). Everything else is optional. `init zsh|bash` sets all of the
+shell-side ones for you.
+
+### Shell (set by `eval "$(elf_loader init zsh|bash)"`)
+
+| variable | meaning | default |
+|---|---|---|
+| `D` | app files dir | `$HOME` |
+| `LX_DISTRO` | distro name for autodetect | `parrot` |
+| `LX_GUEST_HOME` | home dir inside the rootfs | `/root` |
+| `ROOTFS` / `R` | guest rootfs | `$D/nh/distro/$LX_DISTRO` |
+| `L` | loader binary | autodetected |
+| `LX_LOG` | logs, test output, feedback reports | `$HOME/.cache/lx` |
+| `LOCPATH` | guest locale dir | `$ROOTFS/usr/lib/locale` if present |
+| `LC_ALL` | locale | `C.UTF-8` |
+| `LX_SHELL` | shell used by `lx -c` | `$R/bin/bash` |
+| `LX_ENV` | extra `A=1 B=2` vars for the guest | empty |
+| `LX_NO_RC` | `1` = do not source `~/.elfrc` | unset |
+| `ELF_RC` | user rc file | `$HOME/.elfrc` |
+| `LX_DW` / `LX_WORLD` | double-world state (set by `lxdw on`) | unset |
+| `LX_DW_SHELL` / `LX_DW_RC` | guest shell and its rc in double-world | `$R/usr/bin/zsh` or `/bin/bash` |
+| `LX_FEEDBACK` | `lxfb` report directory | `$LX_LOG/feedback` |
+| `LXFB_DEBUG` / `LXFB_MAX` | loader debug env / max log lines in a report | see `help debug` |
+
+### Loader behaviour (all optional, default off)
+
+| variable | effect |
+|---|---|
+| `ELF_DEBUG` | load progress trace |
+| `ELF_LOADER_TIMING` | phase timings |
+| `ELF_LOADER_DIAG` | routine traces to `$ROOTFS/usr/diag.<pid>.txt` |
+| `ELF_LOADER_L1` / `_L1_SCAN` | syscall-site path translation (`=1` beside hooks, `=2` replaces pure-translate hooks) |
+| `ELF_LOADER_L2` / `_L2_LAZY` | seccomp safety net for raw syscalls (static/Go/Bun) |
+| `ELF_LOADER_IMGCACHE` / `_NO_CACHE` / `_NO_HASH` | relocation cache and hash lookup knobs |
+| `ELF_LOADER_LAZY` | lazy PLT binding |
+| `ELF_LOADER_GOMODE` | Go mode (`=0` disables it) |
+| `ELF_LOADER_NO_COMPAT` | skip the seccomp compat filter |
+| `ELF_LOADER_NO_PROCVIRT` | skip `/proc` virtualization |
+| `ELF_LOADER_HELPER` | extra glibc `.so` own-loaded before everything else |
+| `ELF_LOADER_NO_LOCALE` / `_NO_INITS` / `_NO_PATCH` / `_NO_RELSYM` | skip locale setup / init functions / PLT patching / relsym |
+| `F2_FILTER`, `F2_ONLY`, `F2_SKIP`, `F2_NO_*` | which hook families are installed |
+| `LX_BINDS`, `LX_BINDS_FILE` | bind table (`host:guest[:ro],…`) and its shared file |
+| `LX_FAKEROOT` | `proot -0` equivalent (uid/gid → 0, xattr-backed chown) |
+| `LX_L2S`, `LX_L2S_DIR` | `proot -l` equivalent (hardlinks as symlinks) |
+
+`elf_loader --help` prints a shorter version; the full list lives here.
 
 ## How it works
 

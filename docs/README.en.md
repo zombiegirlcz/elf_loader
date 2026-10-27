@@ -37,14 +37,29 @@ from `$HOME`/`$ROOTFS`:
 | variable | meaning | default |
 |---|---|---|
 | `D` | app files dir | `$HOME` |
-| `ROOTFS` | guest rootfs | `$D/nh/distro/parrot` |
+| `LX_DISTRO` | distro name for rootfs autodetect | `parrot` |
+| `LX_GUEST_HOME` | home dir **inside** the rootfs | `/root` |
+| `ROOTFS` | guest rootfs (autodetect) | `$D/nh/distro/$LX_DISTRO` |
 | `R` | alias for `ROOTFS` | `$ROOTFS` |
 | `L` | loader binary | `$D/usr/bin/elf_loader` |
 | `LX_LOG` | log directory | `$HOME/.cache/lx` |
 | `LOCPATH` | guest locale dir (only if it exists) | `$ROOTFS/usr/lib/locale` |
 | `LC_ALL` | locale | `C.UTF-8` |
 
-Overridable from outside: `ROOTFS=/other/rootfs zsh`.
+No distro is hard-coded: `ROOTFS` is autodetected from
+`$D/nh/distro/$LX_DISTRO`, `$D/$LX_DISTRO`, `$D/.local/share/$LX_DISTRO`, then
+the Termux proot-distro layouts
+`$PREFIX/var/lib/proot-distro/containers/$LX_DISTRO` (proot-distro >= 4) and
+`…/installed-rootfs/$LX_DISTRO` (older).
+
+```sh
+ROOTFS=/other/rootfs zsh      # explicit rootfs wins
+LX_DISTRO=debian zsh          # autodetect another distro
+LX_GUEST_HOME=/home/user lx bash   # non-root guest user
+```
+
+Full list of loader knobs (`ELF_LOADER_*`, `LX_BINDS`, `LX_FAKEROOT`, `LX_L2S`,
+`F2_*`): see the main `README.md` → *Environment variables*.
 
 ### Shell helpers
 
