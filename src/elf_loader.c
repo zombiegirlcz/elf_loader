@@ -6527,6 +6527,34 @@ NOSP static void sigsys_handler(int sig, siginfo_t *si, void *uc) {
         f2_reinstall_sigsys();
         return;
     }
+    /* rt_sigprocmask(135): L2 filtr ho TRAPuje i pro volání z GUEST LIBC
+     * (mimo [g_go_lo,g_go_hi) -> go_handle se nezavolá). Bez emulace by
+     * fallback vrátil -ENOSYS a Go runtime (netpoll, nová vlákna) by na
+     * chybě z panikařil (nil-deref na pc=svc+12). Emulace nad uc_sigmask:
+     * SIGSYS v masce nikdy nenecháme (kernel 4.14 jinak resetuje handler). */
+    if (nr == 135) { /* L2FALLBACK135 */
+        unsigned long long *r0 = ctx->uc_mcontext.regs;
+        unsigned long *m = (unsigned long *)(void *)&ctx->uc_sigmask;
+        unsigned long cur = *m;
+        long how = (long)r0[0];
+        const unsigned long *set = (const unsigned long *)r0[1];
+        unsigned long *old = (unsigned long *)r0[2];
+        if (set && how != 0 && how != 1 && how != 2) {
+            r0[0] = (unsigned long long)-22L;
+            f2_reinstall_sigsys();
+            return;
+        }
+        if (old) *old = cur;
+        if (set) {
+            if (how == 0) cur |= *set;
+            else if (how == 1) cur &= ~*set;
+            else cur = *set;
+        }
+        *m = cur & ~(1UL << 30);
+        r0[0] = 0;
+        f2_reinstall_sigsys();
+        return;
+    }
     long emu = -999;  /* -999 = nemáme emulaci pro tento nr */
     switch (nr) {
         /* POZOR: getuid()/getgid() jsou BIONICKE funkce - pod parrot TP
