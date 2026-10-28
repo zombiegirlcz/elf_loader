@@ -6041,3 +6041,36 @@ střídavě, `time` z ashell): loader 10,63 / 6,51 / 6,82 s, proot
 **Testy:** `test-all.sh fakeroot` PASS, `l2s` PASS, `all` 206/1/33 (dříve
 204/1/33; FAIL = `nslookup localhost`, prostředí). Host unit testy PASS.
 Parrot nedotčen (nic novějšího než deploy v etc/bin/usr).
+
+## 2026-10-28 (gh SIGSYS/SIGSEGV + jadx/Java boot classpath — oba VYŘEŠENY)
+
+Dokončena rozpracovaná práce z jiné agent session (`pi`/deepseek, 2026-10-27,
+`/root/elf_loader/../../tmp/session.jsonl`) — `rt_sigprocmask` (135) fallback
+emulace byla hotová ve zdroji, ale nekomitnutá a nenasazená.
+
+- Commit `dcc4a78` (po `c5f8134`): `go_handle`/L2 fallback pro 135 teď
+  emuluje masku nad `uc_sigmask` místo `-ENOSYS` (Go runtime na chybě
+  panikařil nil-derefem — `gh api`, `gh repo view`, `gh run list` padaly
+  SIGSEGV rc=139 i po opravě 439/clone3).
+- Push + `tools/gh_build_deploy.sh` (run `40619979575`, NDK, 825448 B) —
+  nasazeno. **Pozor:** `gh run watch`/`gh run view --jq` pod `--ownall`
+  staré binárky (ale i nově někdy) padá SIGSYS intermitentně (shoduje se
+  s otevřeným nálezem „cesty se nekdy neprekladaji pod ROOTFS, vzacne/
+  časové" u L1/L2) — `gh run list`/`gh run download` bez `--jq` fungovaly
+  stabilně, použito jako workaround.
+- **Ověřeno:** `gh auth status`, `gh api user`, `gh repo view`, `gh run
+  list` — všechny OK (`rc=0`) s novým loaderem.
+
+**Vedlejší efekt:** stejná dvojice oprav (439 `-ENOSYS` patch + 135 maska
+emulace) **opravila i dřívější otevřený bug „jadx/Java pod loaderem"**
+(2026-10-16, viz výše — `Failed setting boot class path.`). `java -version`
+i `jadx --version` teď fungují (`rc=0`). Reálný test: `jadx -d <out>
+split_feature_incode_sdk.apk` (Revolut, 7 MB) — **2451 `.java` souborů**,
+1783 tříd, 24 chyb (typické i nativně, ne loader bug), výstup čitelný
+(ověřeno obsahem souboru). `base.apk` z 2026-10-16 už v `revolut/` není
+(zmizel mezi sessions), test proveden na dostupném `split_*.apk`.
+
+**Hypotéza není potvrzena mechanismem** — nebylo zjištěno/ověřeno PROČ přesně
+439/135 fix pomohl i JVM (HotSpot pravděpodobně taky naráží na `faccessat2`
+nebo `rt_sigprocmask` při startu JIT vláken/GC vláken, ale přesný call site
+nebyl trasován). Funkčně ale **obě cesty (gh, jadx) jsou teď zelené**.
