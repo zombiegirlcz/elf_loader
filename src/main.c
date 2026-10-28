@@ -382,7 +382,6 @@ static char **guest_environ(void) {
 #include "binds.h"
 #include "fakeroot.h"
 #include "l2s.h"
-#include "proot_compat.h"
 /* shim_excluded = "cesta se NEprekladu pod ROOTFS, nechat hostovou" = v tabulce
  * bindu IDENTITY shoda (host==guest). Pred binds_init (g_binds_ready=0) fallback
  * na puvodni natvrdo zapsany seznam, aby brzke volani melo stejne chovani. */
@@ -2049,6 +2048,11 @@ static int raw_path_exists(const char *path) {
     long r = shim_raw_syscall6(79, -100, (long)path, (long)st, 0x100, 0, 0);
     return r == 0;
 }
+
+/* prompt 09: AZ TADY (po raw_open/raw_read/raw_close/raw_access/
+ * shim_raw_syscall6/fp_execve) — hybridni dispatch cast potrebuje tyhle
+ * TLS-safe primitivy, viz komentar v souboru. */
+#include "proot_compat.h"
 
 /* 1 = cilova binarka je glibc ELF (PT_INTERP obsahuje "ld-linux"), tedy se
  * NESMI spustit primym bionickym execve (host nema /lib/ld-linux-aarch64.so.1),
@@ -6154,7 +6158,7 @@ static void elf_print_init_bash(int dw) {
 static int proot_compat_main(int argc, char **argv, char **envp) {
     int cmd_start = 0, root_id = 0;
     if (proot_compat_parse(argc, argv, &cmd_start, &root_id) != 0) {
-        const char *real = proot_compat_real_bin();
+        const char *real = proot_compat_real_bin_envp(envp);
         char *na[256];
         int n = 0;
         na[n++] = (char *)real;

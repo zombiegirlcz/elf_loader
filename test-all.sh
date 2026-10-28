@@ -2392,11 +2392,13 @@ category_prootcompat() {
     [ "$out2" = "0" ] || { ok=0; detail="$detail [-0 id -u: '$out2']"; }
 
     # C: argv[0]==proot detekce (symlink na loader se jmenem proot)
-    local link="$D/tmp/lx-prootcompat-proot-$$"
+    local linkdir="$D/tmp/lx-prootcompat-$$"
+    mkdir -p "$linkdir"
+    local link="$linkdir/proot"
     ln -sf "$L" "$link" 2>/dev/null
     local out3
     out3=$(ashell_out "$link -r $R -w / echo argv0-proot-ok" 2>&1)
-    rm -f "$link"
+    rm -rf "$linkdir"
     [ "$out3" = "argv0-proot-ok" ] || { ok=0; detail="$detail [argv0==proot: '$out3']"; }
 
     # D: nezname volby -> fallback na REALNY proot beze zmeny (jen pokud je
