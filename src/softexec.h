@@ -240,6 +240,7 @@ struct sx_ksigaction {
 static void sx_reset_signals(void) {
     sx_log("sig-enter");
     for (int s = 1; s <= 64; s++) {
+        sx_log_num("sig-iter", s);
         if (s == SIGKILL || s == SIGSTOP)
             continue;
         /* Synchronni signaly drzi loader (fault handler + SIGSYS pro L2/Go);
