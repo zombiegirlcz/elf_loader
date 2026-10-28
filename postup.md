@@ -6074,3 +6074,82 @@ split_feature_incode_sdk.apk` (Revolut, 7 MB) — **2451 `.java` souborů**,
 439/135 fix pomohl i JVM (HotSpot pravděpodobně taky naráží na `faccessat2`
 nebo `rt_sigprocmask` při startu JIT vláken/GC vláken, ale přesný call site
 nebyl trasován). Funkčně ale **obě cesty (gh, jadx) jsou teď zelené**.
+
+## 2026-10-28 (2) — prompt 09: proot-kompatibilní CLI + hybridní dispatch
+
+**Cíl:** appka (`ProotManager.kt`) umí vyměnit `proot` za `elf_loader` jen
+záměnou binárky; co loader neumí own-loadovat, jde pod skutečný proot.
+
+**Implementace** (`src/proot_compat.h`, zapojeno do `src/main.c`):
+
+1. `elf_loader --proot-compat <proot argv>` **a** detekce `argv[0]==proot`
+   (main() kontroluje basename argv[0] před běžným dispatchem) — obě cesty
+   vedou do `proot_compat_main()`. Parsuje `-r/--rootfs`, `-b/--bind`,
+   `-w/--cwd/--pwd`, `-0/--root-id`, `-l/--link2symlink`,
+   `-k/--kernel-release`, `--kill-on-exit`. Úspěch → `ROOTFS`/`LX_BINDS`/
+   `LX_FAKEROOT`/`LX_L2S` env + `run_ownall()` na zbytku argv (nebo
+   `$SHELL`/`/bin/bash`, když příkaz chybí). Neznámá volba nebo chybějící
+   `-r` → **celé** původní argv jde beze změny na skutečný proot
+   (`LX_PROOT_BIN`, default zkouší pár instalačních cest + `$PATH`).
+2. Hybridní dispatch v `shim_execve` (dvě větve, `elf_hybrid_needs_real_proot`
+   + `elf_hybrid_exec_proot`): binárka s cizí `e_machine`, basename v
+   `$ROOTFS/etc/lx-force-proot`, nebo (jen `ELF_LOADER_STATIC_PROOT=1`)
+   statická nativní binárka → `proot_compat_exec_real()` spustí skutečný
+   proot se **stejnými bindy** (sebranými z `binds.h` sdílené tabulky)
+   místo přímého `real execve`. Cizí arch navíc zkouší
+   `$ROOTFS/usr/bin/qemu-<arch>-static` přes `proot -q`.
+
+**Past, na kterou jsem narazil a opravil v témže kroku:** první verze
+`proot_compat_is_forced`/`elf_hybrid_needs_real_proot`/
+`proot_compat_exec_real` volala `fopen`/`fgets`/`snprintf`/`getenv`/
+`execve()` — přesně pitfall #1 z `AGENTS.md` (guest TP nesmí volat
+bionicky TLS-závislé funkce), tenhle projekt ho má za sebou už 3× (`4602b18`,
+`80c3ffd`, `c69eeac`) a teď počtvrté. Na kali rootfs (`lx-force-proot`)
+to spadlo FAULT-ENTER sig=11 přesně v `snprintf("%s/etc/lx-force-proot")`
+voláném pod guest (parrot) TP. Oprava: celá hot-path část přepsaná na čisté
+`raw_*`/`shim_str*` syscally + `pc_envp_get()` (scan `envp[]` místo
+`getenv`), `g_orig_execve` místo přímého `execve()`. CLI parser
+(`proot_compat_parse`/`proot_compat_main`) běží jen pod bionickým TP při
+startu, tam `getenv`/`setenv`/`fopen` zůstávají (bezpečné). `#include
+"proot_compat.h"` musel být přesunut za definice `raw_open`/`raw_read`/
+`raw_close`/`raw_access`/`shim_raw_syscall6`/`fp_execve` v `main.c` (header
+je používá).
+
+**Ověřeno na zařízení** (build+deploy přes `tools/gh_build_deploy.sh`,
+GitHub Actions run 40623169891):
+
+- `test-all.sh prootcompat` PASS (CLI parse + `run_ownall` dispatch,
+  `-0` → `id -u` == 0, `argv[0]==proot` detekce přes symlink, fallback na
+  skutečný proot bez pádu loaderu na neznámé volbě).
+- `--proot-compat -r $R -w / echo hello world` → `hello world` (základní
+  dispatch).
+- Bez příkazu (`SHELL=.../echo`) → spustí shell binárku bez argumentů,
+  žádný pád.
+- `lx-force-proot` na **kali** rootfs (`echo` do souboru) → `--ownall
+  $K/bin/echo` skutečně doběhl přes **reálný proot** (`forced-via-proot`
+  na stdout) — potvrzuje hybridní dispatch end-to-end, včetně sběru bindů.
+- `test-all.sh all`: 206 PASS / 4 FAIL / 31 SKIP. Všechny 4 FAIL
+  vyhodnoceny jako **nesouvisející** s touto změnou:
+  - `staticexec` — build testovací static binárky padá na `collect2:
+    cannot find 'ld'` (chybějící linker v parrot rootfs toolchainu,
+    reprodukováno izolovaně, netýká se dispatch kódu).
+  - `binds`/`procvirt`/`dw` — korelují s nahromaděnými osiřelými
+    `binds.*.tab` soubory v `~/.cache/lx` (9 navíc) z mého intenzivního
+    manuálního testování mimo test harness v téže session; smazání
+    zablokoval safety classifier (shared scratch sweep) — ponecháno na
+    uživateli. Žádná z těchto 3 kategorií se dotýká `shim_execve`/exec
+    dispatche, který tento prompt měnil.
+
+**Otevřené mezery (zapsáno i do `docs/nextgen/prechod-z-proot.md`):**
+- Hybridní dispatch **nemá** `posix_spawn`/`posix_spawnp` cestu —
+  `proot_compat_exec_real` dělá `execve` (process replace), ne fork+exec,
+  který `posix_spawn` potřebuje. V praxi vzácné (jen uv/python `ld-linux
+  --version` detekce).
+- `-k/--kernel-release` se jen spolkne, žádná emulace.
+- qemu-user cesta (`proot -q`) netestována end-to-end (žádný
+  `qemu-*-static` v dostupných rootfs) — jen logika sestavení argv.
+
+**Soubory:** `src/proot_compat.h` (nový), `src/main.c` (zapojení CLI módu
++ hybridní dispatch ve `shim_execve`), `test-all.sh` (kategorie
+`prootcompat`), `docs/nextgen/prechod-z-proot.md` (nový, krátký návod pro
+appku).
