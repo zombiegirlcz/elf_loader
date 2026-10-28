@@ -236,4 +236,13 @@ void elf_timing_mark(const char *label);
 void elf_timing_mark_us(const char *label, unsigned long long us);
 unsigned long long elf_timing_now_us(void);
 
+/* ===== prompt 11 — soft exec (src/softexec.h) =========================
+ * Ucetni globaly loaderu, ktere musi soft exec vratit do stavu ze snapshotu. */
+void elf_sx_fake_blocks(void **g, size_t *gn, void **ro, size_t *ron);
+void *elf_sx_brk_get(void);
+void elf_sx_brk_set(void *p);
+size_t elf_sx_pending_count(void);
+void elf_sx_pending_truncate(size_t n);
+void elf_sx_tls_truncate(size_t n, uintptr_t next);
+
 #endif

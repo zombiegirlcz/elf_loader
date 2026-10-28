@@ -7026,3 +7026,47 @@ void elf_unload(elf_object_t *obj) {
     cache_module_free((cache_module_t *)obj->cache);
     free(obj);
 }
+/* ===== prompt 11 — soft exec: pristupy k loaderovym ucetnim globalum ======
+ * Soft exec (src/softexec.h) obnovuje "pristine" stav guest glibc porizeny
+ * v run_ownall. Krome RW segmentu modulu musi vratit i falesne _rtld_global /
+ * _rtld_global_ro bloky (jsou v .bss LOADERU, ne v modulu) a ucetni globaly,
+ * ktere drzi stav "co uz je nacteno" - jinak by se nove exe registrovalo
+ * nad zbytky predchoziho programu. */
+void elf_sx_fake_blocks(void **g, size_t *gn, void **ro, size_t *ron) {
+    if (g) *g = ldso_global;
+    if (gn) *gn = sizeof ldso_global;
+    if (ro) *ro = ldso_ro;
+    if (ron) *ron = sizeof ldso_ro;
+}
+
+void *elf_sx_brk_get(void) {
+    ldso_private_heap_init();
+    return parrot_brk_cur;
+}
+
+void elf_sx_brk_set(void *p) {
+    if (p)
+        parrot_brk_cur = (char *)p;
+}
+
+size_t elf_sx_pending_count(void) { return g_pending_count; }
+
+void elf_sx_pending_truncate(size_t n) {
+    if (n <= g_pending_count)
+        g_pending_count = n;
+}
+
+/* Moduly nactene AZ PO snapshotu (dlopen v predchozim programu) z TLS
+ * registru odstranime, aby novy exe nedostal jejich offsety do DTV.
+ * Moduly ze snapshotu se NEprecisluji - modid je index v tomhle poli a
+ * glibc ho ma zapsany v relokovanych GOT slotech (ty se obnovuji ze
+ * snapshotu, takze musi odpovidat). */
+void elf_sx_tls_truncate(size_t n, uintptr_t next) {
+    if (n > g_tls_mod_count)
+        return;
+    for (size_t i = n; i < g_tls_mod_count; i++)
+        g_tls_mods[i] = NULL;
+    g_tls_mod_count = n;
+    if (next)
+        g_tls_next = next;
+}

@@ -2054,6 +2054,20 @@ static int raw_path_exists(const char *path) {
  * TLS-safe primitivy, viz komentar v souboru. */
 #include "proot_compat.h"
 
+/* prompt 11 (soft exec): definice az v src/softexec.h (potrebuje procvirt),
+ * shim_execve je ale nad nim. */
+static int softexec_try(const char *path, char *const argv[], char *const envp[]);
+static void softexec_capture(elf_scope_t *scope);
+
+/* vfork(2) sdili pamet s rodicem: soft exec by v takovem "ditetu" prepsal
+ * glibc stav RODICE. Pod ELF_LOADER_SOFTEXEC=1 proto vfork/__vfork
+ * prepiseme na obycejny fork (raw clone(SIGCHLD)) - stejne jako to delaji
+ * jine sandboxy. Vraci se jen ztrata "rodic ceka na exec", na kterou se
+ * podle POSIXu stejne nesmi spolehat. Raw syscall => bezpecne pod guest TP. */
+static int shim_vfork(void) {
+    return (int)shim_raw_syscall6(220 /*clone*/, 17 /*SIGCHLD*/, 0, 0, 0, 0, 0);
+}
+
 /* 1 = cilova binarka je glibc ELF (PT_INTERP obsahuje "ld-linux"), tedy se
  * NESMI spustit primym bionickym execve (host nema /lib/ld-linux-aarch64.so.1),
  * ale MUSI projit pres loader - i kdyz lezi MIMO ROOTFS (napr. uv managed
@@ -2725,6 +2739,11 @@ static int shim_execve(const char *p, char *const argv[], char *const envp[]) {
         return rf ? rf(p, argv, envp) : -1;
     }
     wl_log_exec(p, chkpath, is_script, interp);
+
+    /* prompt 11 — soft exec: vymena programu uvnitr procesu misto re-execu
+     * loaderu. Vraci se jen kdyz se nepouzil (podminky v src/softexec.h). */
+    if (!is_script)
+        softexec_try(chkpath, argv, envp);
 
     char *na[512];
     int narg = 0;
@@ -3416,6 +3435,7 @@ static int shim_setdomainname(const char *n, size_t l) {
 
 #include "procvirt.h"
 #include "l1.h"
+#include "softexec.h"   /* prompt 11: soft exec (ELF_LOADER_SOFTEXEC=1) */
 
 static FILE *shim_fopen(const char *p, const char *mode) {
     char b[8192]; const char *path = p; if (shim_translate(p, b, sizeof b)) path = b;
@@ -4588,6 +4608,11 @@ static int run_ownall(const char *path, int argc, char **argv, char **envp) {
      * V8/node instaluje sve handlery a nas fault dump se nezobrazi). */
     if (!getenv("ELF_LOADER_NO_SA_OVERRIDE"))
         elf_register_override("sigaction", (void *)diag_wrapped_sigaction);
+    /* prompt 11: viz komentar u shim_vfork */
+    if (getenv("ELF_LOADER_SOFTEXEC")) {
+        elf_register_override("vfork", (void *)shim_vfork);
+        elf_register_override("__vfork", (void *)shim_vfork);
+    }
 
 
     if (!g_exec_mode) g_exec_mode = "--ownall";
@@ -4924,6 +4949,11 @@ static int run_ownall(const char *path, int argc, char **argv, char **envp) {
     if (stacksize_sym) {
         *(size_t *)stacksize_sym = 8 * 1024 * 1024;
     }
+
+    /* prompt 11 — soft exec: pristine snapshot RW stavu guest glibc. Tady uz
+     * jsou vsechny zavislosti nactene, zrelokovane a zahakovane, ale exe do
+     * glibc jeste nesahl (COPY relokace, inity, link mapa, TLS). */
+    softexec_capture(scope);
 
     if (elf_relocate(obj) != 0) {
         fprintf(stderr, "[-] Relocation failed\n");
