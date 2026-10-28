@@ -6149,8 +6149,29 @@ a běžící `claude`), takže smazání by rozbilo bind tabulku aktivního
 shellu. Mazat jen tabulky, jejichž pid už neexistuje (`[ -d /proc/$pid ]`),
 a root-owned nechat být.
 
-**Zbývá otevřené:** `mapsleak=1` v `procvirt` a `dw/flip` HOME —
-samostatné, pre-existující nálezy; `staticexec` root cause neizolován.
+**Oprava téhož dne (2026-10-28, běh sady přes `ashell -c`):** `mapsleak=1`
+a `dw/flip` **nejsou nálezy** — byl to **artefakt mého měření**. Kategorie
+jsem pouštěl přímo z proot/host shellu, ne přes `ashell -c`, což je přesně
+to, proti čemu varuje pravidlo „jediný platný test je `ashell -c`".
+V korektním běhu (`ashell -c "… --ownall $R/bin/bash … test-all.sh all"`):
+
+```
+PASS: 207   FAIL: 1   SKIP: 33
+```
+
+- `procvirt` **12/12** (žádný `mapsleak`), `dw` **setid i flip PASS**,
+  `binds` **6/6 včetně „GC tabulek"**, `prootcompat` PASS.
+- `staticexec` → **SKIP** („static build failed" — bez guest PATH nenajde
+  gcc `ld`), tj. přesně jak je popsáno výše; jako FAIL vyleze jen při
+  samostatném běhu kategorie s funkčním PATH.
+- Jediný FAIL: `nslookup localhost` → `NXDOMAIN` z 8.8.8.8 — prostředí
+  (DNS/NSS neumí `localhost` přes veřejný resolver), ne regrese loaderu.
+- Osiřelé `binds.*.tab` **uklidil GC sám**, jak pidy zmizely — ruční
+  mazání (které chtěl prompt-09 agent) nebylo vůbec potřeba.
+
+**Zbývá otevřené:** jen úprava samotného testu `staticexec` (omezit na
+přímé spuštění loaderem, nebo known-limit SKIP, nebo doplnit re-instalaci
+SIGSYS handleru po reálném exec — to je samostatná práce).
 
 **Otevřené mezery (zapsáno i do `docs/nextgen/prechod-z-proot.md`):**
 - Hybridní dispatch **nemá** `posix_spawn`/`posix_spawnp` cestu —
