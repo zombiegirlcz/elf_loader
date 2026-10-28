@@ -382,6 +382,7 @@ static char **guest_environ(void) {
 #include "binds.h"
 #include "fakeroot.h"
 #include "l2s.h"
+#include "proot_compat.h"
 /* shim_excluded = "cesta se NEprekladu pod ROOTFS, nechat hostovou" = v tabulce
  * bindu IDENTITY shoda (host==guest). Pred binds_init (g_binds_ready=0) fallback
  * na puvodni natvrdo zapsany seznam, aby brzke volani melo stejne chovani. */
@@ -2110,6 +2111,65 @@ static int elf_needs_real_exec(const char *path) {
     return !is_glibc_elf(path);
 }
 
+#ifndef EM_AARCH64
+#define EM_AARCH64 183
+#endif
+
+/* e_machine z ELF headeru (0 pri chybe/necteni). TLS-safe, jen raw_*. */
+static unsigned short elf_read_machine(const char *path) {
+    int fd = raw_open(path, O_RDONLY);
+    if (fd < 0) return 0;
+    unsigned char h[20];
+    ssize_t n = raw_read(fd, h, sizeof h);
+    raw_close(fd);
+    if (n < 20 || h[0] != 0x7f) return 0;
+    return (unsigned short)(h[18] | (h[19] << 8));  /* LE offset 18 */
+}
+
+/* basename bez alokace — ukazuje do stejneho bufferu jako p. */
+static const char *elf_shim_basename(const char *p) {
+    const char *b = p;
+    for (const char *s = p; *s; s++)
+        if (*s == '/') b = s + 1;
+    return b;
+}
+
+/* prompt 09 — hybridni dispatch: 1 = tuto binarku (uz vime, ze
+ * elf_needs_real_exec()==1, tzn. bez PT_INTERP nebo neni glibc) posli pod
+ * REALNY proot (proot_compat_exec_real), misto primeho real execve.
+ * Rozhoduje:
+ *  - cizi e_machine (loader umi jen EM_AARCH64) -> vzdy;
+ *  - basename v $ROOTFS/etc/lx-force-proot -> vzdy;
+ *  - staticka NATIVNI (aarch64) ELF jinak zustava na primem real execve
+ *    (ashell/su_wrapper a dalsi bionicke testovaci nastroje v rootfs to
+ *    chteji) - ELF_LOADER_STATIC_PROOT=1 tuto vetev prepne take na proot
+ *    (test-all.sh prootcompat kategorie pro staticke binarky bez L2). */
+static int elf_hybrid_needs_real_proot(const char *path) {
+    if (!path || !path[0]) return 0;
+    unsigned short mach = elf_read_machine(path);
+    if (mach && mach != EM_AARCH64) return 1;
+    if (g_shim_root && proot_compat_is_forced(g_shim_root, elf_shim_basename(path)))
+        return 1;
+    const char *sp = getenv("ELF_LOADER_STATIC_PROOT");
+    if (sp && sp[0] && shim_strcmp(sp, "0") != 0) return 1;
+    return 0;
+}
+
+/* proot_compat_exec_real() + auto -q qemu-<arch>-static pro cizi e_machine
+ * (ukol 3 — "cizi architektura: pokud je v rootfs qemu-<arch>-static,
+ * pouzit ho"). Volano jen z hybridni vetve (uz vime elf_needs_real_exec). */
+static void elf_hybrid_exec_proot(const char *path, char *const *argv,
+                                   char *const *envp) {
+    unsigned short mach = elf_read_machine(path);
+    const char *qemu = (mach && mach != EM_AARCH64)
+                           ? proot_compat_qemu_bin(g_shim_root, mach)
+                           : NULL;
+    char *extra[2];
+    int nextra = 0;
+    if (qemu) { extra[nextra++] = (char *)"-q"; extra[nextra++] = (char *)qemu; }
+    proot_compat_exec_real(g_shim_root, extra, nextra, path, argv, envp);
+}
+
 /* TLS-safe symlink resolver for paths under ROOTFS. Resolves symlink chains
  * where targets are guest-absolute (e.g. /etc/alternatives/awk -> /usr/bin/mawk)
  * by prepending ROOTFS to absolute targets. Returns 1 if resolved, 0 if not a
@@ -2504,6 +2564,11 @@ static int shim_execve(const char *p, char *const argv[], char *const envp[]) {
          * PT_INTERP/TLS layout). Skripty (#!) nejsou ELF, projdou beze zmeny
          * na shebang-handling nize. */
         if (elf_needs_real_exec(p)) {
+            /* prompt 09 — hybridni dispatch: co loader neumi (cizi arch,
+             * lx-force-proot, nebo ELF_LOADER_STATIC_PROOT=1) jde pod
+             * realny proot se stejnymi bindy misto primeho real execve. */
+            if (elf_hybrid_needs_real_proot(p))
+                elf_hybrid_exec_proot(p, argv, envp);
             fp_execve f = (fp_execve)g_orig_execve;
             return f ? f(p, argv, envp) : -1;
         }
@@ -2589,6 +2654,8 @@ static int shim_execve(const char *p, char *const argv[], char *const envp[]) {
      * zadana jako "$ROOTFS/usr/local/bin/su_wrapper" bezela. force_redirect
      * znaci glibc ELF mimo ROOTFS, ktery uz is_glibc_elf() prosel. */
     if (!force_redirect && resolved[0] && elf_needs_real_exec(resolved)) {
+        if (elf_hybrid_needs_real_proot(resolved))
+            elf_hybrid_exec_proot(resolved, argv, envp);
         fp_execve fr = (fp_execve)g_orig_execve;
         return fr ? fr(resolved, argv, envp) : -1;
     }
@@ -6076,6 +6143,77 @@ static void elf_print_init_bash(int dw) {
         stdout);
 }
 
+/* prompt 09 — proot-kompatibilni CLI: `elf_loader --proot-compat <proot argv>`
+ * nebo detekce argv[0]==proot (viz main()). Rozparsuje -r/-b/-w/-0/-l/-k/
+ * --kill-on-exit (proot_compat_parse, src/proot_compat.h), promitne do
+ * ROOTFS/LX_BINDS/LX_FAKEROOT/LX_L2S a zbytek argv dispatchne jako
+ * run_ownall(<cmd>). Nezname volby -> cele puvodni volani realnemu prootu
+ * beze zmeny (appka nikdy nedostane "unknown option" na necem, co
+ * proot-compat jeste nepokryva). argc/argv NEOBSAHUJE argv[0] (nazev
+ * loaderu/proot) — jen proot-style argumenty. */
+static int proot_compat_main(int argc, char **argv, char **envp) {
+    int cmd_start = 0, root_id = 0;
+    if (proot_compat_parse(argc, argv, &cmd_start, &root_id) != 0) {
+        const char *real = proot_compat_real_bin();
+        char *na[256];
+        int n = 0;
+        na[n++] = (char *)real;
+        for (int i = 0; i < argc && n < 254; i++) na[n++] = argv[i];
+        na[n] = NULL;
+        execve(real, na, envp);
+        fprintf(stderr, "elf_loader: proot-compat: execve(%s) failed: %s "
+                "(nastav LX_PROOT_BIN na skutecny proot)\n", real, strerror(errno));
+        return 127;
+    }
+
+    const char *rootfs = getenv("ROOTFS");
+    char *cmd_argv[64];
+    int ncmd = 0;
+    if (cmd_start < argc) {
+        for (int i = cmd_start; i < argc && ncmd < 62; i++)
+            cmd_argv[ncmd++] = argv[i];
+    } else {
+        /* proot bez prikazu = interaktivni shell v rootu */
+        const char *sh = getenv("SHELL");
+        static char shbuf[512];
+        if (sh && sh[0]) {
+            shbuf[0] = 0;
+            strncpy(shbuf, sh, sizeof shbuf - 1);
+        } else {
+            strcpy(shbuf, "/bin/bash");
+        }
+        cmd_argv[ncmd++] = shbuf;
+    }
+    cmd_argv[ncmd] = NULL;
+
+    const char *cwd = getenv("ELF_LOADER_PROOT_CWD");
+    if (cwd && cwd[0] && rootfs && rootfs[0]) {
+        char full[4096];
+        snprintf(full, sizeof full, "%s%s", rootfs, cwd);
+        if (chdir(full) != 0)
+            chdir(rootfs);
+    } else if (rootfs && rootfs[0]) {
+        chdir(rootfs);
+    }
+
+    /* cmd_argv[0] resolvovat na absolutni cestu PODLE ROOTFS, pokud neni
+     * uz absolutni/relativni se '/' - run_ownall() neprohledava PATH. */
+    static char resolved_cmd[4096];
+    const char *path0 = cmd_argv[0];
+    if (rootfs && rootfs[0] && path0 && !strchr(path0, '/')) {
+        static const char *cands[] = { "/bin/", "/usr/bin/", "/usr/local/bin/", NULL };
+        for (int i = 0; cands[i]; i++) {
+            snprintf(resolved_cmd, sizeof resolved_cmd, "%s%s%s", rootfs, cands[i], path0);
+            if (access(resolved_cmd, X_OK) == 0) { path0 = resolved_cmd; break; }
+        }
+    } else if (rootfs && rootfs[0] && path0 && path0[0] == '/') {
+        snprintf(resolved_cmd, sizeof resolved_cmd, "%s%s", rootfs, path0);
+        if (access(resolved_cmd, X_OK) == 0) path0 = resolved_cmd;
+    }
+    (void)root_id;
+    return run_ownall(path0, ncmd, cmd_argv, envp);
+}
+
 int main(int argc, char **argv, char **envp) {
     /* Kernelova oblast argv (arg_start..arg_end) pro procvirt_rewrite_argarea:
      * hranice ted, nez se na argv sahne (guest argv je tataz pole). Jen kdyz
@@ -6129,6 +6267,17 @@ int main(int argc, char **argv, char **envp) {
     if (argc < 2) {
         print_help(argv[0]);
         return 1;
+    }
+
+    /* prompt 09: appka vymenila "proot" za loader jen zamenou binarky ->
+     * argv[0] basename == proot znamena CELE argv[1..] je proot syntaxe
+     * (bez --lazy/--argv0 prefixu, ty proot nezna). */
+    {
+        const char *b = argv[0];
+        for (const char *s = argv[0]; s && *s; s++)
+            if (*s == '/') b = s + 1;
+        if (b && strcmp(b, "proot") == 0)
+            return proot_compat_main(argc - 1, &argv[1], envp);
     }
 
     int ai = 1;
@@ -6261,6 +6410,10 @@ int main(int argc, char **argv, char **envp) {
         }
         return run_own(argv[ai + 1], argv[ai + 2], argc - (ai + 3),
                        &argv[ai + 3], envp);
+    }
+
+    if (strcmp(argv[ai], "--proot-compat") == 0) {
+        return proot_compat_main(argc - (ai + 1), &argv[ai + 1], envp);
     }
 
     if (strcmp(argv[ai], "--ownall") == 0) {

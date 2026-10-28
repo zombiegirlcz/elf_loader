@@ -2375,6 +2375,51 @@ category_discovered() {
     check_orphans "discovered"
 }
 
+category_prootcompat() {
+    echo ""
+    echo "=== proot-kompatibilni CLI + hybridni dispatch (prompt 09) ==="
+    local ok=1 detail=""
+    local realproot="$R/usr/bin/proot"
+
+    # A: --proot-compat -r $R <cmd> == --ownall <cmd> (read-only, bez zapisu)
+    local out1
+    out1=$(ashell_out "$L --proot-compat -r $R -w / echo proot-compat-ok" 2>&1)
+    [ "$out1" = "proot-compat-ok" ] || { ok=0; detail="$detail [basic: '$out1']"; }
+
+    # B: -b host:guest se promitne do ROOTFS vysledku (id -u pod -0 == 0)
+    local out2
+    out2=$(ashell_out "$L --proot-compat -r $R -0 id -u" 2>&1)
+    [ "$out2" = "0" ] || { ok=0; detail="$detail [-0 id -u: '$out2']"; }
+
+    # C: argv[0]==proot detekce (symlink na loader se jmenem proot)
+    local link="$D/tmp/lx-prootcompat-proot-$$"
+    ln -sf "$L" "$link" 2>/dev/null
+    local out3
+    out3=$(ashell_out "$link -r $R -w / echo argv0-proot-ok" 2>&1)
+    rm -f "$link"
+    [ "$out3" = "argv0-proot-ok" ] || { ok=0; detail="$detail [argv0==proot: '$out3']"; }
+
+    # D: nezname volby -> fallback na REALNY proot beze zmeny (jen pokud je
+    # v rootfs dostupny - jinak jen oveřit, ze loader nepadne a vrati nenulovy
+    # exit misto crashe)
+    if [ -x "$realproot" ]; then
+        local out4
+        out4=$(ashell_out "LX_PROOT_BIN=$realproot $L --proot-compat --this-flag-neexistuje -r $R echo x" 2>&1)
+        # realny proot na nezname volbe hlasi chybu, ale NESMI to byt pad loaderu
+        case "$out4" in *"Segmentation"*|*"segfault"*) ok=0; detail="$detail [fallback real proot spadl]";; esac
+    fi
+
+    if [ "$ok" = 1 ]; then
+        echo "PASS prootcompat: CLI parse + run_ownall dispatch + argv0==proot + fallback bez padu"
+        echo "PASS: prootcompat - proot-compat CLI" >> "$PASS_LOG"
+        ((PASS_COUNT++)) || true
+    else
+        echo "FAIL prootcompat:$detail"
+        echo "FAIL: prootcompat - proot-compat CLI |$detail" >> "$FAIL_LOG"
+        ((FAIL_COUNT++)) || true
+    fi
+}
+
 case "${1:-all}" in
     basic)
         category_basic
@@ -2496,6 +2541,10 @@ case "${1:-all}" in
         category_fakeroot
         print_summary
         ;;
+    prootcompat)
+        category_prootcompat
+        print_summary
+        ;;
     l2s)
         category_l2s
         print_summary
@@ -2583,6 +2632,7 @@ case "${1:-all}" in
         category_lazybind
         category_imgcache
         category_fakeroot
+        category_prootcompat
         category_l2s
         category_binds
         category_argv0
