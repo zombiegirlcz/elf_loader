@@ -209,6 +209,7 @@ struct sx_ksigaction {
 };
 
 static void sx_reset_signals(void) {
+    sx_log("sig-enter");
     for (int s = 1; s <= 64; s++) {
         if (s == SIGKILL || s == SIGSTOP)
             continue;
@@ -228,10 +229,12 @@ static void sx_reset_signals(void) {
         shim_memset(&act, 0, sizeof act);
         shim_raw_syscall6(134, s, (long)(unsigned long)&act, 0, 8, 0, 0);
     }
+    sx_log("sig-loop-end");
     struct { void *sp; int flags; int pad; size_t size; } ss;
     shim_memset(&ss, 0, sizeof ss);
     ss.flags = 2;   /* SS_DISABLE */
     shim_raw_syscall6(132 /*sigaltstack*/, (long)(unsigned long)&ss, 0, 0, 0, 0, 0);
+    sx_log("sig-altstack-done");
     struct { long sec, usec, isec, iusec; } itv;
     shim_memset(&itv, 0, sizeof itv);
     for (int w = 0; w < 3; w++)
@@ -363,9 +366,11 @@ static int softexec_try(const char *path, char *const argv[], char *const envp[]
     sx_log("restore-begin");
     softexec_restore();
     sx_log("restore-done");
-    sx_close_cloexec();
+    if (!getenv("ELF_LOADER_SOFTEXEC_SKIP_FD"))
+        sx_close_cloexec();
     sx_log("fds-done");
-    sx_reset_signals();
+    if (!getenv("ELF_LOADER_SOFTEXEC_SKIP_SIG"))
+        sx_reset_signals();
     sx_log("signals-done");
 
     elf_scope_t *scope = g_sx_scope;
