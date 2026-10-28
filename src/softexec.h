@@ -61,12 +61,39 @@ static elf_scope_t *g_sx_scope;
 static int      g_sx_trace;
 static int      g_sx_l2;         /* elf_l2_enabled() v dobe capture (getenv chce host TP) */
 
+/* Trasa jde na stderr i do souboru: pri zatuhnuti se stderr (roura ashellu)
+ * nemusi dostat ven. Cesta = $ELF_LOADER_SOFTEXEC_TRACE, kdyz zacina '/'. */
+static const char *g_sx_logfile;
+
 static void sx_log(const char *msg) {
     if (!g_sx_trace) return;
     static const char pfx[] = "[softexec] ";
     shim_raw_syscall6(64, 2, (long)(unsigned long)pfx, sizeof(pfx) - 1, 0, 0, 0);
     shim_raw_syscall6(64, 2, (long)(unsigned long)msg, shim_strlen(msg), 0, 0, 0);
     shim_raw_syscall6(64, 2, (long)(unsigned long)"\n", 1, 0, 0, 0);
+    if (g_sx_logfile) {
+        int fd = (int)shim_raw_syscall6(56, -100, (long)(unsigned long)g_sx_logfile,
+                                        0x441 /*O_WRONLY|O_CREAT|O_APPEND*/, 0644, 0, 0);
+        if (fd >= 0) {
+            shim_raw_syscall6(64, fd, (long)(unsigned long)msg, shim_strlen(msg), 0, 0, 0);
+            shim_raw_syscall6(64, fd, (long)(unsigned long)"\n", 1, 0, 0, 0);
+            shim_raw_syscall6(57, fd, 0, 0, 0, 0, 0);
+        }
+    }
+}
+
+static void sx_log_num(const char *msg, long v) {
+    if (!g_sx_trace) return;
+    char b[96]; int i = 0;
+    while (*msg && i < 64) b[i++] = *msg++;
+    b[i++] = '=';
+    if (v < 0) { b[i++] = '-'; v = -v; }
+    char t[24]; int ti = 0;
+    if (!v) t[ti++] = '0';
+    while (v > 0) { t[ti++] = (char)('0' + v % 10); v /= 10; }
+    while (ti > 0) b[i++] = t[--ti];
+    b[i] = 0;
+    sx_log(b);
 }
 
 static int softexec_enabled(void) {
@@ -74,7 +101,9 @@ static int softexec_enabled(void) {
     if (v < 0) {
         const char *e = getenv("ELF_LOADER_SOFTEXEC");
         v = (e && e[0] && e[0] != '0') ? 1 : 0;
-        g_sx_trace = getenv("ELF_LOADER_SOFTEXEC_TRACE") != NULL;
+        const char *t = getenv("ELF_LOADER_SOFTEXEC_TRACE");
+        g_sx_trace = (t != NULL);
+        g_sx_logfile = (t && t[0] == '/') ? t : NULL;
     }
     return v;
 }
@@ -225,9 +254,11 @@ static void sx_reset_signals(void) {
             continue;
         if (old.handler == (void *)0 || old.handler == (void *)1)  /* DFL/IGN */
             continue;
+        sx_log_num("sig-reset", s);
         struct sx_ksigaction act;
         shim_memset(&act, 0, sizeof act);
         shim_raw_syscall6(134, s, (long)(unsigned long)&act, 0, 8, 0, 0);
+        sx_log_num("sig-reset-ok", s);
     }
     sx_log("sig-loop-end");
     struct { void *sp; int flags; int pad; size_t size; } ss;
@@ -381,7 +412,13 @@ static int softexec_try(const char *path, char *const argv[], char *const envp[]
 
     size_t mods_before = scope->count;
     sx_log("load-begin");
+    /* run_ownall po nacteni exe nuluje elf_own_scope; bez obnoveni by novy
+     * exe nemel scope a vsechny importy (stdout, program_invocation_*) by
+     * zustaly nerelokovane (GOT = 0 -> skok na pc=0 v __libc_init_first). */
+    elf_own_deps = 1;
+    elf_own_scope = scope;
     elf_object_t *obj = elf_load(path);
+    elf_own_scope = NULL;
     sx_log("load-done");
     if (!obj || elf_relocate(obj) != 0) {
         static const char m[] = "[softexec] FATAL: nelze nacist cil\n";
