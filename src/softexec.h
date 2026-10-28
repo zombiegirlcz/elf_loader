@@ -360,9 +360,13 @@ static int softexec_try(const char *path, char *const argv[], char *const envp[]
 
     /* ---- bod, odkud neni navratu ---- */
     g_loader_active = 1;
+    sx_log("restore-begin");
     softexec_restore();
+    sx_log("restore-done");
     sx_close_cloexec();
+    sx_log("fds-done");
     sx_reset_signals();
+    sx_log("signals-done");
 
     elf_scope_t *scope = g_sx_scope;
     elf_init_argc = argc;
@@ -371,17 +375,21 @@ static int softexec_try(const char *path, char *const argv[], char *const envp[]
     shim_strcpy(g_guest_exe_path, sizeof(g_guest_exe_path), path);
 
     size_t mods_before = scope->count;
+    sx_log("load-begin");
     elf_object_t *obj = elf_load(path);
+    sx_log("load-done");
     if (!obj || elf_relocate(obj) != 0) {
         static const char m[] = "[softexec] FATAL: nelze nacist cil\n";
         shim_raw_syscall6(64, 2, (long)(unsigned long)m, sizeof(m) - 1, 0, 0, 0);
         shim_raw_syscall6(94 /*exit_group*/, 127, 0, 0, 0, 0, 0);
     }
+    sx_log("reloc-done");
     elf_queue_module_inits(obj);
     g_exe_base = (uintptr_t)obj->base_addr;
     scope->exe = obj;
     ldso_install_exe_linkmap(obj, path);
     ldso_install_module_list(scope->mods, scope->count);
+    sx_log("linkmap-done");
 
     /* Nove nactene moduly (nova zavislost cile) jeste nemaji prepsane
      * svc #0 ani L1 stuby; u uz nactenych je flag svc_patched/l1_patched. */
@@ -399,6 +407,7 @@ static int softexec_try(const char *path, char *const argv[], char *const envp[]
         }
     }
 
+    sx_log("patch-done");
     if (!getenv("ELF_LOADER_NO_PROCVIRT")) {
         const char *bn = path;
         for (const char *q = path; *q; q++) if (*q == '/') bn = q + 1;
@@ -408,10 +417,13 @@ static int softexec_try(const char *path, char *const argv[], char *const envp[]
         procvirt_rewrite_argarea(g_karg_start, g_karg_end, argc, nargv);
     }
 
+    sx_log("procvirt-done");
     g_loader_active = 0;
     elf_setup_own_tls(obj, scope);
+    sx_log("tls-done");
     /* execve zachovava masku blokovanych signalu volajiciho */
     shim_raw_syscall6(135, SIG_SETMASK, (long)(unsigned long)&oldmask, 0, 8, 0, 0);
+    sx_log("run");
     elf_run(obj, argc, nargv, nenvp);
     shim_raw_syscall6(94, 127, 0, 0, 0, 0, 0);
     return 0;
