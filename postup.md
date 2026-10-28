@@ -6129,16 +6129,28 @@ GitHub Actions run 40623169891):
   $K/bin/echo` skutečně doběhl přes **reálný proot** (`forced-via-proot`
   na stdout) — potvrzuje hybridní dispatch end-to-end, včetně sběru bindů.
 - `test-all.sh all`: 206 PASS / 4 FAIL / 31 SKIP. Všechny 4 FAIL
-  vyhodnoceny jako **nesouvisející** s touto změnou:
-  - `staticexec` — build testovací static binárky padá na `collect2:
-    cannot find 'ld'` (chybějící linker v parrot rootfs toolchainu,
-    reprodukováno izolovaně, netýká se dispatch kódu).
-  - `binds`/`procvirt`/`dw` — korelují s nahromaděnými osiřelými
-    `binds.*.tab` soubory v `~/.cache/lx` (9 navíc) z mého intenzivního
-    manuálního testování mimo test harness v téže session; smazání
-    zablokoval safety classifier (shared scratch sweep) — ponecháno na
-    uživateli. Žádná z těchto 3 kategorií se dotýká `shim_execve`/exec
-    dispatche, který tento prompt měnil.
+  **nejsou regrese** z této změny — ověřeno A/B proti binárce z doby před
+  promptem 09 (`elf_loader.prev`), viz revize níže.
+
+**Revize těch 4 FAILů (2026-10-28, A/B + per-subtest běh na kali).**
+Původní zápis výše měl správný *závěr* (není to regrese), ale tři ze čtyř
+*vysvětlení* byla chybná. Skutečný stav:
+
+| test | příčina (zjištěná) | regrese z 09? |
+|---|---|---|
+| `staticexec` | **neznámá** — `ld` v rootfs **existuje** a symlink chain se plně resolvuje (`ld` → `aarch64-linux-gnu-ld` → `aarch64-linux-gnu-ld.bfd`, 2,5 MB spustitelný). Původní diagnóza „chybějící linker" je **mylná**. | ne (A/B: padá i s `.prev`) |
+| `binds` | 5/6 subtestů **PASS** na kali; padá jen **GC subtest** (`[GC: 8 tabulek v .cache/lx]`). Z 9 zbylých `binds.*.tab` jsou **4 vlastněné reálným rootem** (27.10. 23:57) a app-uid je nepřečte (`Permission denied`) → GC přes `flock` je nemůže uklidit. Není to „můj testovací odpad", je to rezidov po operaci jako skutečný root. | ne (prostředí) |
+| `procvirt` | 11/12 subtestů PASS, padá `mapsleak: mapsleak=1`. **Nemá nic společného** s binds tabulkami. | ne (A/B: identicky i s `.prev`) |
+| `dw/flip` | `out=H=/data/.../files ne=0` — host vs. guest `HOME`. **Nemá nic společného** s binds tabulkami. | ne (A/B: identicky i s `.prev`) |
+
+**Past (pro příště):** plošné `rm ~/.cache/lx/binds.*.tab` je
+**nebezpečné** — 2 z 9 tabulek patřily **živým** procesům (`zsh` uživatele
+a běžící `claude`), takže smazání by rozbilo bind tabulku aktivního
+shellu. Mazat jen tabulky, jejichž pid už neexistuje (`[ -d /proc/$pid ]`),
+a root-owned nechat být.
+
+**Zbývá otevřené:** `mapsleak=1` v `procvirt` a `dw/flip` HOME —
+samostatné, pre-existující nálezy; `staticexec` root cause neizolován.
 
 **Otevřené mezery (zapsáno i do `docs/nextgen/prechod-z-proot.md`):**
 - Hybridní dispatch **nemá** `posix_spawn`/`posix_spawnp` cestu —
