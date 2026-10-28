@@ -6138,7 +6138,7 @@ Původní zápis výše měl správný *závěr* (není to regrese), ale tři ze
 
 | test | příčina (zjištěná) | regrese z 09? |
 |---|---|---|
-| `staticexec` | **neznámá** — `ld` v rootfs **existuje** a symlink chain se plně resolvuje (`ld` → `aarch64-linux-gnu-ld` → `aarch64-linux-gnu-ld.bfd`, 2,5 MB spustitelný). Původní diagnóza „chybějící linker" je **mylná**. | ne (A/B: padá i s `.prev`) |
+| `staticexec` | **izolováno**, viz rozbor níže. Původní diagnóza „chybějící linker" je **mylná**: `ld` existuje a chain se plně resolvuje (`ld` → `aarch64-linux-gnu-ld` → `aarch64-linux-gnu-ld.bfd`, 2,5 MB), build s guest PATH projde (704 KB binárka). | ne (A/B až k 2026-10-22) |
 | `binds` | 5/6 subtestů **PASS** na kali; padá jen **GC subtest** (`[GC: 8 tabulek v .cache/lx]`). Z 9 zbylých `binds.*.tab` jsou **4 vlastněné reálným rootem** (27.10. 23:57) a app-uid je nepřečte (`Permission denied`) → GC přes `flock` je nemůže uklidit. Není to „můj testovací odpad", je to rezidov po operaci jako skutečný root. | ne (prostředí) |
 | `procvirt` | 11/12 subtestů PASS, padá `mapsleak: mapsleak=1`. **Nemá nic společného** s binds tabulkami. | ne (A/B: identicky i s `.prev`) |
 | `dw/flip` | `out=H=/data/.../files ne=0` — host vs. guest `HOME`. **Nemá nic společného** s binds tabulkami. | ne (A/B: identicky i s `.prev`) |
@@ -6165,3 +6165,55 @@ samostatné, pre-existující nálezy; `staticexec` root cause neizolován.
 + hybridní dispatch ve `shim_execve`), `test-all.sh` (kategorie
 `prootcompat`), `docs/nextgen/prechod-z-proot.md` (nový, krátký návod pro
 appku).
+
+### staticexec — root cause izolován (2026-10-28)
+
+Scénář testu: static glibc binárka (`gcc -static -no-pie`) v rootfs, spuštěná
+**z own-loadovaného guest bashe** (`$L --ownall $R/bin/bash -c '<cesta>'`).
+
+Měření (parrot, binárka 704 KB, `puts("STATIC-OK")`):
+
+| způsob spuštění | výsledek |
+|---|---|
+| `$L --ownall $R/tmp/sx1/s` (přímo loaderem) | **STATIC-OK, RC=0** |
+| `$L --ownall $R/bin/bash -c '/tmp/sx1/s'` (guest-abs) | SIGSYS, **RC=159** |
+| `$L --ownall $R/bin/bash -c '$R/tmp/sx1/s'` (ROOTFS-abs) | SIGSYS, **RC=159** |
+| totéž s `ELF_LOADER_L2=1` | SIGSYS, **RC=159** |
+
+**Root cause:** je to ten **dokumentovaný hard limit** ze sekce „Seccomp /
+exec" — *seccomp filtr přežije `execve`, ale SIGSYS handler se resetuje*.
+Static ELF správně jde přes `elf_needs_real_exec()` → **reálný `execve`**;
+dítě zdědí seccomp filtr, ale handler mu kernel zahodí, takže první
+TRAPnutý syscall skončí default action = kill. `ELF_LOADER_L2=1` nepomůže:
+L2 instaluje range filtr nad textem **rodiče**, dítě po reálném exec žádný
+handler nemá. Stejný mechanismus, proč v této session `gh` spuštěný bare
+ve zděděném shellu padal („Bad system call"), ale `$L --ownall … gh` jel.
+
+**Není to regrese:** A/B s binárkami z **2026-10-22** (`elf_loader.m08`,
+`elf_loader.a2764d6`, prompt-08 éra, kdy `all` hlásil 0 FAIL) dává
+**RC=159 taky**. Důvod, proč to tehdy nebylo vidět: v `all` běhu
+`category_staticexec` **SKIPuje** (bez guest PATH nenajde gcc `ld` — viz
+výše v tomto dokumentu), takže se jako FAIL nikdy neprojevil. FAIL vyleze
+jen při samostatném běhu kategorie, kde build projde.
+
+**Důsledek pro test:** `staticexec` v dnešní podobě testuje scénář, který
+na tomto kernelu bez re-instalace handleru v dítěti **fungovat nemůže**.
+Buď test omezit na přímé spuštění loaderem (to funguje), nebo ho označit
+jako known-limit SKIP, nebo (správně) doplnit re-instalaci SIGSYS handleru
+po reálném exec — to je ale samostatná práce, ne oprava testu.
+
+### Past: A/B se starými binárkami poškodí bind tabulku živé session
+
+Při tomto A/B (spuštění `elf_loader.m08` / `.a2764d6` z 2026-10-22) se
+projevila **nedokumentovaná past**: `LX_BINDS_FILE` se dědí na potomky a
+tabulka je MAP_SHARED **cross-process**, takže stará binárka zapsala do
+tabulky sdílené s živým `claude` procesem záznam, který dnešní loader
+interpretuje jako **ro bind** → `rename()` v tom procesu začal vracet
+`EROFS` („read-only file system"), i když `touch`/`mv` z nově spuštěného
+shellu fungovaly normálně. Projevilo se to jako selhání Edit/Write toolu
+uvnitř agenta, ne jako chyba filesystému.
+
+**Pravidlo:** při A/B se starou binárkou vždy izolovat tabulku —
+`LX_BINDS_FILE= <stary_loader> …` (prázdná hodnota = nová session), jinak
+si poškodíš bind stav běžící session. Osiřelé tabulky uklidí GC sám, až
+pid zmizí (ověřeno: 9 → 8 tabulek bez zásahu).
