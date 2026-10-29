@@ -6678,3 +6678,74 @@ Android má `/bin` → `/system/bin` a `PT_INTERP` sám nestačí k rozhodnutí
 Stop kritéria z promptu se **nenaplnila** ani jedno (`--audit` se volá,
 W^X nebrání). Zastavil se rozsah, ne cesta: dotáhnout L1/L2 do audit
 knihovny je samostatná práce na dny.
+
+## 2026-10-29 (4) — proot parita: apt/dpkg na kali znovu zelené
+
+**Vstupní stav:** `dpkg --configure -a` pod loaderem padalo na
+`error removing old backup file '/var/lib/dpkg/status-old': Permission
+denied`, `apt-get check` rc=100.
+
+**(1) Není to regrese loaderu, ale rozbité SELinux labely.** V celém kali
+rootfs byl **jediný** špatně olabelovaný soubor: `.l2s/.l2s.status0030`
+(`u:object_r:app_data_file:s0` **bez** MLS kategorií, visící odkaz) — l2s
+úložiště pro `var/lib/dpkg/status-old`. Z app domény na něj nejde ani
+`lstat`, takže dpkg nemohl starou záložní kopii odstranit. Zbytek po root
+operacích z 23.–25. 10. (povinnost z `CLAUDE.md` po root operaci se
+neudělala).
+
+`tools/fix-app-ownership.sh` to ale neumělo opravit — hlásilo úspěch
+a nedělalo nic: label se bral jako `awk '{print $1}'` z `ls -ldZ`, což je
+sloupec s právy (`drwx------`), `chcon` to odmítl a `2>/dev/null || true`
+chybu spolklo. Opraveno (label se hledá podle tvaru `^u:object_r:`),
+přidán počet mislabelů před/po přes `ls -ldZ` v dávkách (`find -printf
+'%Z'` sleduje symlinky — past 13, a právě u symlinků to vadí nejvíc),
+chyba `chcon` se už nespolkne, a **`restorecon -R` vyhozen**: `file_contexts`
+na `/data/data` nemá per-app MLS kategorie, takže by právě nastavené
+`c67,…` srazil zpátky na holé `app_data_file:s0` — přesně do stavu, který
+skript opravuje. Nový `tools/find-badlabel.sh` vypíše konkrétní viníky.
+Po `--apply` na kali: 0 špatných labelů, 0 souborů root:root.
+
+Po relabelu (`LX_FAKEROOT=1 LX_L2S=1`, `--ownall`): `id` → `uid=0(root)`,
+`dpkg --audit` rc=0, `dpkg --configure -a` rc=0 (dokonfiguroval `nano`,
+triggery `kali-menu`), `apt-get check` rc=0.
+
+**(2) `apt-get install` padalo na virtualizaci identity, ne na cestách.**
+A/B reálné instalace ukázalo:
+
+```
+E: setegid 30015 failed - setegid (1: Operation not permitted)
+E: seteuid 30015 failed - seteuid (1: Operation not permitted)
+```
+
+rc=100. apt při stahování shodí privilegia na uživatele `_apt`
+(uid/gid 30015) a pak je obnoví; `shim_id_same` povolovalo změnu jen na
+fake ID nebo na skutečné app ID. Oprava (`4d5ca9c`): pod `LX_FAKEROOT` se
+identita **virtualizuje** jako v prootím `fake_id0` — `g_fr_{r,e,s}uid` /
+`g_fr_{r,e,s}gid` ve `src/fakeroot.h`, `set*id` do nich zapisuje bez
+jediného skutečného syscallu, fake root (euid 0) smí nastavit cokoli,
+neprivilegovaná identita jen přehazovat mezi real/effective/saved
+(`fr_may_setid`). `get*id`/`getres*id` čtou tuhle trojici. **Mapování
+vlastníka v `stat` zůstává na `g_fakeroot_uid`** — změnou euid se v jádře
+vlastníci souborů nemění, takže dpkg vidí soubory dál jako root.
+
+Výsledek (kali, nový build run `40837129688`):
+`apt-get install --reinstall -y hostname` → **rc=0**, „Setting up hostname
+(3.25+b1)", triggery `kali-menu` proběhly. Varování „symbolic link size has
+changed from 18 to 8" je fscrypt (host `ls` hlásí totéž nativně), ne loader.
+`test-all.sh fakeroot` PASS i s novým pod-testem C (python drop na 30015
+a zpět, kontroluje i to, že `seteuid` nehýbe real ID).
+
+**(3) Otevřený child-exec path bug se nereprodukoval.** Stress podle vzoru
+ze zápisu 2026-10-22 (7) bod 3 (`tools/` není, skripty v `$D/tmp/p12`):
+- v1: 20 kol × 40 iterací, bash pod loaderem → holý `cat`/`ls` → **0 chyb**;
+- v2: 10 kol × **4 paralelní** `--ownall` běhy × 25 iterací, vnoření
+  bash → sh → `cat`, shebang skript, python `open`/`stat`, se zapnutým
+  `LX_FAKEROOT=1 LX_L2S=1` → **0 chyb**.
+
+Dohromady ~2 800 pokusů v 6 vzorech bez jediného nepřeložení cesty. Nález
+je z 22. 10.; od té doby přišly opravy 439/`clone3`, 135 `rt_sigprocmask`
+a virtualizace `/proc`. **Není to důkaz, že bug neexistuje** (původně byl
+popsán jako vzácný/časový), ale ten konkrétní popsaný vzor už
+reprodukovatelný není. Doporučení: než se `LX_L2S` přepne na default,
+nechat běžet širší zátěž (`test-all.sh all` + reálný apt) a teprve pak
+rozhodnout — ne otevírat hledání root cause naslepo.
