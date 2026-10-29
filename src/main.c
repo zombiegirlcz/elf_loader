@@ -4908,52 +4908,26 @@ static int run_ownall(const char *path, int argc, char **argv, char **envp) {
      * '/usr/bin/id'` uid=0) a shodilo `dpkg --configure` ("7 expected
      * programs not found in PATH").
      *
-     * Prepisujeme jen kdyz PATH skutecne obsahuje hostovy /system/{bin,xbin}
-     * — PATH, ktery si uz poskladal `lx`/double-world (hostove absolutni
-     * $R/usr/bin...), zustava nedotceny. Puvodni hodnota se zachova v
-     * LX_HOST_PATH. Vypnuti: ELF_LOADER_NO_GUEST_PATH=1. */
+     * Prepisujeme POUZE ukazatel na existujici PATH= polozku v puvodnim poli.
+     * Nove pole (calloc) tu nejde: envp je kernelova oblast na zasobniku,
+     * navazuje na ni auxv a procvirt_rewrite_argarea z ni pocita hranice —
+     * s heapovou kopii padal guest libc init na SIGSEGV (namereno na kali).
+     * Hostovy PATH zustava v LX_HOST_PATH v env loaderu (exec shim), ne
+     * v guest envp. Vypnuti: ELF_LOADER_NO_GUEST_PATH=1. */
     if (g_shim_root && g_shim_root[0] && !getenv("ELF_LOADER_NO_GUEST_PATH")) {
-        const char *cur = NULL;
-        int path_idx = -1, n_env = 0;
         for (int i = 0; envp && envp[i]; i++) {
-            if (path_idx < 0 && strncmp(envp[i], "PATH=", 5) == 0) {
-                path_idx = i;
-                cur = envp[i] + 5;
-            }
-            n_env++;
-        }
-        if (cur && (strstr(cur, "/system/bin") || strstr(cur, "/system/xbin"))) {
-            static const char *gp =
+            if (strncmp(envp[i], "PATH=", 5) != 0) continue;
+            const char *cur = envp[i] + 5;
+            if (!strstr(cur, "/system/bin") && !strstr(cur, "/system/xbin"))
+                break;
+            static char gpath[] =
                 "PATH=/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin";
-            size_t hl = strlen("LX_HOST_PATH=") + strlen(cur) + 1;
-            char *hp = malloc(hl);
-            char **ne = calloc((size_t)n_env + 2, sizeof(char *));
-            if (hp && ne) {
-                snprintf(hp, hl, "LX_HOST_PATH=%s", cur);
-                int o = 0;
-                for (int i = 0; envp && envp[i]; i++) {
-                    if (i == path_idx) continue;
-                    if (strncmp(envp[i], "LX_HOST_PATH=", 13) == 0) continue;
-                    ne[o++] = envp[i];
-                }
-                ne[o++] = (char *)gp;
-                ne[o++] = hp;
-                ne[o] = NULL;
-                envp = ne;
-                /* guest environ staví elf_loader.c z elf_init_envp (nastaveno
-                 * na zacatku run_ownall) — bez teto aktualizace by guest dostal
-                 * stare pole a prepis PATH by se k nemu nedostal. */
-                elf_init_envp = envp;
-                /* i pro loaderuv vlastni getenv/exec shim */
-                setenv("LX_HOST_PATH", cur, 1);
-                setenv("PATH", gp + 5, 1);
-                if (elf_debug())
-                    fprintf(stderr, "[+] guest PATH nastaven (%s), host v LX_HOST_PATH\n",
-                            gp + 5);
-            } else {
-                free(hp);
-                free(ne);
-            }
+            setenv("LX_HOST_PATH", cur, 1);
+            envp[i] = gpath;
+            setenv("PATH", gpath + 5, 1);
+            if (elf_debug())
+                fprintf(stderr, "[+] guest PATH=%s (host v LX_HOST_PATH)\n", gpath + 5);
+            break;
         }
     }
     if (!g_shim_loader || !g_shim_loader[0]) {
