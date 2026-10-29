@@ -65,6 +65,18 @@ static int      g_sx_l2;         /* elf_l2_enabled() v dobe capture (getenv chce
  * nemusi dostat ven. Cesta = $ELF_LOADER_SOFTEXEC_TRACE, kdyz zacina '/'. */
 static const char *g_sx_logfile;
 
+/* Prompt 13 (T1): strop trasy soft execu — bez nej dal osireny proces
+ * zacykleny v sig-iter smyčce zapise do g_sx_logfile neomezene (v provozu
+ * 6,4 GB rychlosti ~1,4 MB/s). Default 16 MiB, override v bajtech pres
+ * ELF_LOADER_SOFTEXEC_TRACE_MAX (0 = bez limitu, pro ladeni). Cteno v
+ * softexec_enabled() (host TP, getenv je tam bezpecny), pouzito tady —
+ * sx_log bezi pod guest TP, takze jen shim_raw_syscall6/shim_str*, zadny
+ * getenv/snprintf (past c. 1 v AGENTS.md). */
+#define SX_LOG_MAX_DEFAULT (16UL * 1024 * 1024)
+static size_t g_sx_log_max = SX_LOG_MAX_DEFAULT;
+static size_t g_sx_logged;
+static int    g_sx_log_capped;
+
 static void sx_log(const char *msg) {
     if (!g_sx_trace) return;
     static const char pfx[] = "[softexec] ";
@@ -72,12 +84,26 @@ static void sx_log(const char *msg) {
     shim_raw_syscall6(64, 2, (long)(unsigned long)msg, shim_strlen(msg), 0, 0, 0);
     shim_raw_syscall6(64, 2, (long)(unsigned long)"\n", 1, 0, 0, 0);
     if (g_sx_logfile) {
+        if (g_sx_log_max && g_sx_logged >= g_sx_log_max) {
+            if (g_sx_log_capped) return;
+            g_sx_log_capped = 1;
+            static const char cap[] = "[softexec] trace capped\n";
+            int fd = (int)shim_raw_syscall6(56, -100, (long)(unsigned long)g_sx_logfile,
+                                            0x441 /*O_WRONLY|O_CREAT|O_APPEND*/, 0644, 0, 0);
+            if (fd >= 0) {
+                shim_raw_syscall6(64, fd, (long)(unsigned long)cap, sizeof(cap) - 1, 0, 0, 0);
+                shim_raw_syscall6(57, fd, 0, 0, 0, 0, 0);
+            }
+            return;
+        }
         int fd = (int)shim_raw_syscall6(56, -100, (long)(unsigned long)g_sx_logfile,
                                         0x441 /*O_WRONLY|O_CREAT|O_APPEND*/, 0644, 0, 0);
         if (fd >= 0) {
-            shim_raw_syscall6(64, fd, (long)(unsigned long)msg, shim_strlen(msg), 0, 0, 0);
+            size_t n = shim_strlen(msg);
+            shim_raw_syscall6(64, fd, (long)(unsigned long)msg, n, 0, 0, 0);
             shim_raw_syscall6(64, fd, (long)(unsigned long)"\n", 1, 0, 0, 0);
             shim_raw_syscall6(57, fd, 0, 0, 0, 0, 0);
+            g_sx_logged += n + 1;
         }
     }
 }
@@ -104,6 +130,11 @@ static int softexec_enabled(void) {
         const char *t = getenv("ELF_LOADER_SOFTEXEC_TRACE");
         g_sx_trace = (t != NULL);
         g_sx_logfile = (t && t[0] == '/') ? t : NULL;
+        const char *m = getenv("ELF_LOADER_SOFTEXEC_TRACE_MAX");
+        if (m && m[0]) {
+            long long mv = strtoll(m, NULL, 0);
+            g_sx_log_max = (mv > 0) ? (size_t)mv : 0; /* 0 = bez limitu */
+        }
     }
     return v;
 }
