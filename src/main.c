@@ -4940,6 +4940,10 @@ static int run_ownall(const char *path, int argc, char **argv, char **envp) {
                 ne[o++] = hp;
                 ne[o] = NULL;
                 envp = ne;
+                /* guest environ staví elf_loader.c z elf_init_envp (nastaveno
+                 * na zacatku run_ownall) — bez teto aktualizace by guest dostal
+                 * stare pole a prepis PATH by se k nemu nedostal. */
+                elf_init_envp = envp;
                 /* i pro loaderuv vlastni getenv/exec shim */
                 setenv("LX_HOST_PATH", cur, 1);
                 setenv("PATH", gp + 5, 1);
