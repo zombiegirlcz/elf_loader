@@ -1810,28 +1810,31 @@ static void *g_orig_getuid, *g_orig_geteuid, *g_orig_getgid, *g_orig_getegid,
             *g_orig_fchown, *g_orig_fchmod, *g_orig_fstat;
 /* LX_FAKEROOT=uid:gid: fake identita je g_fakeroot_uid/gid (default 0:0).
  * Nikde neni natvrdo 0, aby fungoval i `lxdw on --uid 1234:5678`. */
-static unsigned int shim_fr_getuid(void) { if (g_fakeroot_on) return g_fakeroot_uid;
+/* get*id ctou MUTOVATELNOU identitu (g_fr_*), ne nastavenou fake identitu:
+ * po `seteuid(30015)` musi `geteuid()` vratit 30015, jinak apt/dpkg nepozna,
+ * ze drop privilegii prosel (viz komentar u g_fr_ruid v fakeroot.h). */
+static unsigned int shim_fr_getuid(void) { if (g_fakeroot_on) return g_fr_ruid;
     unsigned int (*f)(void) = (unsigned int (*)(void))g_orig_getuid; return f ? f() : 0; }
 /* elf_loader.c (auxv) potrebuje videt, jestli je fakeroot zapnuty. */
 int elf_fakeroot_active(void) { return g_fakeroot_on; }
 unsigned int elf_fakeroot_uid(void) { return g_fakeroot_uid; }
 unsigned int elf_fakeroot_gid(void) { return g_fakeroot_gid; }
-static unsigned int shim_fr_geteuid(void) { if (g_fakeroot_on) return g_fakeroot_uid;
+static unsigned int shim_fr_geteuid(void) { if (g_fakeroot_on) return g_fr_euid;
     unsigned int (*f)(void) = (unsigned int (*)(void))g_orig_geteuid; return f ? f() : 0; }
-static unsigned int shim_fr_getgid(void) { if (g_fakeroot_on) return g_fakeroot_gid;
+static unsigned int shim_fr_getgid(void) { if (g_fakeroot_on) return g_fr_rgid;
     unsigned int (*f)(void) = (unsigned int (*)(void))g_orig_getgid; return f ? f() : 0; }
-static unsigned int shim_fr_getegid(void) { if (g_fakeroot_on) return g_fakeroot_gid;
+static unsigned int shim_fr_getegid(void) { if (g_fakeroot_on) return g_fr_egid;
     unsigned int (*f)(void) = (unsigned int (*)(void))g_orig_getegid; return f ? f() : 0; }
 static int shim_fr_getresuid(unsigned int *ru, unsigned int *eu, unsigned int *su) {
     int (*f)(unsigned int *, unsigned int *, unsigned int *) = g_orig_getresuid;
     int r = f ? f(ru, eu, su) : -1;
-    if (r == 0 && g_fakeroot_on) { if (ru) *ru = g_fakeroot_uid; if (eu) *eu = g_fakeroot_uid; if (su) *su = g_fakeroot_uid; }
+    if (r == 0 && g_fakeroot_on) { if (ru) *ru = g_fr_ruid; if (eu) *eu = g_fr_euid; if (su) *su = g_fr_suid; }
     return r;
 }
 static int shim_fr_getresgid(unsigned int *rg, unsigned int *eg, unsigned int *sg) {
     int (*f)(unsigned int *, unsigned int *, unsigned int *) = g_orig_getresgid;
     int r = f ? f(rg, eg, sg) : -1;
-    if (r == 0 && g_fakeroot_on) { if (rg) *rg = g_fakeroot_gid; if (eg) *eg = g_fakeroot_gid; if (sg) *sg = g_fakeroot_gid; }
+    if (r == 0 && g_fakeroot_on) { if (rg) *rg = g_fr_rgid; if (eg) *eg = g_fr_egid; if (sg) *sg = g_fr_sgid; }
     return r;
 }
 static int shim_fr_getgroups(int n, unsigned int *list) {
@@ -3759,20 +3762,106 @@ static int shim_setid_ret(int ok) {
     shim_guest_errno_set(EPERM);
     return -1;
 }
-static int shim_setuid(unsigned int u) { return shim_setid_ret(shim_id_same(174, u)); }
-static int shim_setgid(unsigned int g) { return shim_setid_ret(shim_id_same(176, g)); }
-static int shim_seteuid(unsigned int u) { return shim_setid_ret(shim_id_same(175, u)); }
-static int shim_setegid(unsigned int g) { return shim_setid_ret(shim_id_same(177, g)); }
+/* Pod LX_FAKEROOT se identita VIRTUALIZUJE (g_fr_* v fakeroot.h, ekvivalent
+ * proot fake_id0): zadny skutecny syscall, jen prepis trojice r/e/s. Fake
+ * root smi cokoli, takze `apt` muze shodit privilegia na "_apt" (30015)
+ * a zpatky. Bez fakerootu zustava puvodni chovani (zmena na soucasne ID
+ * nebo -1 = uspech, jine = EPERM) — tam se nic nevirtualizuje.
+ *
+ * Vsechny tyhle funkce bezi pod GUEST TP: jen staticke globaly a
+ * main_raw_syscall4, zadny getenv/snprintf (past c. 1). */
+static int shim_setuid(unsigned int u) {
+    if (g_fakeroot_on) {
+        if (!fr_may_setid(g_fr_euid, u, g_fr_ruid, g_fr_euid, g_fr_suid))
+            return shim_setid_ret(0);
+        if (u != (unsigned int)-1) {
+            if (g_fr_euid == 0) g_fr_ruid = g_fr_suid = u;
+            g_fr_euid = u;
+        }
+        return 0;
+    }
+    return shim_setid_ret(shim_id_same(174, u));
+}
+static int shim_setgid(unsigned int g) {
+    if (g_fakeroot_on) {
+        if (!fr_may_setid(g_fr_euid, g, g_fr_rgid, g_fr_egid, g_fr_sgid))
+            return shim_setid_ret(0);
+        if (g != (unsigned int)-1) {
+            if (g_fr_euid == 0) g_fr_rgid = g_fr_sgid = g;
+            g_fr_egid = g;
+        }
+        return 0;
+    }
+    return shim_setid_ret(shim_id_same(176, g));
+}
+static int shim_seteuid(unsigned int u) {
+    if (g_fakeroot_on) {
+        if (!fr_may_setid(g_fr_euid, u, g_fr_ruid, g_fr_euid, g_fr_suid))
+            return shim_setid_ret(0);
+        if (u != (unsigned int)-1) g_fr_euid = u;
+        return 0;
+    }
+    return shim_setid_ret(shim_id_same(175, u));
+}
+static int shim_setegid(unsigned int g) {
+    if (g_fakeroot_on) {
+        if (!fr_may_setid(g_fr_euid, g, g_fr_rgid, g_fr_egid, g_fr_sgid))
+            return shim_setid_ret(0);
+        if (g != (unsigned int)-1) g_fr_egid = g;
+        return 0;
+    }
+    return shim_setid_ret(shim_id_same(177, g));
+}
 static int shim_setreuid(unsigned int r, unsigned int e) {
+    if (g_fakeroot_on) {
+        if (!fr_may_setid(g_fr_euid, r, g_fr_ruid, g_fr_euid, g_fr_suid) ||
+            !fr_may_setid(g_fr_euid, e, g_fr_ruid, g_fr_euid, g_fr_suid))
+            return shim_setid_ret(0);
+        if (r != (unsigned int)-1) g_fr_ruid = r;
+        if (e != (unsigned int)-1) g_fr_euid = e;
+        /* jako v jadre: pri zmene real nebo pri e != puvodni real se saved
+         * srovna s novym effective */
+        if (r != (unsigned int)-1) g_fr_suid = g_fr_euid;
+        return 0;
+    }
     return shim_setid_ret(shim_id_same(174, r) && shim_id_same(175, e));
 }
 static int shim_setregid(unsigned int r, unsigned int e) {
+    if (g_fakeroot_on) {
+        if (!fr_may_setid(g_fr_euid, r, g_fr_rgid, g_fr_egid, g_fr_sgid) ||
+            !fr_may_setid(g_fr_euid, e, g_fr_rgid, g_fr_egid, g_fr_sgid))
+            return shim_setid_ret(0);
+        if (r != (unsigned int)-1) g_fr_rgid = r;
+        if (e != (unsigned int)-1) g_fr_egid = e;
+        if (r != (unsigned int)-1) g_fr_sgid = g_fr_egid;
+        return 0;
+    }
     return shim_setid_ret(shim_id_same(176, r) && shim_id_same(177, e));
 }
 static int shim_setresuid(unsigned int r, unsigned int e, unsigned int s) {
+    if (g_fakeroot_on) {
+        if (!fr_may_setid(g_fr_euid, r, g_fr_ruid, g_fr_euid, g_fr_suid) ||
+            !fr_may_setid(g_fr_euid, e, g_fr_ruid, g_fr_euid, g_fr_suid) ||
+            !fr_may_setid(g_fr_euid, s, g_fr_ruid, g_fr_euid, g_fr_suid))
+            return shim_setid_ret(0);
+        if (r != (unsigned int)-1) g_fr_ruid = r;
+        if (e != (unsigned int)-1) g_fr_euid = e;
+        if (s != (unsigned int)-1) g_fr_suid = s;
+        return 0;
+    }
     return shim_setid_ret(shim_id_same(174, r) && shim_id_same(175, e) && shim_id_same(175, s));
 }
 static int shim_setresgid(unsigned int r, unsigned int e, unsigned int s) {
+    if (g_fakeroot_on) {
+        if (!fr_may_setid(g_fr_euid, r, g_fr_rgid, g_fr_egid, g_fr_sgid) ||
+            !fr_may_setid(g_fr_euid, e, g_fr_rgid, g_fr_egid, g_fr_sgid) ||
+            !fr_may_setid(g_fr_euid, s, g_fr_rgid, g_fr_egid, g_fr_sgid))
+            return shim_setid_ret(0);
+        if (r != (unsigned int)-1) g_fr_rgid = r;
+        if (e != (unsigned int)-1) g_fr_egid = e;
+        if (s != (unsigned int)-1) g_fr_sgid = s;
+        return 0;
+    }
     return shim_setid_ret(shim_id_same(176, r) && shim_id_same(177, e) && shim_id_same(177, s));
 }
 /* setgroups: Android seccomp vraci ENOSYS (apt/dpkg behem drop/restore

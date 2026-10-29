@@ -2367,8 +2367,35 @@ category_fakeroot() {
     ft=$(ashell_out "$fenv $L --ownall $KR/usr/bin/stat -c %F $dev" 2>&1)
     [ "$ft" = "character special file" ] || { ok=0; detail="$detail [mknod: '$ft']"; }
 
+    # C: drop/restore privilegii na "_apt" (uid/gid 30015) a zpatky.
+    # apt to dela behem kazde instalace; dokud set*id vracelo EPERM, koncil
+    # `apt-get install` na "E: setegid 30015 failed", rc=100 (2026-10-29).
+    if [ -x "$KR/usr/bin/python3" ]; then
+        cat > "$tdir/drop.py" <<'PYEOF'
+import os, sys
+try:
+    os.setegid(30015); os.seteuid(30015)
+    if (os.geteuid(), os.getegid()) != (30015, 30015):
+        print("efektivni ID se nezmenilo:", os.geteuid(), os.getegid()); sys.exit(1)
+    if (os.getuid(), os.getgid()) != (0, 0):
+        print("real ID se zmenilo pri seteuid:", os.getuid(), os.getgid()); sys.exit(1)
+    os.seteuid(0); os.setegid(0)
+    if (os.geteuid(), os.getegid()) != (0, 0):
+        print("obnoveni na root selhalo:", os.geteuid(), os.getegid()); sys.exit(1)
+except OSError as e:
+    print("OSError:", e); sys.exit(1)
+print("dropok")
+PYEOF
+        local dr
+        dr=$(ashell_out "$fenv $L --ownall $KR/usr/bin/python3 /tmp/lx-fr-test/drop.py" 2>&1)
+        case "$dr" in
+            *dropok*) ;;
+            *) ok=0; detail="$detail [drop/restore _apt: '$(printf '%s' "$dr" | tail -2 | tr '\n' '|')']" ;;
+        esac
+    fi
+
     if [ "$ok" = 1 ]; then
-        echo "PASS fakeroot: getuid=0, chown/chmod setuid/mknod pres xattr DB, bez LX_FAKEROOT beze zmeny"
+        echo "PASS fakeroot: getuid=0, chown/chmod setuid/mknod pres xattr DB, drop/restore _apt, bez LX_FAKEROOT beze zmeny"
         echo "PASS: fakeroot - LX_FAKEROOT" >> "$PASS_LOG"
         ((PASS_COUNT++)) || true
     else

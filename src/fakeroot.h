@@ -65,6 +65,23 @@ static unsigned int g_fakeroot_app_gid = 0xFFFFFFFFu;
 static unsigned int g_fakeroot_uid = 0;
 static unsigned int g_fakeroot_gid = 0;
 
+/* MUTOVATELNA identita procesu pod fakerootem — ekvivalent proot `fake_id0`,
+ * ktery drzi cely set real/effective/saved uid+gid a `set*id` do nej zapisuje.
+ *
+ * Proc to nestaci mit jen na `g_fakeroot_uid`: `apt-get install` behem
+ * stahovani shodi privilegia na uzivatele "_apt" (uid/gid 30015) a pak je
+ * obnovi. Puvodni `shim_id_same` povolovalo jen zmenu na fake ID nebo na
+ * skutecne app ID, takze `setegid(30015)` vratilo EPERM a apt skoncil
+ * "E: setegid 30015 failed - setegid (1: Operation not permitted)", rc=100
+ * (namereno na kali 2026-10-29). Pod fake rootem (euid 0) musi set*id
+ * uspet na libovolne ID, jako u skutecneho roota.
+ *
+ * POZOR: mapovani vlastnika v `stat` zustava na `g_fakeroot_uid` (nastavena
+ * fake identita), NE na aktualnim euid — presne jako v jadre, kde se zmenou
+ * euid nemeni vlastnici souboru. */
+static unsigned int g_fr_ruid = 0, g_fr_euid = 0, g_fr_suid = 0;
+static unsigned int g_fr_rgid = 0, g_fr_egid = 0, g_fr_sgid = 0;
+
 /* Parsovani LX_FAKEROOT:
  *   (nebo prazdne)  -> vypnuto
  *   0 / off / no    -> vypnuto
@@ -102,7 +119,17 @@ static void fakeroot_init(void) {
     if (g_fakeroot_on) {
         g_fakeroot_app_uid = (unsigned int)getuid();
         g_fakeroot_app_gid = (unsigned int)getgid();
+        g_fr_ruid = g_fr_euid = g_fr_suid = g_fakeroot_uid;
+        g_fr_rgid = g_fr_egid = g_fr_sgid = g_fakeroot_gid;
     }
+}
+
+/* Smi se pod fakerootem nastavit ID na `v`? Fake root (euid 0) smi cokoli;
+ * jinak jen prehazovat mezi real/effective/saved, jako nepriv. proces.
+ * -1 = "nemenit" (setreuid/setresuid konvence). */
+static int fr_may_setid(unsigned int cur_e, unsigned int v,
+                        unsigned int r, unsigned int e, unsigned int s) {
+    return cur_e == 0 || v == (unsigned int)-1 || v == r || v == e || v == s;
 }
 
 /* --- raw syscall wrappery pro guest TP (fsetxattr=7, fgetxattr=10 na arm64;
