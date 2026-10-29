@@ -2171,7 +2171,20 @@ category_l2s_rename() {
     local env="ROOTFS=$KR ELF_ROOTFS=$KR ELF_LOADER=$L LX_L2S=1"
     local ok=1 detail=""
 
+    # Uklid PRES LOADER (ne jen hostovym rm -rf) - jinak hostovy rm smaze
+    # jen symlinky v rootfs, ale nedekrementuje pocitadlo backing souboru
+    # v .l2s, takze dalsi beh testu zacina s pokrivenym stavem (nlink
+    # zdedeny z predchoziho behu). Stejny vzor jako category_l2s vyse.
+    if [ -e "$dir/a" ] || [ -e "$dir/b" ]; then
+        ashell_out "$env $L --ownall $KR/bin/rm -f /tmp/lx-l2s-rename/a /tmp/lx-l2s-rename/b /tmp/lx-l2s-rename/c" >/dev/null 2>&1
+    fi
     "$R/system/bin/rm" -rf "$dir" 2>/dev/null || true
+    # Tvrdy reset i pro pripad, ze v .l2s zustaly osirele zaznamy z drivejsiho
+    # (rozbiteho) behu teto SAME kategorie, jejichz basename se vzdy jmenuje
+    # a/b - bez tohoto by novy beh zdedil cizi pocitadlo a selhal uz na
+    # "pred rename" kontrole. Bezpecne: destruktivni test uz tak smi mazat
+    # jen nad nepouzivanym kali ($KR), nikdy nad $R.
+    "$R/system/bin/find" "$KR/.l2s" -maxdepth 1 \( -name '.l2s.a[0-9]*' -o -name '.l2s.b[0-9]*' \) -delete 2>/dev/null || true
     mkdir -p "$dir"
     echo hello > "$dir/a"
     echo other > "$dir/c"
@@ -2200,6 +2213,9 @@ category_l2s_rename() {
     leftover=$(ls "$KR/.l2s" 2>/dev/null | grep -c '^\.l2s\.b[0-9]' || true)
     [ "${leftover:-0}" = 0 ] || { ok=0; detail="$detail [po rename: $leftover zbytku .l2s.b* v .l2s]"; }
 
+    # Uklid opet PRES LOADER (decrementuje .l2s pocitadlo a), az pak
+    # hostovy rm -rf jako pojistka na samotny adresar.
+    ashell_out "$env $L --ownall $KR/bin/rm -f /tmp/lx-l2s-rename/a /tmp/lx-l2s-rename/b" >/dev/null 2>&1
     "$R/system/bin/rm" -rf "$dir" 2>/dev/null || true
 
     if [ "$ok" = 1 ]; then
