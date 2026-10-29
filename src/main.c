@@ -6386,6 +6386,50 @@ static int proot_compat_main(int argc, char **argv, char **envp) {
         if (access(resolved_cmd, X_OK) == 0) path0 = resolved_cmd;
     }
     (void)root_id;
+    /* Env, ktere `proot_compat_parse` nastavilo pres setenv(), MUSI dojit do
+     * guest envp. setenv meni jen `environ` loaderu, ne pole `envp`, ktere
+     * jsme dostali z main() — a to pole se predava guestu a dedi se do
+     * potomku. Bez toho mel fakeroot jen PRVNI proces: `--proot-compat -0 -l
+     * apt-get install` doslo az k `dpkg: error: requested operation requires
+     * superuser privilege` (apt vidi euid 0, dcera dpkg uz ne), rc=100
+     * (namereno na kali 2026-10-29).
+     *
+     * Nepouzivame proste `environ`, aby se nezahodila injekce
+     * ELF_LOADER_PRELOAD, kterou main() udelal do vlastniho pole. */
+    {
+        static const char *keys[] = { "ROOTFS", "LX_BINDS", "LX_FAKEROOT",
+                                      "LX_L2S", "ELF_LOADER_PROOT_CWD", NULL };
+        int n = 0;
+        for (int i = 0; envp && envp[i]; i++) n++;
+        int nk = 0;
+        for (; keys[nk]; nk++) {}
+        char **ne = calloc((size_t)n + (size_t)nk + 1, sizeof(char *));
+        if (ne) {
+            int o = 0;
+            for (int i = 0; envp && envp[i]; i++) {
+                int skip = 0;
+                for (int k = 0; keys[k]; k++) {
+                    size_t kl = strlen(keys[k]);
+                    if (strncmp(envp[i], keys[k], kl) == 0 && envp[i][kl] == '=') {
+                        skip = 1;
+                        break;
+                    }
+                }
+                if (!skip) ne[o++] = envp[i];
+            }
+            for (int k = 0; keys[k]; k++) {
+                const char *v = getenv(keys[k]);
+                if (!v) continue;
+                size_t len = strlen(keys[k]) + 1 + strlen(v) + 1;
+                char *e = malloc(len);
+                if (!e) continue;
+                snprintf(e, len, "%s=%s", keys[k], v);
+                ne[o++] = e;
+            }
+            ne[o] = NULL;
+            envp = ne;
+        }
+    }
     return run_ownall(path0, ncmd, cmd_argv, envp);
 }
 
