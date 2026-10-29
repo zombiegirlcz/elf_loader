@@ -1570,6 +1570,11 @@ static int shim_rename(const char *o, const char *n) {
     char b1[8192], b2[8192]; const char *oldp = o, *newp = n;
     if (shim_translate(o, b1, sizeof b1)) oldp = b1;
     if (shim_translate(n, b2, sizeof b2)) newp = b2;
+    /* prompt 13 (T2): plain rename(2) vzdy prepisuje cil (zadne RENAME_*
+     * flagy) -> pokud je newp l2s symlink, pred prepsanim snizit pocitadlo
+     * backing souboru, jinak zustane osireny (viz AGENTS.md, past "rename
+     * pres l2s jmeno nesnizuje pocitadlo"). */
+    l2s_unlink(newp);
     fp_rename f = (fp_rename)g_orig_rename; return f ? f(oldp, newp) : -1;
 }
 /* GNU coreutils mv (a dalsi) volaji renameat2/renameat, NE rename. Bez techto
@@ -1582,6 +1587,9 @@ static int shim_renameat(int odfd, const char *o, int ndfd, const char *n) {
     char b1[8192], b2[8192]; const char *oldp = o, *newp = n;
     if (odfd == -100 && o && o[0] == '/') { if (shim_translate(o, b1, sizeof b1)) oldp = b1; }
     if (ndfd == -100 && n && n[0] == '/') { if (shim_translate(n, b2, sizeof b2)) newp = b2; }
+    /* prompt 13 (T2): renameat(2) nema RENAME_* flagy, vzdy prepisuje cil —
+     * stejna past jako shim_rename. */
+    if (ndfd == -100) l2s_unlink(newp);
     fp_renameat f = (fp_renameat)g_orig_renameat; return f ? f(odfd, oldp, ndfd, newp) : -1;
 }
 typedef int (*fp_renameat2)(int, const char *, int, const char *, unsigned int);
@@ -1591,6 +1599,11 @@ static int shim_renameat2(int odfd, const char *o, int ndfd, const char *n, unsi
     char b1[8192], b2[8192]; const char *oldp = o, *newp = n;
     if (odfd == -100 && o && o[0] == '/') { if (shim_translate(o, b1, sizeof b1)) oldp = b1; }
     if (ndfd == -100 && n && n[0] == '/') { if (shim_translate(n, b2, sizeof b2)) newp = b2; }
+    /* prompt 13 (T2): jen pro skutecne prepisujici rename — RENAME_EXCHANGE
+     * (obe strany zustavaji zive) a RENAME_NOREPLACE (cil se neprepisuje)
+     * vynechat, viz docs/nextgen/13-uklid-a-odolnost.md. */
+    if (ndfd == -100 && !(flags & (RENAME_EXCHANGE | RENAME_NOREPLACE)))
+        l2s_unlink(newp);
     fp_renameat2 f = (fp_renameat2)g_orig_renameat2; return f ? f(odfd, oldp, ndfd, newp, flags) : -1;
 }
 typedef int (*fp_unlink)(const char *);
