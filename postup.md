@@ -6347,11 +6347,20 @@ exec načítal nový exe **bez scope** → `stdout` a
 
 ### Testy
 
-`test-all.sh softexec` (nová kategorie, 6 podtestů): shoda výstupu
+`test-all.sh softexec` (nová kategorie, 8 podtestů): shoda výstupu
 default vs soft exec na řetězu execů, důkaz z trasy že se in-process
 výměna opravdu použila, `exec -a` (argv[0]), virtualizovaný
-`/proc/self/cmdline`, fallback u `PT_TLS` binárky (`python3`) a shebang
-skript. **6/0.**
+`/proc/self/cmdline`, fallback u `PT_TLS` binárky (`python3`), řetěz
+`exec` v jednom procesu (víc soft execů za sebou), návratové kódy +
+`SIGTERM` do soft-exec nutého dítěte (143) a shebang skript. **8/0.**
+
+Plná sada: **default 213/1/33**, **`ELF_LOADER_SOFTEXEC=1` 212/2/33** —
+tzn. celý testovací rámec (včetně všech vnořených execů harnessu samotného)
+běží pod soft execem. Oba FAILy jsou známé/flaky: `nslookup localhost`
+→ NXDOMAIN od 8.8.8.8 (nesouvisí, padá i v defaultu) a `symhash`, což je
+**prahový** test (`hooks_bti < 6000 µs`) — při samostatném běhu projde
+v obou režimech (4531 µs se soft execem, 4924 µs bez něj), v plné sadě
+pod zátěží ukázal 9689 µs.
 
 ### Známé nekompatibility (proto default vypnuto)
 

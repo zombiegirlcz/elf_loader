@@ -1298,7 +1298,35 @@ category_softexec() {
         ((SKIP_COUNT++)) || true
     fi
 
-    # 6) skript (#!) soft exec nebere - musi dal fungovat
+    # 6) retez exec v JEDNOM procesu (vice soft execu za sebou)
+    local out_ch
+    out_ch=$(_sx_run "$env $sx" 'exec /bin/sh -c "exec /bin/echo CHAIN-OK"')
+    if printf '%s' "$out_ch" | grep -q CHAIN-OK; then
+        echo "PASS softexec-chain: retez exec v jednom procesu"
+        echo "PASS: softexec-chain" >> "$PASS_LOG"
+        ((PASS_COUNT++)) || true
+    else
+        echo "FAIL softexec-chain: [$out_ch]"
+        echo "FAIL: softexec-chain | $out_ch" >> "$FAIL_LOG"
+        ((FAIL_COUNT++)) || true
+    fi
+
+    # 7) navratove kody a doruceni signalu do soft-exec nuteho ditete
+    local out_rc
+    out_rc=$(_sx_run "$env $sx" '/bin/false; echo rc=$?; /bin/sh -c "exit 7"; echo rc2=$?; /bin/sleep 5 & p=$!; /bin/kill -TERM $p; wait $p; echo sig=$?')
+    if printf '%s' "$out_rc" | grep -q "rc=1" && \
+       printf '%s' "$out_rc" | grep -q "rc2=7" && \
+       printf '%s' "$out_rc" | grep -q "sig=143"; then
+        echo "PASS softexec-exit: navratove kody + SIGTERM (143)"
+        echo "PASS: softexec-exit" >> "$PASS_LOG"
+        ((PASS_COUNT++)) || true
+    else
+        echo "FAIL softexec-exit: [$out_rc]"
+        echo "FAIL: softexec-exit | $out_rc" >> "$FAIL_LOG"
+        ((FAIL_COUNT++)) || true
+    fi
+
+    # 8) skript (#!) soft exec nebere - musi dal fungovat
     local sdir="$R/tmp/sxscript.$$"
     mkdir -p "$sdir"
     printf '#!/bin/sh\necho SCRIPT-OK\n' > "$sdir/s.sh"

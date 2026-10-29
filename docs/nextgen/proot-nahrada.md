@@ -615,6 +615,14 @@ Ne exec, ale **`fork`**: 500× `( : )` bez execu dá loader 2,08 s
 tables drahou. Druhá páka je recyklace TLS regionu a guest stacku místo
 nového `mmap`+`memset` (~1,3 ms z těch 4,1 ms).
 
+### Jak moc se tomu dá věřit
+
+Celá sada `test-all.sh all` běží pod `ELF_LOADER_SOFTEXEC=1` (tedy i všechny
+vnořené execy harnessu samotného) se stejným výsledkem jako default:
+**212/2/33** proti **213/1/33**; oba FAILy jsou známé/flaky (`nslookup
+localhost` → NXDOMAIN, a prahový `symhash`, který samostatně projde v obou
+režimech). Kategorie `test-all.sh softexec` má 8 podtestů, 8/0.
+
 ### Známé nekompatibility
 
 Není to `execve`: ladicí nástroje nevidí exec event, setuid/setgid se

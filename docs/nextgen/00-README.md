@@ -240,7 +240,9 @@ ale volající nedostane skutečné dítě (pid/wait/job control).
 
 Podmínky (jinak fallback na re-exec): PIE ELF s `PT_INTERP` a **bez
 `PT_TLS`**, jednovláknový proces, není to skript, není L2. Pod knobem se
-`vfork` přepisuje na `fork`. Test `test-all.sh softexec` 6/0.
+`vfork` přepisuje na `fork`. Test `test-all.sh softexec` 8/0; plná sada
+pod zapnutým knobem **212/2/33** proti defaultu 213/1/33 (oba FAILy známé
+/flaky — `nslookup`, prahový `symhash`).
 
 **Zbývající úzké hrdlo je `fork`, ne exec**: 4,2 ms/fork u loaderu proti
 1,2 ms u prootu (tlustý adresní prostor — 1 GB aréna, 64 MB stack).
