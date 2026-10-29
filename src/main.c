@@ -6457,7 +6457,18 @@ static int proot_compat_main(int argc, char **argv, char **envp) {
         char *na[256];
         int n = 0;
         na[n++] = (char *)real;
-        for (int i = 0; i < argc && n < 254; i++) na[n++] = argv[i];
+        /* PRVNI samostatne "--" vynechat: je to jen oddelovac options od
+         * prikazu a tenhle proot ho nezna ("proot error: unknown option
+         * '--'"), takze by cely fallback skoncil fatal errorem. Dalsi "--"
+         * uz muze patrit guest prikazu (`ls --`), ta se predavaji dal. */
+        int skipped_sep = 0;
+        for (int i = 0; i < argc && n < 254; i++) {
+            if (!skipped_sep && strcmp(argv[i], "--") == 0) {
+                skipped_sep = 1;
+                continue;
+            }
+            na[n++] = argv[i];
+        }
         na[n] = NULL;
         execve(real, na, envp);
         fprintf(stderr, "elf_loader: proot-compat: execve(%s) failed: %s "

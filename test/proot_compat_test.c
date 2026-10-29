@@ -41,6 +41,11 @@ static long shim_raw_syscall6(long nr, long a, long b, long c, long d, long e, l
 }
 typedef int (*fp_execve)(const char *, char *const[], char *const[]);
 static void *g_orig_execve = NULL;
+/* bind_reverse (src/binds.h) - nevola se v testovane casti (parser), ale
+ * exec_real pulka hlavicky na ni odkazuje -> musi se zkompilovat. */
+static int bind_reverse(const char *host, char *out, size_t n) {
+    (void)host; (void)out; (void)n; return 0;
+}
 
 #include "../src/proot_compat.h"
 
@@ -55,8 +60,15 @@ static void test_boot_flags_are_accepted(void) {
                       "--sysvipc", "-r", "/tmp/rootfs", "-w", "/root", "--", "id" };
     int cmd_start = -1, root_id = -1;
     unsetenv("LX_FAKEROOT"); unsetenv("LX_L2S");
-    CHECK(proot_compat_parse(11, argv, &cmd_start, &root_id) == 0);
-    CHECK(strcmp(argv[cmd_start], "id") == 0);
+    /* LX_PROOT_SYSVIPC=strict je dokumentovany escape hatch, takze ho muze
+     * mit kdokoliv exportovany v shellu; pak parse vrati -1 a cmd_start
+     * zustane na -1. CHECK neprerusuje beh, takze bez teto kontroly by
+     * nasledoval argv[-1]. */
+    unsetenv("LX_PROOT_SYSVIPC");
+    int rc = proot_compat_parse(11, argv, &cmd_start, &root_id);
+    CHECK(rc == 0);
+    CHECK(cmd_start >= 0 && cmd_start < 11 &&
+          strcmp(argv[cmd_start], "id") == 0);
     CHECK(root_id == 1);                                  /* --change-id=0:0 -> fakeroot */
     CHECK(getenv("LX_FAKEROOT") && strcmp(getenv("LX_FAKEROOT"), "1") == 0);
     CHECK(getenv("LX_L2S") && strcmp(getenv("LX_L2S"), "1") == 0);  /* --link2symlink */
