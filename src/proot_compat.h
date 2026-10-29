@@ -179,10 +179,18 @@ static int proot_compat_exec_real(const char *rootfs, char *const *extra_argv,
      * option '--'") a hybridni dispatch na nem kvuli tomu nikdy neprosel.
      * Prikaz je vzdy absolutni cesta, takze separator neni potreba. */
     /* A proot chce GUEST cestu (ma uz -r rootfs), ne hostovou - jinak hlasi
-     * "'<rootfs>/usr/sbin/ldconfig' not found (root = <rootfs>)". Prefix
-     * rootfs proto odrizneme. Rucni smycky, zadne libc volani (guest TP). */
+     * "'<rootfs>/usr/sbin/ldconfig' not found (root = <rootfs>)". Rucni
+     * smycky, zadne libc volani (guest TP). Poradi odvozeni:
+     *   1) bind_reverse() - binarka dosazena pres bind remap (LX_BINDS) ma
+     *      hostovou cestu mimo ROOTFS; bind_reverse ji prelozi na guest
+     *      cestu v tabulce bindu (longest-prefix host->guest).
+     *   2) odriznuti prefixu ROOTFS - binarka uz je pod ROOTFS.
+     *   3) puvodni cesta beze zmeny - fallback. */
+    char gpath_buf[4096];
     const char *gpath = path;
-    if (rootfs && rootfs[0] && path) {
+    if (path && bind_reverse(path, gpath_buf, sizeof gpath_buf)) {
+        gpath = gpath_buf;
+    } else if (rootfs && rootfs[0] && path) {
         size_t rl = 0;
         while (rootfs[rl]) rl++;
         while (rl > 1 && rootfs[rl - 1] == '/') rl--;  /* "<rootfs>/" */
