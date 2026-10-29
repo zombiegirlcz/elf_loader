@@ -350,9 +350,13 @@ fork veneer (vfork-style clone) [#L685].
   2026-10-22 (3)): memfd pro vlastní `cmdline`/`maps`/`mounts`/`mountinfo`,
   přepis kernelové oblasti argv pro cizí čtenáře (`ps`), `comm` přes
   `PR_SET_NAME`.
-- **Binárku mimo `$ROOTFS` nelze spustit** — `shim_execve` nalepí `$ROOTFS`
-  i na absolutní host cestu. Nejspíš táž vrstva jako vnořený `make`
-  (postup.md 2026-10-07 (2)) — řešit najednou [#L4029].
+- ~~**Binárku mimo `$ROOTFS` nelze spustit**~~ a ~~**vnořený `make`**~~ —
+  **nereprodukovatelné 2026-10-29**, oba nálezy (prefix přebývá / prefix
+  chybí) prošly: glibc binárka v `$D/tmp/.../scratchpad` běží jak přímo
+  (`--ownall <abs cesta>`), tak jako dítě guest bashe, a `make -C sub`
+  s `which cmake` uvnitř dá `/usr/bin/cmake` + rc=0. Pravděpodobně to
+  spravila identity tabulka bindů (prompt 06) + větev `is_glibc_elf` mimo
+  ROOTFS. Původní popis [#L4029].
 - **rustc/cargo odvozuje `sysroot` z `cwd`, ne z binárky** → `E0463: can't
   find crate for std`. Root cause neizolován. Workaround
   `--sysroot $R/root/.rustup/toolchains/stable-aarch64-unknown-linux-gnu`
@@ -372,10 +376,13 @@ fork veneer (vfork-style clone) [#L685].
   2.42 dostane layout 2.43 neověřeně. Při další verzi glibc znovu změřit
   (`ldso_apply_glibc_layout`, postup.md 2026-10-22 (4)).
 - **Prompt 08 mezery:** fakeroot/l2s jen přes jmenné hooky (ne L1/L2 →
-  statické/Go binárky je nevidí); `rename` přes l2s jméno nesnižuje počítadlo
-  (zbytky v `.l2s`); `lstat` symlinku hlásí velikost šifrovaného cíle (fscrypt
-  na 4.14, i nativně → dpkg varuje „size has changed“). Agent hlásil vzácné
-  ENOENT u dítěte pod `--ownall` i bez knobů — neověřeno (postup.md 2026-10-22 (7)).
+  statické/Go binárky je nevidí) — **poslední skutečná mezera**; `lstat`
+  symlinku hlásí velikost šifrovaného cíle (fscrypt na 4.14, i nativně →
+  dpkg varuje „size has changed“). ~~`rename` přes l2s jméno nesnižuje
+  počítadlo~~ — opraveno promptem 13 (T2) a **ověřeno 2026-10-29**
+  (`.0002`→`.0001` při `mv x <l2s jméno>`, po `rm` v `.l2s` nic nezbyde;
+  `tools/l2s-rename` scénář). ~~Vzácné ENOENT u dítěte pod `--ownall`~~ —
+  byl to nepřeložený cwd, past č. 22.
 - ~~**Vzácné nepřeložení cesty u potomka pod `--ownall`**~~ — **vyřešeno**
   2026-10-29 (5): relativní cesty resolvuje jádro proti skutečnému cwd
   (past č. 22), `run_ownall` ho přepočítá do ROOTFS. `test-all.sh all`

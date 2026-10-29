@@ -6837,3 +6837,48 @@ lookup z 20. 10. Integrita po A/B čistá: `dpkg -V hostname` rc=0,
 **Past, na kterou jsem při měření narazil (past 12 znovu):** `date +%s%N`
 rozdíl v `$(( ))` hostového `sh` dal **záporné** ms — oba operandy přesahují
 2³¹−1. Počítat awkem.
+
+## 2026-10-29 (7) — přeměření tří starých otevřených nálezů (dva mrtvé)
+
+Po opravě cwd (záznam (5)) jsem na dnešním buildu znovu zkusil tři nálezy,
+které byly v `AGENTS.md` vedené jako otevřené.
+
+**1) „Binárku mimo `$ROOTFS` nelze spustit" — nereprodukovatelné.**
+glibc binárka ve scratchpadu (`$D/tmp/claude-…/scratchpad/outside`, tedy
+mimo rootfs) běží rc=0 obojím způsobem:
+
+```
+elf_loader --ownall $D/tmp/.../scratchpad/outside            → outside-rootfs-ok
+elf_loader --ownall $R/bin/bash -c '$D/tmp/.../outside'      → outside-rootfs-ok
+```
+
+Žádný navíc nalepený `$ROOTFS` prefix. Pravděpodobně to spravila identity
+tabulka bindů (prompt 06) + větev `is_glibc_elf` pro glibc ELF mimo ROOTFS
+v `shim_execve`. Root cause neizolován, proto zapsáno jako
+**nereprodukovatelné**, ne jako „opraveno".
+
+**2) „Vnořený `make` → `/usr/bin/cmake: No such file or directory`" (týž
+nález z druhé strany, tam prefix naopak chyběl) — nereprodukovatelné.**
+`make` → `make -C sub`, v podmake `which cmake` → `/usr/bin/cmake`,
+`MAKE_RC=0`.
+
+**3) „`rename` přes l2s jméno nesnižuje počítadlo" — opraveno promptem 13
+(T2), teď ověřeno na zařízení.** Čistý test s unikátním basename na kali
+(`LX_L2S=1`):
+
+```
+ln rnNNN rnNNNb            → nlink 2/2, .l2s.rnNNN0001 + .0002
+mv rnNNNc rnNNNb           → cat = "world", nlink rnNNN = 1, backing .0001
+rm rnNNN rnNNNb            → v .l2s nezbyl ani jeden záznam s tagem
+```
+
+**Past při tom měření (málem jsem z toho udělal falešný závěr):** první verze
+testu počítala položky v `.l2s` přes `ls -1 | wc -l` a dostala **0 před
+i po**, protože **toybox `ls -1` skrývá dotfiles** a všechny l2s záznamy
+začínají tečkou (`.l2s.<jméno>NNNN`). Skutečný stav: 357 záznamů. Navíc
+jsem v nich viděl `.l2s.a0001 -> .0002` a málem ho přičetl svému testu —
+je to zbytek po `test-all.sh l2s`, který používá stejné jméno `a`. Proto
+v l2s testech **unikátní basename** a počítat jen `ls -1a`.
+
+Zbývá tedy jediná skutečná mezera promptu 08: fakeroot/l2s fungují jen přes
+jmenné hooky, takže statické a Go binárky je nevidí (chce zapojení do L1/L2).
