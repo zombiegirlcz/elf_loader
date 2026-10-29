@@ -6882,3 +6882,68 @@ v l2s testech **unikátní basename** a počítat jen `ls -1a`.
 
 Zbývá tedy jediná skutečná mezera promptu 08: fakeroot/l2s fungují jen přes
 jmenné hooky, takže statické a Go binárky je nevidí (chce zapojení do L1/L2).
+
+## 2026-10-29 (8) — poslední mezera parity: fakeroot pro statické a Go binárky
+
+**Nález (A/B knobem na téže statické sondě, kali).** Jmenné hooky
+(`g_f2_hooks`) potřebují PLT vazbu do naší libc. Statická binárka ani Go
+runtime ji nemají — dělají `svc` přímo — takže pod `LX_FAKEROOT=1` dál
+viděly skutečné app uid. Proot to řeší na úrovni syscallu (`fake_id0`),
+takže pro paritu to musí dělat i naše syscall vrstva. Výchozí stav:
+
+| knob | `stat` cesty | identita | `st_uid` |
+|---|---|---|---|
+| bez knobu | ✗ (`rc=-1`) | ✗ 10323 | ✗ |
+| `LX_FAKEROOT=1` | ✗ | ✗ 10323 | ✗ |
+| `+ L2=1` | ✓ | ✗ 10323 | ✗ 10323 |
+| `+ L1=1` | ✓ | ✗ 10323 | ✗ 10323 |
+| dynamická (`id`) | ✓ | ✓ 0 | ✓ |
+
+L1/L2 tedy cesty překládaly, ale identitu nedodávaly.
+
+**Implementace.**
+
+1. `l2_install_range_filter` pod fakerootem TRAPuje i identitní čísla
+   (174–177, 148/150, 158/159, 143–152). Mimo fakeroot se filtr nemění,
+   takže žádná režie.
+2. `go_fakeroot_pre` je zodpoví bez syscallu z trojice `g_fr_*`; `set*id`
+   volá tytéž `shim_set*id`, aby se semantika (fake root smí cokoli)
+   nerozcházela mezi vrstvami.
+3. `go_fakeroot_post` opraví výsledek `newfstatat`(79)/`statx`(291) přes
+   `fakeroot_fix_stat`/`_fd`/`_statx` a `l2s_fix_stat*`.
+4. `fakeroot_fix_statx` vytažen ze `shim_statx` do `fakeroot.h`. Při tom
+   opravena maličkost: fallback větev psala `*uid_p = 0` natvrdo, teď
+   `g_fakeroot_uid`/`g_fakeroot_gid` jako zbytek kódu (`LX_FAKEROOT=uid:gid`
+   je legitimní vstup).
+
+**Druhý průchod — nekonzistence, kterou to odhalilo.** Po bodech 1–3 dávalo
+`L1=2 L2=1` správnou identitu, ale `st_uid` **skutečného** app uid, i když
+`L2=1` samotné dávalo 0. Důvod: pod `L1=2` se cestová `svc` přepíší na L1
+stuby, takže L2 TRAP u `newfstatat`/`statx` už nenastane a
+`go_fakeroot_post` se nezavolá. Stejný důsledek měl `L1=1` samotný. Proto
+`l1_after` opravuje výsledek 79/291 sám a `l1_before` kvůli tomu nastaví
+`L1_NEED_AFTER` i když se žádná cesta nepřeložila (fallback „app uid → fake
+uid" cestu nepotřebuje). Cesta se předává jen u `AT_FDCWD` + absolutní
+(tedy už přeložené), jinak NULL — žádný buffer na zásobníku, `l1_after`
+běží na cizím 8 KB stacku (past č. 10).
+
+**Výsledný stav:**
+
+| knob | `stat` cesty | identita | `st_uid` |
+|---|---|---|---|
+| `LX_FAKEROOT=1 L2=1` | ✓ | ✓ 0 | ✓ 0 |
+| `LX_FAKEROOT=1 L1=1` | ✓ | ✗ 10323 | ✓ 0 |
+| `LX_FAKEROOT=1 L1=2 L2=1` | ✓ | ✓ 0 | ✓ 0 |
+
+`L1=1` samotné identitu nedodá **a je to správně**: L1 patchuje jen
+*cestová* `svc` místa a `getuid` žádnou cestu nemá. Identita proto vyžaduje
+L2; kombinace `L1=2 L2=1` funguje, protože identitní `svc` L1 nepřepíše,
+takže zůstanou TRAPovatelné.
+
+**Testy.** `test/l1_logic_test.c` má mocky fakeroot/l2s a 6 nových kontrol
+(přeložená cesta u `AT_FDCWD`, NULL + fallback u `dirfd`, vynechání l2s bez
+absolutní cesty, žádná oprava při chybovém výsledku, `statx` včetně offsetu
+uid, a že se bez fakerootu nic nevolá) — ALL PASS. `test-all.sh all`
+s defaulty: **218 PASS / 0 FAIL / 33 SKIP** (poprvé bez FAILu; i `nslookup
+localhost` tenhle běh prošel, je síťově závislý). Důležité hlavně proto, že
+refaktor `fakeroot_fix_statx` zasáhl i default cestu jmenných hooků.

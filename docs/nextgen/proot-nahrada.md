@@ -950,8 +950,12 @@ proti 10 086 ms u prootu (3,1×)**, a loader je navíc stabilní (rozptyl
 
 **Co zbývá k tomu, aby šel proot smazat:**
 
-1. `fakeroot`/`l2s` fungují jen přes **jmenné hooky** — statické a Go
-   binárky je nevidí. Potřebují zapojení do L1/L2 (ty jsou default vypnuté).
+1. ~~`fakeroot`/`l2s` fungují jen přes jmenné hooky~~ — **hotovo**
+   2026-10-29 (8): pod `LX_FAKEROOT` TRAPuje L2 filtr i identitní čísla
+   a `l1_after` opravuje výsledek `stat` rodiny, takže statická i Go
+   binárka vidí fake identitu (`uid=0`, `st_uid=0`). Vyžaduje **L2** —
+   `L1=1` samotné identitu nedodá, protože patchuje jen cestová `svc`.
+   L1/L2 jsou ale pořád default vypnuté, viz bod 2.
 2. Rozhodnutí o defaultech: `LX_L2S`/`LX_FAKEROOT` jsou default vypnuté.
    Přes proot-kompatibilní CLI se zapínají samy (`-0`/`-l`), takže pro
    appku to překážka není; pro bare `--ownall` je to otevřená volba.

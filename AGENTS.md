@@ -194,8 +194,11 @@ fork veneer (vfork-style clone) [#L685].
   strip → Bun bez `F2_NO_CWD_STRIP`. **Default vypnuto** (`ELF_LOADER_L2=1`;
   pod ním se místo Go módu instaluje L2). Lazy přepis `svc`→L1 stub
   (`ELF_LOADER_L2_LAZY=1`, default vyp — není ARM-safe souběžně). `L2=1`
-  dělá statickou glibc i Go viditelnou do rootfs. `all` default 195/0/33
-  [2026-10-21 (3)].
+  dělá statickou glibc i Go viditelnou do rootfs. Pod `LX_FAKEROOT` navíc
+  TRAPuje identitní čísla (174–177, `getres*id`, `get/setgroups`, 143–152)
+  a `go_fakeroot_pre/_post` dodají fake identitu i opravu `stat` výsledků —
+  bez toho statická/Go binárka fakeroot nevidí (2026-10-29 (8)). `all`
+  default 195/0/33 [2026-10-21 (3)].
 - **Tabulka mountů** (prompt 06, `src/binds.h`): longest-prefix
   `guest → host [ro]`, default = bývalý `shim_excluded` (identity) + remap
   `/dev/shm`. MAP_SHARED soubor (`$LX_LOG/binds.*.tab`, jinak
@@ -375,8 +378,12 @@ fork veneer (vfork-style clone) [#L685].
   `_rtld_global(_ro)` je ověřen jen pro 2.41 (parrot) a 2.43 (kali);
   2.42 dostane layout 2.43 neověřeně. Při další verzi glibc znovu změřit
   (`ldso_apply_glibc_layout`, postup.md 2026-10-22 (4)).
-- **Prompt 08 mezery:** fakeroot/l2s jen přes jmenné hooky (ne L1/L2 →
-  statické/Go binárky je nevidí) — **poslední skutečná mezera**; `lstat`
+- **Prompt 08 mezery:** ~~fakeroot/l2s jen přes jmenné hooky (ne L1/L2 →
+  statické/Go binárky je nevidí)~~ — **vyřešeno** 2026-10-29 (8): L2 filtr
+  pod fakerootem TRAPuje i identitní čísla (`go_fakeroot_pre/_post`)
+  a `l1_after` opravuje výsledek `stat` rodiny. `L1=1` samotné identitu
+  nedodá (patchuje jen cestová `svc`, `getuid` cestu nemá) → fakeroot pro
+  statické/Go vyžaduje **L2**. `lstat`
   symlinku hlásí velikost šifrovaného cíle (fscrypt na 4.14, i nativně →
   dpkg varuje „size has changed“). ~~`rename` přes l2s jméno nesnižuje
   počítadlo~~ — opraveno promptem 13 (T2) a **ověřeno 2026-10-29**
