@@ -7047,3 +7047,70 @@ run 40944634105, nasazeno na `$D/usr/bin/elf_loader` (0.9.8, 881600 B).
 prootem obecne nepobezi (proot sam potrebuje interpreter/qemu) — to je
 vlastnost prootu, ne bug teto opravy; `lx-force-proot`/bind kombinace je
 urcena primarne pro staticke/cizi-arch ELFy, ne bionic.
+
+## 2026-10-29 (11) — doplneni nalezu #6: varianta ELF_LOADER_STATIC_PROOT + edge case g_binds_ready
+
+Navazuje na (10) (`bind_reverse` v `proot_compat_exec_real`, commit `b0b90cf`).
+Dve veci, ktere tam zustaly neoverene.
+
+**A) Neotestovana varianta: `ELF_LOADER_STATIC_PROOT=1` (misto `lx-force-proot`).**
+V (10) byl bind+proot scenar overen jen pres `$ROOTFS/etc/lx-force-proot`.
+`elf_hybrid_needs_real_proot` ale ma tri nezavisle brany (cizi `e_machine`,
+`lx-force-proot`, `ELF_LOADER_STATIC_PROOT=1`) — vsechny vedou do stejneho
+`elf_hybrid_exec_proot`/`proot_compat_exec_real`, takze oprava by mela platit
+pro vsechny, ale nebylo to zmereno. Repro na kali: staticka ET_EXEC binarka
+bez PT_INTERP (`-static -nostdlib`, raw `exit` syscall — zadny gcc primo na
+zarizeni, postavena na hostu a nakopirovana) v `$HOSTDIR/mystatic`, bind
+`LX_BINDS="$HOSTDIR:/opt/bindtest2"`, `ELF_LOADER_STATIC_PROOT=1` (BEZ
+`lx-force-proot`):
+```
+ROOTFS=$K LX_BINDS="$HOSTDIR:/opt/bindtest2" ELF_LOADER_STATIC_PROOT=1 \
+  PROOT_LOADER=$D/usr/bin/loader PROOT_TMP_DIR=$D/tmp \
+  elf_loader --ownall $K/bin/bash -c '/opt/bindtest2/mystatic; echo RC=$?'
+```
+→ **RC=0** (zadny "not found" na hostove ceste). Oprava z (10) tedy platí i
+pro tuto branu, ne jen pro `lx-force-proot`.
+
+Cizi `e_machine` (treti brana) NEOTESTOVANA — kali rootfs nema zadny
+`qemu-*-static` (`ls $K/usr/bin/qemu-*-static` → No such file or directory),
+takze test by selhal na chybejicim qemu, ne na necem, co tato oprava resi.
+Neni to mezera v oprave, je to chybejici zavislost v test prostredi.
+
+**B) Edge case `g_binds_ready`.** Otazka: muze `proot_compat_exec_real()` byt
+volana DRIV, nez `binds_init()` nastavi `g_binds_ready=1`, a pokud ano, je
+fallback (krok 2/3 v `bind_reverse`→ROOTFS-prefix→beze zmeny) bezpecny?
+
+Rozbor volaciho grafu (`main.c`): jediná dvě call-site `elf_hybrid_exec_proot()`
+(main.c:2622, 2709) jsou uvnitř hooknute `execve()`, ktera bezi jen v procesu,
+kde uz probehlo `run_ownall()` → `binds_init()` (main.c:4876, volano HNED
+na zacatku `run_ownall`, pred jakymkoli shebang/exec rozhodovanim). `proot_compat_main`
+(`--proot-compat` CLI) ma vlastni "neznama volba" fallback (main.c ~6456-6474),
+ktery ale `proot_compat_exec_real()` NEVOLA — jen surove predava puvodni argv
+realnemu prootu beze zmeny cesty, takze bind_reverse tam neni potreba. Jinymi
+slovy: **v soucasnem kodu neni zadna dosazitelna cesta, kde by
+`proot_compat_exec_real` bezela s `g_binds_ready==0`.** `binds_init()` navic
+nastavuje `g_binds_ready=1` nepodminene na konci (vsechny tri vetve — attach/
+fork/create — pres spolecny radek za if/else), takze ani castecna
+inicializace to nenecha na 0.
+
+Protoze se to nejde reprodukovat v behu (neni "kam" to zavolat predcasne),
+otestovan primo invariant, na kterem fallback stoji: `bind_reverse()` MUSI
+pri `g_binds_ready==0` vratit 0 BEZ zapisu do vystupniho bufferu (aby
+`proot_compat_exec_real` bezpecne spadl do kroku 2 — odriznuti ROOTFS
+prefixu — a nepracoval se smetim). Novy host test
+`test/binds_gready_test.c` (NE stub jako `proot_compat_test.c` — primo
+`#include "../src/binds.h"`, jen minimalni `shim_*`/`g_shim_root`/`elf_debug`
+stuby pro kompilaci): `binds_init()` s realnym bindem → `bind_reverse()` s
+`g_binds_ready=1` najde remap (kontrolni pozitivni test) → rucne
+`g_binds_ready=0` → `bind_reverse()` vraci 0 a vystupni buffer zustava
+nedotceny (kanarek `'X'` ve `out[0]`) → navrat `g_binds_ready=1` → funguje
+znovu (neni to trvale poskozeni stavu). `gcc -Ipath -o /tmp/bg_test
+test/binds_gready_test.c && /tmp/bg_test` → **ALL PASS**.
+
+**Verdikt.** A) oprava (10) platí i pro `ELF_LOADER_STATIC_PROOT=1` cestu
+(zmereno RC=0 na kali), cizi-arch brana zustava netestovana pro chybejici
+qemu v rootfs (prostredi, ne kod). B) `g_binds_ready==0` pri volani
+`proot_compat_exec_real` je teoreticky nedosazitelny stav v aktualnim
+volacim grafu; i kdyby se to zmenilo (budouci refaktor), `bind_reverse()`
+uz ted bezpecne vraci 0 bez zapisu — oveřeno primym host testem nad realnym
+`src/binds.h`, ne jen uvahou.
