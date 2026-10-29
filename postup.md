@@ -6378,3 +6378,121 @@ pod zátěží ukázal 9689 µs.
 - `clone(CLONE_VM)` bez `CLONE_THREAD` následovaný `execve` by soft exec
   vzal (jednovláknová kontrola ho nerozliší) — `vfork` je ošetřený
   přepisem na `fork`, tahle díra zůstává.
+
+## 2026-10-29 (2) — prompt 13: úklid `.l2s`, stropy tras, odolnost proti zaplnění
+
+Vyvolal to provozní incident: volných **6,4 GiB ze 107 GiB**, appka 53 GB.
+Dva nezávislé žrouty a jeden slepý bod v měření.
+
+### Žrout 1 — trasa soft execu bez stropu (6,4 GB)
+
+`$D/usr/sx.log` rostl **1,4 MB/s** na 6,4 GB. Psal do něj osiřelý proces
+(`env /bin/echo T1`, pid 21220, uid 10323, 1,6 h ve stavu `R`) zacyklený
+v `sig-iter` smyčce — tedy přesně ta smyčka, kterou opravil `c14655b`
+(kernelová `sigaction` má 32 B). Smyčka je opravená, ale `sx_log`
+(`src/softexec.h`) neměl **žádný limit**, takže každý další zacyklený proces
+by to zopakoval.
+
+**Fix (T1, `0148a21`):** `SX_LOG_MAX_DEFAULT` 16 MiB, override
+`ELF_LOADER_SOFTEXEC_TRACE_MAX` (bajty, `0` = bez limitu). Env se čte
+v `softexec_enabled()` (host TP), počítadlo `g_sx_logged` se zvyšuje v
+`sx_log`, který běží pod guest TP → jen `shim_raw_syscall6`/`shim_strlen`
+(past č. 1). Po překročení se jednou zapíše `[softexec] trace capped`.
+
+**Zbývá:** strop je **per-proces**, ne per-soubor — počítá jen to, co zapsal
+tenhle proces, a do stejné cesty se přes `O_APPEND` sypou všichni. 100 procesů
+se 16 MiB limitem dá 1,6 GB. Na tenhle případ to stačí (žrout byl jeden),
+obecně by to chtělo `lseek` na konec při otevření.
+
+### Žrout 2 — `l2s_unlink` se nevolal při `rename` (3,58 GiB)
+
+`$ROOTFS/.l2s` mělo **9,39 GiB**, z toho **67 187 osiřelých backing souborů
+= 3,58 GiB (40 %)**. `l2s_unlink` byl zapojený jen do `shim_unlink`
+a `shim_unlinkat`, ne do `shim_rename`/`shim_renameat`/`shim_renameat2`.
+`rename(a, b)` nad l2s cílem zahodil `b` bez snížení počítadla. Typický
+producent je git (`tmp_pack_X` → `rename` na `pack-<sha>.pack`); dál
+`tmp_obj_*`, `tmp_idx_*`, `dep-graph.bin*` (cargo), `idm-*`, `*.manifest#*`.
+
+**Fix (T2, `aa45320`):** `l2s_unlink(newp)` před renamem; v `shim_renameat`
+jen pro `ndfd == -100`, v `shim_renameat2` navíc bez `RENAME_EXCHANGE`
+(obě strany zůstávají) a `RENAME_NOREPLACE` (cíl se nepřepisuje).
+
+### Slepý bod — root-owned soubory a SELinux kategorie
+
+`du` pod uid appky dalo **46,06 GiB**, pod rootem **52,71 GiB**. Rozdíl
+6,65 GiB byly cesty, na které appka nemá ani `stat`: **22 087 souborů
+`root:root`** a **30 291 s labelem `app_data_file:s0` bez kategorií**
+(správně `…:s0:c67,c257,c512,c768`), zbytky po apt/dpkg pod skutečným
+rootem 23.–25. 10. bez následného `chown -h` + `chcon`. Opraveno;
+nástroj `tools/fix-app-ownership.sh` (T4) label i vlastníka **odvozuje
+z cílové složky**, protože kategorie plynou z uid a konstanta v kódu je chyba.
+
+### Dvouúrovňový GC `.l2s`
+
+```
+cesta v rootfs (symlink) → .l2s/.l2s.<jméno><NNNN> (symlink) → .l2s/.l2s.<jméno><NNNN>.<nlink> (data)
+```
+
+`orphans = data_names − (cíle živých mezistupňů ∪ rootrefs)`, kde živý
+mezistupeň = ten, na který míří cesta z rootfs. Jednoúrovňová varianta bere
+mezistupeň za důkaz života a unikne jí 2 619 mrtvých mezistupňů včetně
+512 MB packu. Naměřeno pod rootem: 172 023 data souborů / 104 823 mezistupňů
+(102 204 živých, 2 619 mrtvých) / 104 836 odkazů → **67 187 osiřelých,
+3,58 GiB**. Po sklizni `.l2s` **9,39 → 5,74 GiB** a **0 rozbitých odkazů
+z 215 001**. Nástroj `tools/l2s-gc.sh` (T3), `--dry-run` default.
+
+Disk celkem: volno **6,4 → 15,76 GiB**.
+
+### Co se při tom ztratilo (a proč je v GC denylist)
+
+`var/lib/dpkg/status` v parrotu neexistoval už od **27. 10. 17:38** — dpkg
+spadl mezi zápisem `status-new` (0 B) a přejmenováním, `status-old` chybí,
+`var/backups` bez záloh. Poslední kopie obsahu (**2 250 273 B**) žila jako
+*osiřelý* `.l2s.status0001.0001` a úklid ji smazal: kritérium „nikdo na něj
+nemíří" bylo splněné správně, ale neumí rozlišit uniklý gitový temp od
+poslední kopie databáze po havárii. Proto má `l2s-gc.sh` povinný denylist
+`*status*`/`*dpkg*`/`*.l2s.diversions*` a karanténu místo `rm`.
+`tools/dpkg-status-rebuild.sh` (T5) složí `status.rebuilt` z `info/*.list`
+a verzí z `var/log/dpkg.log`: **2 431 balíčků, 2 429 s reálnou verzí**
+(chybí jen `gnupg-utils`, `powershell-empire`). Závislosti, `Conffiles`
+a popisy obnovit nelze — jen z `apt update`.
+
+### Testy
+
+Nové kategorie `softexec_cap` a `l2s_rename` (destruktivní → **jen kali**),
+zaregistrované v `all` i samostatně. Plná sada v klidu (žádné souběžné
+ruční `--ownall` příkazy vedle):
+
+**216 PASS / 2 FAIL / 33 SKIP**, oba nové testy PASS
+(`softexec-cap`, `l2s_rename`). Oba FAILy jsou známé: `nslookup localhost`
+→ NXDOMAIN (nesouvisí) a `csplit` (flaky).
+
+Pozn.: celkem 218 testů proti zapsané baseline 214 (213/1/33), přičemž nové
+kategorie přidávají jen 2 — ty zbylé 2 jsem nedohledal, baseline v docs by
+si zasloužila přepočítat.
+
+Během implementace se objevil **mass-fail napříč nesouvisejícími
+kategoriemi** (cp/mv/rm/tar/touch, „No such file or directory" na běžných
+guest cestách) při bězích `all` spuštěných za sebou souběžně s ručními
+`--ownall` příkazy. V klidném běhu se **nereprodukoval**. Odpovídá už
+zapsanému otevřenému bugu (nepřeložené cesty u child-exec pod `--ownall`,
+2026-10-22 (7)); T1/T2 se `shim_translate` ani PATH logiky nedotýkají.
+
+### Pasti do AGENTS.md (11–16)
+
+Všechny ověřené A/B, každá vyrobila konkrétní falešný nález:
+
+- **prootí `readlink` zkracuje cíle na 14 B** (2 874 prázdných) → analýza
+  symlinků v rootfs **jen hostovými nástroji přes `ashell`**; jinak vyjde
+  169 391 falešných osiřelých místo 67 187;
+- **proot zkracuje argv na ~504 položek** — `cmd $dir/*` nad 2 431 soubory
+  zpracuje 504 (argv 220 936 B, `ARG_MAX` 2 097 152); host i **náš loader
+  dají správných 2 431**, je to výhradně proot;
+- **host `sh`/`test` je 32bitový**: `[ 3839243310 -lt 6442450944 ]` → `rc=1`,
+  guard neprojde → porovnávat v MiB nebo `awk`em;
+- **`find -printf '%Z'` následuje symlinky** → z 2 241 „špatných labelů"
+  bylo 11 skutečných; label odkazu čti `ls -ldZ`;
+- **relativní cíl symlinku nelze testovat `[ -e "$target" ]`** (vyhodnotí se
+  proti cwd) → `[ -e "$link" ]`; tato chyba nahlásila 1 919 rozbitých
+  odkazů, kterých bylo 0;
+- **toybox `find` nezná `-printf '%h'`**.
