@@ -59,7 +59,16 @@ check_interpreter() {
         exit 1
     fi
 }
-check_interpreter "$L"
+# Nativni mod (prompt 12, prototyp): `L` nemiri na loader, ale na shell shim
+# tools/lxnative-ownall.sh, ktery test spusti pres nativni rootfs ld.so.
+# Shim neni bionic ELF, takze by na `check_interpreter` skoncil tise na
+# `exit 1` (stderr se v ashell kanalu ztrati). Default je nedotceny.
+if [ "${LX_NATIVE_MODE:-0}" = 1 ]; then
+    L=${LXN_SHIM:-$D/tmp/p12/lxnative-ownall.sh}
+    [ -x "$L" ] || { echo "LX_NATIVE_MODE=1 ale neni $L" >&2; exit 1; }
+else
+    check_interpreter "$L"
+fi
 
 # Spusti prikaz PRIMO (bez dalsiho ashell -c) - cely test-all.sh uz bezi
 # uvnitr jednoho ashell -c (viz hlavicka). DULEZITE: `timeout`/`bash` tady
