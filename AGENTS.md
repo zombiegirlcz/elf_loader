@@ -242,6 +242,34 @@ fork veneer (vfork-style clone) [#L685].
    `stp/ldp` X párů má dosah jen 504 B. Host test asm musí mít mock, který
    caller-saved registry a NZCV úmyslně ničí (jinak negativní kontrola projde).
 
+11. **Prootí `readlink` vrací cíle zkrácené na 14 B.** Uvnitř prootu dá
+   `find -printf '%l'` na l2s symlinku `/.l2s/.l2s.div` — konstantně 14 B pro
+   všechny, 2 874 cílů prázdných; host toybox dá správných 82 B. Analýzu
+   symlinků v rootfs proto dělej **jen hostovými nástroji přes `ashell`**:
+   jednou už to vyrobilo 169 391 falešných „osiřelých“ místo 67 187
+   skutečných. Rozšiřuje past č. 7.
+12. **Host `sh`/`test` je 32bitový.** `[ 3839243310 -lt 6442450944 ]` → `rc=1`
+   (oba operandy přesahují 2³¹−1 a srazí se na `INT_MAX`). Guardy a kontroly
+   velikostí počítej v MiB, nebo porovnávej `awk`em.
+13. **`find -printf '%Z'` následuje symlinky** → hlásí label cíle, ne odkazu.
+   Z 2 241 „špatně olabelovaných“ bylo 11 skutečných; zbytek byly visící
+   odkazy (`?`), odkazy do `/system/bin` (`toolbox_exec`) a na `/dev/null`.
+   Label odkazu samotného čti `ls -ldZ`.
+14. **Relativní cíl symlinku nelze testovat `[ -e "$target" ]`** — vyhodnotí se
+   proti cwd procesu, ne proti adresáři odkazu. Testuj `[ -e "$link" ]`.
+   Tato chyba vyrobila hlášení 1 919 rozbitých odkazů, kterých bylo 0.
+15. **Toybox `find` nezná `-printf '%h'`** (`%f`, `%l`, `%s`, `%p`, `%Z` jdou).
+   S `2>/dev/null` na tom `find` chybu spolkne a vrátí prázdný výstup.
+
+16. **Proot tiše zkracuje argv na ~504 položek.** `cmd $dir/*` nad velkým
+   adresářem zpracuje jen zlomek: na `var/lib/dpkg/info/*.list` (2 431
+   souborů, 220 936 B argv, `ARG_MAX` 2 097 152) dá shellový builtin 2 431,
+   ale externí program po `exec` jen **504**; `xargs` dělí na dávky a každou
+   zkrátí taky (1 008). Host i **náš loader dají správných 2 431** — je to
+   výhradně proot. V prootu proto počítej `find`em nebo `ls -1 | grep -c`,
+   nikdy globem předaným externímu programu. Tahle past vyrobila číslo
+   „503 balíčků“ místo 2 431.
+
 ## Otevřené bugy
 
 - ~~**Statický glibc ELF v rootfs končí SIGSYS** (RC=159)~~ — **vyřešeno pod
