@@ -2177,6 +2177,42 @@ static unsigned short elf_read_machine(const char *path) {
     return (unsigned short)(h[18] | (h[19] << 8));  /* LE offset 18 */
 }
 
+/* 1 = native aarch64 ELF typu ET_DYN BEZ PT_INTERP, tedy static-PIE.
+ * Static-PIE na tomhle zarizeni nejde spustit vubec (SIGSEGV i u prazdneho
+ * main, viz pamet "elf-loader-static-pie-broken"): jadro takovy obraz
+ * nenamapuje spravne, takze ani primy real execve, ani own-load neprojde.
+ * Glibc static-PIE (Debianovsky `ldconfig`) tim padal na RC=159 / SIGSEGV;
+ * bionicke staticke nastroje (ashell, Magisk su_wrapper) jsou ET_EXEC,
+ * takze touhle vetvi NEprojdou a zustavaji na primem real execve.
+ * Dynamicke bionicke binarky maji PT_INTERP (/system/bin/linker64) ->
+ * take 0. TLS-safe: jen raw_* syscally. */
+static int elf_is_static_pie(const char *path) {
+    int fd = raw_open(path, O_RDONLY);
+    if (fd < 0) return 0;
+    unsigned char h[64];
+    ssize_t n = raw_read(fd, h, sizeof h);
+    if (n < 64 || h[0] != 0x7f || h[1] != 'E' || h[2] != 'L' || h[3] != 'F') {
+        raw_close(fd);
+        return 0;
+    }
+    uint16_t e_type = (uint16_t)(h[16] | (h[17] << 8));
+    if (e_type != 3 /*ET_DYN*/) { raw_close(fd); return 0; }
+    uint64_t phoff = *(uint64_t *)(void *)(h + 32);
+    uint16_t phentsize = *(uint16_t *)(void *)(h + 54);
+    uint16_t phnum = *(uint16_t *)(void *)(h + 56);
+    if (phentsize < 56 || phnum == 0 || phnum > 1024) { raw_close(fd); return 0; }
+    int has_interp = 0;
+    for (int i = 0; i < phnum && !has_interp; i++) {
+        unsigned char ph[64];
+        shim_raw_syscall6(62 /*lseek*/, fd,
+                          (long)(phoff + (uint64_t)i * phentsize), 0, 0, 0, 0);
+        if (raw_read(fd, ph, sizeof ph) < 56) break;
+        if (*(uint32_t *)(void *)ph == 3 /*PT_INTERP*/) has_interp = 1;
+    }
+    raw_close(fd);
+    return !has_interp;
+}
+
 /* basename bez alokace — ukazuje do stejneho bufferu jako p. */
 static const char *elf_shim_basename(const char *p) {
     const char *b = p;
@@ -2191,7 +2227,9 @@ static const char *elf_shim_basename(const char *p) {
  * Rozhoduje:
  *  - cizi e_machine (loader umi jen EM_AARCH64) -> vzdy;
  *  - basename v $ROOTFS/etc/lx-force-proot -> vzdy;
- *  - staticka NATIVNI (aarch64) ELF jinak zustava na primem real execve
+ *  - static-PIE (ET_DYN bez PT_INTERP) -> vzdy (na tomhle zarizeni ho
+ *    nenamapuje ani jadro, viz elf_is_static_pie);
+ *  - ostatni staticka NATIVNI (aarch64) ELF zustava na primem real execve
  *    (ashell/su_wrapper a dalsi bionicke testovaci nastroje v rootfs to
  *    chteji) - ELF_LOADER_STATIC_PROOT=1 tuto vetev prepne take na proot
  *    (test-all.sh prootcompat kategorie pro staticke binarky bez L2). */
@@ -2201,6 +2239,10 @@ static int elf_hybrid_needs_real_proot(const char *path) {
     if (mach && mach != EM_AARCH64) return 1;
     if (g_shim_root && proot_compat_is_forced(g_shim_root, elf_shim_basename(path)))
         return 1;
+    /* static-PIE (ET_DYN bez PT_INTERP) na tomhle zarizeni nejde spustit
+     * nijak jinak -> vzdy pod realny proot. Bionicke staticke nastroje jsou
+     * ET_EXEC a touhle vetvi neprojdou (past c. 25 / otevreny bug ldconfig). */
+    if (elf_is_static_pie(path)) return 1;
     const char *sp = getenv("ELF_LOADER_STATIC_PROOT");
     if (sp && sp[0] && shim_strcmp(sp, "0") != 0) return 1;
     return 0;
@@ -4857,6 +4899,58 @@ static int run_ownall(const char *path, int argc, char **argv, char **envp) {
         n = snprintf(shellpath, sizeof shellpath, "%s/bin/bash", g_shim_root);
         if (n > 0 && (size_t)n < sizeof shellpath && shim_access_host(shellpath, 1) == 0)
             setenv("SHELL", shellpath, 0);
+    }
+    /* Guest PATH (past c. 24): guest procesy jinak dedi HOSTOVY PATH, ktery
+     * na Androidu obsahuje /system/bin — a `bash -c 'id'` pak spusti Androidi
+     * toybox /system/bin/id, ktery bezi NATIVNE MIMO loader: zadny fakeroot,
+     * zadny preklad cest. Projevilo se to jako "fakeroot nefunguje pro
+     * potomky" (`--ownall bash -c 'id'` dalo uid=10323, `--ownall bash -c
+     * '/usr/bin/id'` uid=0) a shodilo `dpkg --configure` ("7 expected
+     * programs not found in PATH").
+     *
+     * Prepisujeme jen kdyz PATH skutecne obsahuje hostovy /system/{bin,xbin}
+     * — PATH, ktery si uz poskladal `lx`/double-world (hostove absolutni
+     * $R/usr/bin...), zustava nedotceny. Puvodni hodnota se zachova v
+     * LX_HOST_PATH. Vypnuti: ELF_LOADER_NO_GUEST_PATH=1. */
+    if (g_shim_root && g_shim_root[0] && !getenv("ELF_LOADER_NO_GUEST_PATH")) {
+        const char *cur = NULL;
+        int path_idx = -1, n_env = 0;
+        for (int i = 0; envp && envp[i]; i++) {
+            if (path_idx < 0 && strncmp(envp[i], "PATH=", 5) == 0) {
+                path_idx = i;
+                cur = envp[i] + 5;
+            }
+            n_env++;
+        }
+        if (cur && (strstr(cur, "/system/bin") || strstr(cur, "/system/xbin"))) {
+            static const char *gp =
+                "PATH=/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin";
+            size_t hl = strlen("LX_HOST_PATH=") + strlen(cur) + 1;
+            char *hp = malloc(hl);
+            char **ne = calloc((size_t)n_env + 2, sizeof(char *));
+            if (hp && ne) {
+                snprintf(hp, hl, "LX_HOST_PATH=%s", cur);
+                int o = 0;
+                for (int i = 0; envp && envp[i]; i++) {
+                    if (i == path_idx) continue;
+                    if (strncmp(envp[i], "LX_HOST_PATH=", 13) == 0) continue;
+                    ne[o++] = envp[i];
+                }
+                ne[o++] = (char *)gp;
+                ne[o++] = hp;
+                ne[o] = NULL;
+                envp = ne;
+                /* i pro loaderuv vlastni getenv/exec shim */
+                setenv("LX_HOST_PATH", cur, 1);
+                setenv("PATH", gp + 5, 1);
+                if (elf_debug())
+                    fprintf(stderr, "[+] guest PATH nastaven (%s), host v LX_HOST_PATH\n",
+                            gp + 5);
+            } else {
+                free(hp);
+                free(ne);
+            }
+        }
     }
     if (!g_shim_loader || !g_shim_loader[0]) {
         static char self_exe[1024];
