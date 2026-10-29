@@ -221,9 +221,46 @@ static int proot_compat_exec_real(const char *rootfs, char *const *extra_argv,
         na[narg++] = argv[i];
     na[narg] = NULL;
 
+    /* Realny proot potrebuje svuj PROOT_LOADER a PROOT_TMP_DIR. V prostredi
+     * dpkg/maintainer-scriptu uvnitr guestu ani jedno neni (dpkg si env
+     * ciste) a proot pak skonci na
+     *   proot warning: can't canonicalize /tmp/
+     *   proot error: execve("/usr/sbin/ldconfig"): No such file or directory
+     * — tedy presne na triggeru `libc-bin`, kvuli kteremu dispatch vznikl.
+     * Dolepime je do envp: loader = sourozenec prootovy binarky, tmp =
+     * <rootfs>/tmp (hostovy /tmp na Androidu neexistuje). Staticke buffery:
+     * tahle funkce uz jen execve, nevraci se. TLS-safe (zadne libc). */
+    static char pl_buf[4200], pt_buf[4200];
+    static char *ne[600];
+    char *const *use_envp = envp;
+    int have_pl = pc_envp_get(envp, "PROOT_LOADER") != NULL;
+    int have_pt = pc_envp_get(envp, "PROOT_TMP_DIR") != NULL;
+    if (!have_pl || !have_pt) {
+        int o = 0;
+        for (int i = 0; envp && envp[i] && o < 596; i++) ne[o++] = envp[i];
+        if (!have_pl && o < 597) {
+            shim_strcpy(pl_buf, sizeof pl_buf, "PROOT_LOADER=");
+            size_t base = shim_strlen(pl_buf);
+            shim_strcat(pl_buf, sizeof pl_buf, realproot);
+            size_t cut = shim_strlen(pl_buf);
+            while (cut > base && pl_buf[cut - 1] != '/') cut--;
+            pl_buf[cut] = 0;
+            shim_strcat(pl_buf, sizeof pl_buf, "loader");
+            if (raw_access(pl_buf + base, 1 /*X_OK*/) == 0) ne[o++] = pl_buf;
+        }
+        if (!have_pt && o < 598 && rootfs && rootfs[0]) {
+            shim_strcpy(pt_buf, sizeof pt_buf, "PROOT_TMP_DIR=");
+            shim_strcat(pt_buf, sizeof pt_buf, rootfs);
+            shim_strcat(pt_buf, sizeof pt_buf, "/tmp");
+            ne[o++] = pt_buf;
+        }
+        ne[o] = NULL;
+        use_envp = ne;
+    }
+
     fp_execve f = (fp_execve)g_orig_execve;
-    if (f) return f(realproot, na, envp);
-    return (int)shim_raw_syscall6(SYS_execve, (long)realproot, (long)na, (long)envp, 0, 0, 0);
+    if (f) return f(realproot, na, use_envp);
+    return (int)shim_raw_syscall6(SYS_execve, (long)realproot, (long)na, (long)use_envp, 0, 0, 0);
 }
 
 /* ---- konfigurace "spust pod realnym prootem, ne pod loaderem" (TLS-safe) */
