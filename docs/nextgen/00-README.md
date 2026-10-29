@@ -19,8 +19,8 @@ v [proot-nahrada.md](proot-nahrada.md) — prompty odkazují na její kapitoly.
 | 09 | [proot-kompatibilní CLI + hybrid](09-proot-cli-hybrid.md) | 3.6, 7 | 06, 08 | implementace | **hotovo** 2026-10-28 (posix_spawn cesta bez hybridu) |
 | 10 | [cache obrazů + líné vázání](10-exec-image-cache.md) | 5.5, 5.6 | 01, 02 | implementace | **hotovo** 2026-10-20 |
 | 11 | [soft exec / zygote — výzkum](11-soft-exec-zygote.md) | 5.7, 5.8 | 01, 10 | výzkum + prototyp | **hotovo** 2026-10-29 (varianta A, default vypnuto) |
-| 12 | [nativní ld.so mód — prototyp](12-nativni-ldso.md) | 6 | 04, 05 | výzkum + prototyp | – |
-| 13 | [úklid .l2s, stropy tras, odolnost](13-uklid-a-odolnost.md) | – | 08, 11 | oprava + nástroje | – |
+| 12 | [nativní ld.so mód — prototyp](12-nativni-ldso.md) | 6 | 04, 05 | výzkum + prototyp | **hotovo** 2026-10-29 (prototyp za přepínačem, doporučení hybrid) |
+| 13 | [úklid .l2s, stropy tras, odolnost](13-uklid-a-odolnost.md) | – | 08, 11 | oprava + nástroje | **hotovo** 2026-10-29 |
 
 07 jde dělat kdykoli, je nezávislý.
 

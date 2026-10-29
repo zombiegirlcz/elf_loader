@@ -6496,3 +6496,185 @@ Všechny ověřené A/B, každá vyrobila konkrétní falešný nález:
   proti cwd) → `[ -e "$link" ]`; tato chyba nahlásila 1 919 rozbitých
   odkazů, kterých bylo 0;
 - **toybox `find` nezná `-printf '%h'`**.
+
+## 2026-10-29 (3) — prompt 12: nativní ld.so mód (prototyp)
+
+Zadání bylo prototyp a **strategické rozhodnutí**, ne nový mód. Výsledek:
+**doporučení hybrid, s nativním módem jako cílem pro CLI zátěž.** Plná
+kapitola s tabulkami je v `docs/nextgen/proot-nahrada.md` („Nativní ld.so
+— výsledek"), tady je deník a čísla.
+
+### Vstupní kontrola
+
+Doména je `untrusted_app_27` (targetSdk ≤ 28), takže `execute_no_trans` na
+`app_data_file` ještě není odebraný a `ld.so` z app dat jde spustit —
+obava kapitoly 6 o W^X na tomhle zařízení neplatí (pro targetSdk ≥ 29 platí
+dál). `ld.so --version` → rc=0. glibc 2.41 (parrot) i 2.43 (kali).
+
+Bod 4 ale **selhal**: `ld.so --library-path … /bin/true` → SIGSYS, rc=159,
+na obou rootfs. Podle promptu tady měl prompt skončit. Neskončil, protože
+příčina jsou dva syscally.
+
+### Izolace příčiny (každý krok měřen)
+
+1. Umírá i program s **nulovou** závislostí na libc (`-nostdlib -fPIE -pie`,
+   jen `svc` na `exit`) → vinník je v `ld.so`, ne v libc ani v programu.
+2. `LD_DEBUG=all` končí po version checkech a před relokací = `init_tls()`
+   → `TLS_INIT_TP` → `__tls_init_tp`.
+3. `GLIBC_TUNABLES=glibc.pthread.rseq=0` nepomohlo (tunable existuje,
+   `--list-tunables` ho ukazuje) → není to `rseq`.
+4. Freestanding ptracer přečetl z `PTRACE_GETSIGINFO`: **`si_syscall=99`
+   = `set_robust_list`**, `si_code=1` (`SYS_SECCOMP`),
+   `si_arch=0xc00000b7`. Shodně parrot i kali.
+5. Po pohlcení SIGSYS proces **doběhne**. Druhý a poslední trap je `293`
+   = `rseq`. Dva traps na proces, dva na každé další vlákno.
+
+glibc volá `set_robust_list` v `__tls_init_tp` nepodmíněně a tunable na to
+nemá; návratovou hodnotu ale toleruje. Jádro před SIGSYS nastaví
+`x0 = -ENOSYS`, takže pohlcení signálu je korektní odpověď, ne hack.
+
+### Korekce: app profil TRAPuje, nekilluje
+
+Freestanding sonda v čistém `ashell` kontextu (0–600, raw `svc`, vlastní
+`RET_ERRNO|66` filtr na každé zkoumané číslo): **0 KILL, 362 TRAP**. Profil
+je whitelist s `SECCOMP_RET_TRAP` jako defaultem — proto TRAPuje i všechna
+neexistující čísla nad 470.
+
+Komentáře v `src/elf_loader.c:2177` a `:4141` tvrdí „app seccomp KILLuje
+rseq(293), set_robust_list(99) a clone3(435)" a odvozují z toho, že „KILL
+nejde přebít filtrem ani SIGSYS handlerem". **První část je chybná**, druhá
+proto taky. `elf_patch_syscall_sites` tím ale zbytečný není: `RET_ERRNO`
+filtr TRAP nepřebije (jádro bere nejnižší akci, `RET_TRAP` 0x00030000 <
+`RET_ERRNO` 0x00050000) a handler by u loaderu běžel pod cizím TP (past
+č. 1). Zůstává nejlevnější, jen z jiného důvodu.
+
+Proč se to nezjistilo dřív: glibc sonda `src/sigsys_probe.c` dá v obou
+dostupných prostředích nesmysl — pod loaderem je `syscall()` hookovaný
+a `svc` místa přepsaná, pod prootem se syscall interponuje. Nahlásila
+**0 KILL a 0 TRAP**. Past č. 17.
+
+### Proč musí pohlcení dělat tracer
+
+Zevnitř procesu to nejde: vlastní seccomp filtr prohraje s TRAPem,
+dispozice signálů se při `execve` resetují a `--audit`/`LD_PRELOAD` se
+nevolají dřív než `__tls_init_tp` (změřeno — bez pohlcení se `la_version`
+**vůbec nespustí**), `SIG_IGN` seccomp přebije přes `force_sig_info`.
+Tracer se narozdíl od prootu zastavuje **jen na SIGSYS**, tedy 2× za proces,
+takže je jeho režie v šumu. ptrace přežívá `execve`, takže potomci absorbér
+neztratí; `PTRACE_O_TRACEFORK|TRACEVFORK|TRACECLONE` pokryje i vlákna.
+
+### Co se postavilo
+
+`tools/lxnative.c` (freestanding statický ptrace supervizor),
+`tools/liblx-audit.c` (rtld-audit: `la_symbind64` přesměruje PLT vazby
+cestových funkcí na wrappery, exec shim, `/proc/self/exe`),
+`tools/lxnative-run.sh` (přepínač), `tools/lxnative-ownall.sh` (shim pro
+harness), `tools/lxnative-build.sh`, `tools/bench-native-ldso.sh`,
+`tools/bench-native-python.sh`, `tools/compare-native-mode.sh`,
+a `LX_NATIVE_MODE=1` v `test-all.sh` (přeskočí `check_interpreter`, default
+nedotčený). **Oba kusy staví rootfs gcc** — žádný NDK ani Modal, takže se
+nativní mód dá iterovat bez build loopu.
+
+### Čísla
+
+Stroj byl hlučný (`toybox true` vyšel 11,9 ms a 25,9 ms ve dvou bězích),
+proto rozsahy ze dvou pořadí; rozhodují poměry.
+
+`/bin/true`, N=40: nativní **3,5–7,0 ms**, nativní+audit 3,6–4,6 ms,
+proot 14,7–25,9 ms, loader `--ownall` 25,2–41,5 ms.
+
+`python3 -c 0`, N=5, dvě kola: nativní **35,7 / 54,1 ms**, nativní+audit
+36,9 / 48,0 ms, proot 28,0 / 39,4 ms, loader 98,4 / 93,4 ms (dřívější
+referenční 102,8 ms se potvrdilo).
+
+**Cena rtld-auditu je v šumu** i na pythonu, který váže stovky symbolů.
+To byl největší otevřený risk celého promptu a nevyšel.
+
+RSS, `cat /proc/self/status`: nativní `VmHWM` **252 kB** / `VmSize`
+2 652 kB, loader 5 496 kB / 3 271 484 kB → **21,8× nižší RSS**, `VmSize`
+1 234× nižší (1 GB aréna + 64 MB stack own-loadu). `python3`: nativní
+8 216 kB, nativní+audit 8 880 kB, loader 13 036 kB.
+
+### `test-all.sh` v nativním módu
+
+Harness zůstává pod loaderem, přepíná se jen `L`. Vnořený tracer by
+kolidoval s vnějším (jeden tracee má jen jednoho tracera, `TRACEFORK`
+vnějšího by vnitřnímu `lxnative` sebral dítě → `EPERM`).
+
+Pustila se **nedestruktivní podmnožina 20 kategorií**, ne `all`. Důvod:
+překlad cest je v PoC částečný a kategorie, které mažou (`l2s`,
+`l2s_rename`, `binds`, `fakeroot`, `imgcache`), by `rm -rf` mířily na
+nepřeložené, tedy hostové cesty. Navíc kategorie testující **mechanismy
+loaderu** (`l1`, `l2`, `softexec*`, `execcache`, `symhash`, `lazybind`,
+`relsym`, `procvirt`) v nativním módu neexistují — velká část sady testuje
+loader, ne guest funkcionalitu.
+
+| mód | PASS | FAIL | SKIP |
+|---|---|---|---|
+| own-load (default) | 158 | 2 | 32 |
+| nativní, PoC v1 (15 jmen) | 131 | 29 | 32 |
+| nativní, PoC v2 (36 jmen) | 141 | 19 | 32 |
+| nativní, PoC v3 (+ uid/gid v allowlistu traceru) | 142 | 18 | 32 |
+
+Oba FAILy v defaultu jsou známé a nesouvisející (`nslookup localhost`
+→ NXDOMAIN, flaky `csplit`).
+
+### Taxonomie selhání — vlastní odpověď promptu
+
+1. **Chybějící jména v tabulce** — ne strukturální, jen práce. v1 neměl
+   `mkdtemp`/`mkstemp`, takže `/tmp/pathops.NNN` vznikl v **hostovém**
+   `/tmp` (na Androidu neexistuje) → `pathops` 4/4 FAIL. Doplnění
+   `fstatat`/`faccessat` zvedlo `find /etc | wc -l` z **1 na 229**.
+2. **Interní volání v libc** → **L1**. `bl` uvnitř `libc.so.6` neprochází
+   PLT (past č. 2). Projevuje se u `make` (`/usr/bin/echo: No such file`),
+   u NSS (dlopen modulu zevnitř libc) a u `fts`/`glob`/`scandir`. Řeší se
+   přepisem `svc` v textu libc v `la_objopen` — a `la_objopen` **vidí
+   i `ld.so` a `libc.so.6`** (změřeno), takže hákovací bod existuje.
+3. **Raw syscally** → **L2**. Go, Bun, statické binárky.
+4. **`open` programu, který dělá `ld.so` sám.** `/usr/bin/awk`
+   a `/usr/bin/which` jsou symlinky na absolutní `/etc/alternatives/…`;
+   jádro je vyhodnotí proti hostovému korenu ještě před načtením audit
+   knihovny → `cannot open shared object file`. Překladem to opravit
+   **nelze**. Nativní mód tím dává cenovku už otevřené položce
+   „celorootfs konverze absolutních symlinků" (`tools/relsymlinks.sh`,
+   1 093 linků) — tam je to nutná podmínka, ne kosmetika.
+5. **Syscally TRAPované profilem mimo allowlist traceru.** `busybox
+   mktemp -d` umřel na `nr=144` (`setgid`) — pod own-loadem to odchytí uid
+   shimy v libc, v nativním módu není co zachytit. Doplněno 143–146 a 149
+   do allowlistu, pak `mktemp -d /tmp/xXXXXXX` → `/tmp/p12testMaPLUf`
+   (správně guestová cesta, zpětná konverze `unxlat` funguje). ENOSYS je
+   pro tuhle rodinu správná odpověď jen náhodou — správně by tracer měl
+   vracet 0 přes `PTRACE_SETREGSET`, jako to dělá fakeroot (prompt 08).
+
+### Revize strategických bodů kapitoly 6
+
+- W^X: na tomhle zařízení neaktuální, pro targetSdk ≥ 29 platí dál. Dokud
+  se `ld.so` bere z rootfs, je GLIBC_PRIVATE konzistence zaručená zdarma —
+  **to je jediný argument, který own-loadingu zůstává bez výhrad.**
+- Bionic bridge (GPU) v čistě glibc procesu nejde → own-load bez alternativy.
+- RAM: změřeno, nativní vyhrává výrazně.
+- Past č. 1 (guest TP vs bionický TLS) v nativním módu **neplatí** —
+  wrappery smí volat cokoli z libc včetně `snprintf`.
+- `/proc/self/exe` shim je potřeba a je hotový (`LX_PROG`). Bez něj to
+  pro python nahodou funguje, protože si z cesty k `ld.so` (ležícímu
+  v rootfs) správně odvodí `sys.prefix` — náhoda, ne vlastnost.
+
+### Nové pasti (17–21 v `AGENTS.md`)
+
+Seccomp profil nelze měřit glibc sondou; korekce KILL → TRAP; staticky
+linkovaná binárka s prázdnou `.data` se nespustí (`PT_LOAD` s
+`p_filesz == 0`); `la_symbind64` dostává `st_value` už jako finální adresu;
+Android má `/bin` → `/system/bin` a `PT_INTERP` sám nestačí k rozhodnutí
+„glibc binárka".
+
+### Co zbývá, kdyby se do toho šlo
+
+1. `tools/relsymlinks.sh` — **nutná podmínka**, bez ní třída 4 nezmizí.
+2. L1 v `la_objopen` nad `libc.so.6` — zruší třídu 2 a většinu FAILů.
+3. L2 okno pro statické/Go — zruší třídu 3.
+4. Teprve pak má smysl `test-all.sh all` a srovnání s 216/2/33.
+5. Bionic bridge a targetSdk ≥ 29 nechat own-loadingu.
+
+Stop kritéria z promptu se **nenaplnila** ani jedno (`--audit` se volá,
+W^X nebrání). Zastavil se rozsah, ne cesta: dotáhnout L1/L2 do audit
+knihovny je samostatná práce na dny.

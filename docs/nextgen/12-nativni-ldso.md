@@ -1,5 +1,12 @@
 # Prompt 12 — prototyp: nativní glibc proces (`ld-linux-aarch64.so.1` jako program)
 
+> **Hotovo 2026-10-29.** Výsledek, čísla a doporučení (hybrid) jsou
+> v `docs/nextgen/proot-nahrada.md`, kapitola „Nativní ld.so — výsledek";
+> deník a taxonomie selhání v `postup.md` 2026-10-29 (3). Prototyp žije
+> v `tools/lxnative*.c|sh` + `tools/liblx-audit.c`, přepínač
+> `tools/lxnative-run.sh`, v harnessu `LX_NATIVE_MODE=1`. Text níže je
+> původní zadání.
+
 Pracuješ v `/root/elf_loader`. Přečti `docs/nextgen/00-README.md`, `AGENTS.md`
 (sekce 2, 5, 8 — chyby, které existují jen kvůli dvěma libc v procesu; sekce 9
 bionic bridge), postup.md:310–340 (přímý běh ld.so, proč `patchelf_interp`

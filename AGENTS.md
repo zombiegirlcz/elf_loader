@@ -78,6 +78,18 @@ knobem přepisuje na `fork`. **Zbývající hrdlo je `fork`** (4,2 ms/fork
 u loaderu vs 1,2 ms u prootu — 1 GB aréna + 64 MB stack), ne exec.
 A/B měření: `tools/bench-softexec.sh` (z hosta, `ashell -c`).
 
+**Nativní ld.so mód** (prompt 12, **prototyp, není to mód loaderu**): guest
+glibc program běží pod `ld.so` z rootfs, ne own-loadem. `tools/lxnative.c`
+(freestanding statický ptrace supervizor, pohlcuje SIGSYS — app profil
+TRAPuje `set_robust_list`/`rseq` v glibc TLS initu) + `tools/liblx-audit.c`
+(rtld-audit, `la_symbind64` přesměruje PLT vazby cestových funkcí + exec
+shim). Přepínač `tools/lxnative-run.sh`, v harnessu `LX_NATIVE_MODE=1`.
+**Oba kusy staví rootfs gcc** (`tools/lxnative-build.sh`), žádný NDK ani
+Modal. Naměřeno: exec 3,5–7,0 ms proti 25–41 ms u `--ownall`, RSS 252 kB
+proti 5 496 kB; `python3 -c 0` 36–54 ms proti 93–98 ms. Default nedotčený,
+žádný dopad na loader. Čísla, taxonomie selhání a doporučení (hybrid)
+v `docs/nextgen/proot-nahrada.md`, kapitola „Nativní ld.so — výsledek".
+
 Knoby: `ELF_LOADER_TIMING`, `ELF_LOADER_NO_CACHE`, `ELF_LOADER_NO_HASH`,
 `ELF_LOADER_HASH_CHECK`, `ELF_LOADER_LAZY`, `ELF_LOADER_IMGCACHE`,
 `ELF_LOADER_NO_RELSYM`, `ELF_LOADER_NO_BIONIC_BRIDGE`, `ELF_LOADER_EXEC_TRACE`,
@@ -269,6 +281,40 @@ fork veneer (vfork-style clone) [#L685].
    výhradně proot. V prootu proto počítej `find`em nebo `ls -1 | grep -c`,
    nikdy globem předaným externímu programu. Tahle past vyrobila číslo
    „503 balíčků“ místo 2 431.
+17. **Seccomp profil nelze měřit glibc sondou.** Pod loaderem je `syscall()`
+   hookovaný a cestová `svc` místa se navíc přepisují
+   (`elf_patch_syscall_sites`), pod prootem se syscall interponuje — obojí
+   výsledek maskuje. `src/sigsys_probe.c` (glibc) nahlásil v rozsahu 0–600
+   **0 KILL a 0 TRAP**, freestanding `-static -nostdlib` ET_EXEC s raw `svc`
+   přes `ashell` nahlásil **0 KILL a 362 TRAP**. Platný je jen ten druhý.
+18. **KOREKCE ke komentářům v `src/elf_loader.c:2177` a `:4141`: app profil
+   tyhle syscally NEKILLuje, ale TRAPuje.** Naměřeno 2026-10-29:
+   `set_robust_list` (99), `rseq` (293) i `clone3` (435) dávají
+   `SECCOMP_RET_TRAP`, `si_code=1` (`SYS_SECCOMP`), `si_arch=0xc00000b7`.
+   Profil je whitelist s TRAPem jako defaultem (proto TRAPuje i všechna
+   neexistující čísla). Dopad: SIGSYS **je** zachytitelný, takže věta „KILL
+   nejde přebít filtrem ani SIGSYS handlerem“ neplatí. Neplatí ale ani
+   obrácený závěr, že je `elf_patch_syscall_sites` zbytečný: ERRNO filtr
+   TRAP nepřebije (jádro bere z filtrů **nejnižší** akci a `RET_TRAP`
+   0x00030000 < `RET_ERRNO` 0x00050000) a handler by u loaderu běžel pod
+   cizím TP (past č. 1). Přepis instrukce zůstává nejlevnější cesta, jen
+   z jiného důvodu, než je u ní napsaný.
+19. **Staticky linkovaná binárka s prázdnou `.data` se nespustí.** Čistá
+   `.bss` vyrobí `PT_LOAD` s `p_filesz == 0` a jádro na tomhle zařízení
+   takový segment nenamapuje → SIGSEGV **před první instrukcí programu**
+   (padne i volání bez argumentů, takže to vypadá na chybu v argv).
+   Řešení: jedna inicializovaná globálka, nebo `-Wl,-N` (ten ale vyrobí RWX
+   segment). Viz `tools/lxnative.c`.
+20. **`la_symbind64` dostává `st_value` už jako finální runtime adresu.**
+   glibc předává audit knihovně **kopii** symbolu, ve které `_dl_fixup`
+   přepsal `st_value` na výslednou adresu. Přičtení `l_addr` ji posune
+   podruhé → wrapper volá smetí a proces padne na SIGSEGV.
+21. **Android má `/bin` → `/system/bin`.** `[ -e /bin/ls ]` proto na hostu
+   uspěje a „guestovou“ absolutní cestu je nutné hledat **nejdřív v rootfs**.
+   Opačné pořadí spustí Androidí toybox přes glibc `ld.so` a projeví se jako
+   `libcrypto.so: cannot open shared object file` (bionic jména knihoven
+   nemají verzi). A `PT_INTERP` sám nestačí k rozhodnutí „glibc binárka“ —
+   bionic binárky ho mají taky (`/system/bin/linker64`), čti jeho obsah.
 
 ## Otevřené bugy
 
@@ -294,7 +340,12 @@ fork veneer (vfork-style clone) [#L685].
   až po návratu (PC je v `l1_common`, ne v okně `__syscall_cancel_arch`).
   Bezpečné, jen odložené. Default L1 zatím vypnutý.
 - **Celorootfs konverze absolutních symlinků čeká na potvrzení** (1093 linků,
-  1081 převoditelných) — `tools/relsymlinks.sh --dry-run`.
+  1081 převoditelných) — `tools/relsymlinks.sh --dry-run`. V nativním módu
+  (prompt 12) to **není kosmetika, ale nutná podmínka**: `/usr/bin/awk`
+  a `/usr/bin/which` jsou symlinky na absolutní `/etc/alternatives/…`, které
+  jádro vyhodnotí proti HOSTOVÉMU korenu už při otevírání programu — tedy
+  dřív, než se načte audit knihovna → `error while loading shared libraries:
+  …/awk: cannot open shared object file`. Překladem to opravit nelze.
 - **glibc 2.42+ podpora je odvozená, ne obecná** — layout falešných
   `_rtld_global(_ro)` je ověřen jen pro 2.41 (parrot) a 2.43 (kali);
   2.42 dostane layout 2.43 neověřeně. Při další verzi glibc znovu změřit
