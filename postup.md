@@ -6959,3 +6959,11 @@ defaultu (218/0/33) je **celý vysvětlený**: `comm` nad pass logy ukazuje, že
 chybí přesně 9 položek a všechny jsou softexec subtesty (kategorie se počítá
 jako 1 SKIP, ale obsahuje 8 subtestů + `softexec-cap`). Žádná skrytá
 regrese z identitního filtru ani z `go_handle`.
+
+**Verze 0.9.6** — release parity s prootem: fakeroot virtualizuje celou
+identitní trojici, fakeroot/l2s vidí i statické a Go binárky (přes L2),
+`--proot-compat` propisuje env do guest `envp` (jinak `-0`/`-l` platilo jen
+pro první proces) a cwd se při startu přepočítá do ROOTFS (past č. 22).
+`apt-get install` prochází na kali přes `--ownall`, `--proot-compat` i přes
+symlink jménem `proot`; ~3,1× rychleji než proot. `test-all.sh all`
+218/0/33 default, 209/0/35 pod `ELF_LOADER_L2=1`.
