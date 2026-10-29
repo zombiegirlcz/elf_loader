@@ -14,6 +14,8 @@
 #include <sys/syscall.h>
 #include <unistd.h>
 
+#include <sys/stat.h>
+
 static const char *g_shim_root = "/data/R";
 static int g_cwd_keep_host = 0;
 static char g_guest_exe_path[256] = "/data/R/usr/bin/prog";
@@ -64,6 +66,35 @@ static size_t bind_reverse_inplace(char *buf, size_t cap) {
     memmove(buf + gl, buf + hl, rest + 1);
     memcpy(buf, g, gl);
     return gl + rest;
+}
+/* fakeroot/l2s (prompt 08) zjednodusene: jen priznaky + pocitadla, at je
+ * videt, ze l1_after opravu vysledku stat rodiny VOLA se spravnou cestou.
+ * Plnou semantiku xattr DB pokryva test-all.sh fakeroot. */
+static int g_fakeroot_on = 0;
+static int g_l2s_enabled = 0;
+static unsigned g_fr_app_uid = 10323, g_fr_fake_uid = 0;
+static int n_fix_stat = 0, n_fix_statx = 0, n_l2s_stat = 0, n_l2s_statx = 0;
+static char last_fix_path[256];
+static void fakeroot_fix_stat(const char *path, int follow, struct stat *st) {
+    (void)follow;
+    n_fix_stat++;
+    shim_strcpy(last_fix_path, sizeof last_fix_path, path ? path : "(null)");
+    if (st && st->st_uid == g_fr_app_uid) st->st_uid = g_fr_fake_uid;
+}
+static void fakeroot_fix_statx(const char *path, int follow, void *stx) {
+    (void)follow;
+    n_fix_statx++;
+    shim_strcpy(last_fix_path, sizeof last_fix_path, path ? path : "(null)");
+    if (stx) {
+        unsigned *uid_p = (unsigned *)((unsigned char *)stx + 20);
+        if (*uid_p == g_fr_app_uid) *uid_p = g_fr_fake_uid;
+    }
+}
+static void l2s_fix_stat(const char *path, int follow, struct stat *st) {
+    (void)path; (void)follow; (void)st; n_l2s_stat++;
+}
+static void l2s_fix_statx(const char *path, int follow, int dfd, unsigned mask, void *stx) {
+    (void)path; (void)follow; (void)dfd; (void)mask; (void)stx; n_l2s_statx++;
 }
 #include "l1.h"
 
@@ -219,6 +250,71 @@ int main(void) {
     CHECK(f[21] == 0 && !strcmp((const char *)f[23], "/etc/x") && g_l1_miss == 1,
           "plna tabulka: bez prekladu, g_l1_miss++");
     for (int i = 0; i < L1_SLOTS; i++) g_l1_owner[i] = 0;
+
+    /* --- fakeroot/l2s oprava vysledku stat rodiny v l1_after (2026-10-29) --- */
+    /* vypnute: l1_after se pro 79 vubec nema volat (zadna rezie) */
+    n_fix_stat = n_l2s_stat = 0;
+    g_fakeroot_on = 0; g_l2s_enabled = 0;
+    mkframe(f, 79, (unsigned long)-100, (unsigned long)"/etc/x", 0, 0);
+    l1_before(f, 79);
+    CHECK(f[21] == 0 || f[21] > L1_NEED_AFTER, "stat: bez fakerootu zadny NEED_AFTER navic");
+
+    /* zapnute + AT_FDCWD + absolutni cesta -> oprava s PRELOZENOU cestou */
+    g_fakeroot_on = 1;
+    struct stat st_fr;
+    memset(&st_fr, 0, sizeof st_fr);
+    st_fr.st_uid = g_fr_app_uid;
+    n_fix_stat = n_l2s_stat = 0;
+    last_fix_path[0] = 0;
+    mkframe(f, 79, (unsigned long)-100, (unsigned long)"/etc/x",
+            (unsigned long)&st_fr, 0);
+    l1_before(f, 79);
+    f[20] = 0;                                  /* syscall uspel */
+    l1_after(f, 79);
+    CHECK(n_fix_stat == 1, "stat: fakeroot_fix_stat zavolan");
+    CHECK(!strcmp(last_fix_path, "/data/R/etc/x"), "stat: oprava dostala PRELOZENOU cestu");
+    CHECK(st_fr.st_uid == g_fr_fake_uid, "stat: app uid prepsan na fake uid");
+    CHECK(n_l2s_stat == 1, "stat: l2s_fix_stat zavolan pro AT_FDCWD + absolutni");
+
+    /* dirfd != AT_FDCWD (relativni jmeno) -> cesta NULL, fallback presto bezi,
+     * l2s se vynecha (nemame absolutni cestu, kterou by resolvovalo) */
+    memset(&st_fr, 0, sizeof st_fr);
+    st_fr.st_uid = g_fr_app_uid;
+    n_fix_stat = n_l2s_stat = 0;
+    last_fix_path[0] = 0;
+    mkframe(f, 79, 7 /* dirfd */, (unsigned long)"x", (unsigned long)&st_fr, 0);
+    l1_before(f, 79);
+    f[20] = 0;
+    l1_after(f, 79);
+    CHECK(n_fix_stat == 1, "stat(dirfd): fakeroot_fix_stat presto zavolan");
+    CHECK(!strcmp(last_fix_path, "(null)"), "stat(dirfd): cesta NULL (jen fallback)");
+    CHECK(st_fr.st_uid == g_fr_fake_uid, "stat(dirfd): app uid prepsan");
+    CHECK(n_l2s_stat == 0, "stat(dirfd): l2s_fix_stat vynechan");
+
+    /* chybovy vysledek se neopravuje */
+    n_fix_stat = 0;
+    mkframe(f, 79, (unsigned long)-100, (unsigned long)"/etc/x",
+            (unsigned long)&st_fr, 0);
+    l1_before(f, 79);
+    f[20] = (unsigned long)-2L;                 /* ENOENT */
+    l1_after(f, 79);
+    CHECK(n_fix_stat == 0, "stat: pri chybe se vysledek neopravuje");
+
+    /* statx: tatáž cesta, uid v bufferu na offsetu 20 */
+    unsigned char stx[256];
+    memset(stx, 0, sizeof stx);
+    *(unsigned *)(stx + 20) = g_fr_app_uid;
+    n_fix_statx = n_l2s_statx = 0;
+    last_fix_path[0] = 0;
+    mkframe(f, 291, (unsigned long)-100, (unsigned long)"/etc/x", 0, 0);
+    f[26] = (unsigned long)stx;                 /* arg 4 = stx buffer */
+    l1_before(f, 291);
+    f[20] = 0;
+    l1_after(f, 291);
+    CHECK(n_fix_statx == 1, "statx: fakeroot_fix_statx zavolan");
+    CHECK(*(unsigned *)(stx + 20) == g_fr_fake_uid, "statx: app uid prepsan na fake uid");
+    CHECK(n_l2s_statx == 1, "statx: l2s_fix_statx zavolan");
+    g_fakeroot_on = 0;
 
     printf(fails ? "\n%d FAILED\n" : "\nALL PASS\n", fails);
     return fails ? 1 : 0;

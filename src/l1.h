@@ -153,6 +153,13 @@ static void l1_slot_release(l1_slot_t *s) {
 long l1_before(unsigned long *frame, long nr) {
     unsigned mask = l1_path_args(nr);
     if (nr == 17 || nr == 78) frame[21] = L1_NEED_AFTER;   /* fixup vysledku */
+    /* stat rodina pod fakerootem/l2s potrebuje opravu VYSLEDKU i tehdy, kdyz
+     * se zadna cesta neprelozila (relativni, dirfd) — fallback "app uid -> fake
+     * uid" zadnou cestu nepotrebuje. Bez tohohle davalo `L1=2 L2=1` st_uid
+     * skutecneho app uid: L1 cestova `svc` prepise na stuby, takze L2 TRAP
+     * (a s nim `go_fakeroot_post`) uz nenastane (namereno 2026-10-29). */
+    if ((nr == 79 || nr == 291) && (g_fakeroot_on || g_l2s_enabled))
+        frame[21] = L1_NEED_AFTER;
     if (!(mask & 0xffu)) return 0;                 /* nic na vstupu */
     /* Rychla cesta: zadny ABSOLUTNI cestovy argument (find/fts jedou pres
      * dirfd + jmeno) -> nic k prekladu, zadny slot, zadny CAS a l1_after se
@@ -264,6 +271,28 @@ void l1_after(unsigned long *frame, long nr) {
                     ret = (long)shim_strlen(b);
             }
             frame[20] = (unsigned long)ret;
+        }
+    }
+
+    /* fakeroot / l2s oprava vysledku stat rodiny. Cestu pouzijeme jen kdyz je
+     * AT_FDCWD + absolutni (tedy uz prelozena); jinak NULL — `fakeroot_fix_*`
+     * pak udela jen fallback na fake uid a `l2s_fix_*` se vynecha. Zadny
+     * buffer na zasobniku: l1_after bezi na cizim 8 KB stacku (past c. 10). */
+    if (ret == 0 && (nr == 79 || nr == 291) && (g_fakeroot_on || g_l2s_enabled)) {
+        long dfd = (long)L1_ARG(frame, 0);
+        const char *tp = (const char *)L1_ARG(frame, 1);
+        int usable = (dfd == -100 && tp && tp[0] == '/');
+        if (nr == 79) {
+            int follow = !((int)L1_ARG(frame, 3) & 0x100 /* AT_SYMLINK_NOFOLLOW */);
+            struct stat *st = (struct stat *)L1_ARG(frame, 2);
+            fakeroot_fix_stat(usable ? tp : NULL, follow, st);
+            if (usable) l2s_fix_stat(tp, follow, st);
+        } else {
+            int follow = !((int)L1_ARG(frame, 2) & 0x100);
+            void *stx = (void *)L1_ARG(frame, 4);
+            fakeroot_fix_statx(usable ? tp : NULL, follow, stx);
+            if (usable)
+                l2s_fix_statx(tp, follow, (int)dfd, (unsigned int)L1_ARG(frame, 3), stx);
         }
     }
 
