@@ -1345,6 +1345,45 @@ category_softexec() {
     fi
 }
 
+# prompt 13 (T1) - strop trasy soft execu (SX_LOG_MAX / ELF_LOADER_SOFTEXEC_TRACE_MAX).
+# Bez stropu dal zacykleny/dlouhy proces zapisuje do trasy neomezene (v
+# provozu 6,4 GB). Test vynuti male ELF_LOADER_SOFTEXEC_TRACE_MAX=4096 a
+# hodne soft-execu v jednom top-level behu (kazdy /bin/true je novy fork +
+# soft exec), overi ze soubor neprerostl limit a obsahuje "trace capped".
+category_softexec_cap() {
+    echo ""
+    echo "=== soft exec - strop trasy (prompt 13 T1) ==="
+    local env="ROOTFS=$R ELF_ROOTFS=$R ELF_LOADER=$L"
+    local sx="ELF_LOADER_SOFTEXEC=1 ELF_LOADER_SOFTEXEC_TRACE_MAX=4096"
+    local trace="$R/tmp/softexec.cap.$$"
+    local t="$R/usr/bin/timeout"
+    rm -f "$trace"
+
+    local cmd='for i in $(seq 1 400); do /bin/true; done; echo DONE'
+    "$t" 60 "$R/bin/bash" -c \
+        "$env $sx ELF_LOADER_SOFTEXEC_TRACE=$trace $L --ownall $R/bin/bash -c '$cmd'" \
+        >/dev/null 2>&1 || true
+
+    local sz=0 ok=1 detail=""
+    [ -f "$trace" ] && sz=$(stat -c %s "$trace" 2>/dev/null || echo 0)
+    [ -f "$trace" ] || { ok=0; detail="$detail [trace chybi]"; }
+    grep -q "trace capped" "$trace" 2>/dev/null || { ok=0; detail="$detail [chybi 'trace capped']"; }
+    # mekky strop - posledni zapis pred kontrolou muze limit prekrocit o
+    # jeden radek, toleruj maly presah
+    [ "${sz:-0}" -le $((4096 + 256)) ] || { ok=0; detail="$detail [soubor $sz B > limit+rezerva]"; }
+    rm -f "$trace"
+
+    if [ "$ok" = 1 ]; then
+        echo "PASS softexec-cap: trasa zastavena na limitu (${sz} B), 'trace capped' pritomno"
+        echo "PASS: softexec-cap - strop trasy soft execu" >> "$PASS_LOG"
+        ((PASS_COUNT++)) || true
+    else
+        echo "FAIL softexec-cap:$detail (sz=${sz:-?})"
+        echo "FAIL: softexec-cap - strop trasy soft execu |$detail (sz=${sz:-?})" >> "$FAIL_LOG"
+        ((FAIL_COUNT++)) || true
+    fi
+}
+
 category_staticexec() {
     echo ""
     echo "=== staticky ELF v rootfs pres guest-absolutni cestu ==="
@@ -2098,6 +2137,66 @@ category_l2s() {
     fi
 }
 
+# prompt 13 (T2) - l2s_unlink pri prepisujicim rename. DESTRUKTIVNI (zapisy
+# pod --ownall do .l2s) -> jen nad kali, NIKDY nad $R (stejne pravidlo jako
+# category_l2s vyse). A/B: stara binarka necha nlink(a) falesne na 2 (rename
+# precte .l2s_unlink nevola), nova ho spravne snizi na 1 a v .l2s nezustane
+# osireny backing soubor.
+category_l2s_rename() {
+    echo ""
+    echo "=== link2symlink + prepisujici rename (prompt 13 T2) ==="
+    local KR=${ELF_TEST_KALI:-$D/nh/distro/kali}
+    if [ "$KR" = "$R" ] || [ ! -x "$KR/bin/ln" ] || [ ! -x "$KR/bin/mv" ] || [ ! -x "$KR/bin/ls" ]; then
+        echo "SKIP l2s_rename: destruktivni test jen nad kali ($KR nedostupny)"
+        echo "SKIP: l2s_rename - neni kali rootfs" >> "$SKIP_LOG"; ((SKIP_COUNT++)) || true
+        return 0
+    fi
+    local dir="$KR/tmp/lx-l2s-rename"
+    local env="ROOTFS=$KR ELF_ROOTFS=$KR ELF_LOADER=$L LX_L2S=1"
+    local ok=1 detail=""
+
+    "$R/system/bin/rm" -rf "$dir" 2>/dev/null || true
+    mkdir -p "$dir"
+    echo hello > "$dir/a"
+    echo other > "$dir/c"
+
+    ashell_out "$env $L --ownall $KR/bin/ln /tmp/lx-l2s-rename/a /tmp/lx-l2s-rename/b" >/dev/null 2>&1
+
+    local ls_before nl_before
+    ls_before=$(ashell_out "$env $L --ownall $KR/bin/ls -li /tmp/lx-l2s-rename/a" 2>&1)
+    nl_before=$(printf '%s\n' "$ls_before" | awk '{print $3}')
+    [ "$nl_before" = "2" ] || { ok=0; detail="$detail [pred rename: nlink a=$nl_before, cek. 2]"; }
+
+    # prepisujici rename (mv c -> b) musi pred prepisem snizit pocitadlo
+    # puvodniho l2s cile b (resp. jeho backing souboru, sdileneho s a).
+    ashell_out "$env $L --ownall $KR/bin/mv /tmp/lx-l2s-rename/c /tmp/lx-l2s-rename/b" >/dev/null 2>&1
+
+    local ls_after nl_after
+    ls_after=$(ashell_out "$env $L --ownall $KR/bin/ls -li /tmp/lx-l2s-rename/a" 2>&1)
+    nl_after=$(printf '%s\n' "$ls_after" | awk '{print $3}')
+    [ "$nl_after" = "1" ] || { ok=0; detail="$detail [po rename: nlink a=$nl_after, cek. 1 - l2s_unlink se nezavolal]"; }
+
+    local cat_b
+    cat_b=$(ashell_out "$env $L --ownall $KR/bin/cat /tmp/lx-l2s-rename/b" 2>&1)
+    [ "$cat_b" = "other" ] || { ok=0; detail="$detail [b po rename ma spatny obsah: '$cat_b']"; }
+
+    local leftover
+    leftover=$(ls "$KR/.l2s" 2>/dev/null | grep -c '^\.l2s\.b[0-9]' || true)
+    [ "${leftover:-0}" = 0 ] || { ok=0; detail="$detail [po rename: $leftover zbytku .l2s.b* v .l2s]"; }
+
+    "$R/system/bin/rm" -rf "$dir" 2>/dev/null || true
+
+    if [ "$ok" = 1 ]; then
+        echo "PASS l2s_rename: prepisujici rename spravne snizil pocitadlo, zadny osireny backing soubor"
+        echo "PASS: l2s_rename - rename dekrementuje l2s pocitadlo" >> "$PASS_LOG"
+        ((PASS_COUNT++)) || true
+    else
+        echo "FAIL l2s_rename:$detail"
+        echo "FAIL: l2s_rename - rename nedekrementuje l2s pocitadlo |$detail" >> "$FAIL_LOG"
+        ((FAIL_COUNT++)) || true
+    fi
+}
+
 # DESTRUKTIVNI kategorie (IMGCACHE + --ownall) -> NIKDY nad zivym parrotem
 # ($R), jen nad nepouzivanym kali rootfs (AGENTS.md "Bezpecnost", incident
 # 2026-10-21). Bez kali -> SKIP, ne fallback na $R.
@@ -2653,6 +2752,10 @@ case "${1:-all}" in
         category_softexec
         print_summary
         ;;
+    softexec_cap)
+        category_softexec_cap
+        print_summary
+        ;;
     execcache)
         category_execcache
         print_summary
@@ -2691,6 +2794,10 @@ case "${1:-all}" in
         ;;
     l2s)
         category_l2s
+        print_summary
+        ;;
+    l2s_rename)
+        category_l2s_rename
         print_summary
         ;;
     binds)
@@ -2778,6 +2885,7 @@ case "${1:-all}" in
         category_fakeroot
         category_prootcompat
         category_l2s
+        category_l2s_rename
         category_binds
         category_argv0
         category_procvirt
@@ -2785,6 +2893,7 @@ case "${1:-all}" in
         category_l1
         category_l2
         category_softexec
+        category_softexec_cap
         category_lxc
         category_dw
         category_elfrc
