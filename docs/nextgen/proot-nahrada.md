@@ -565,3 +565,64 @@ vyplatil i na krátkých úlohách.
 - `ELF_LOADER_TIMING=1` — fázový profil na stderr, default no-op.
 - `tools/bench-nextgen.sh [proot|loader|linuxsh]` — zátěžový benchmark, medián.
 - `test-all.sh timing` — A/B regrese (TIMING vypnutý = ticho).
+
+---
+
+## Soft exec / zygote — výsledek (prompt 11, 2026-10-29)
+
+**Doporučení: jít dál s variantou A (soft exec), variantu B (zygota)
+zavřít.** Prototyp je hotový za `ELF_LOADER_SOFTEXEC=1`, default vypnuto.
+Detaily, pasti a čísla v postup.md 2026-10-29.
+
+### Platil ještě předpoklad promptu?
+
+Ano. Po promptech 02/10 je interní práce loaderu ~7–9 ms (z 61 ms
+z promptu 01), ale vlastní own-load pořád stojí **9–12 ms na každý exec**
+a na exec-heavy zátěži (400 execů `cat`/`grep`/`sed`/`expr`/`rm`) byl
+loader **~3× pomalejší než proot** (12,6 s vs 3,9 s).
+
+### Proč A a ne B
+
+Zygota by měla **stejnou cenu** jako soft exec — její potomek má glibc
+načtenou a *pristine* z definice, takže nepotřebuje snapshot — jenže
+platí identitou procesu: volající nedostane skutečné dítě (pid, `wait`,
+`getppid`, `/proc/<pid>`, job control přes `setpgid` napříč sessions).
+Soft exec dá tutéž úsporu a pid zůstane správný. Zygota by dávala smysl
+jen tehdy, kdyby se ukázalo, že *pristine snapshot* nejde udržet — ten
+ale funguje (4 oblasti / ~85 KB, obnova 0,34 ms).
+
+### Co to umí a co to stojí
+
+| zátěž | loader default | **SOFTEXEC** | proot |
+|---|---|---|---|
+| guest `sh`: 500× `/bin/true` | 12,3–15,2 s | **4,4–4,6 s** | 2,1–2,2 s |
+| `fakeconf`, 400 execů | 12,6–13,3 s | **4,0–4,7 s** | 2,2–3,9 s |
+| `find /usr -type f` | 0,44 s | 0,44 s | 11,0 s |
+
+**Exec-heavy zátěž 3× rychlejší** (31 → 11 ms na exec) při zachování 25×
+náskoku na cestově těžkých úlohách. Proot je na *čistém* execu pořád ~2×
+rychlejší.
+
+In-process práce soft execu je **~4,1 ms** (`sx_load` 1,15 / `sx_tls`
+1,14 / `sx_reloc` 0,64 / `sx_restore` 0,34 / zbytek pod 0,2 ms) místo
+~18 ms kompletního startu loaderu.
+
+### Co je teď úzké hrdlo (pro případné pokračování)
+
+Ne exec, ale **`fork`**: 500× `( : )` bez execu dá loader 2,08 s
+(4,2 ms/fork) proti prootovým 0,61 s (1,2 ms). Tlustý adresní prostor
+(1 GB rezerva privátní arény, 64 MB guest stack, moduly) dělá kopii page
+tables drahou. Druhá páka je recyklace TLS regionu a guest stacku místo
+nového `mmap`+`memset` (~1,3 ms z těch 4,1 ms).
+
+### Známé nekompatibility
+
+Není to `execve`: ladicí nástroje nevidí exec event, setuid/setgid se
+neaplikuje, starý obraz exe / stack / TLS / mmapy zůstanou namapované
+(RSS ~jednotky MB na soft exec), moduly `dlopen`-nuté předchozím
+programem zůstanou ve scope s neobnoveným RW stavem, POSIX timery se
+neresetují. Soft exec se nepoužije pro binárky s `PT_TLS` (blok hlavního
+exe musí ležet na `TP+0x10`, ten drží předchozí exe), pro skripty,
+pro vícevláknový proces a pod L2. `vfork` se pod knobem přepisuje na
+`fork` (jinak by soft exec přepsal glibc rodiče); `clone(CLONE_VM)`
+bez `CLONE_THREAD` zůstává nepokrytý.

@@ -66,6 +66,17 @@ skenu (`cache_nr_t.scanned`, i negativní výsledek) a DT_GNU_HASH lookup
 jsou hotové, ale defaultně vypnuté a měřením nepotvrzené. Neotvírat znovu
 bez nového měření.
 
+**Soft exec** (prompt 11, `src/softexec.h`, `ELF_LOADER_SOFTEXEC=1`, default
+vyp): `shim_execve` místo re-execu loaderu vymění guest program **uvnitř
+procesu** — obnoví pristine snapshot RW stavu guest glibc (pořízený
+v `run_ownall` před relokací exe), dodělá co jinak dělá jádro při `execve`
+(O_CLOEXEC fd, dispozice signálů, sigaltstack, timery) a načte nový exe.
+Exec-heavy zátěž **3× rychlejší** (31 → 11 ms/exec), in-process práce
+~4,1 ms místo ~18 ms startu loaderu. Jen PIE ELF s `PT_INTERP` a **bez
+`PT_TLS`**, jednovláknový proces, ne skript, ne pod L2; `vfork` se pod
+knobem přepisuje na `fork`. **Zbývající hrdlo je `fork`** (4,2 ms/fork
+u loaderu vs 1,2 ms u prootu — 1 GB aréna + 64 MB stack), ne exec.
+
 Knoby: `ELF_LOADER_TIMING`, `ELF_LOADER_NO_CACHE`, `ELF_LOADER_NO_HASH`,
 `ELF_LOADER_HASH_CHECK`, `ELF_LOADER_LAZY`, `ELF_LOADER_IMGCACHE`,
 `ELF_LOADER_NO_RELSYM`, `ELF_LOADER_NO_BIONIC_BRIDGE`, `ELF_LOADER_EXEC_TRACE`,
@@ -74,6 +85,8 @@ jmenných hooků), `F2_ONLY` (allowlist), `ELF_LOADER_L2` (`=1` záchytná síť
 `ELF_LOADER_L2_LAZY` (líný přepis, default vyp), `ELF_LOADER_GOMODE=0`
 (vypne Go mód; L2 ho nahrazuje), `ELF_LOADER_NO_PROCVIRT` (prompt 07),
 `ELF_LOADER_DIAG=1` (rutinní stopy do `$D/usr/diag.<pid>.txt`; pádové vždy).
+`ELF_LOADER_SOFTEXEC=1` (prompt 11, soft exec; `ELF_LOADER_SOFTEXEC_TRACE`
+= stderr, nebo absolutní cesta = i do souboru).
 `LX_FAKEROOT=1` (prompt 08, `src/fakeroot.h`, ekvivalent `proot -0`):
 uid/gid funkce → 0, `stat` rodina hlásí app uid jako 0:0, `chown`/setuid
 `chmod`/`mknod` zařízení se ukládají do xattru `user.lxfakeroot` na inode
@@ -216,7 +229,12 @@ fork veneer (vfork-style clone) [#L685].
    musí měřit HOST nástroji, jinak ho shim zachrání a A/B nic neprokáže.
 8. **Hardlinky (`link`) zakazuje SELinux app domény** i nativně — platformní
    limit.
-9. **Kód volaný z L1 stubu** (`l1_before/after`, `shim_translate`, relsym)
+9. **Kernelová `struct sigaction` má na aarch64 i `sa_restorer`** — je
+   **32 B**, ne 24. Raw `rt_sigaction(sig, NULL, &old, 8)` s menším
+   bufferem tiše přepíše sousední lokálku na zásobníku (v promptu 11 to
+   bylo počítadlo smyčky → nekonečná smyčka ve stavu R). Totéž hrozí
+   u každé kernelové struktury, kterou si deklarujeme ručně.
+10. **Kód volaný z L1 stubu** (`l1_before/after`, `shim_translate`, relsym)
    běží pod guest TP **na cizím zásobníku** (Go goroutine 8 KB) → žádné
    velké buffery na stacku (použít slot). Syscall ABI zachovává **všechny**
    registry kromě `x0` — i `x1..x7` se guestu vrací původní, ne přeložené.
@@ -290,6 +308,7 @@ fork veneer (vfork-style clone) [#L685].
 | L2 — seccomp záchytná síť (okno, go_handle) | 2026-10-21 (3) |
 | tabulka mountů, bindy, incident binds testu | 2026-10-21 (4), 2026-10-22 |
 | `--argv0`, virtualizace `/proc`, comm | 2026-10-22 (2), (3) |
+| soft exec (prompt 11) | 2026-10-29 |
 | výkon: timing, cache, hash, imgcache, lazy | 2026-10-16, 2026-10-20 |
 | zátěžový test multi-runtime | L3885, L4047 |
 | otevřené nálezy exec/argv | L3939, L3973, L3988, L4029 |

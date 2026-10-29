@@ -18,7 +18,7 @@ v [proot-nahrada.md](proot-nahrada.md) — prompty odkazují na její kapitoly.
 | 08 | [fake root + link2symlink](08-fakeroot-l2s.md) | 3.2, 3.3 | 04 (doporučeno) | implementace | **hotovo, ověřeno funkční** 2026-10-28 (default vypnuto) |
 | 09 | [proot-kompatibilní CLI + hybrid](09-proot-cli-hybrid.md) | 3.6, 7 | 06, 08 | implementace | **hotovo** 2026-10-28 (posix_spawn cesta bez hybridu) |
 | 10 | [cache obrazů + líné vázání](10-exec-image-cache.md) | 5.5, 5.6 | 01, 02 | implementace | **hotovo** 2026-10-20 |
-| 11 | [soft exec / zygote — výzkum](11-soft-exec-zygote.md) | 5.7, 5.8 | 01, 10 | výzkum + prototyp | – |
+| 11 | [soft exec / zygote — výzkum](11-soft-exec-zygote.md) | 5.7, 5.8 | 01, 10 | výzkum + prototyp | **hotovo** 2026-10-29 (varianta A, default vypnuto) |
 | 12 | [nativní ld.so mód — prototyp](12-nativni-ldso.md) | 6 | 04, 05 | výzkum + prototyp | – |
 
 07 jde dělat kdykoli, je nezávislý.
@@ -227,6 +227,30 @@ a L2=1); util-linux `umount` příkaz a `findmnt` nad bindem fungují.
   `/proc/self/exe` dál vrací host cestu guest binárky (vědomě), cizí
   `cmdline` čtený host nástrojem má nulovou vycpávku, `df` přiřadí bind k `/`
   (syntetické `0:N`).
+
+**11 — soft exec (varianta A).** Hotovo, **default vypnuto**
+(`ELF_LOADER_SOFTEXEC=1`). `shim_execve` místo re-execu loaderu vymění
+guest program uvnitř procesu: obnoví *pristine* snapshot RW stavu guest
+glibc (pořízený v `run_ownall` před relokací exe), dodělá co jinak dělá
+jádro při `execve` (O_CLOEXEC fd, dispozice signálů, sigaltstack, timery)
+a načte nový exe. **Exec-heavy zátěž 3× rychlejší** (31 → 11 ms na exec;
+400 execů 12,6 s → 4,0–4,7 s, proot 2,2–3,9 s), in-process práce ~4,1 ms
+místo ~18 ms startu loaderu. Varianta B (zygota) **zavřena**: stejná cena,
+ale volající nedostane skutečné dítě (pid/wait/job control).
+
+Podmínky (jinak fallback na re-exec): PIE ELF s `PT_INTERP` a **bez
+`PT_TLS`**, jednovláknový proces, není to skript, není L2. Pod knobem se
+`vfork` přepisuje na `fork`. Test `test-all.sh softexec` 6/0.
+
+**Zbývající úzké hrdlo je `fork`, ne exec**: 4,2 ms/fork u loaderu proti
+1,2 ms u prootu (tlustý adresní prostor — 1 GB aréna, 64 MB stack).
+
+**Dvě pasti z promptu 11:** (1) kernelová `struct sigaction` má na aarch64
+i `sa_restorer` (**32 B**, ne 24) — menší buffer u `rt_sigaction(…, &old)`
+tiše přepíše sousední lokálku (tady počítadlo smyčky → nekonečná smyčka
+ve stavu R); (2) `run_ownall` po `elf_load(exe)` nuluje `elf_own_scope`,
+takže kdokoli další, kdo volá `elf_load`, si ho musí nastavit sám — jinak
+zůstanou importy nezrelokované (GOT = 0).
 
 ### Co z toho plyne pro další prompty
 

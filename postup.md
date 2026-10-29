@@ -6238,3 +6238,131 @@ uvnitř agenta, ne jako chyba filesystému.
 `LX_BINDS_FILE= <stary_loader> …` (prázdná hodnota = nová session), jinak
 si poškodíš bind stav běžící session. Osiřelé tabulky uklidí GC sám, až
 pid zmizí (ověřeno: 9 → 8 tabulek bez zásahu).
+
+---
+
+## 2026-10-29 — prompt 11: soft exec (varianta A), exec bez `execve(2)`
+
+**Zadání:** `docs/nextgen/11-soft-exec-zygote.md` — výzkum + prototyp za
+proměnnou, výstupem rozhodnutí podložené měřením.
+
+### Vstupní měření (nejdřív: platí ještě předpoklad promptu?)
+
+Fázový profil loaderu je po promptech 02/10 úplně jinde než v promptu 01
+(tehdy 61 ms interní práce). Teplý profil `--ownall $R/bin/true` dnes:
+`overrides_reg` 0,7 / `load_done` 1,5–2,0 / `hooks_bti` 2,6–4,0 /
+`reloc` 0,23 / `svc_patch` 0,49 / `tls` 0,88 → **celkem ~7–9 ms**.
+
+Wall-clock (host `sh`, N=300, `time`): loader start bez own-loadu
+(`--version`) **10,7 ms**, `--ownall /bin/true` **19,5 ms**,
+`--ownall /bin/sed --version` **22,7 ms** → vlastní own-load stojí
+**9–12 ms na exec**. Vnořený exec (guest `sh` spouští `/bin/true`)
+**18,5 ms** vs tentýž shim na HOST binárku (`/system/bin/true`, žádný
+own-load) **13,5 ms**.
+
+Exec-heavy zátěž (`fakeconf.sh`, 80 „checků" × 5 execů = 400 execů
+`cat`/`grep`/`sed`/`expr`/`rm`): **loader 12,6 s vs proot 3,9–4,5 s** →
+na execu loader prohrával **~3×**. Předpoklad promptu 11 tedy platil.
+
+### Varianta A vs B
+
+Zvolena **A (soft exec)**. B (zygota) by měla stejnou cenu — potomek
+zygoty má glibc načtenou a *pristine* z definice, takže by nepotřebovala
+snapshot — ale platí se za to identitou procesu: volající nedostane
+skutečné dítě (pid, `wait`, `getppid`, `/proc/<pid>`, job control přes
+`setpgid` napříč sessions). A dává tutéž úsporu se správným pidem.
+
+### Jak je to udělané (`src/softexec.h`, 430 ř., `ELF_LOADER_SOFTEXEC=1`)
+
+1. `run_ownall` těsně **před `elf_relocate(exe)`** pořídí *pristine
+   snapshot*: PF_W segmenty všech modulů scope + falešné
+   `_rtld_global`/`_rtld_global_ro` (ty jsou v `.bss` LOADERU, ne modulu)
+   + účetní globály (privátní aréna `parrot_brk_cur`, počet queued initů,
+   TLS registr). V tomhle bodě je glibc načtená, zrelokovaná a zahákovaná,
+   ale exe do ní ještě nesáhl (COPY relokace, inity, link mapa, TLS).
+   U `dash` to jsou 4 oblasti / ~85 KB, `memcpy` tam i zpět ~0,3 ms.
+2. `shim_execve` → `softexec_try()`: přepne TP na bionický (jako
+   `dl_enter_host`), obnoví snapshot, dodělá to, co jinak dělá jádro při
+   `execve` (zavře `O_CLOEXEC` fd přes `/proc/self/fd`, resetuje dispozice
+   signálů, `sigaltstack`, interval timery), načte nový exe
+   (`elf_load`/`elf_relocate`), přeinstaluje link mapy, dopatchuje
+   `svc`/L1 u nově přibylých modulů, nastaví `comm` + argv oblast
+   (procvirt), udělá nový TLS a skočí přes `elf_run`.
+
+**Podmínky** (jinak fallback na dnešní re-exec): cíl je PIE (`ET_DYN`)
+aarch64 ELF s `PT_INTERP` a **bez `PT_TLS`**, proces je jednovláknový,
+není to skript a není aktivní L2. `PT_TLS` je tvrdá podmínka: blok
+hlavního exe musí ležet na `TP+0x10` a ten už drží předchozí exe
+(`python3`, `gcc` mají `PT_TLS`; coreutils, `sed`, `grep`, `bash`,
+`dash`, `make` **ne**). Starý obraz exe se **neodmapovává** — glibc GOT
+může po COPY relokacích ukazovat do jeho `.bss`.
+
+Pod zapnutým knobem se navíc `vfork`/`__vfork` přepisuje na `fork`
+(raw `clone(SIGCHLD)`): `vfork` sdílí paměť s rodičem, takže by soft exec
+v takovém „dítěti" přepsal glibc stav **rodiče**.
+
+### Naměřeno (stejná binárka, A/B knobem; medián 2 kol, obě pořadí)
+
+| zátěž (500 execů / 400 execů) | loader default | **loader SOFTEXEC** | proot |
+|---|---|---|---|
+| guest `sh`: 500× `/bin/true` | 12,3–15,2 s | **4,4–4,6 s** | 2,1–2,2 s |
+| `fakeconf` 400 execů | 12,6–13,3 s | **4,0–4,7 s** | 2,2–3,9 s |
+
+→ **soft exec zrychlil exec-heavy zátěž 3×** (31 → 11 ms na exec).
+Proot zůstává na čistém execu ~2× rychlejší; na cestově těžkých úlohách
+(`find /usr`) zůstává loader 25× rychlejší než proot.
+
+Fázový profil soft execu (`ELF_LOADER_TIMING=1`, teplé):
+`sx_restore` 336 µs, `sx_fds` 175, `sx_signals` 165, `sx_load` 1151,
+`sx_reloc` 642, `sx_linkmap` 43, `sx_patch` 16, `sx_procvirt` 41,
+`sx_tls` 1141, stack+entry 375 → **~4,1 ms** in-process práce místo
+~18 ms kompletního startu loaderu.
+
+**Kde je teď zbytek:** `fork` samotný. 500× `( : )` (fork bez execu):
+loader **2,08 s** (4,2 ms/fork) vs proot **0,61 s** (1,2 ms) vs host `sh`
+1,47 s. Tlustý adresní prostor loaderu (1 GB rezerva privátní arény,
+64 MB guest stack, moduly) dělá kopii page tables drahou. Další páka tedy
+**není exec, ale fork** — plus `sx_tls` (1,1 ms = `memset` ~1 MB TLS
+regionu) a `sx_load` (1,15 ms), kde by šlo recyklovat region/stack
+předchozího programu.
+
+### Past: `rt_sigaction` přetekl buffer (nekonečná smyčka)
+
+První běh soft execu **zatuhl ve stavu R** (5,7 M iterací za 20 s, log plný
+`sig-iter=1`). Příčina: kernelová `struct sigaction` má na aarch64 i
+`sa_restorer` (glibc pro ni používá čtyřpoložkový `kernel_sigaction`) =
+**32 B**, ne 24. Dotaz `rt_sigaction(s, NULL, &old, 8)` s 24bajtovým
+bufferem zapsal `sa_mask` 8 B za něj — přesně do počítadla smyčky: `s`
+se přepsalo nulou, `s++` → 1, a smyčka se točila na SIGHUP donekonečna.
+Samostatný test se stejnou strukturou prošel (jiné rozložení zásobníku),
+takže past je **tichá a nahodilá**. Buffer je teď `union` se 64 B rezervou.
+
+### Past: `elf_own_scope` je po načtení exe NULL
+
+`run_ownall` hned po `elf_load(exe)` nuluje `elf_own_scope`, takže soft
+exec načítal nový exe **bez scope** → `stdout` a
+`program_invocation_short_name` zůstaly nezrelokované (GLOB_DAT = 0) a
+`__libc_start_main` skočil na `pc=0`. Soft exec si proto `elf_own_deps`
+/ `elf_own_scope` na dobu `elf_load` nastaví sám.
+
+### Testy
+
+`test-all.sh softexec` (nová kategorie, 6 podtestů): shoda výstupu
+default vs soft exec na řetězu execů, důkaz z trasy že se in-process
+výměna opravdu použila, `exec -a` (argv[0]), virtualizovaný
+`/proc/self/cmdline`, fallback u `PT_TLS` binárky (`python3`) a shebang
+skript. **6/0.**
+
+### Známé nekompatibility (proto default vypnuto)
+
+- není to `execve`: ladicí nástroje nevidí exec event, `/proc/<pid>/exe`
+  dál ukazuje na loader (to platí i dnes), setuid/setgid se neaplikuje;
+- starý obraz exe, starý guest stack, starý TLS region a mmapy
+  předchozího programu zůstanou namapované (RSS leak ~jednotky MB na
+  jeden soft exec; ve vzoru `fork`→`exec` dělá potomek právě jeden);
+- moduly `dlopen`-nuté předchozím programem zůstanou ve scope
+  s neobnoveným RW stavem;
+- POSIX timery (`timer_create`) a robust futex list se neresetují;
+- `clone(CLONE_VM)` bez `CLONE_THREAD` následovaný `execve` by soft exec
+  vzal (jednovláknová kontrola ho nerozliší) — `vfork` je ošetřený
+  přepisem na `fork`, tahle díra zůstává.
