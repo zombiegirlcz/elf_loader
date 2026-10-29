@@ -230,17 +230,20 @@ static void sx_close_cloexec(void) {
         shim_raw_syscall6(57, victims[i], 0, 0, 0, 0, 0);
 }
 
-/* aarch64 kernel sigaction: { handler, flags, mask } (bez sa_restorer). */
-struct sx_ksigaction {
+/* POZOR: kernelova `struct sigaction` ma na aarch64 i `sa_restorer`
+ * (glibc pro ni pouziva 4-polozkovy `kernel_sigaction`) => 32 B, ne 24.
+ * S mensim bufferem kernel pri dotazu (act=NULL, oldact=&buf) pretece do
+ * sousedni promenne na zasobniku. Prave tim se rozbilo pocitadlo teto
+ * smycky: `s` se prepsalo nulou ze sa_mask, s++ -> 1, a smycka se tocila
+ * na SIGHUP donekonecna (5,7 M iteraci za 20 s). Buffer proto s rezervou. */
+union sx_ksigaction {
     void          *handler;
-    unsigned long  flags;
-    unsigned long  mask;
+    unsigned char  raw[64];
 };
 
 static void sx_reset_signals(void) {
     sx_log("sig-enter");
     for (int s = 1; s <= 64; s++) {
-        sx_log_num("sig-iter", s);
         if (s == SIGKILL || s == SIGSTOP)
             continue;
         /* Synchronni signaly drzi loader (fault handler + SIGSYS pro L2/Go);
@@ -248,7 +251,7 @@ static void sx_reset_signals(void) {
         if (s == SIGSEGV || s == SIGBUS || s == SIGILL || s == SIGFPE ||
             s == SIGTRAP || s == SIGSYS)
             continue;
-        struct sx_ksigaction old;
+        union sx_ksigaction old;
         shim_memset(&old, 0, sizeof old);
         if (shim_raw_syscall6(134 /*rt_sigaction*/, s, 0,
                               (long)(unsigned long)&old, 8, 0, 0) != 0)
@@ -256,10 +259,9 @@ static void sx_reset_signals(void) {
         if (old.handler == (void *)0 || old.handler == (void *)1)  /* DFL/IGN */
             continue;
         sx_log_num("sig-reset", s);
-        struct sx_ksigaction act;
+        union sx_ksigaction act;
         shim_memset(&act, 0, sizeof act);
         shim_raw_syscall6(134, s, (long)(unsigned long)&act, 0, 8, 0, 0);
-        sx_log_num("sig-reset-ok", s);
     }
     sx_log("sig-loop-end");
     struct { void *sp; int flags; int pad; size_t size; } ss;
