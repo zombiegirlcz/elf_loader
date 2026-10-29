@@ -7114,3 +7114,75 @@ qemu v rootfs (prostredi, ne kod). B) `g_binds_ready==0` pri volani
 volacim grafu; i kdyby se to zmenilo (budouci refaktor), `bind_reverse()`
 uz ted bezpecne vraci 0 bez zapisu — oveřeno primym host testem nad realnym
 `src/binds.h`, ne jen uvahou.
+
+## 2026-10-29 (12) — dve systemove mezery: static-PIE autodetekce a guest PATH
+
+Dve veci, ktere drzely proot-nahradu nehotovou (pasti c. 24 a c. 25).
+
+### 1) `elf_is_static_pie()` — rozliseni glibc static-PIE od bionic static
+
+`ELF_LOADER_STATIC_PROOT=1` nesel zapnout defaultne, protoze
+`elf_hybrid_needs_real_proot()` neumel rozlisit **bionic** static
+(ashell/su_wrapper — ty nativne bezet MAJI) od **glibc** static-PIE (ten na
+tomhle zarizeni pada vzdy). Rozlisovaci znak: static-PIE = **ET_DYN bez
+PT_INTERP**. Bionicke staticke nastroje jsou ET_EXEC, dynamicke bionicke maji
+`PT_INTERP=/system/bin/linker64` → oboji vrati 0.
+
+Zapojeno do obou cest:
+- exec shim: `elf_hybrid_needs_real_proot()` (vedle cizi `e_machine`,
+  `lx-force-proot` a knobu);
+- **primy `--ownall <static-PIE>`**: ten zadny `execve` nedela, takze se do
+  hybridni vetve nedostal a koncil SIGSEGV. `run_ownall` ho po
+  `binds_init/fakeroot_init/l2s_init` posila na realny proot stejnou cestou.
+
+Namereno na kali (`ashell -c`, bez `lx-force-proot`, bez knobu):
+
+| volani | pred | po |
+|---|---|---|
+| `--ownall $K/usr/sbin/ldconfig --version` | rc=139 (SIGSEGV) | **rc=0** |
+| `--ownall bash -c '/usr/sbin/ldconfig --version'` | rc=159 (SIGSYS) | **rc=0** |
+| `--ownall $K/bin/true` | rc=0 | rc=0 (nedotceno) |
+
+Knob `ELF_LOADER_NO_STATIC_PIE_PROOT=1` vypina. Tim padá otevreny bug
+„glibc static-PIE v rootfs loader nespusti" v casti, ktera blokovala
+`libc-bin.postinst` (`ldconfig -r` pod `set -e`).
+
+### 2) Guest `PATH` v `run_ownall`
+
+Guest dedil HOSTOVY `PATH` s `/system/bin`, takze `bash -c 'id'` spustil
+Androidi toybox **mimo loader** (zadny fakeroot, zadny preklad cest).
+`run_ownall` ted nastavuje
+`/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin`, hostovy
+zustava v `LX_HOST_PATH` (env loaderu, pro exec shim). Prepis jen kdyz PATH
+obsahuje `/system/{bin,xbin}` → PATH poskladany `lx`/double-world zustava
+nedotceny. Vypnuti `ELF_LOADER_NO_GUEST_PATH=1`.
+
+**Past, kterou to vyrobilo:** prvni verze stavela nove pole pres `calloc` a
+nastavovala i `elf_init_envp`. Na zarizeni pak `--ownall bash -c 'echo hi'`
+padal SIGSEGV v guest libc initu: `envp` je **kernelova oblast na zasobniku**,
+navazuje na ni auxv a `procvirt_rewrite_argarea` z ni pocita hranice.
+Spravne reseni je prepsat **jen ukazatel** na `PATH=` polozku v puvodnim poli
+(identita i delka pole zustanou).
+
+Namereno na kali:
+
+| volani | pred | po |
+|---|---|---|
+| `--ownall bash -c 'echo $PATH'` | hostovy s `/system/bin` | guest PATH |
+| `LX_FAKEROOT=1 --ownall bash -c 'id -u'` | 10323 | **0** |
+| `ELF_LOADER_NO_GUEST_PATH=1 …` | — | hostovy PATH (knob funguje) |
+
+### Vedlejsi zjisteni: `git push` v parrotu byl rozbity poskozenim rootfs
+
+`git-remote-https` padal SIGSEGV v `curl_global_init` (`Unresolved RELA
+GLOB_DAT: gnutls_free`). Pricina nebyla v loaderu: z rootfs **fyzicky
+chybely** `libgnutls.so.30`, `libbrotli{common,dec,enc}.so.1` a
+`libtasn1.so.6` (a dpkg/status o nich nevi) — dusledek skody z
+2026-10-29 (10). Obnoveno z `/var/cache/apt/archives/*.deb` pres
+`dpkg-deb -x` + kopie `.so` do `/usr/lib/aarch64-linux-gnu` (bez zasahu do
+dpkg DB), `git push` pak funguje. Nez to bylo jasne, musel jit jeden commit
+nahoru pres GitHub API (`gh api`: blob → tree → commit → ref).
+
+Commity: `6b6063b` (autodetekce + prvni verze guest PATH), `cd670c6`
+(`elf_init_envp`, pozdeji nahrazeno), `d4316c8` (prepis jen ukazatelem),
+`655fa2d` (static-PIE i pri primem `--ownall`). Host unit testy 6/6 PASS.

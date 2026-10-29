@@ -98,7 +98,9 @@ jmenných hooků), `F2_ONLY` (allowlist), `ELF_LOADER_L2` (`=1` záchytná síť
 `ELF_LOADER_L2_LAZY` (líný přepis, default vyp), `ELF_LOADER_GOMODE=0`
 (vypne Go mód; L2 ho nahrazuje), `ELF_LOADER_NO_PROCVIRT` (prompt 07),
 `ELF_LOADER_DIAG=1` (rutinní stopy do `$D/usr/diag.<pid>.txt`; pádové vždy),
-`ELF_LOADER_NO_CWD_FIX=1` (vypne přepočet cwd do ROOTFS, viz past č. 22).
+`ELF_LOADER_NO_CWD_FIX=1` (vypne přepočet cwd do ROOTFS, viz past č. 22),
+`ELF_LOADER_NO_GUEST_PATH=1` (nenastavovat guest `PATH`, past č. 24),
+`ELF_LOADER_NO_STATIC_PIE_PROOT=1` (neposílat static-PIE na reálný proot).
 `ELF_LOADER_SOFTEXEC=1` (prompt 11, soft exec; `ELF_LOADER_SOFTEXEC_TRACE`
 = stderr, nebo absolutní cesta = i do souboru).
 `LX_FAKEROOT=1` (prompt 08, `src/fakeroot.h`, ekvivalent `proot -0`):
@@ -349,8 +351,14 @@ fork veneer (vfork-style clone) [#L685].
    `dpkg --configure`: „warning: 'ldconfig' not found in PATH", „error:
    7 expected programs not found in PATH". Guestovi je proto nutné nastavit
    guest `PATH` (`/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin`)
-   — ani `--ownall`, ani `--proot-compat` to zatím nedělají. Rozšiřuje past
-   č. 21 (2026-10-29 (9)).
+   Rozšiřuje past č. 21 (2026-10-29 (9)). **Opraveno 2026-10-29 (12):**
+   `run_ownall` guest `PATH` nastavuje (hostový zůstává v `LX_HOST_PATH`
+   v env loaderu), přepis jen když PATH obsahuje `/system/{bin,xbin}` —
+   PATH poskládaný `lx`/double-world zůstává nedotčený; vypnutí
+   `ELF_LOADER_NO_GUEST_PATH=1`. Pozor: přepisuje se **ukazatel v původním
+   poli `envp`**, ne nová calloc kopie — `envp` je kernelová oblast na
+   zásobníku, navazuje na ni auxv a `procvirt_rewrite_argarea` z ní počítá
+   hranice, takže heapová kopie shodí guest libc init na SIGSEGV (naměřeno).
 
 25. **Hybridní dispatch na skutečný proot nikdy nefungoval** (do 2026-10-29).
    `proot_compat_exec_real()` vkládalo před příkaz `--`, které tenhle proot
@@ -436,10 +444,14 @@ fork veneer (vfork-style clone) [#L685].
   (static-PIE na tomhle zařízení nefunguje ani u prázdného `main`).
   **Workaround ověřený 2026-10-29:** `ELF_LOADER_STATIC_PROOT=1` → rc=0,
   nebo basename v `$ROOTFS/etc/lx-force-proot`. Obojí funguje až po opravě
-  pasti č. 25. **Otevřené:** knob je default vypnutý a `elf_hybrid_needs_real_proot`
-  nerozlišuje **bionic** static (ashell/su_wrapper — ty nativně běžet MAJÍ)
-  od **glibc** static-PIE (ten padá). Dokud to rozlišení nevznikne, nejde
-  zapnout defaultně.
+  pasti č. 25. **Vyřešeno 2026-10-29 (12):** `elf_is_static_pie()` (ET_DYN
+  bez PT_INTERP) rozlišuje glibc static-PIE od bionic static (ashell,
+  su_wrapper = ET_EXEC → zůstávají na přímém real execve; dynamické bionic
+  mají `PT_INTERP=/system/bin/linker64`), takže se na proot směruje
+  **automaticky bez knobu**. Platí pro obě cesty: exec shim
+  (`elf_hybrid_needs_real_proot`) i přímé `--ownall <static-PIE>`
+  (`run_ownall`, předtím rc=139). Naměřeno na kali: `ldconfig --version`
+  přímo rc=0, přes exec rc=0. Vypnutí `ELF_LOADER_NO_STATIC_PIE_PROOT=1`.
 - Test na reálném 16K Android 15+ (Task 3). `nmap` není v rootfs [#L680];
   ostatní síťové binárky ověřeny OK.
 - Kosmetika: `src/main.c:149` sign-compare, `\]` escape.
