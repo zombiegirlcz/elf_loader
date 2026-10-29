@@ -6980,3 +6980,70 @@ Při tom opraveny dvě chyby: `print_help` měl **17 `%s` proti 16 argumentům**
 (poslední příklad vypisoval smetí — UB, potvrzeno `gcc -Wformat`), a v nově
 psaném shell helpu zpětné apostrofy ve dvojitých uvozovkách způsobily, že
 `help proot` v zsh **spustil skutečný proot** a vypsal jeho vlastní help.
+
+## 2026-10-29 (10) — proot-compat: bind_reverse pro cesty remapovane pres LX_BINDS
+
+**Priznak.** Hybridni dispatch (prompt 09) na skutecny proot melo jen
+castecny fix (26de79b) — odrizeni prefixu `$ROOTFS` z cesty predavane
+prootu. To ale pokryva jen binarky uz pod ROOTFS. Binarka dosazena pres
+bind remap (`LX_BINDS=host:guest`, host adresar MIMO ROOTFS) si cestu
+nechala hostovou (resolved v `elf_hybrid_exec_proot` je vysledek
+`shim_translate` -> pro `BIND_REMAP` je to host cesta bindu, main.c:483-485
+a volajici main.c:2707-2710), a proot (ma `-r rootfs`) ji logicky nenasel.
+
+**Repro (pred opravou, kali, bionic toybox jako "mytrue" — glibc /bin/true
+nejde, `is_glibc_elf` je true a hybridni vetev se vubec nenastartuje):**
+```
+K=.../nh/distro/kali; D=.../files; HOSTDIR=$D/tmp/pc_bindtest_src
+cp /system/bin/toybox $HOSTDIR/mytrue
+echo mytrue > $K/etc/lx-force-proot
+ROOTFS=$K LX_BINDS="$HOSTDIR:/opt/bindtest" PROOT_LOADER=$D/usr/bin/loader \
+  PROOT_TMP_DIR=$D/tmp elf_loader --ownall $K/bin/bash -c '/opt/bindtest/mytrue true'
+```
+→ `proot error: '$D/tmp/pc_bindtest_src/mytrue' not found (root = $K)` —
+presne hostova cesta bindu, ne guest `/opt/bindtest/mytrue`.
+
+**Oprava** (`src/proot_compat.h`, `proot_compat_exec_real`): pred odrizenim
+prefixu ROOTFS zkusit `bind_reverse(path, buf, sizeof buf)` (uz existuje,
+`src/binds.h:171`, longest-prefix host->guest, zahrnuto pres `main.c:426`
+pred `proot_compat.h:2088` — v scope bez forward deklarace). Poradi: 1)
+bind_reverse, 2) odrizeni ROOTFS prefixu (puvodni fix), 3) puvodni cesta
+beze zmeny. `bind_reverse` vrati 0 (a tedy fallback na krok 2/3), pokud
+`g_binds_ready` neni nastaveno — tabulka se ale inicializuje pri startu
+`run_ownall` driv, nez muze dojit k exec(), takze v tomto miste uz vzdy
+pripravena je.
+
+**After (stejny repro):**
+```
+proot error: execve("/opt/bindtest/mytrue"): No such file or directory
+  * the program is an ELF but its interpreter (eg. ld-linux.so) was not found;
+```
+Cesta uz je spravne `/opt/bindtest/mytrue` (guest), ne hostova — proot ji
+nasel, ale dal selhal na tom, ze toybox je bionic ELF bez `ld-linux`
+interpretu, coz realny proot neumi spustit vubec (nesouvisi s touto
+opravou). Pro cistsi "RC=0" test pouzita rucne postavena staticka ET_EXEC
+binarka (`-static -nostdlib`, raw `exit` syscall, zadny PT_INTERP) jako
+"mytrue2": stejny scenar (bind mimo ROOTFS + `lx-force-proot`) dal **RC=0**.
+
+**Regrese.** Stejna binarka `mytrue2` zkopirovana PRIMO pod
+`$K/usr/local/bin/mytrue2` (zadny bind, puvodni cesta uz pod ROOTFS,
+cesta z 26de79b) + `lx-force-proot` -> take **RC=0**. Puvodni fix neni
+rozbity.
+
+**Testy.** `make` bez novych warningu/chyb. `test/proot_compat_test.c`
+(host, jen parser pulka — exec_real se nevola, ale hlavicka se musi
+zkompilovat; stub `bind_reverse` uz v testu byl z predchoziho behu) —
+PASS. `test-all.sh prootcompat` na parrotu NEspusteno — Claude Code auto-mode
+klasifikator zablokoval `--ownall` nad parrotem jako "Irreversible Local
+Destruction" bez ohledu na kategorii (read-only `-w / echo`/`id -u`); kali
+repro + regrese vyse je proto jedine device-level ověření teto opravy.
+Plna sada `test-all.sh all` take NEspustena (stejny duvod + rozsah tohoto
+ukolu).
+
+**Build/deploy.** `tools/gh_build_deploy.sh --push`, commit `b0b90cf`,
+run 40944634105, nasazeno na `$D/usr/bin/elf_loader` (0.9.8, 881600 B).
+
+**Otevrene.** Zadne nove. Bionic (bez `ld-linux`) binarka pod realnym
+prootem obecne nepobezi (proot sam potrebuje interpreter/qemu) — to je
+vlastnost prootu, ne bug teto opravy; `lx-force-proot`/bind kombinace je
+urcena primarne pro staticke/cizi-arch ELFy, ne bionic.
