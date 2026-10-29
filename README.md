@@ -129,11 +129,51 @@ elf_loader [--lazy] --run   <elf> [args..]     host-loader mode (host libc)
 elf_loader [--lazy] --own   <elf> <shared.so>  own-load one shared module
 elf_loader [--lazy] --ownall <elf> [args..]    own-load all deps (guest glibc)
 elf_loader [--lazy] --shim  <elf> [args..]     F2 path-translation shim
+elf_loader --proot-compat [proot-opts] -- <cmd> [args..]   proot command line
+proot [proot-opts] -- <cmd> [args..]           same, via a symlink named `proot`
 elf_loader init zsh|bash                        print eval-able shell env
 elf_loader init example [zsh|bash]              print example ~/.elfrc
 elf_loader init install [--force]               write example to ${ELF_RC:-$HOME/.elfrc}
 elf_loader <elf>                                introspect (no execution)
 ```
+
+### Replacing proot
+
+`--proot-compat` (or simply calling the loader through a symlink named `proot`)
+accepts proot's own command line, so existing scripts keep working:
+
+| proot option | effect |
+|---|---|
+| `-r`, `--rootfs DIR` | guest rootfs → `ROOTFS` |
+| `-b`, `--bind H:G[:ro]` | bind mount, repeatable → `LX_BINDS` |
+| `-w`, `--cwd DIR` | start cwd inside the rootfs |
+| `-0`, `--root-id` | fake uid/gid 0 → `LX_FAKEROOT=1` |
+| `-l`, `--link2symlink` | hardlinks as symlinks → `LX_L2S=1` |
+| `-k`, `--kernel-release R`, `--kill-on-exit` | accepted, no-op |
+
+`--opt=value` works too, `--` ends option parsing, and with no command the
+rootfs `$SHELL` (default `/bin/bash`) is started. Any option that is *not*
+emulated (`-S`, `-v`, `--sysvipc`, …) makes the loader hand the whole command
+line to the real proot binary (`$LX_PROOT_BIN`, otherwise the first existing of
+`…/files/usr/bin/proot`, `/data/adb/elf_loader/proot`, `/system/bin/proot`).
+The same fallback covers foreign-architecture binaries (run under
+`proot -q qemu-<arch>-static`) and anything whose basename is listed in
+`$ROOTFS/etc/lx-force-proot`.
+
+Installing packages needs **both** `-0` and `-l` — dpkg backs files up with
+hardlinks and wants to own them as root:
+
+```sh
+# via proot's CLI
+elf_loader --proot-compat -r "$ROOTFS" -0 -l -- apt-get install -y hostname
+# or with the loader's own flags
+LX_FAKEROOT=1 LX_L2S=1 ROOTFS=$ROOTFS elf_loader --ownall \
+    "$ROOTFS/usr/bin/apt-get" install -y hostname
+```
+
+Static and Go binaries make their syscalls without going through libc, so they
+only see the fake identity with the seccomp safety net on: add
+`ELF_LOADER_L2=1`.
 
 ## Environment variables
 
