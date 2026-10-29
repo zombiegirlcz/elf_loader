@@ -4949,6 +4949,21 @@ static int run_ownall(const char *path, int argc, char **argv, char **envp) {
     fakeroot_init();
     l2s_init();
 
+    /* static-PIE (ET_DYN bez PT_INTERP) vlastnim loadem skonci SIGSEGV —
+     * jadro takovy obraz na tomhle zarizeni nenamapuje. Pres exec cestu to
+     * resi elf_hybrid_needs_real_proot(), ale `--ownall <static-PIE>` se do
+     * ni nedostane (zadny execve), takze `ldconfig` volany primo padal
+     * rc=139. Posilame ho na realny proot stejnou cestou jako exec shim.
+     * Vypnuti: ELF_LOADER_NO_STATIC_PIE_PROOT=1. */
+    if (path && path[0] && elf_is_static_pie(path) &&
+        !getenv("ELF_LOADER_NO_STATIC_PIE_PROOT")) {
+        if (elf_debug())
+            fprintf(stderr, "[+] %s je static-PIE -> realny proot\n", path);
+        elf_hybrid_exec_proot(path, argv, envp);
+        /* exec se nepovedl -> pokracuj puvodni (padajici) cestou, at je
+         * videt skutecna chyba, ne tichy exit */
+    }
+
     char **argv_pre_shebang = argv;   /* shebang blok argv nahradi -> skript */
     /* jmeno pro comm: cesta z execve PRED resolvem symlinku (python3, ne
      * python3.13); u skriptu (shebang nize) skript, jako jadro */
