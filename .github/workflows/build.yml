@@ -77,7 +77,7 @@ jobs:
           chmod +x magisk-module/system/bin/elf_loader
           (cd magisk-module && ./build.sh)
           TAG="${GITHUB_REF_NAME}"
-          cp magisk-module/parrot_elf_loader.zip "/tmp/parrot_elf_loader_${TAG}.zip"
+          cp magisk-module/elf_loader.zip "/tmp/parrot_elf_loader_${TAG}.zip"
           cp /tmp/elf_loader_ndk "/tmp/elf_loader_${TAG}_ndk"
           cp /tmp/elf_loader_ndk_staticpie "/tmp/elf_loader_${TAG}_staticpie"
 
