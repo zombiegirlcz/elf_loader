@@ -118,6 +118,11 @@ void f2_set_cwd_keep_host(int v);       /* L2/Go: getcwd NEstripovat $ROOTFS */
 void f2_set_bind_hooks(int (*remap)(const char *, char *, size_t),
                        int (*deny)(long, const unsigned long *, long *),
                        size_t (*rev)(char *, size_t));   /* L2/Go: tabulka bindu (prompt 06) */
+/* L2/Go: fakeroot na urovni syscallu (staticke a Go binarky nemaji PLT vazbu,
+ * kterou by jmenne hooky zachytily). pre = identitni syscally, post = oprava
+ * vysledku stat rodiny. */
+void f2_set_fakeroot_hooks(int (*pre)(long, const unsigned long *, long *),
+                           void (*post)(long, const long *, long));
 int  elf_l2_enabled(void);              /* L2 (prompt 05): ELF_LOADER_L2 */
 void elf_l2_prepare_exe_load(void);     /* rezervuj okno, PIE exe do nej */
 void elf_l2_after_exe_load(void);       /* zavislosti uz do okna nechceme */

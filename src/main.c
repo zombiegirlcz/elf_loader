@@ -1452,36 +1452,9 @@ static int shim_statx(int dfd, const char *p, int flags, unsigned int mask, void
     }
     fp_statx f = (fp_statx)g_orig_statx; int r = f ? f(dfd, path, flags, mask, stx) : -1;
     char frab[8192];
-    if (r == 0 && g_fakeroot_on && p && stx) {
-        const char *frp = fakeroot_at_path(dfd, path, frab, sizeof frab);
-        /* struct statx (linux/stat.h, overeno proti kernel headru): stx_mask
-         * u32@0, stx_blksize u32@4, stx_attributes u64@8, stx_nlink u32@16,
-         * stx_uid u32@20, stx_gid u32@24, stx_mode u16@28, stx_rdev_major
-         * u32@128, stx_rdev_minor u32@132. Patchujeme primo offsety, aby kod
-         * nezavisel na pritomnosti hlavicky struct statx v build prostredi. */
-        unsigned char *b2 = (unsigned char *)stx;
-        unsigned short *mode_p = (unsigned short *)(b2 + 28);
-        unsigned int *uid_p = (unsigned int *)(b2 + 20);
-        unsigned int *gid_p = (unsigned int *)(b2 + 24);
-        unsigned int *rmaj_p = (unsigned int *)(b2 + 128);
-        unsigned int *rmin_p = (unsigned int *)(b2 + 132);
-        lxfr_rec_t rec;
-        if (fakeroot_xattr_get(frp, !(flags & 0x100), &rec) == 0) {
-            *uid_p = rec.uid; *gid_p = rec.gid;
-            if (rec.mode_extra & (S_IFCHR | S_IFBLK)) {
-                unsigned short perm = *mode_p & 07777;
-                *mode_p = (unsigned short)((rec.mode_extra & (S_IFCHR | S_IFBLK)) | perm |
-                           (rec.mode_extra & (S_ISUID | S_ISGID | S_ISVTX)));
-                *rmaj_p = rec.rdev_major; *rmin_p = rec.rdev_minor;
-            } else {
-                *mode_p = (unsigned short)((*mode_p & ~(unsigned short)(S_ISUID | S_ISGID | S_ISVTX)) |
-                           (rec.mode_extra & (S_ISUID | S_ISGID | S_ISVTX)));
-            }
-        } else if (*uid_p == g_fakeroot_app_uid) {
-            *uid_p = 0;
-            if (*gid_p == g_fakeroot_app_gid) *gid_p = 0;
-        }
-    }
+    if (r == 0 && g_fakeroot_on && p && stx)
+        fakeroot_fix_statx(fakeroot_at_path(dfd, path, frab, sizeof frab),
+                           !(flags & 0x100 /* AT_SYMLINK_NOFOLLOW */), stx);
     if (r == 0 && dfd == -100) l2s_fix_statx(raw, !(flags & 0x100), dfd, mask, stx);
     return r;
 }
@@ -3888,6 +3861,94 @@ static int shim_initgroups(const char *user, unsigned int gid) {
     return f ? f(user, gid) : -1;
 }
 
+/* ===== fakeroot pro L2 (staticke a Go binarky) ===============================
+ *
+ * Jmenne hooky (`g_f2_hooks`) potrebuji PLT vazbu do nasi libc. Staticka
+ * binarka ani Go runtime ji nemaji — delaji `svc` primo — takze pod
+ * `LX_FAKEROOT=1` dal videly skutecne app uid. Namereno 2026-10-29 na
+ * staticke sonde: s `ELF_LOADER_L2=1` se cesty uz prelozily
+ * (`stat_rc=0`), ale `uid=10323 euid=10323` a `st_uid=10323`.
+ *
+ * Proot to resi na urovni syscallu (`fake_id0`), takze pro paritu to musi
+ * delat i L2: filtr (`l2_install_range_filter`) pod fakerootem TRAPuje i
+ * identitni cisla a `go_handle` je zodpovi odtud.
+ *
+ * POZOR: obe funkce bezi z SIGSYS handleru pod GUEST TP — jen staticke
+ * globaly, raw syscally a fakeroot/l2s helpery (ty uz pod guest TP bezi
+ * i z jmennych hooku). Zadny getenv/snprintf/fprintf (past c. 1). */
+
+/* 1 = syscall obsluzen, vysledek v *out. */
+static int go_fakeroot_pre(long nr, const unsigned long *r, long *out) {
+    if (!g_fakeroot_on || !out) return 0;
+    switch (nr) {
+        case 174: *out = (long)g_fr_ruid; return 1;   /* getuid  */
+        case 175: *out = (long)g_fr_euid; return 1;   /* geteuid */
+        case 176: *out = (long)g_fr_rgid; return 1;   /* getgid  */
+        case 177: *out = (long)g_fr_egid; return 1;   /* getegid */
+        case 148:                                      /* getresuid */
+        case 150: {                                    /* getresgid */
+            unsigned int *a = (unsigned int *)r[0];
+            unsigned int *b = (unsigned int *)r[1];
+            unsigned int *c = (unsigned int *)r[2];
+            int uid = (nr == 148);
+            if (a) *a = uid ? g_fr_ruid : g_fr_rgid;
+            if (b) *b = uid ? g_fr_euid : g_fr_egid;
+            if (c) *c = uid ? g_fr_suid : g_fr_sgid;
+            *out = 0;
+            return 1;
+        }
+        case 158: {                                    /* getgroups */
+            int n = (int)r[0];
+            unsigned int *list = (unsigned int *)r[1];
+            if (n == 0) { *out = 1; return 1; }        /* dotaz na pocet */
+            if (n < 1 || !list) { *out = -EINVAL; return 1; }
+            list[0] = g_fr_egid;
+            *out = 1;
+            return 1;
+        }
+        case 159: *out = 0; return 1;                  /* setgroups: vzdy OK */
+        /* set*id: tytez funkce jako jmenne hooky, aby se semantika
+         * (fake root smi cokoli) nerozchazela mezi vrstvami. Vracejí
+         * -1 + guest errno; na syscall urovni je spravna hodnota -errno. */
+        case 146: *out = shim_setuid((unsigned int)r[0]) == 0 ? 0 : -EPERM; return 1;
+        case 144: *out = shim_setgid((unsigned int)r[0]) == 0 ? 0 : -EPERM; return 1;
+        case 145: *out = shim_setreuid((unsigned int)r[0], (unsigned int)r[1]) == 0
+                         ? 0 : -EPERM; return 1;
+        case 143: *out = shim_setregid((unsigned int)r[0], (unsigned int)r[1]) == 0
+                         ? 0 : -EPERM; return 1;
+        case 147: *out = shim_setresuid((unsigned int)r[0], (unsigned int)r[1],
+                                        (unsigned int)r[2]) == 0 ? 0 : -EPERM; return 1;
+        case 149: *out = shim_setresgid((unsigned int)r[0], (unsigned int)r[1],
+                                        (unsigned int)r[2]) == 0 ? 0 : -EPERM; return 1;
+        case 151: *out = (long)g_fr_ruid; return 1;    /* setfsuid: vraci stare */
+        case 152: *out = (long)g_fr_rgid; return 1;    /* setfsgid */
+        default: return 0;
+    }
+}
+
+/* Oprava VYSLEDKU stat rodiny. `a[]` jsou argumenty PO prekladu cest
+ * (host cesty), `rr` vysledek syscallu. */
+static void go_fakeroot_post(long nr, const long *a, long rr) {
+    if (rr != 0 || !a) return;
+    if (nr == 79) {          /* newfstatat(dirfd, path, st, flags) */
+        int follow = !((int)a[3] & 0x100 /* AT_SYMLINK_NOFOLLOW */);
+        if (g_fakeroot_on) {
+            if (((int)a[3] & 0x1000 /* AT_EMPTY_PATH */) &&
+                a[1] && !((const char *)a[1])[0])
+                fakeroot_fix_stat_fd((int)a[0], (struct stat *)a[2]);
+            else
+                fakeroot_fix_stat((const char *)a[1], follow, (struct stat *)a[2]);
+        }
+        if ((int)a[0] == -100) l2s_fix_stat((const char *)a[1], follow, (struct stat *)a[2]);
+    } else if (nr == 291) {  /* statx(dirfd, path, flags, mask, stx) */
+        int follow = !((int)a[2] & 0x100);
+        if (g_fakeroot_on)
+            fakeroot_fix_statx((const char *)a[1], follow, (void *)a[4]);
+        if ((int)a[0] == -100)
+            l2s_fix_statx((const char *)a[1], follow, (int)a[0], (unsigned int)a[3], (void *)a[4]);
+    }
+}
+
 /* ===== MAP_FIXED_NOREPLACE emulace (kernel 4.14) =====
  * Android kernel 4.14 flag MAP_FIXED_NOREPLACE (0x100000) NEZNA -> ignoruje
  * ho a chova se jako hint. V8/Node s nim rezervuje 4GB pointer-compression
@@ -4917,6 +4978,7 @@ static int run_ownall(const char *path, int argc, char **argv, char **envp) {
      * Jmenne hooky pod L2 bezi soubezne, drz je konzistentni (strip pro vsechny). */
     f2_set_cwd_keep_host(elf_l2_enabled() ? 0 : g_cwd_keep_host);
     f2_set_bind_hooks(shim_bind_remap, shim_sys_intercept, bind_reverse_inplace);
+    f2_set_fakeroot_hooks(go_fakeroot_pre, go_fakeroot_post);
     if (elf_l2_enabled()) g_cwd_keep_host = 0;
     if (elf_debug() && g_cwd_keep_host)
         fprintf(stderr, "[F2] getcwd: host cesta (Bun / F2_NO_CWD_STRIP)\n");

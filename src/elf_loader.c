@@ -6054,6 +6054,18 @@ void f2_set_bind_hooks(int (*remap)(const char *, char *, size_t),
     g_go_bind_rev = rev;
 }
 
+/* Fakeroot pro L2: staticka a Go binarka nema PLT vazbu do nasi libc, takze
+ * jmenne hooky `getuid`/`stat` nema kde zachytit (namereno 2026-10-29).
+ * `pre` zodpovi identitni syscally, `post` opravi vysledek stat rodiny.
+ * main.c je registruje pri startu; obe bezi pod GUEST TP ze SIGSYS handleru. */
+static int (*g_go_fr_pre)(long, const unsigned long *, long *);
+static void (*g_go_fr_post)(long, const long *, long);
+void f2_set_fakeroot_hooks(int (*pre)(long, const unsigned long *, long *),
+                           void (*post)(long, const long *, long)) {
+    g_go_fr_pre = pre;
+    g_go_fr_post = post;
+}
+
 NOSP static int go_exists(const char *p) {
     struct f2_kstat st;
     return raw_syscall6(79, -100L, (long)p, (long)&st, F2_AT_SYMLINK_NOFOLLOW,
@@ -6150,6 +6162,14 @@ NOSP static long go_execve(const char *p, char *const *argv, char *const *envp) 
 NOSP static int go_handle(long nr, ucontext_t *ctx) {
     unsigned long long *r = ctx->uc_mcontext.regs;
     int pa = -1, pb = -1;           /* indexy registru s cestou */
+    /* fakeroot: identitni syscally nemaji cestu, zodpovi se bez syscallu */
+    if (g_go_fr_pre) {
+        long e;
+        if (g_go_fr_pre(nr, (const unsigned long *)r, &e)) {
+            r[0] = (unsigned long long)e;
+            return 1;
+        }
+    }
     switch (nr) {
         case 135: {   /* rt_sigprocmask: emulace nad uc_sigmask, SIGSYS nikdy blokovany.
                        * Kernel 4.14 force_sig_info() pri blokovanem SIGSYS resetuje
@@ -6243,6 +6263,8 @@ NOSP static int go_handle(long nr, ucontext_t *ctx) {
         a[pb] = (long)tb;
     }
     long rr = raw_syscall6(nr, a[0], a[1], a[2], a[3], a[4], (long)F2_SENTINEL);
+    /* fakeroot/l2s oprava vysledku stat rodiny (a[] uz jsou prelozene cesty) */
+    if (g_go_fr_post) g_go_fr_post(nr, a, rr);
     /* readlinkat(78): cil muze byt hostove absolutni (pod $ROOTFS) -> ohlas
      * ho zpet jako guest-absolutni, aby guest nikdy nevidel host cestu. */
     if (nr == 78 && rr > 0 && !g_f2_cwd_keep_host && g_f2_root) {
@@ -6328,11 +6350,27 @@ static int l2_install_range_filter(unsigned long lo, unsigned long hi, const cha
     /* 17=getcwd (fixup vysledku), 49=chdir, 34/35/48/53/54/56/78/79/88/291/439
      * =path (439=faccessat2, glibc 2.33+ ho pouziva misto 48!),
      * 36=symlinkat, 37=linkat, 38/276=renameat, 221=execve, 135/134=sig. */
-    static const unsigned nrs[] = { 17, 56, 79, 48, 439, 78, 291, 221, 49, 34, 35, 38,
-                                    276, 53, 54, 88, 37, 36, 135 };
+    static const unsigned nrs_path[] = { 17, 56, 79, 48, 439, 78, 291, 221, 49, 34, 35, 38,
+                                         276, 53, 54, 88, 37, 36, 135 };
+    /* Pod LX_FAKEROOT i identitni cisla: staticka a Go binarka nema PLT vazbu
+     * do nasi libc, takze jmenny hook `getuid`/`set*id` ji nema kde zachytit
+     * a bez tohohle videla skutecne app uid (namereno 2026-10-29). Proot to
+     * resi taky na urovni syscallu (`fake_id0`). Zodpovi je `go_fakeroot_pre`
+     * pres `go_handle`. Mimo fakeroot se filtr nemeni (zadna rezie). */
+    static const unsigned nrs_id[] = { 174, 175, 176, 177,   /* get{,e}{u,g}id   */
+                                       148, 150,             /* getres{u,g}id    */
+                                       158, 159,             /* get/setgroups    */
+                                       146, 144, 145, 143,   /* set{u,g}id, setre*  */
+                                       147, 149,             /* setres{u,g}id    */
+                                       151, 152 };           /* setfs{u,g}id     */
+    unsigned nrs[sizeof nrs_path / sizeof nrs_path[0] +
+                 sizeof nrs_id / sizeof nrs_id[0]];
+    size_t NN = 0;
+    for (size_t k = 0; k < sizeof nrs_path / sizeof nrs_path[0]; k++) nrs[NN++] = nrs_path[k];
+    if (elf_fakeroot_active())
+        for (size_t k = 0; k < sizeof nrs_id / sizeof nrs_id[0]; k++) nrs[NN++] = nrs_id[k];
     struct sock_filter prog[64];
     size_t n = 0;
-    const size_t NN = sizeof nrs / sizeof nrs[0];
     /* pozice: 0..4 IP check, 5 LD nr, 6..6+NN-1 JEQ, 3 instr. sigaction blok, ALLOW, TRAP */
     size_t i_allow = 6 + NN + 3, i_trap = i_allow + 1;
     prog[n++] = (struct sock_filter)BPF_STMT(BPF_LD | BPF_W | BPF_ABS,

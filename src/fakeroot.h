@@ -293,6 +293,41 @@ static void fakeroot_fix_stat_fd(int fd, struct stat *st) {
     }
 }
 
+/* Oprava vysledku `statx` — vytazeno ze `shim_statx`, aby to slo volat i z L2
+ * (`go_fakeroot_post`): staticka a Go binarka nema PLT vazbu do nasi libc,
+ * takze jmenny hook ji nema kde zachytit a fake identitu ji musi dodat az
+ * syscall vrstva.
+ *
+ * `struct statx` (linux/stat.h, overeno proti kernel headru) se patchuje
+ * primo offsety, aby kod nezavisel na pritomnosti hlavicky v build prostredi:
+ * stx_mask u32@0, stx_nlink u32@16, stx_uid u32@20, stx_gid u32@24,
+ * stx_mode u16@28, stx_rdev_major u32@128, stx_rdev_minor u32@132. */
+static void fakeroot_fix_statx(const char *frp, int follow, void *stx) {
+    if (!g_fakeroot_on || !stx) return;
+    unsigned char *b = (unsigned char *)stx;
+    unsigned short *mode_p = (unsigned short *)(b + 28);
+    unsigned int *uid_p = (unsigned int *)(b + 20);
+    unsigned int *gid_p = (unsigned int *)(b + 24);
+    unsigned int *rmaj_p = (unsigned int *)(b + 128);
+    unsigned int *rmin_p = (unsigned int *)(b + 132);
+    lxfr_rec_t rec;
+    if (frp && fakeroot_xattr_get(frp, follow, &rec) == 0) {
+        *uid_p = rec.uid; *gid_p = rec.gid;
+        if (rec.mode_extra & (S_IFCHR | S_IFBLK)) {
+            unsigned short perm = *mode_p & 07777;
+            *mode_p = (unsigned short)((rec.mode_extra & (S_IFCHR | S_IFBLK)) | perm |
+                       (rec.mode_extra & (S_ISUID | S_ISGID | S_ISVTX)));
+            *rmaj_p = rec.rdev_major; *rmin_p = rec.rdev_minor;
+        } else {
+            *mode_p = (unsigned short)((*mode_p & ~(unsigned short)(S_ISUID | S_ISGID | S_ISVTX)) |
+                       (rec.mode_extra & (S_ISUID | S_ISGID | S_ISVTX)));
+        }
+    } else if (*uid_p == g_fakeroot_app_uid) {
+        *uid_p = g_fakeroot_uid;
+        if (*gid_p == g_fakeroot_app_gid) *gid_p = g_fakeroot_gid;
+    }
+}
+
 static int fakeroot_xattr_fmerge(int fd, const unsigned int *uid, const unsigned int *gid,
                                   const unsigned int *mode_extra,
                                   const unsigned int *rmaj, const unsigned int *rmin) {
