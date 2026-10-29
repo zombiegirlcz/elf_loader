@@ -175,7 +175,9 @@ static int proot_compat_exec_real(const char *rootfs, char *const *extra_argv,
         na[narg++] = extra_argv[i];
     for (int i = 0; i < nbind && narg < 500; i++)
         na[narg++] = bindv[i];
-    na[narg++] = (char *)"--";
+    /* ZADNE "--": proot z tohoto rootfs ho nezna ("proot error: unknown
+     * option '--'") a hybridni dispatch na nem kvuli tomu nikdy neprosel.
+     * Prikaz je vzdy absolutni cesta, takze separator neni potreba. */
     na[narg++] = (char *)path;
     for (int i = 1; argv && argv[i] && narg < 510; i++)
         na[narg++] = argv[i];
