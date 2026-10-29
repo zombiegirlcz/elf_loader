@@ -45,7 +45,12 @@ fi
 
 # vlastnik a label odvozene ze SAMOTNE cilove slozky, ne hardcode
 OWNER=$(stat -c '%U:%G' "$DIR" 2>/dev/null || stat -c '%u:%g' "$DIR")
-LABEL=$(ls -ldZ "$DIR" 2>/dev/null | awk '{print $1}')
+# POZOR: label NENI prvni sloupec. Toybox `ls -ldZ` dava
+#   drwx------ 7 u0_a323 u0_a323 u:object_r:app_data_file:s0:c67,… 3488 … /cesta
+# takze `awk '{print $1}'` vratilo prava (`drwx------`), `chcon` to odmitl
+# a `2>/dev/null || true` chybu spolklo -> skript hlasil uspech a nedelal nic.
+# Hledame proto sloupec podle tvaru, ne podle pozice.
+LABEL=$(ls -ldZ "$DIR" 2>/dev/null | tr -s ' ' '\n' | grep -m1 '^u:object_r:')
 
 [ -n "$OWNER" ] || { echo "nepodarilo se zjistit vlastnika $DIR" >&2; exit 1; }
 [ -n "$LABEL" ] || { echo "nepodarilo se zjistit SELinux label $DIR" >&2; exit 1; }
@@ -55,10 +60,17 @@ echo "  cilovy vlastnik: $OWNER"
 echo "  cilovy label:    $LABEL"
 
 n_wrong_owner_before=$(find "$DIR" -xdev -user 0 2>/dev/null | wc -l)
-# past c. 13: find -printf '%Z' sleduje symlinky a hlasi label CILE, ne
-# odkazu samotneho - na pocty "spatnych" labelu tedy nespoleh, jen report
-# vlastnictvi je spolehlivy pres -user 0. Label kontroluj rucne ls -ldZ.
 echo "  souboru root:root pred:  $n_wrong_owner_before"
+
+# Pocet spatne olabelovanych. `find -printf '%Z'` pouzit NELZE - sleduje
+# symlinky a hlasi label CILE (past c. 13). `ls -ldZ` v davkach ale dela
+# lstat, takze u symlinku vidi label odkazu samotneho.
+count_wrong_label() {
+    find "$DIR" -xdev -exec ls -ldZ {} + 2>/dev/null |
+        tr -s ' ' ' ' | cut -d' ' -f5 | grep -c -v -x -F "$LABEL" || true
+}
+n_wrong_label_before=$(count_wrong_label)
+echo "  spatny label pred:       $n_wrong_label_before"
 
 if [ "$APPLY" != 1 ]; then
     echo "(--dry-run, nic se nemeni; --apply pro skutecnou opravu)"
@@ -70,10 +82,21 @@ fi
 find "$DIR" -xdev -user 0 -exec chown "$OWNER" {} + 2>/dev/null || true
 find "$DIR" -xdev -user 0 -exec chown -h "$OWNER" {} + 2>/dev/null || true
 
-# SELinux relabel - chcon -h pro symlinky, pak restorecon jako pojistka
-find "$DIR" -xdev -exec chcon -h "$LABEL" {} + 2>/dev/null || true
-restorecon -R "$DIR" 2>/dev/null || true
+# SELinux relabel. `chcon -h` i pro symlinky - bez -h by se olabeloval CIL,
+# ne odkaz, a prave na odkazech to vadi nejvic: l2s symlink s labelem
+# `app_data_file:s0` BEZ kategorii nejde z app domeny ani lstat-nout, takze
+# `dpkg` na nem skonci na "error removing old backup file ...: Permission
+# denied" (namereno na kali 2026-10-29).
+#
+# `restorecon -R` se tu ZAMERNE nepousti: file_contexts na /data/data nema
+# per-app kategorie, takze by prave nastavene `c67,…` zase srazil na holé
+# `app_data_file:s0` - tedy presne do toho stavu, ktery opravujeme.
+chcon_err=0
+find "$DIR" -xdev -exec chcon -h "$LABEL" {} + 2>/dev/null || chcon_err=1
+[ "$chcon_err" = 0 ] || echo "  POZOR: chcon nekde selhal (nekompletni relabel)"
 
 n_wrong_owner_after=$(find "$DIR" -xdev -user 0 2>/dev/null | wc -l)
+n_wrong_label_after=$(count_wrong_label)
 echo "  souboru root:root po:    $n_wrong_owner_after"
+echo "  spatny label po:         $n_wrong_label_after"
 echo "hotovo."
