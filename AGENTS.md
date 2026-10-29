@@ -76,6 +76,7 @@ Exec-heavy zátěž **3× rychlejší** (31 → 11 ms/exec), in-process práce
 `PT_TLS`**, jednovláknový proces, ne skript, ne pod L2; `vfork` se pod
 knobem přepisuje na `fork`. **Zbývající hrdlo je `fork`** (4,2 ms/fork
 u loaderu vs 1,2 ms u prootu — 1 GB aréna + 64 MB stack), ne exec.
+A/B měření: `tools/bench-softexec.sh` (z hosta, `ashell -c`).
 
 Knoby: `ELF_LOADER_TIMING`, `ELF_LOADER_NO_CACHE`, `ELF_LOADER_NO_HASH`,
 `ELF_LOADER_HASH_CHECK`, `ELF_LOADER_LAZY`, `ELF_LOADER_IMGCACHE`,

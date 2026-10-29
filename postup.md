@@ -6303,6 +6303,9 @@ v takovém „dítěti" přepsal glibc stav **rodiče**.
 
 ### Naměřeno (stejná binárka, A/B knobem; medián 2 kol, obě pořadí)
 
+Reprodukce: `tools/bench-softexec.sh` (spouštět **z hosta** přes
+`ashell -c`, ne pod loaderem — past z promptu 01).
+
 | zátěž (500 execů / 400 execů) | loader default | **loader SOFTEXEC** | proot |
 |---|---|---|---|
 | guest `sh`: 500× `/bin/true` | 12,3–15,2 s | **4,4–4,6 s** | 2,1–2,2 s |

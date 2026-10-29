@@ -599,6 +599,8 @@ ale funguje (4 oblasti / ~85 KB, obnova 0,34 ms).
 | `fakeconf`, 400 execů | 12,6–13,3 s | **4,0–4,7 s** | 2,2–3,9 s |
 | `find /usr -type f` | 0,44 s | 0,44 s | 11,0 s |
 
+(reprodukce: `tools/bench-softexec.sh`, spouštět z hosta přes `ashell -c`)
+
 **Exec-heavy zátěž 3× rychlejší** (31 → 11 ms na exec) při zachování 25×
 náskoku na cestově těžkých úlohách. Proot je na *čistém* execu pořád ~2×
 rychlejší.
