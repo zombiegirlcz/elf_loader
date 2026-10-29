@@ -6947,3 +6947,15 @@ uid, a že se bez fakerootu nic nevolá) — ALL PASS. `test-all.sh all`
 s defaulty: **218 PASS / 0 FAIL / 33 SKIP** (poprvé bez FAILu; i `nslookup
 localhost` tenhle běh prošel, je síťově závislý). Důležité hlavně proto, že
 refaktor `fakeroot_fix_statx` zasáhl i default cestu jmenných hooků.
+
+**Regrese pod `ELF_LOADER_L2=1`.** První běh dal 216/2/33 a oba FAILy byly
+softexec („trasa chybi", „strop trasy"). Není to regrese: soft exec se pod
+L2 **záměrně** neaktivuje (`src/softexec.h:394`, `g_sx_l2` — L2 má vlastní
+seccomp okno pro exe), takže trasa nevznikne a test hledal něco, co tam být
+nemá. Obě kategorie proto pod L2 SKIPují s vysvětlením; bez L2 dál 7/7 PASS.
+
+Po té opravě `all` s `L2=1`: **209 PASS / 0 FAIL / 35 SKIP**. Rozdíl proti
+defaultu (218/0/33) je **celý vysvětlený**: `comm` nad pass logy ukazuje, že
+chybí přesně 9 položek a všechny jsou softexec subtesty (kategorie se počítá
+jako 1 SKIP, ale obsahuje 8 subtestů + `softexec-cap`). Žádná skrytá
+regrese z identitního filtru ani z `go_handle`.
