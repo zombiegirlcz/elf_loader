@@ -6967,3 +6967,16 @@ pro první proces) a cwd se při startu přepočítá do ROOTFS (past č. 22).
 `apt-get install` prochází na kali přes `--ownall`, `--proot-compat` i přes
 symlink jménem `proot`; ~3,1× rychleji než proot. `test-all.sh all`
 218/0/33 default, 209/0/35 pod `ELF_LOADER_L2=1`.
+
+**Verze 0.9.7** — dokumentace náhrady prootu. `--help` o `--proot-compat`
+nemělo ani slovo a `LX_FAKEROOT`/`LX_L2S` byly jen vyjmenované bez vysvětlení,
+takže se podle helpu nedalo zjistit, jak apt/dpkg vlastně rozchodit. Doplněna
+sekce „proot compatibility" (mapování `-r`/`-b`/`-w`/`-0`/`-l`/`-k`, chování
+při neemulované volbě = fallback na skutečný proot, `$LX_PROOT_BIN`,
+`lx-force-proot`, qemu), rozepsané knoby, příklady s `apt-get`; README dostal
+sekci „Replacing proot" a shellový help nové téma `help proot`.
+
+Při tom opraveny dvě chyby: `print_help` měl **17 `%s` proti 16 argumentům**
+(poslední příklad vypisoval smetí — UB, potvrzeno `gcc -Wformat`), a v nově
+psaném shell helpu zpětné apostrofy ve dvojitých uvozovkách způsobily, že
+`help proot` v zsh **spustil skutečný proot** a vypsal jeho vlastní help.
