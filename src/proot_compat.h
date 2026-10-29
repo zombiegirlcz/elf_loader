@@ -5,7 +5,7 @@
  *
  *  1. `elf_loader --proot-compat <proot argv>` (nebo detekce argv[0]==proot,
  *     viz main()) — rozparsuje typickou proot syntaxi (-r/-b/-w/-0/-l/-k/
- *     --kill-on-exit), promitne ji do ROOTFS/LX_BINDS/LX_FAKEROOT/LX_L2S a
+ *     -L/--change-id/--sysvipc/--kill-on-exit), promitne ji do ROOTFS/LX_BINDS/LX_FAKEROOT/LX_L2S a
  *     zbytek argv dispatchne jako --ownall <cmd>. Bezi pod BIONICKYM TP
  *     (hlavni vlakno pred elf_run), takze getenv/setenv/fopen/snprintf jsou
  *     bezpecne — tahle cast (proot_compat_parse, proot_compat_main v
@@ -68,8 +68,8 @@ static const char *proot_compat_real_bin_envp(char *const envp[]) {
 static int proot_compat_collect_binds(char *const envp[], char **out, int max,
                                        char *scratch, size_t scratch_sz) {
     int n = 0;
-    size_t used = 0;
 #ifdef ELF_LOADER_BINDS_H
+    size_t used = 0;
     if (g_tab) {
         for (unsigned i = 0; i < g_tab->count && n + 2 <= max; i++) {
             lx_bind_t *e = &g_tab->e[i];
@@ -170,6 +170,24 @@ static int proot_compat_exec_real(const char *rootfs, char *const *extra_argv,
     if (rootfs && rootfs[0]) {
         na[narg++] = (char *)"-r";
         na[narg++] = (char *)rootfs;
+    }
+    /* Emulace teto session prelozit na prootske volby. Bez toho dispatchovana
+     * binarka bezi pod realnym uid/gid a s realnymi hardlinky, i kdyz session
+     * jede pod fakerootem/l2s: chown/chmod na roota v maintainer scriptech
+     * skonci na EPERM a link() na EACCES (Android hardlinky v app datech
+     * zakazuje). Loaderovy libc shimy uvnitr prootu nebezi, takze samotne
+     * LX_FAKEROOT/LX_L2S v envp nic neudelaji - musi to byt -0/-l.
+     * pc_envp_get, ne getenv (guest TP). */
+    const char *v_fr = pc_envp_get(envp, "LX_FAKEROOT");
+    if (v_fr && v_fr[0] && !(v_fr[0] == '0' && v_fr[1] == 0))
+        na[narg++] = (char *)"-0";
+    const char *v_l2s = pc_envp_get(envp, "LX_L2S");
+    if (v_l2s && v_l2s[0] && !(v_l2s[0] == '0' && v_l2s[1] == 0))
+        na[narg++] = (char *)"-l";
+    const char *v_cwd = pc_envp_get(envp, "ELF_LOADER_PROOT_CWD");
+    if (v_cwd && v_cwd[0] == '/') {
+        na[narg++] = (char *)"-w";
+        na[narg++] = (char *)v_cwd;
     }
     for (int i = 0; i < extra_argc && narg < 500; i++)
         na[narg++] = extra_argv[i];
@@ -330,7 +348,10 @@ static int proot_compat_parse(int argc, char **argv, int *cmd_start,
         } else if (a[0] != '-') {
             break;  /* zacatek guest prikazu */
         } else {
-            return -1;  /* nezname volby (-S, -v, -V, --sysvipc, ...) */
+            /* nezname volby (-S, -v, -V, ...) -> fallback na realny proot.
+             * POZOR: --sysvipc sem uz NEDOJDE, ma vlastni vetev vys (no-op,
+             * nebo -1 pri LX_PROOT_SYSVIPC=strict). */
+            return -1;
         }
     }
     if (!rootfs || !rootfs[0]) return -1;
