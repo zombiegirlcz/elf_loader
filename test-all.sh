@@ -1207,6 +1207,116 @@ except OSError:
     fi
 }
 
+# prompt 11 - soft exec (ELF_LOADER_SOFTEXEC=1): vymena guest programu bez
+# execve. A/B: knob vypnuty (default) vs zapnuty musi dat STEJNY vystup,
+# a pod zapnutym knobem musi trasa dolozit, ze se soft exec opravdu pouzil.
+category_softexec() {
+    echo ""
+    echo "=== soft exec (prompt 11) ==="
+    local env="ROOTFS=$R ELF_ROOTFS=$R ELF_LOADER=$L"
+    local sx="ELF_LOADER_SOFTEXEC=1"
+    local trace="$R/tmp/softexec.trace.$$"
+    rm -f "$trace"
+    local t="$R/usr/bin/timeout"
+
+    _sx_run() {   # $1 = env navic, $2 = guest prikaz pro bash -c
+        "$t" 25 "$R/bin/bash" -c "$1 $L --ownall $R/bin/bash -c '$2'" 2>&1 | head -c 20k || true
+    }
+
+    # 1) funkcni shoda default vs soft exec na retezu exec
+    local cmd='/bin/echo A; /bin/true; echo rc=$?; /usr/bin/expr 6 \* 7; /bin/sed -e s/x/y/ <<< x'
+    local out_def out_sx
+    out_def=$(_sx_run "$env" "$cmd")
+    out_sx=$(_sx_run "$env $sx" "$cmd")
+    if [ "$out_def" = "$out_sx" ] && printf '%s' "$out_sx" | grep -q 42; then
+        echo "PASS softexec-equal: default == softexec"
+        echo "PASS: softexec-equal" >> "$PASS_LOG"
+        ((PASS_COUNT++)) || true
+    else
+        echo "FAIL softexec-equal: def=[$out_def] sx=[$out_sx]"
+        echo "FAIL: softexec-equal | def=$out_def sx=$out_sx" >> "$FAIL_LOG"
+        ((FAIL_COUNT++)) || true
+    fi
+
+    # 2) soft exec se opravdu pouzil (trasa do souboru konci "run")
+    "$t" 25 "$R/bin/bash" -c \
+        "$env $sx ELF_LOADER_SOFTEXEC_TRACE=$trace $L --ownall $R/bin/bash -c '/bin/echo T'" \
+        >/dev/null 2>&1 || true
+    if [ -f "$trace" ] && grep -q '^run$' "$trace" && grep -q '^load-done$' "$trace"; then
+        echo "PASS softexec-used: trasa dokladá in-process vymenu"
+        echo "PASS: softexec-used" >> "$PASS_LOG"
+        ((PASS_COUNT++)) || true
+    else
+        echo "FAIL softexec-used: trasa chybi/nekompletni ($trace)"
+        echo "FAIL: softexec-used - trasa chybi" >> "$FAIL_LOG"
+        ((FAIL_COUNT++)) || true
+    fi
+    rm -f "$trace"
+
+    # 3) vlastni argv[0] (exec -a) prezije i soft exec
+    local out_a
+    out_a=$(_sx_run "$env $sx" 'exec -a ZZTOP /bin/sh -c "echo \$0"')
+    if printf '%s' "$out_a" | grep -q ZZTOP; then
+        echo "PASS softexec-argv0: exec -a prochazi"
+        echo "PASS: softexec-argv0" >> "$PASS_LOG"
+        ((PASS_COUNT++)) || true
+    else
+        echo "FAIL softexec-argv0: [$out_a]"
+        echo "FAIL: softexec-argv0 | $out_a" >> "$FAIL_LOG"
+        ((FAIL_COUNT++)) || true
+    fi
+
+    # 4) /proc/self/cmdline (procvirt) soft-exec nuteho programu
+    local out_c
+    out_c=$(_sx_run "$env $sx" '/bin/cat /proc/self/cmdline | /usr/bin/tr "\\0" " "')
+    if printf '%s' "$out_c" | grep -q "/bin/cat /proc/self/cmdline"; then
+        echo "PASS softexec-cmdline: virtualizovany cmdline"
+        echo "PASS: softexec-cmdline" >> "$PASS_LOG"
+        ((PASS_COUNT++)) || true
+    else
+        echo "FAIL softexec-cmdline: [$out_c]"
+        echo "FAIL: softexec-cmdline | $out_c" >> "$FAIL_LOG"
+        ((FAIL_COUNT++)) || true
+    fi
+
+    # 5) fallback: binarka s PT_TLS (python3) soft exec NESMI vzit, ale musi bezet
+    if [ -x "$R/usr/bin/python3" ]; then
+        local out_p
+        out_p=$(_sx_run "$env $sx" '/usr/bin/python3 -c "print(7*6)"')
+        if printf '%s' "$out_p" | grep -q 42; then
+            echo "PASS softexec-fallback: PT_TLS binarka jde klasickym re-execem"
+            echo "PASS: softexec-fallback" >> "$PASS_LOG"
+            ((PASS_COUNT++)) || true
+        else
+            echo "FAIL softexec-fallback: [$out_p]"
+            echo "FAIL: softexec-fallback | $out_p" >> "$FAIL_LOG"
+            ((FAIL_COUNT++)) || true
+        fi
+    else
+        echo "SKIP softexec-fallback: chybi python3"
+        echo "SKIP: softexec-fallback - no python3" >> "$SKIP_LOG"
+        ((SKIP_COUNT++)) || true
+    fi
+
+    # 6) skript (#!) soft exec nebere - musi dal fungovat
+    local sdir="$R/tmp/sxscript.$$"
+    mkdir -p "$sdir"
+    printf '#!/bin/sh\necho SCRIPT-OK\n' > "$sdir/s.sh"
+    chmod +x "$sdir/s.sh"
+    local out_s
+    out_s=$(_sx_run "$env $sx" "${sdir#$R}/s.sh")
+    rm -rf "$sdir"
+    if printf '%s' "$out_s" | grep -q SCRIPT-OK; then
+        echo "PASS softexec-script: shebang prochazi"
+        echo "PASS: softexec-script" >> "$PASS_LOG"
+        ((PASS_COUNT++)) || true
+    else
+        echo "FAIL softexec-script: [$out_s]"
+        echo "FAIL: softexec-script | $out_s" >> "$FAIL_LOG"
+        ((FAIL_COUNT++)) || true
+    fi
+}
+
 category_staticexec() {
     echo ""
     echo "=== staticky ELF v rootfs pres guest-absolutni cestu ==="
@@ -2511,6 +2621,10 @@ case "${1:-all}" in
         category_staticexec
         print_summary
         ;;
+    softexec)
+        category_softexec
+        print_summary
+        ;;
     execcache)
         category_execcache
         print_summary
@@ -2642,6 +2756,7 @@ case "${1:-all}" in
         category_relsym
         category_l1
         category_l2
+        category_softexec
         category_lxc
         category_dw
         category_elfrc

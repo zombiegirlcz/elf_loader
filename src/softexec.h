@@ -397,15 +397,19 @@ static int softexec_try(const char *path, char *const argv[], char *const envp[]
 
     /* ---- bod, odkud neni navratu ---- */
     g_loader_active = 1;
+    elf_timing_mark("sx_enter");
     sx_log("restore-begin");
     softexec_restore();
     sx_log("restore-done");
+    elf_timing_mark("sx_restore");
     if (!getenv("ELF_LOADER_SOFTEXEC_SKIP_FD"))
         sx_close_cloexec();
     sx_log("fds-done");
+    elf_timing_mark("sx_fds");
     if (!getenv("ELF_LOADER_SOFTEXEC_SKIP_SIG"))
         sx_reset_signals();
     sx_log("signals-done");
+    elf_timing_mark("sx_signals");
 
     elf_scope_t *scope = g_sx_scope;
     elf_init_argc = argc;
@@ -423,18 +427,21 @@ static int softexec_try(const char *path, char *const argv[], char *const envp[]
     elf_object_t *obj = elf_load(path);
     elf_own_scope = NULL;
     sx_log("load-done");
+    elf_timing_mark("sx_load");
     if (!obj || elf_relocate(obj) != 0) {
         static const char m[] = "[softexec] FATAL: nelze nacist cil\n";
         shim_raw_syscall6(64, 2, (long)(unsigned long)m, sizeof(m) - 1, 0, 0, 0);
         shim_raw_syscall6(94 /*exit_group*/, 127, 0, 0, 0, 0, 0);
     }
     sx_log("reloc-done");
+    elf_timing_mark("sx_reloc");
     elf_queue_module_inits(obj);
     g_exe_base = (uintptr_t)obj->base_addr;
     scope->exe = obj;
     ldso_install_exe_linkmap(obj, path);
     ldso_install_module_list(scope->mods, scope->count);
     sx_log("linkmap-done");
+    elf_timing_mark("sx_linkmap");
 
     /* Nove nactene moduly (nova zavislost cile) jeste nemaji prepsane
      * svc #0 ani L1 stuby; u uz nactenych je flag svc_patched/l1_patched. */
@@ -453,6 +460,7 @@ static int softexec_try(const char *path, char *const argv[], char *const envp[]
     }
 
     sx_log("patch-done");
+    elf_timing_mark("sx_patch");
     if (!getenv("ELF_LOADER_NO_PROCVIRT")) {
         const char *bn = path;
         for (const char *q = path; *q; q++) if (*q == '/') bn = q + 1;
@@ -463,9 +471,11 @@ static int softexec_try(const char *path, char *const argv[], char *const envp[]
     }
 
     sx_log("procvirt-done");
+    elf_timing_mark("sx_procvirt");
     g_loader_active = 0;
     elf_setup_own_tls(obj, scope);
     sx_log("tls-done");
+    elf_timing_mark("sx_tls");
     /* execve zachovava masku blokovanych signalu volajiciho */
     shim_raw_syscall6(135, SIG_SETMASK, (long)(unsigned long)&oldmask, 0, 8, 0, 0);
     sx_log("run");
