@@ -178,7 +178,19 @@ static int proot_compat_exec_real(const char *rootfs, char *const *extra_argv,
     /* ZADNE "--": proot z tohoto rootfs ho nezna ("proot error: unknown
      * option '--'") a hybridni dispatch na nem kvuli tomu nikdy neprosel.
      * Prikaz je vzdy absolutni cesta, takze separator neni potreba. */
-    na[narg++] = (char *)path;
+    /* A proot chce GUEST cestu (ma uz -r rootfs), ne hostovou - jinak hlasi
+     * "'<rootfs>/usr/sbin/ldconfig' not found (root = <rootfs>)". Prefix
+     * rootfs proto odrizneme. Rucni smycky, zadne libc volani (guest TP). */
+    const char *gpath = path;
+    if (rootfs && rootfs[0] && path) {
+        size_t rl = 0;
+        while (rootfs[rl]) rl++;
+        while (rl > 1 && rootfs[rl - 1] == '/') rl--;  /* "<rootfs>/" */
+        size_t i = 0;
+        while (i < rl && path[i] == rootfs[i]) i++;
+        if (i == rl && path[rl] == '/') gpath = path + rl;
+    }
+    na[narg++] = (char *)gpath;
     for (int i = 1; argv && argv[i] && narg < 510; i++)
         na[narg++] = argv[i];
     na[narg] = NULL;
