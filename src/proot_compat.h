@@ -283,6 +283,25 @@ static int proot_compat_parse(int argc, char **argv, int *cmd_start,
         } else if (strcmp(a, "--kill-on-exit") == 0) {
             /* loader dite nemusi explicitne hlidat (zivotnost == loader
              * proces), no-op pro kompatibilitu CLI. */
+        } else if (strcmp(a, "-L") == 0 || strcmp(a, "--fix-symlink-size") == 0) {
+            /* proot timhle koriguje velikost, kterou lstat hlasi u symlinku
+             * (nekompatibilni s nekterymi filesystemy); loader to nema a
+             * chova se jako nativni beh — no-op pro kompatibilitu CLI. */
+        } else if ((strcmp(a, "--change-id") == 0) && i + 1 < argc) {
+            const char *v = argv[++i];
+            if (strcmp(v, "0:0") == 0) root_id = 1;
+            else return -1;  /* loader umi jen fake root, ne libovolne uid:gid */
+        } else if (strncmp(a, "--change-id=", 12) == 0) {
+            const char *v = a + 12;
+            if (strcmp(v, "0:0") == 0) root_id = 1;
+            else return -1;
+        } else if (strcmp(a, "--sysvipc") == 0) {
+            /* no-op: zadna zname zavislost na System V IPC v tomhle projektu
+             * (viz AGENTS.md); LX_PROOT_SYSVIPC=strict je escape hatch pro
+             * kohokoliv, kdo real System V IPC potrebuje -> realny proot. */
+            if (getenv("LX_PROOT_SYSVIPC") &&
+                strcmp(getenv("LX_PROOT_SYSVIPC"), "strict") == 0)
+                return -1;
         } else if (strcmp(a, "--") == 0) {
             i++;
             break;

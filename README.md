@@ -149,11 +149,14 @@ accepts proot's own command line, so existing scripts keep working:
 | `-w`, `--cwd DIR` | start cwd inside the rootfs |
 | `-0`, `--root-id` | fake uid/gid 0 → `LX_FAKEROOT=1` |
 | `-l`, `--link2symlink` | hardlinks as symlinks → `LX_L2S=1` |
+| `-L`, `--fix-symlink-size` | accepted, no-op (loader already behaves like a native run) |
+| `--change-id=0:0` | fake root, same as `-0`; any other `uid:gid` is not emulated |
+| `--sysvipc` | accepted, no-op — not emulated; `LX_PROOT_SYSVIPC=strict` forces the real proot |
 | `-k`, `--kernel-release R`, `--kill-on-exit` | accepted, no-op |
 
 `--opt=value` works too, `--` ends option parsing, and with no command the
 rootfs `$SHELL` (default `/bin/bash`) is started. Any option that is *not*
-emulated (`-S`, `-v`, `--sysvipc`, …) makes the loader hand the whole command
+emulated at all (`-S`, `-v`, …) makes the loader hand the whole command
 line to the real proot binary (`$LX_PROOT_BIN`, otherwise the first existing of
 `…/files/usr/bin/proot`, `/data/adb/elf_loader/proot`, `/system/bin/proot`).
 The same fallback covers foreign-architecture binaries (run under
