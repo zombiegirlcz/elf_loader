@@ -1222,6 +1222,15 @@ except OSError:
 category_softexec() {
     echo ""
     echo "=== soft exec (prompt 11) ==="
+    # Soft exec se pod L2 ZAMERNE neaktivuje (src/softexec.h:394 - L2 ma
+    # vlastni seccomp okno pro exe), takze trasa nevznikne a test by hledal
+    # neco, co tam byt nema. Pod L2 proto SKIP, ne FAIL (2026-10-29).
+    if [ "${ELF_LOADER_L2:-0}" != 0 ]; then
+        echo "SKIP softexec: soft exec je pod L2 vypnuty (softexec.h: g_sx_l2)"
+        echo "SKIP: softexec - pod ELF_LOADER_L2 se soft exec neaktivuje" >> "$SKIP_LOG"
+        ((SKIP_COUNT++)) || true
+        return 0
+    fi
     local env="ROOTFS=$R ELF_ROOTFS=$R ELF_LOADER=$L"
     local sx="ELF_LOADER_SOFTEXEC=1"
     local trace="$R/tmp/softexec.trace.$$"
@@ -1362,6 +1371,15 @@ category_softexec() {
 category_softexec_cap() {
     echo ""
     echo "=== soft exec - strop trasy (prompt 13 T1) ==="
+    # Soft exec se pod L2 ZAMERNE neaktivuje (src/softexec.h:394 - L2 ma
+    # vlastni seccomp okno pro exe), takze trasa nevznikne a test by hledal
+    # neco, co tam byt nema. Pod L2 proto SKIP, ne FAIL (2026-10-29).
+    if [ "${ELF_LOADER_L2:-0}" != 0 ]; then
+        echo "SKIP softexec-cap: soft exec je pod L2 vypnuty (softexec.h: g_sx_l2)"
+        echo "SKIP: softexec-cap - pod ELF_LOADER_L2 se soft exec neaktivuje" >> "$SKIP_LOG"
+        ((SKIP_COUNT++)) || true
+        return 0
+    fi
     local env="ROOTFS=$R ELF_ROOTFS=$R ELF_LOADER=$L"
     local sx="ELF_LOADER_SOFTEXEC=1 ELF_LOADER_SOFTEXEC_TRACE_MAX=4096"
     local trace="$R/tmp/softexec.cap.$$"
