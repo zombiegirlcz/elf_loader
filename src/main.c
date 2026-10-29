@@ -5258,6 +5258,45 @@ static int run_ownall(const char *path, int argc, char **argv, char **envp) {
         prctl(PR_SET_NAME, comm, 0, 0, 0);
         procvirt_rewrite_argarea(g_karg_start, g_karg_end, argc, argv);
     }
+    /* Pracovni adresar do ROOTFS (proot to dela taky: `-w`, default = cwd
+     * prepocitany na guest, fallback `/`).
+     *
+     * Proc to musi byt: RELATIVNI cesty resolvuje JADRO proti skutecnemu cwd
+     * procesu a zadny shim to nemuze prelozit - cesta se k nam vubec
+     * nedostane. Kdyz loader nastartuje s hostovym cwd `/`, guest si mysli,
+     * ze je v guest korenu, ale `creat("xx00")` jde do HOSTOVEHO `/` a padne
+     * na EACCES. Presne tohle shazovalo `test-all.sh` test `csplit`
+     * (`csplit /tmp/cs.txt 2 4` zapisuje `xx00..` do cwd) - rc=1 pri cwd `/`,
+     * rc=0 pri cwd pod ROOTFS. Je to i nejpravdepodobnejsi vysvetleni
+     * otevreneho nalezu "cesty se v nekterych child-exec-pod---ownall
+     * scenarich neprekladaji" (postup.md 2026-10-22 (7) bod 3): nevypadalo
+     * to nahodne kvuli casovani, ale kvuli tomu, s jakym cwd se beh spustil.
+     *
+     * Prekladame jen kdyz `$ROOTFS<cwd>` existuje. Kdyz cwd lezi mimo rootfs
+     * a namapovat ho nejde (napr. `/data/user/0/...`), nechavame ho byt -
+     * tam relativni cesty proti hostovemu cwd fungujou spravne.
+     *
+     * Bezi jeste pod BIONIC TP (pred elf_setup_own_tls), takze getcwd/chdir/
+     * snprintf jsou bezpecne. `ELF_LOADER_NO_CWD_FIX=1` vypne. */
+    if (g_shim_root && g_shim_root[0] && !getenv("ELF_LOADER_NO_CWD_FIX")) {
+        char cwd[PATH_MAX];
+        if (getcwd(cwd, sizeof cwd)) {
+            size_t rl = strlen(g_shim_root);
+            int under = (strncmp(cwd, g_shim_root, rl) == 0 &&
+                         (cwd[rl] == '/' || cwd[rl] == 0));
+            if (!under) {
+                char mapped[PATH_MAX];
+                if ((size_t)snprintf(mapped, sizeof mapped, "%s%s",
+                                     g_shim_root, cwd) < sizeof mapped) {
+                    struct stat st;
+                    if (stat(mapped, &st) == 0 && S_ISDIR(st.st_mode)) {
+                        if (chdir(mapped) == 0 && elf_debug())
+                            fprintf(stderr, "[cwd] %s -> %s\n", cwd, mapped);
+                    }
+                }
+            }
+        }
+    }
     g_loader_active = 0;  /* od ted bezi cilova binarka (parrot TLS) */
     elf_tls_ctx_t tls = elf_setup_own_tls(obj, scope);
     elf_timing_mark("tls_done");
