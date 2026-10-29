@@ -917,3 +917,47 @@ V tomto pořadí, protože každý krok je měřitelný samostatně:
 se nevolá", „W^X nejde") — `--audit` se volá a `la_objopen` vidí i `ld.so`
 a `libc.so.6`. Prototyp se nezastavil, zastavil se rozsah: dotáhnout L1/L2
 do audit knihovny je samostatná práce na dny, ne zbytek tohoto promptu.
+
+## Parita s prootem — stav k 2026-10-29
+
+Kapitola 3 („Funkce proot, které loader musí umět") je hotová:
+
+| funkce proot | stav | kde |
+|---|---|---|
+| `-b` bind mounty | hotovo | prompt 06, `src/binds.h` |
+| `-0` fake root | hotovo, vč. **virtualizované identity** (`set*id`) | prompt 08 + 2026-10-29 (4) |
+| `-l` link2symlink | hotovo, formát přesně podle prootu | prompt 08 |
+| `/proc` virtualizace | hotovo (`cmdline`/`maps`/`mounts`/`mountinfo`, `comm`) | prompt 07 |
+| `-w` cwd | hotovo — a byl to root cause otevřeného path bugu | 2026-10-29 (5) |
+| `argv[0]` | hotovo (`--argv0`) | prompt 07 |
+| `-k` fake verze jádra | volba se spolkne, `uname` se nemění | prompt 09 |
+| `-q` cizí architektura | přes hybridní dispatch na skutečný proot/qemu | prompt 09 |
+| drop-in CLI | hotovo (`--proot-compat`, detekce `argv[0]==proot`) | prompt 09 + 2026-10-29 (6) |
+
+**Akceptační test náhrady** (kali, build run `40855257562`): binárka
+pojmenovaná `proot` (symlink na `elf_loader`), volaná prootí syntaxí,
+nainstaluje balíček:
+
+```
+proot -r $K -0 -l -w /root /usr/bin/apt-get install --reinstall -y hostname
+→ rc=0, "Setting up hostname (3.25+b1)", triggery kali-menu
+```
+
+`dpkg -V hostname` rc=0, `apt-get check` rc=0. Medián instalace **3 242 ms
+proti 10 086 ms u prootu (3,1×)**, a loader je navíc stabilní (rozptyl
+160 ms proti 4 266 ms). `test-all.sh all` 217/1/33, jediný FAIL je známý
+`nslookup localhost` (prostředí).
+
+**Co zbývá k tomu, aby šel proot smazat:**
+
+1. `fakeroot`/`l2s` fungují jen přes **jmenné hooky** — statické a Go
+   binárky je nevidí. Potřebují zapojení do L1/L2 (ty jsou default vypnuté).
+2. Rozhodnutí o defaultech: `LX_L2S`/`LX_FAKEROOT` jsou default vypnuté.
+   Přes proot-kompatibilní CLI se zapínají samy (`-0`/`-l`), takže pro
+   appku to překážka není; pro bare `--ownall` je to otevřená volba.
+3. Binárku **mimo `$ROOTFS`** nelze spustit (`shim_execve` nalepí `$ROOTFS`
+   i na absolutní host cestu) — stejná vrstva jako vnořený `make`.
+4. `rename` přes l2s jméno nesnižuje počítadlo; `lstat` symlinku hlásí
+   velikost šifrovaného cíle (fscrypt, projeví se i nativně).
+5. bionic bridge (GPU) a targetSdk ≥ 29 drží own-load jako primární mód —
+   nativní ld.so (prompt 12) je rychlejší, ale jen pro CLI práci.

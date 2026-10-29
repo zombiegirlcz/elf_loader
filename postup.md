@@ -6749,3 +6749,91 @@ popsán jako vzácný/časový), ale ten konkrétní popsaný vzor už
 reprodukovatelný není. Doporučení: než se `LX_L2S` přepne na default,
 nechat běžet širší zátěž (`test-all.sh all` + reálný apt) a teprve pak
 rozhodnout — ne otevírat hledání root cause naslepo.
+
+## 2026-10-29 (5) — ROOT CAUSE otevřeného path bugu: nepřeložený cwd
+
+**Nález:** `test-all.sh all` po opravě fakerootu dalo 216/2/33 a ten druhý
+FAIL (kromě známého `nslookup`) byl `csplit`. Reprodukováno **deterministicky**
+přesným harness příkazem — a příčina není v `csplit`:
+
+```
+cwd `/`            → rc=1, žádný výstup
+cwd pod $ROOTFS    → rc=0, výstup správný
+```
+
+`csplit /tmp/cs.txt 2 4` zapisuje `xx00..` do **cwd**. Relativní cesty
+resolvuje **jádro proti skutečnému cwd procesu** — žádný shim to přeložit
+nemůže, protože se k nám ta cesta vůbec nedostane. Když loader nastartuje
+s hostovým cwd `/`, guest si myslí, že je v guest korenu, ale `creat("xx00")`
+jde do **hostového** `/` → EACCES.
+
+**Tohle vysvětluje otevřený nález z 2026-10-22 (7) bod 3** („cesty se
+v některých child-exec-pod-`--ownall` scénářích nepřekládají pod ROOTFS,
+vzácné/časové, ne 100% reprodukovatelné"). Nebylo to časování, ale to,
+**s jakým cwd se běh spustil**. Proto stress na ten vzor nic nenašel:
+
+- v1 (20 × 40, bash → `cat`/`ls`): 0 chyb
+- v2 (10 kol × **4 paralelní** `--ownall` × 25, bash → sh → `cat`, shebang
+  skript, python `open`/`stat`, `LX_FAKEROOT=1 LX_L2S=1`): 0 chyb
+
+~2 800 pokusů v 6 variantách — všechny s cwd pod rootfs, tedy mimo tu chybu.
+
+**Oprava:** `run_ownall` před `elf_run` přepne cwd na `$ROOTFS<cwd>`, pokud
+takový adresář existuje. Když cwd leží mimo rootfs a namapovat ho nejde
+(`/data/user/0/…`), zůstává beze změny — tam relativní cesty proti hostovému
+cwd fungují správně. Totéž dělá proot (`-w`, default = cwd přepočítaný na
+guest, fallback `/`). Knob `ELF_LOADER_NO_CWD_FIX=1`. Běží ještě pod bionic
+TP (před `elf_setup_own_tls`), takže getcwd/chdir/snprintf jsou bezpečné.
+
+**Výsledek:** `test-all.sh all` → **217 PASS / 1 FAIL / 33 SKIP**, jediný
+FAIL je známý `nslookup localhost` (NXDOMAIN, prostředí). Dosud nejlepší
+zaznamenaný stav (206/1/33 k 22. 10., kritérium promptu 12 bylo 213/1/33).
+
+## 2026-10-29 (6) — drop-in náhrada prootu: env se nedědilo do potomků
+
+Test toho, co je vlastně smysl celé sady — spustit apt tak, jak to udělá
+appka po záměně binárky:
+
+```
+elf_loader --proot-compat -r $K -0 -l -w /root /usr/bin/apt-get install \
+    --reinstall -y hostname
+```
+
+→ `dpkg: error: requested operation requires superuser privilege`,
+`E: Sub-process /usr/bin/dpkg returned an error code (2)`, rc=100.
+
+**Příčina:** `proot_compat_parse` promítá proot volby do env přes
+`setenv()`, ale `setenv` mění jen `environ` loaderu — ne pole `envp`, které
+`main()` předává `run_ownall` a které guest dědí do potomků. Fakeroot/l2s
+měl proto jen **první** proces: apt viděl euid 0, jeho dcera dpkg už ne.
+
+**Oprava:** před `run_ownall` se envp přestaví — `ROOTFS`/`LX_BINDS`/
+`LX_FAKEROOT`/`LX_L2S`/`ELF_LOADER_PROOT_CWD` se vyřadí a doplní aktuálními
+hodnotami. Ne prostě `environ`, aby se nezahodila injekce
+`ELF_LOADER_PRELOAD`, kterou `main()` udělal do vlastního pole.
+
+**Ověřeno na kali (build run `40855257562`):**
+
+| volání | rc |
+|---|---|
+| `--ownall` + `LX_FAKEROOT=1 LX_L2S=1`, `apt-get install --reinstall hostname` | 0 |
+| `--proot-compat -r $K -0 -l -w /root /usr/bin/apt-get install …` | 0 |
+| symlink pojmenovaný `proot` + tatáž proot syntaxe (**skutečný drop-in**) | 0 |
+
+**A/B instalace balíčku** (`apt-get install --reinstall -y hostname`, kali,
+3 kola střídavě, `PROOT_LOADER`/`PROOT_TMP_DIR` nastavené jako v `boot`):
+
+| | 1 | 2 | 3 | medián |
+|---|---|---|---|---|
+| loader | 3 094 ms | 3 242 ms | 3 257 ms | **3 242 ms** |
+| proot | 6 349 ms | 10 615 ms | 10 086 ms | 10 086 ms |
+
+Loader je **3,1× rychlejší** a hlavně stabilní (rozptyl 160 ms proti
+4 266 ms). Proti měření z 22. 10. (loader 6,82 s vs proot 9,77 s, −30 %) je
+to posun o třetinu dolů — pravděpodobně cache svc-site skenu a DT_GNU_HASH
+lookup z 20. 10. Integrita po A/B čistá: `dpkg -V hostname` rc=0,
+`apt-get check` rc=0.
+
+**Past, na kterou jsem při měření narazil (past 12 znovu):** `date +%s%N`
+rozdíl v `$(( ))` hostového `sh` dal **záporné** ms — oba operandy přesahují
+2³¹−1. Počítat awkem.

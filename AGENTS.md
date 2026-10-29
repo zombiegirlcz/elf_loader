@@ -97,7 +97,8 @@ Knoby: `ELF_LOADER_TIMING`, `ELF_LOADER_NO_CACHE`, `ELF_LOADER_NO_HASH`,
 jmenných hooků), `F2_ONLY` (allowlist), `ELF_LOADER_L2` (`=1` záchytná síť),
 `ELF_LOADER_L2_LAZY` (líný přepis, default vyp), `ELF_LOADER_GOMODE=0`
 (vypne Go mód; L2 ho nahrazuje), `ELF_LOADER_NO_PROCVIRT` (prompt 07),
-`ELF_LOADER_DIAG=1` (rutinní stopy do `$D/usr/diag.<pid>.txt`; pádové vždy).
+`ELF_LOADER_DIAG=1` (rutinní stopy do `$D/usr/diag.<pid>.txt`; pádové vždy),
+`ELF_LOADER_NO_CWD_FIX=1` (vypne přepočet cwd do ROOTFS, viz past č. 22).
 `ELF_LOADER_SOFTEXEC=1` (prompt 11, soft exec; `ELF_LOADER_SOFTEXEC_TRACE`
 = stderr, nebo absolutní cesta = i do souboru).
 `LX_FAKEROOT=1` (prompt 08, `src/fakeroot.h`, ekvivalent `proot -0`):
@@ -118,10 +119,12 @@ které v rootfs vytvořil skutečný proot). `ln`/`ls` fungují (coreutils volaj
 jen `linkat`/`statx`, ne `link`/`lstat` — doplněno do existujícího
 `hook_inline_prologue` fallbacku pro BTI prolog vedle `fstatat`/`unlink`/
 `mkdir`/`rmdir`/`link`). `test-all.sh l2s` (destruktivní, jen kali) PASS.
-**Otevřené:** obecný (na l2s nezávislý) bug — cesty se v některých
-child-exec-pod-`--ownall` scénářích nepřekládají pod ROOTFS (zachyceno na
-holém `cat`/`ls`, vzácné/časové, ne 100% reprodukovatelné) — proto `LX_L2S`
-zůstává default vypnuto. Detaily postup.md 2026-10-22 (6) a (7).
+~~**Otevřené:** obecný bug — cesty se v child-exec-pod-`--ownall`
+scénářích nepřekládají pod ROOTFS (vzácné/časové)~~ — **vyřešeno**
+2026-10-29 (5): nebylo to časování, ale **nepřeložený cwd** (past č. 22).
+`run_ownall` teď cwd přepočítá do ROOTFS. `LX_L2S` zůstává default vypnuté,
+ale už **ne kvůli tomuhle** — chybí jen rozhodnutí o defaultu; přes
+proot-kompatibilní CLI (`-l`) se zapíná samo.
 
 **Metodika:** pinování CPU mění čísla o desítky % → měřit při stejné CPU
 politice a A/B dělat knobem na téže binárce, ne dvěma buildy.
@@ -316,6 +319,24 @@ fork veneer (vfork-style clone) [#L685].
    nemají verzi). A `PT_INTERP` sám nestačí k rozhodnutí „glibc binárka“ —
    bionic binárky ho mají taky (`/system/bin/linker64`), čti jeho obsah.
 
+22. **Relativní cesty resolvuje jádro proti skutečnému cwd — shim je nevidí.**
+   Když loader nastartuje s hostovým cwd mimo `$ROOTFS` (typicky `/`), guest
+   si myslí, že je v guest korenu, ale `creat("xx00")` jde do HOSTOVÉHO `/`
+   a padne na EACCES. Žádná jmenná ani L1/L2 vrstva to opravit nemůže — ta
+   cesta se k nám nedostane. `run_ownall` proto cwd přepočítá na
+   `$ROOTFS<cwd>`, pokud existuje (jako proot `-w`); `ELF_LOADER_NO_CWD_FIX=1`
+   vypne. Tahle past byla **skutečná příčina** otevřeného nálezu „cesty se
+   v child-exec-pod-`--ownall` scénářích nepřekládají, vzácné/časové"
+   (2026-10-22 (7) bod 3) — nebylo to časování, ale cwd při spuštění.
+   Projevila se na `test-all.sh` testu `csplit` (postup.md 2026-10-29 (5)).
+
+23. **`setenv()` v loaderu nedojde do guestu.** Mění jen `environ` loaderu,
+   ne pole `envp`, které se předává `run_ownall` a dědí do potomků. Pod
+   `--proot-compat` tak `-0`/`-l` platilo jen pro PRVNÍ proces: `apt` vidělo
+   euid 0, jeho dcera `dpkg` už ne („requested operation requires superuser
+   privilege", rc=100). Kdo nastaví env po startu, musí ho promítnout i do
+   `envp` (postup.md 2026-10-29 (6)).
+
 ## Otevřené bugy
 
 - ~~**Statický glibc ELF v rootfs končí SIGSYS** (RC=159)~~ — **vyřešeno pod
@@ -355,6 +376,10 @@ fork veneer (vfork-style clone) [#L685].
   (zbytky v `.l2s`); `lstat` symlinku hlásí velikost šifrovaného cíle (fscrypt
   na 4.14, i nativně → dpkg varuje „size has changed“). Agent hlásil vzácné
   ENOENT u dítěte pod `--ownall` i bez knobů — neověřeno (postup.md 2026-10-22 (7)).
+- ~~**Vzácné nepřeložení cesty u potomka pod `--ownall`**~~ — **vyřešeno**
+  2026-10-29 (5): relativní cesty resolvuje jádro proti skutečnému cwd
+  (past č. 22), `run_ownall` ho přepočítá do ROOTFS. `test-all.sh all`
+  217/1/33 (jediný FAIL = známý `nslookup localhost`).
 - Test na reálném 16K Android 15+ (Task 3). `nmap` není v rootfs [#L680];
   ostatní síťové binárky ověřeny OK.
 - Kosmetika: `src/main.c:149` sign-compare, `\]` escape.
