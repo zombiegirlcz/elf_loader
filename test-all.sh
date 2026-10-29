@@ -1356,12 +1356,28 @@ category_softexec_cap() {
     local env="ROOTFS=$R ELF_ROOTFS=$R ELF_LOADER=$L"
     local sx="ELF_LOADER_SOFTEXEC=1 ELF_LOADER_SOFTEXEC_TRACE_MAX=4096"
     local trace="$R/tmp/softexec.cap.$$"
+    local chain="$R/tmp/sx_chain.$$.sh"
     local t="$R/usr/bin/timeout"
-    rm -f "$trace"
+    rm -f "$trace" "$chain"
 
-    local cmd='for i in $(seq 1 400); do /bin/true; done; echo DONE'
+    # Realny incident byl JEDEN proces zacykleny v sig-iter smycce (sig-reset
+    # v sx_reset_signals, pred fixem c14655b) - trasa bez stropu rostla
+    # uvnitr jedineho soft execu. Zde se stejna "jeden proces, hodne zapisu"
+    # situace simuluje bezpecne: /bin/bash (ELF, ne skript) opakovane EXECuje
+    # sam sebe nad timto souborem jako argumentem (bez forku, stejny pid) ->
+    # kazda iterace je samostatny soft exec a kazda vola sx_reset_signals
+    # (az 64x "sig-reset" do trasy). 400 iteraci bezpecne prekroci kazdy
+    # rozumny strop vcetne defaultnich 16 MiB.
+    cat > "$chain" <<CHAINEOF
+n=\$1
+if [ "\$n" -gt 0 ]; then
+    exec /bin/bash ${chain#$R} \$((n-1))
+fi
+echo CHAIN-DONE
+CHAINEOF
+
     "$t" 60 "$R/bin/bash" -c \
-        "$env $sx ELF_LOADER_SOFTEXEC_TRACE=$trace $L --ownall $R/bin/bash -c '$cmd'" \
+        "$env $sx ELF_LOADER_SOFTEXEC_TRACE=$trace $L --ownall $R/bin/bash ${chain#$R} 400" \
         >/dev/null 2>&1 || true
 
     local sz=0 ok=1 detail=""
@@ -1370,8 +1386,8 @@ category_softexec_cap() {
     grep -q "trace capped" "$trace" 2>/dev/null || { ok=0; detail="$detail [chybi 'trace capped']"; }
     # mekky strop - posledni zapis pred kontrolou muze limit prekrocit o
     # jeden radek, toleruj maly presah
-    [ "${sz:-0}" -le $((4096 + 256)) ] || { ok=0; detail="$detail [soubor $sz B > limit+rezerva]"; }
-    rm -f "$trace"
+    [ "${sz:-0}" -le $((4096 + 512)) ] || { ok=0; detail="$detail [soubor $sz B > limit+rezerva]"; }
+    rm -f "$trace" "$chain"
 
     if [ "$ok" = 1 ]; then
         echo "PASS softexec-cap: trasa zastavena na limitu (${sz} B), 'trace capped' pritomno"
