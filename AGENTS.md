@@ -340,6 +340,35 @@ fork veneer (vfork-style clone) [#L685].
    privilege", rc=100). Kdo nastaví env po startu, musí ho promítnout i do
    `envp` (postup.md 2026-10-29 (6)).
 
+24. **Guest procesy dědí HOSTOVÝ `PATH` — a na Androidu `/system/bin` existuje.**
+   Guest shell pod loaderem má `PATH=$D/usr/bin:/system/bin:/system/xbin:…`,
+   takže `bash -c 'id'` spustí **Androidí toybox** `/system/bin/id`, který běží
+   nativně **mimo loader** — žádný fakeroot, žádný překlad cest. Projeví se to
+   jako „fakeroot nefunguje pro potomky": `--ownall bash -c 'id'` dá uid=10323,
+   ale `--ownall bash -c '/usr/bin/id'` dá uid=0. Stejná příčina shodila
+   `dpkg --configure`: „warning: 'ldconfig' not found in PATH", „error:
+   7 expected programs not found in PATH". Guestovi je proto nutné nastavit
+   guest `PATH` (`/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin`)
+   — ani `--ownall`, ani `--proot-compat` to zatím nedělají. Rozšiřuje past
+   č. 21 (2026-10-29 (9)).
+
+25. **Hybridní dispatch na skutečný proot nikdy nefungoval** (do 2026-10-29).
+   `proot_compat_exec_real()` vkládalo před příkaz `--`, které tenhle proot
+   build nezná (`proot error: unknown option '--'`), a pak předávalo
+   **hostovou** cestu, i když proot má `-r rootfs` a čeká guest cestu
+   (`'<rootfs>/usr/sbin/ldconfig' not found`). Mrtvé proto byly VŠECHNY cesty,
+   co na něm visí: `lx-force-proot`, qemu pro cizí `e_machine`
+   i `ELF_LOADER_STATIC_PROOT`. Důsledek pro ladění: selhání se tvářilo jako
+   „loader to neumí", ne „záchytná cesta je rozbitá". Fallback v
+   `proot_compat_main` (neznámá volba → celé argv prootu) posílal `--` dál
+   ještě i po té první opravě.
+
+26. **Toybox `find … -exec cat {} +` tiše vrátí prázdno.** Ne chybu, ne
+   nenulový rc — prostě nic. Vyrobilo to „0 očekávaných `/etc` položek"
+   místo 1050 při analýze `dpkg/info/*.list`. Používej `while read -r f; do
+   … "$f" …; done < seznam`. Rozšiřuje past č. 15 (toybox `find` nezná
+   `-printf '%h'`).
+
 ## Otevřené bugy
 
 - ~~**Statický glibc ELF v rootfs končí SIGSYS** (RC=159)~~ — **vyřešeno pod
@@ -394,6 +423,23 @@ fork veneer (vfork-style clone) [#L685].
   2026-10-29 (5): relativní cesty resolvuje jádro proti skutečnému cwd
   (past č. 22), `run_ownall` ho přepočítá do ROOTFS. `test-all.sh all`
   217/1/33 (jediný FAIL = známý `nslookup localhost`).
+- **Glibc static-PIE v rootfs loader nespustí** — `ldconfig` (Debian ho má jako
+  static-PIE, `--check` dá `ET_DYN, deps=0`) padá: přes exec cestu RC=159
+  (SIGSYS), při přímém `--ownall` SIGSEGV uvnitř svého vlastního textu. Pod
+  skutečným prootem rc=0. **Důsledek:** `libc-bin.postinst` dělá
+  `ldconfig -r "$DPKG_ROOT/"`, má `set -e` → balíček zůstane half-configured
+  a apt/dpkg od té chvíle odmítá všechno další. Postihne to **každý balíček
+  se shared library** (trigger `libc-bin`); `apt-get install hostname`, na
+  kterém stála deklarovaná parita, žádnou `.so` neinstaluje, takže ldconfig
+  nikdy nespustil — ten test paritu neprokazoval. Padá ve 0.9.3, 0.9.5
+  i 0.9.7, bez fakerootu i bez l2s, a `ELF_LOADER_L2=1` nepomůže
+  (static-PIE na tomhle zařízení nefunguje ani u prázdného `main`).
+  **Workaround ověřený 2026-10-29:** `ELF_LOADER_STATIC_PROOT=1` → rc=0,
+  nebo basename v `$ROOTFS/etc/lx-force-proot`. Obojí funguje až po opravě
+  pasti č. 25. **Otevřené:** knob je default vypnutý a `elf_hybrid_needs_real_proot`
+  nerozlišuje **bionic** static (ashell/su_wrapper — ty nativně běžet MAJÍ)
+  od **glibc** static-PIE (ten padá). Dokud to rozlišení nevznikne, nejde
+  zapnout defaultně.
 - Test na reálném 16K Android 15+ (Task 3). `nmap` není v rootfs [#L680];
   ostatní síťové binárky ověřeny OK.
 - Kosmetika: `src/main.c:149` sign-compare, `\]` escape.
