@@ -7295,3 +7295,29 @@ Prepis guest `PATH` v `run_ownall` (prepend i append adresare loaderu) —
 nesmysl: `/usr/local/bin` je v guest PATH prvni a `su` tam vzdy najde
 `su_wrapper`; navic je to spravna cesta (socket -> daemon -> Android API),
 ne obchvat. Zmena vracena, `src/main.c` bez diffu.
+
+### KOREKCE (2026-11-01 (4)): je to bug loaderu, ne jen prava
+
+Prvni zaver teto sekce („neni to bug loaderu, oprava patri do appky") byl
+**chybny**. Uzivatel namitl, ze app uid + `proot.orig` funguje, kdezto
+app uid + loader ne. Overeno a potvrzeno:
+
+| scenar (uid 10323, adresar mode 000) | vysledek |
+|---|---|
+| nativni `cat` (bionic) | EACCES |
+| `proot.orig` (guest cesta i bind) | **obsah precten** |
+| loader `--ownall` | EACCES |
+
+Testy probehly na `/root/zz` i `/tmp/zz` (kvuli prootimu specialnimu
+handlingu `/tmp`), mode 000, vlastnik 10323, obe binarky pod stejnym uid,
+`CapEff: 0000000000000000`, `NoNewPrivs: 1`. Rozdilne chovani = rozdil
+mezi prootem a loaderem. **Root cause nezjisten** (nebyl k dispozici
+zadny tracer: strace/ltrace/gdb v rootfs nejsou, `getfattr`/`getcap` chybi,
+python3 v rootfs take ne).
+
+Dalsi krok: zmerit `CapEff` primo u proot procesu behem behu (skript
+`tmp_why.sh` to mel, ale nebyl spusten) a overit `security.capability`
+xattr necim spolehlivym. Pokud proot ma `cap_dac_read_search` nebo
+obdoba, je otazka, proc ho loader nema (stejny deployment, jina binarka).
+
+Do te doby: `ipc 711` je funkcni workaround, ale neni to „spravne chovani".
