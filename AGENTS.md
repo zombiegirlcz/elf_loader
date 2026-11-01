@@ -377,6 +377,21 @@ fork veneer (vfork-style clone) [#L685].
    … "$f" …; done < seznam`. Rozšiřuje past č. 15 (toybox `find` nezná
    `-printf '%h'`).
 
+27. **`su`/`sudo` pod loaderem pod app uid = EACCES na `ipc` (mode 000).**
+   `$D/ipc` má mode **000**; `su_wrapper` (bionic, správná cesta socket →
+   `su_daemon` → Android API) se na `ipc/magisk_daemon.sock` nedostane, když
+   proces běží pod app uid (10323, typicky `ashell -c`). Naměřeno A/B na
+   témže stroji: `ipc 000` → `CONNECT ERR 13`, `ipc 711` → `CONNECT OK` a
+   `su -c id` = `uid=0(root) … u:r:magisk:s0`. **Není to bug loaderu** —
+   `shim_translate`/PATH/bindy to neovlivní, rozhoduje fyzické uid procesu
+   a mode adresáře. Pod skutečným prootem to funguje jen proto, že session
+   `boot` startuje proot pod rootem (`su -c boot parrot`), takže guest má
+   uid 0. Oprava patří do appky (`ipc` aspoň `711`), ne do loaderu. Past se
+   projevuje jako „Root Bridge běží, ale `su` hlásí magisk daemon nedostupný".
+   Pozor: `$R/usr/local/bin/sudo -> /product/bin/su -c` je nefunkční symlink
+   (mezera v cíli); pod prootem `/product` v rootfs ani není — v guestu je
+   jen `/usr/local/bin/su_wrapper`, takže PATH není třeba řešit.
+
 ## Otevřené bugy
 
 - ~~**Statický glibc ELF v rootfs končí SIGSYS** (RC=159)~~ — **vyřešeno pod

@@ -7247,3 +7247,51 @@ Pro `git push`/`gc` na velkých repech v tomto rootfs je bezpečná cesta
 stav s 6 packy) a na kopii hledat minimální sadu objektů, která crash
 vyvolá; pak porovnat pod prootem vs. loaderem a dojít k systémovému
 volání, které se liší.
+
+## 2026-11-01 (3): `su`/`sudo` pod loaderem pod app uid — past c. 26
+
+Uzivatel hlásil `[su_wrapper] CHYBA: magisk daemon nedostupny` pri `su -c`
+v guestu pod loaderem, i kdyz Root Bridge (`su_daemon` PID, `magiskd`)
+prokazatelne bezi. Uzivatel mel pravdu, ze jde o prava — neni to bug loaderu.
+
+### Mereni (deterministicke, opakovatelne)
+
+`/data/user/0/com.linux_core/files/ipc` ma **mode 000** (vlastni `u0_a323`).
+`su_wrapper` je bionic binarka, ktera se pripojuje na UNIX socket
+`ipc/magisk_daemon.sock`. Pod loaderem bezime pod **app uid (10323)**,
+takze na mode 000 dostaneme EACCES:
+
+| ipc mode | loader pod app uid |
+|---|---|
+| `000` | `CONNECT ERR 13 Permission denied` -> `[su_wrapper] CHYBA: ...` |
+| `711` | `CONNECT OK` -> `su -c id` = `uid=0(root) ... context=u:r:magisk:s0` |
+
+Overeno i pres `sudo id` (wrapper `#!/bin/sh exec /product/bin/su -c "$*"`,
+vytvoreny rucne v `$R/usr/local/bin/sudo` — puvodni symlink
+`-> /product/bin/su -c` je nefunkcni, symlink s mezerou v cili).
+
+### Proc to pod realnym prootem funguje
+
+Session `boot` spousti proot **pod rootem** (`su -c boot parrot`), takze
+guest proces ma fyzicke uid 0 a na mode 000 vidi. Loader spusteny z appky
+(typicky `ashell -c`) ma uid 10323 a neprojde. Uzivatelovo pozorovani
+(„root + loader funguje, app uid + loader ne, app uid + proot.orig ano“)
+je tim vysvetlene bez jakekoli akce loaderu.
+
+### Co to znamena
+
+- **Neni to chyba loaderu** — zadna cast `shim_translate`, PATH ani bindu
+tady nic nezmeni; rozhoduje fyzicke uid procesu a mode adresare.
+- Oprava je na strane aplikace (`ipc` aspon `711`, nebo socket/bind
+  pres session adresar jako `boot` dela s `-b $FILES_DIR/ipc:/run/host_ipc`).
+- Pod loaderem pod rootem (`su -c '... elf_loader --ownall ...'`) `su`/`sudo`
+  funguji bez dalsich zmen.
+- `su_wrapper` sam je mrtvy i nativne (`ipc` mode 000) — neni to regrese
+  zpusobena loaderem.
+
+### Co jsem zkusil a nefungovalo (at se to neopakuje)
+
+Prepis guest `PATH` v `run_ownall` (prepend i append adresare loaderu) —
+nesmysl: `/usr/local/bin` je v guest PATH prvni a `su` tam vzdy najde
+`su_wrapper`; navic je to spravna cesta (socket -> daemon -> Android API),
+ne obchvat. Zmena vracena, `src/main.c` bez diffu.
