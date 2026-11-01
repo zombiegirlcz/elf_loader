@@ -1651,6 +1651,107 @@ category_relsym() {
     fi
 }
 
+# Absolutni symlink na zavislost (realny vzor: libblas.so.3 ->
+# /etc/alternatives/libblas.so.3-aarch64-linux-gnu -> /usr/lib/.../blas/...).
+#
+# Proc: load_module_needed() hleda DT_NEEDED pres find_in_paths(), a ta testuje
+# kandidata RAW faccessatem (elf_access, viz commit b1a856b) - jeste PRED
+# elf_load_shared(), ktere ma resolve_symlinks_under_root(). Symlink s
+# absolutnim cilem jadro vyhodnoti proti HOST koreni -> ENOENT ->
+# "module dep X: not found" a program spadne. Invariant projektu je, ze linky v
+# rootfs jsou relativni (shim_symlink/shim_symlinkat + `elf_loader relsym`).
+#
+# A/B na TEZE binarce: dokud je link absolutni, loader zavislost nenajde
+# (RC!=0); po prepsani na relativni projde (RC=0). Kdyby nekdo zmenil
+# find_in_paths() tak, ze absolutni cil resolvuje, A strana prestane padat a
+# tenhle test to rekne - pak je cas kategorii PREHODNOTIT, ne smazat.
+category_depsymlink() {
+    echo ""
+    echo "=== absolutni symlink na zavislost -> 'module dep not found' ==="
+    local hr=/system/bin/readlink hn=/system/bin/ln
+    local h="$R/tmp/depsymlink.$$" g="/tmp/depsymlink.$$"
+    local ok=1 detail=""
+
+    if [ ! -x "$R/usr/bin/gcc" ]; then
+        echo "SKIP depsymlink: chybi $R/usr/bin/gcc (glibc gcc v rootfs)"
+        echo "SKIP: depsymlink - chybi gcc" >> "$SKIP_LOG"
+        ((SKIP_COUNT++)) || true
+        return 0
+    fi
+
+    /system/bin/rm -rf "$h"
+    mkdir -p "$h" || { ok=0; detail="$detail [mkdir $h zlyhalo]"; }
+
+    printf 'int depfn(void){return 42;}\n' > "$h/dep.c"
+    printf 'int depfn(void);int main(void){return depfn()==42?0:1;}\n' > "$h/main.c"
+
+    local brc=0
+    ROOTFS=$R ELF_ROOTFS=$R "$L" --ownall "$R/usr/bin/gcc" -shared -fPIC \
+        -o "$h/realdep.so.1" -Wl,-soname,libabsdep.so.1 "$h/dep.c" >/dev/null 2>&1 || brc=$?
+    ROOTFS=$R ELF_ROOTFS=$R "$L" --ownall "$R/usr/bin/gcc" \
+        -o "$h/prog" "$h/main.c" "$h/realdep.so.1" >/dev/null 2>&1 || brc=$?
+    if [ ! -x "$h/prog" ] || [ ! -f "$h/realdep.so.1" ]; then
+        ok=0; detail="$detail [build selhal: rc=$brc]"
+    fi
+
+    if [ "$ok" = 1 ]; then
+        # cil zapiseme HOST nastrojem -> na disku je skutecne absolutni guest cesta
+        "$hn" -sfn "$g/realdep.so.1" "$h/libabsdep.so.1" 2>/dev/null || true
+        local raw
+        raw=$("$hr" "$h/libabsdep.so.1" 2>&1 || true)
+        [ "$raw" = "$g/realdep.so.1" ] || \
+            { ok=0; detail="$detail [na disku neni absolutni cil: '$raw']"; }
+
+        # A: absolutni cil -> jadro ho hleda v HOST koreni -> zavislost nenajde
+        local aout arc=0
+        aout=$(ROOTFS=$R ELF_ROOTFS=$R "$L" --ownall "$h/prog" 2>&1) || arc=$?
+        [ "$arc" != 0 ] || \
+            { ok=0; detail="$detail [A: absolutni cil prosel (RC=0), cekali jsme selhani]"; }
+        case "$aout" in
+            *"dep libabsdep.so.1"*) ;;
+            *) ok=0; detail="$detail [A: chybi hlaska 'module dep ... not found']" ;;
+        esac
+
+        # B: relativni cil (invariant) -> loader zavislost najde a program bezi
+        "$hn" -sfn realdep.so.1 "$h/libabsdep.so.1" 2>/dev/null || true
+        local brc2=0
+        ROOTFS=$R ELF_ROOTFS=$R "$L" --ownall "$h/prog" >/dev/null 2>&1 || brc2=$?
+        [ "$brc2" = 0 ] || \
+            { ok=0; detail="$detail [B: relativni cil neprosel (RC=$brc2)]"; }
+    fi
+
+    # C: sire - zadny .so* symlink v multiarch libdir nema mit absolutni cil
+    #    mimo host mountpointy / pod $ROOTFS. Presne tenhle tvar dela
+    #    update-alternatives a presne tak se objevil libblas. Skenuji se jen
+    #    ty dva adresare; rekurzivni pruchod rootfs trva minuty.
+    local d f tgt n_abs=0 bad=""
+    for d in "$R/usr/lib/aarch64-linux-gnu" "$R/lib/aarch64-linux-gnu"; do
+        [ -d "$d" ] || continue
+        for f in "$d"/*.so*; do
+            [ -L "$f" ] || continue
+            tgt=$("$hr" "$f" 2>/dev/null || true)
+            case "$tgt" in
+                /proc/*|/dev/*|/sys/*|/system/*|/system_ext/*|/data/*|/apex/*|/vendor/*|/odm/*|/product/*|/metadata/*|/sdcard/*|/storage/*|/linkerconfig/*|/persist/*|/cache/*|/config/*|/debug_ramdisk/*) continue ;;
+                "$R"/*) continue ;;
+                /*) n_abs=$((n_abs + 1)); [ -n "$bad" ] || bad="$f -> $tgt" ;;
+            esac
+        done
+    done
+    [ "$n_abs" = 0 ] || \
+        { ok=0; detail="$detail [C: $n_abs .so linku s absolutnim cilem, napr. $bad]"; }
+
+    /system/bin/rm -rf "$h"
+    if [ "$ok" = 1 ]; then
+        echo "PASS depsymlink: absolutni cil zavislosti selze, relativni projde (A/B), libdir cisty"
+        echo "PASS: depsymlink - absolutni symlink zavislosti" >> "$PASS_LOG"
+        ((PASS_COUNT++)) || true
+    else
+        echo "FAIL depsymlink:$detail"
+        echo "FAIL: depsymlink - absolutni symlink zavislosti |$detail" >> "$FAIL_LOG"
+        ((FAIL_COUNT++)) || true
+    fi
+}
+
 # Prompt 04 (L1): preklad cest na hranici syscallu. Pripady, ktere jmenne
 # hooky historicky MINULY (alias eaccess, glibc-interni volani mkdtemp/remove/
 # glob/nftw/scandir, BTI fstatat u ftok/tempnam), se volaji primo pres ctypes
@@ -2939,6 +3040,10 @@ case "${1:-all}" in
             category_discovered
             print_summary
             ;;
+    depsymlink)
+        category_depsymlink
+        print_summary
+        ;;
     all|*)
         category_basic
         category_reexec
@@ -2976,6 +3081,7 @@ case "${1:-all}" in
         category_argv0
         category_procvirt
         category_relsym
+        category_depsymlink
         category_l1
         category_l2
         category_softexec

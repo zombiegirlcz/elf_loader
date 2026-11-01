@@ -7186,3 +7186,64 @@ nahoru pres GitHub API (`gh api`: blob → tree → commit → ref).
 Commity: `6b6063b` (autodetekce + prvni verze guest PATH), `cd670c6`
 (`elf_init_envp`, pozdeji nahrazeno), `d4316c8` (prepis jen ukazatelem),
 `655fa2d` (static-PIE i pri primem `--ownall`). Host unit testy 6/6 PASS.
+
+## 2026-11-01 (2): intermitentní SIGSEGV v git pack-objects — NEDOŘEŠENO
+
+Při `git push` z `~/​.arvhive` (5,3 GB repo) občas spadl `git pack-objects`
+(8 vláken) na SIGSEGV. Dva faulty:
+
+1. `pc=libc+0x98124` = `__libc_free+0x44`, `si_addr=dbda09ae1a02015e`
+   (nesmyslná adresa = data). Volající: `builtin_repack`.
+2. `pc=git-core/git+0x14efb0`, `ldr x1,[x1,#16]` s `x1=0`, `si_addr=0x10`.
+   Uvnitř gití hash tabulky (chain bucket), NULL tam nepatří.
+
+### Co bylo změřeno (a co to vylučuje)
+
+| test | výsledek |
+|---|---|
+| skutečný proot (`proot.orig` + `PROOT_LOADER`) | **RC=0** |
+| loader `--ownall` | **RC=139** |
+| `pack.threads=1` | 139 (není to počtem vláken) |
+| `core.packedGitMmap=false` | 139 (není to mmap packů) |
+| `MALLOC_ARENA_MAX=1`, `MALLOC_CHECK_=3`, `MALLOC_PERTURB_` | 139, glibc nic nehlásí → přepisují se **aplikační** data, ne malloc metadata |
+| `--window=0` | **0** |
+| `--window=1,2,4` | **0** |
+| `--window=10,20` | **139** |
+| `--window=10 --depth=1` | **0** |
+| `ELF_LOADER_NO_BIONIC_BRIDGE=1` | 0 |
+| `ELF_LOADER_NO_LDSO_PRELOAD=1` | 0 |
+| `ELF_LOADER_NO_CACHE=1` | 0 |
+| `ELF_LOADER_NO_PROCVIRT/NO_GUEST_PATH/NO_RELSYM/NO_CWD_FIX` | 139 |
+| vlastní test `test/mtstress.c` (8 vláken, malloc/free/realloc/mmap) | **OK 5/5** i 1 vlákno |
+
+Malé repo (300 commitů, 6 packů) 8/8 OK → není to počet packů.
+
+### Klíčové: reprodukce ZMIZELA
+
+Crash byl nejdřív 3/3 deterministický, pak po jednom `git gc` v pozadí
+(který sám skončil `fatal: failed to run repack`) **přestal**. Stav se mezitím
+změnil: `count-objects` hlásí `packs: 1` (dřív 6) a `garbage: 281`. V `.l2s`
+zůstalo **70 osiřelých `tmp_pack_*` (1,1 GB)** z spadlých repacků
+a `.l2s` má celkem 206 410 položek.
+
+⇒ Je to **intermitentní**, vázané na konkrétní stav objektů/packů, ne na
+vrstvu loaderu obecně. Nejbližší stopa: delta window (`window>=10`) narazí
+na konkrétní objekt/chain, kde se rozjede paměť.
+
+### Co NEBYLO zjištěno
+
+Root cause neznám. Nespouštěl jsem `git gc` znovu nad živým repem (5,3 GB,
+riziko dalšího poškození), takže nemám potvrzenou reprodukci ani
+minimální vstup. `test/mtstress.c` (obecný multithread malloc) je **negativní**
+— obecná alokace v pořádku, problém je specifický pro gití delta okno.
+
+### Praktické doporučení
+
+Pro `git push`/`gc` na velkých repech v tomto rootfs je bezpečná cesta
+`$ROOTFS/etc/lx-force-proot` pro `git`, `git-pack-objects`, `git-index-pack`
+(reálný proot to zvládá, RC=0). Není to oprava, jen obchvat.
+
+**Příští krok, až bude čas:** zkopírovat repo před `gc` (aby byl zachycen
+stav s 6 packy) a na kopii hledat minimální sadu objektů, která crash
+vyvolá; pak porovnat pod prootem vs. loaderem a dojít k systémovému
+volání, které se liší.
