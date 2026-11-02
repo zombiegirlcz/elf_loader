@@ -6718,7 +6718,14 @@ int main(int argc, char **argv, char **envp) {
         char **ae = envp;
         unsigned ag = 0;
         while (ae[ag] && ag < 65536) ag++;
-        if (ae[ag]) g_auxv = (unsigned long *)(void *)(ae + ag + 1);
+        /* POZOR: `ae[ag]` je tady VZDY NULL (smycka skoncila na terminátoru).
+         * Druhá verze patch mela `if (ae[ag])`, takze g_auxv zustal NULL a
+         * v --ownall to zachranil fallback scan za kernel envp. V --proot-compat
+         * je ale envp heapova kopie, fallback tam cte smeti -> _dl_auxv dostal
+         * garbage a guest glibc init spadl (SIGSEGV, ldr x0,[x0] s x0=0).
+         * Namerene: uutils coreutils pod --proot-compat FAULT#1 sig=11,
+         * zatimco --ownall fungoval. */
+        g_auxv = (unsigned long *)(void *)(ae + ag + 1);
     }
     /* TED je envp jeste kernelove pole, takze g_auxv je presna adresa auxv.
      * ldso_setup() z nej plni _dl_auxv (getauxval). V --proot-compat si
