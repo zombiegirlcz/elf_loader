@@ -1892,32 +1892,12 @@ static int shim_fr_getresgid(unsigned int *rg, unsigned int *eg, unsigned int *s
     return r;
 }
 /* Docasny debug: shim bezi pod guest TP, takze jen raw write na fd 2. */
-/* Diagnostika gated na ELF_DEBUG (nastaveno v main, ne v shimu - pod guest
- * TP nesmime volat bionicky getenv, past c. 1). */
-static int g_gg_dbg = 0;
-static void gg_put(const char *tag, long a, long b) {
-    char buf[112]; int i = 0;
-    while (*tag) buf[i++] = *tag++;
-    for (int k = 0; k < 2; k++) {
-        long v = k ? b : a;
-        buf[i++] = ' ';
-        if (v < 0) { buf[i++] = '-'; v = -v; }
-        char t[24]; int tn = 0;
-        if (!v) t[tn++] = '0';
-        while (v > 0) { t[tn++] = (char)('0' + (int)(v % 10)); v /= 10; }
-        while (tn > 0) buf[i++] = t[--tn];
-    }
-    buf[i++] = '\n';
-    my_raw_syscall6(64, 2, (long)(unsigned long)buf, i, 0, 0, ELF_SENTINEL);
-}
 static int shim_fr_getgroups(int n, unsigned int *list) {
-    if (g_gg_dbg) gg_put("[GG in] n,list=", n, (long)(unsigned long)list);
     /* Tohle je glibc FUNKCE, ne syscall: na chybu se vraci -1 a NASTAVI
      * errno (nikdy surove -errno). Namerene 2026-11-02 (Termux, Ubuntu
      * 26.04, uutils id): vraceni -EINVAL jako "pocet skupin" rozbilo
      * volajiciho -> SIGSEGV si_addr=4. F2_SKIP=getgroups to maskovalo. */
     long rr = fr_raw(158, (long)n, (long)(unsigned long)list, 0);
-    if (g_gg_dbg) gg_put("[GG raw] rr,n=", rr, n);
     if (rr < 0) {
         /* raw syscall vraci -errno; glibc konvence je -1 + errno.
          * __errno_location NEEXISTUJE pod bionickym NDK buildem - pouzivame
@@ -1927,8 +1907,8 @@ static int shim_fr_getgroups(int n, unsigned int *list) {
     }
     int r = (int)rr;
     /* Proot fake_id0 mapuje kazdou skupinu rovnou app gid na fake gid a
-     * ostatni necha (proot -0: groups=0,1077,3001,...). */
-    /* POZOR: mapovat jen kdyz volajici buffer SKUTECNE predal (n > 0).
+     * ostatni necha (proot -0: groups=0,1077,3001,...).
+     * POZOR: mapovat jen kdyz volajici buffer SKUTECNE predal (n > 0).
      * Pri n == 0 syscall buffer ignoruje a vraci jen pocet - a nekteri
      * volajici (uutils coreutils `id`, Ubuntu 26.04) poslou v tom pripade
      * nesmyslny ukazatel (namereno list=4). Nekontrolovane `list &&` ho
@@ -1939,7 +1919,6 @@ static int shim_fr_getgroups(int n, unsigned int *list) {
         for (int i = 0; i < r; i++)
             if (list[i] == g_fakeroot_app_gid) list[i] = g_fakeroot_gid;
     }
-    if (g_gg_dbg) gg_put("[GG out] r,appgid=", r, (long)g_fakeroot_app_gid);
     return r;
 }
 static int shim_fr_fchown(int fd, unsigned int u, unsigned int g) {
@@ -6835,7 +6814,6 @@ int main(int argc, char **argv, char **envp) {
         if (i == argc) { g_karg_start = argv[0]; g_karg_end = e; }
     }
     elf_set_kernel_auxv(g_auxv);
-    g_gg_dbg = getenv("ELF_DEBUG") != NULL;
 
     /* ELF_DEBUG → unbuffered stdout, ať trace při SIGSEGV nekončí v bufferu */
     if (getenv("ELF_DEBUG"))
