@@ -1928,7 +1928,14 @@ static int shim_fr_getgroups(int n, unsigned int *list) {
     int r = (int)rr;
     /* Proot fake_id0 mapuje kazdou skupinu rovnou app gid na fake gid a
      * ostatni necha (proot -0: groups=0,1077,3001,...). */
-    if (r > 0 && list && g_fakeroot_on) {
+    /* POZOR: mapovat jen kdyz volajici buffer SKUTECNE predal (n > 0).
+     * Pri n == 0 syscall buffer ignoruje a vraci jen pocet - a nekteri
+     * volajici (uutils coreutils `id`, Ubuntu 26.04) poslou v tom pripade
+     * nesmyslny ukazatel (namereno list=4). Nekontrolovane `list &&` ho
+     * pustilo dal a smycka cetla list[0..r-1] -> SIGSEGV si_addr=4.
+     * Presne to byl nas FAULT#1 u `-0 id`, zatimco nase sonda tg (NULL)
+     * prochazela. */
+    if (r > 0 && n > 0 && list && g_fakeroot_on) {
         for (int i = 0; i < r; i++)
             if (list[i] == g_fakeroot_app_gid) list[i] = g_fakeroot_gid;
     }
