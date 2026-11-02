@@ -1892,7 +1892,8 @@ static int shim_fr_getresgid(unsigned int *rg, unsigned int *eg, unsigned int *s
     return r;
 }
 static int shim_fr_getgroups(int n, unsigned int *list) {
-    int r = (int)fr_raw(158, (long)n, (long)(unsigned long)list, 0);
+    long rr = fr_raw(158, (long)n, (long)(unsigned long)list, 0);
+    int r = (int)rr;
     /* Proot fake_id0 mapuje kazdou skupinu rovnou app gid na fake gid a
      * ostatni necha (proot -0: groups=0,1077,3001,...). */
     if (r > 0 && list && g_fakeroot_on)
@@ -4019,12 +4020,21 @@ static int go_fakeroot_pre(long nr, const unsigned long *r, long *out) {
             return 1;
         }
         case 158: {                                    /* getgroups */
-            int n = (int)r[0];
-            unsigned int *list = (unsigned int *)r[1];
-            if (n == 0) { *out = 1; return 1; }        /* dotaz na pocet */
-            if (n < 1 || !list) { *out = -EINVAL; return 1; }
-            list[0] = g_fr_egid;
-            *out = 1;
+            /* POZOR: drive se pri n==0 vracelo 1 ("jen egid"). To je ale
+             * LEZ - skutecny pocet skupin je 5. Volajici (uutils id,
+             * Ubuntu 26.04) si podle toho alokuje 1 slot a druhy call
+             * s n=1 prepise buffer: SIGSEGV, si_addr=4 (index 4).
+             * Namerene na Termuxu: `--ownall id` bez fakerootu OK (10299),
+             * s LX_FAKEROOT SIGSEGV; `F2_SKIP=getgroups` to opravilo.
+             * Spravne je chovat se jako proot fake_id0: zavolat skutecny
+             * syscall a jen premapovat app gid -> fake gid. */
+            long rr = my_raw_syscall6(158, r[0], r[1], 0, 0, 0, ELF_SENTINEL);
+            if (rr > 0 && r[1]) {
+                unsigned int *list = (unsigned int *)r[1];
+                for (long i = 0; i < rr; i++)
+                    if (list[i] == g_fakeroot_app_gid) list[i] = g_fakeroot_gid;
+            }
+            *out = rr;
             return 1;
         }
         case 159: *out = 0; return 1;                  /* setgroups: vzdy OK */
