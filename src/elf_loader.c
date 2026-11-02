@@ -412,6 +412,11 @@ static void ldso_set_stack_end(void *top) {
 static char ldso_platform[] = "aarch64";
 static char *ldso_argv_copy[8];
 static Elf64_auxv_t ldso_auxv[64];
+/* Guest cesta spustene binarky (nastavuje main.c pres elf_set_guest_exe).
+ * Potrebuje ji ldso_setup() pro _dl_auxv AT_EXECFN a go_handle() pro
+ * readlink(/proc/self/exe). Bez toho uutils coreutils (Ubuntu 26.04+)
+ * spadne na "Security violation: Requested utility `elf_loader`". */
+static const char *g_elf_guest_exe;
 static int ldso_setup_done;
 
 /* Minimal glibc-shaped struct link_map for the main executable.  glibc reads
@@ -868,6 +873,20 @@ static void ldso_setup(void) {
             ldso_auxv[n] = av[n];
         ldso_auxv[n].a_type = AT_NULL;
         ldso_auxv[n].a_un.a_val = 0;
+        /* AT_EXECFN ukazuje na LOADER (skutecny obraz procesu), ale guest
+         * potrebuje svoji cestu. getauxval() cte presne _dl_auxv (= ldso_auxv
+         * nize v ro[13]), takze oprava tady staci. Namerene: uutils coreutils
+         * (Ubuntu 26.04+) z AT_EXECFN odvozuje jmeno utility a jinak spadne
+         * na "Security violation: Requested utility `elf_loader` does not
+         * match executable name" - i kdyz argv[0] i /proc/self/exe uz byly
+         * spravne. */
+        if (g_elf_guest_exe && g_elf_guest_exe[0]) {
+            for (int k = 0; k < n; k++)
+                if (ldso_auxv[k].a_type == AT_EXECFN) {
+                    ldso_auxv[k].a_un.a_val = (uint64_t)(uintptr_t)g_elf_guest_exe;
+                    break;
+                }
+        }
     }
 
     uint64_t *ro = (uint64_t *)ldso_ro;
@@ -5787,7 +5806,6 @@ void f2_set_root(const char *r) { g_f2_root = r; }
  * (g_guest_exe_path v main.c), ale syrovy readlinkat(78) jde mimo ne.
  * uutils coreutils (Ubuntu 26.04) overuje /proc/self/exe -> bez tehle
  * opravy spadne na "Security violation". */
-static const char *g_elf_guest_exe = NULL;
 void elf_set_guest_exe(const char *p) { g_elf_guest_exe = p; }
 
 /* f2_is_self_exe() nize pouziva tyhle helpery, ktere jsou definovane az
@@ -7025,7 +7043,12 @@ int elf_run(elf_object_t *obj, int argc, char **argv, char **envp) {
     a = auxv_append(a, AT_RANDOM, (uint64_t)rand_bytes);
     a = auxv_append(a, AT_HWCAP, (uint64_t)getauxval(AT_HWCAP));
     a = auxv_append(a, AT_HWCAP2, (uint64_t)getauxval(AT_HWCAP2));
-    a = auxv_append(a, AT_EXECFN, (uint64_t)(argv[0] ? (uintptr_t)argv[0] : 0));
+    /* Guest auxv: AT_EXECFN musi byt guest cesta, ne host (argv[0] je
+     * host cesta spustene binarky). Stejny duvod jako v ldso_setup. */
+    a = auxv_append(a, AT_EXECFN,
+                    (uint64_t)(uintptr_t)((g_elf_guest_exe && g_elf_guest_exe[0])
+                                          ? g_elf_guest_exe
+                                          : (argv[0] ? argv[0] : "")));
     a = auxv_append(a, AT_NULL, 0);
     {
         int fd = open("/dev/urandom", O_RDONLY);
