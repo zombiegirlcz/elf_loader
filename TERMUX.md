@@ -78,17 +78,21 @@ exec zsh -l
 5. **Přejmenuje `proot` → `proot.orig`** a udělá `proot` symlinkem na
    `elf_loader`. Idempotentní: když už symlink je, jen zkontroluje cíl;
    když `proot.orig` existuje, nic nepřepisuje.
-6. **Napíše `~/.elfrc`** — zoxide + starship přes `lxwhich`/`lx` (rootfs!),
-   se spravovaným blokem `ROOTFS`/`LX_DISTRO`/`ELF_LOADER` na začátku.
-7. **Napíše `~/.zshrc`** — základní chování, completion, `lx`/`lxwhich`
-   z `elf_loader init zsh`, kanonizace `ROOTFS`/`R`/`LX_PATH`, aliasy, pluginy,
-   fzf/starship fallback.
-8. **Napíše `~/.bashrc`** — interaktivní bash `exec zsh -l`, neinteraktivní
-   zůstává bash (skripty, `ssh host cmd`).
+6. **Napíše `~/.elfrc`** — **jediná uživatelská vrstva**: aliasy, `mkcd`,
+   `fnd`, zoxide, fzf, starship (vše přes `lxwhich`/`lx`, tj. z rootfs),
+   přepočet `R`/`LX_PATH` a spravovaný blok
+   `ROOTFS`/`LX_DISTRO`/`ELF_LOADER` na začátku.
+7. **Napíše `~/.zshrc`** — **jen zsh vrstva**: `setopt`, `bindkey`,
+   `compinit`/`zstyle`, pluginy, tři helpery (`reload`/`zshrc`/`elfrc`)
+   a jeden `init zsh`, který na konci svého výstupu sám načte `~/.elfrc`.
+8. **Napíše `~/.bashrc`** — interaktivní bash `exec zsh -l`; neinteraktivní
+   zůstává bash, ale dostane stejnou vrstvu (`init bash` / `. ~/.elfrc`).
 9. **Napíše `~/.config/starship.toml`** (`command_timeout = 1000`).
-10. **Volitelně nakopíruje guest `.zshrc`** do `$ROOTFS/root/.zshrc` —
-    varianta bez `init` (v guestu už pod loaderem jsme), ale s `lx`/`lxwhich`.
-11. **Ověří** — `zsh -i`, `lxwhich starship`, `lx /bin/true`, `proot --version`.
+10. **Volitelně nakopíruje rc do guesta** — `$ROOTFS/root/.zshrc`
+    a `$ROOTFS/root/.elfrc` (stejné soubory; `.elfrc` pozná guest podle
+    chybějícího `$PREFIX` a postaví si vlastní `lx`/`lxwhich`).
+11. **Ověří** — `zsh -i`, `lxwhich starship`, `lx /bin/true`,
+    `proot -r rootfs /usr/bin/true`.
 
 Všechny existující soubory se zálohují jako `<soubor>.bak.<timestamp>`.
 
@@ -99,24 +103,58 @@ $PREFIX/bin/elf_loader      NDK build (bionic, /system/bin/linker64)
 $PREFIX/bin/proot           → symlink na elf_loader
 $PREFIX/bin/proot.orig      původní proot (kdyby bylo potřeba se vrátit)
 
-~/.elfrc                    uživatelská vrstva (zoxide, starship, aliasy)
+~/.elfrc                    JEDINÁ uživatelská vrstva — aliasy, mkcd/fnd,
+                            zoxide, fzf, starship, přepočet R/LX_PATH
                             + spravovaný blok ROOTFS/LX_DISTRO/ELF_LOADER
-~/.zshrc                    hlavní rc, jeden pro oba světy
-~/.bashrc                   interaktivní → exec zsh, jinak zůstává bash
+~/.zshrc                    jen zsh vrstva (setopt, bindkey, compinit,
+                            pluginy, helpery) + init zsh
+~/.bashrc                   interaktivní → exec zsh, jinak bash + init bash
 ~/.config/starship.toml     command_timeout = 1000
 ~/.cache/{starship,fzf,zoxide}-init.zsh   generované cache
 
-$ROOTFS/root/.zshrc         guest rc (bez init, s lx/lxwhich)
-$ROOTFS/root/.config/starship.toml
+$ROOTFS/root/.zshrc         guest rc (kopie ~/.zshrc)
+$ROOTFS/root/.elfrc         guest rc (kopie ~/.elfrc)
 ```
 
 ## Jak to funguje
 
+### Vrstvy: `.zshrc` je jen zsh, všechno ostatní je v `.elfrc`
+
+Dělení je striktní, aby se konfigurace nezdvojovala:
+
+| soubor | obsah |
+|---|---|
+| `~/.zshrc` | `setopt`, `bindkey`, `compinit`/`zstyle`, pluginy, helpery, **jeden** `init zsh` |
+| `~/.elfrc` | aliasy, `mkcd`, `fnd`, zoxide, fzf, starship, přepočet `R`/`LX_PATH` |
+| `~/.bashrc` | interaktivní → `exec zsh -l`, jinak `init bash` |
+
+`.zshrc` **nesourcuje `.elfrc` ručně** — dělá to `init zsh` na konci svého
+výstupu. Kdyby to dělal i `.zshrc`, `.elfrc` by se načetl dvakrát a starship
+by se inicializoval 2×.
+
+### ⚠️ `.elfrc` NESMÍ volat `init`
+
+`init zsh|bash` **sám na konci svého výstupu sourcuje `~/.elfrc`**. Když by
+`.elfrc` zavolal `init`, vznikne rekurze:
+
+```
+.elfrc → init → .elfrc → init → … → SIGSEGV
+```
+
+Naměřeno: `zsh -i` skončil `rc=139`, v trace je poslední frame `eval $'…'`
+z initu. Proto je `init` **jen v `.zshrc`/`.bashrc`**, nikdy v `.elfrc`.
+
+Druhý důsledek: `init` autodetekuje rootfs podle `LX_DISTRO` (default
+`parrot`) a spočítá z něj `R`/`LX_PATH`. Teprve **potom** sourcuje `.elfrc`,
+kde je správný `ROOTFS`. `.elfrc` proto po přepsání `ROOTFS` musí `R`
+a `LX_PATH` přepočítat — jinak `R` ukazuje na neexistující rootfs a `lx`
+hlásí `not found in guest rootfs`.
+
 ### Dva světy, jeden rc
 
-`.zshrc` se načítá **dvakrát** — jednou v Termuxu (bionic zsh), jednou
-v guestu (glibc zsh pod loaderem). Proto v něm nesmí být nic, co platí jen
-v jednom z nich:
+`.zshrc` i `.elfrc` se načítají **dvakrát** — jednou v Termuxu (bionic zsh),
+jednou v guestu (glibc zsh pod loaderem). Proto v nich nesmí být nic, co
+platí jen v jednom z nich:
 
 - žádné `/root/...` natvrdo (host `/root` neexistuje, guest `$HOME` je `/root`)
 - všechno volitelné za `command -v` / `lxwhich`
@@ -274,6 +312,18 @@ exec zsh -l
 
 Když ani potom nic, `lxwhich starship` v rootfs nic nenajde → nainstaluj
 starship v rootfs (viz [Závislosti](#závislosti-v-rootfs)).
+
+### Prompt je prázdný a v `~/.cache` je soubor `starship-init.`
+
+Chybí `$_LX_SHELL`. Cache se pak uloží jako `starship-init.` (prázdná
+přípona) místo `starship-init.zsh`, načte se 0 bajtů a `PROMPT` zůstane
+`%# `. Kontrola:
+
+```sh
+ls ~/.cache/*-init.*        # nesmí být soubor končící tečkou
+```
+
+`.elfrc` detekuje shell na začátku (`ZSH_VERSION` → `zsh`, jinak `bash`).
 
 ### `no such file or directory: .../rootfs/usr/bin/starship`
 
