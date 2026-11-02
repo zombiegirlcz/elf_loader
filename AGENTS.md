@@ -534,6 +534,54 @@ Pro bitovou shodu by stačil 6řádkový knob `LX_FAKEROOT_MAP`; uživatel
    ne“; byl to rozdíl mountů `ashell` vs guest, ne chování loaderu.
 
 
+33. **uutils coreutils (Ubuntu 26.04+) ověřuje identitu ze `AT_EXECFN`.**
+   `echo`/`ls`/`id` jsou symlinky na multicall `/usr/lib/cargo/bin/coreutils/*`
+   a před spuštěním porovnávají jméno utility s `AT_EXECFN` (resp.
+   `program_invocation_name`). Když se neshoduje, skončí
+   `Security violation: Requested utility 'elf_loader' does not match
+   executable name: …/coreutils/echo`. **Nestačí opravit `argv[0]` ani
+   `/proc/self/exe`** — naměřeno: i s `--argv0 echo` i s reálně
+   přejmenovaným souborem to hlásilo `elf_loader`. Opravit se musí
+   **obě** cesty, kterými se `AT_EXECFN` do guesta dostane:
+   (a) `ldso_setup()` kopíruje kernel auxv do `ldso_auxv` (= `_dl_auxv`,
+   `ro[13]`), odkud čte `getauxval()`; (b) `elf_run()` staví guestovi
+   vlastní auxv (tam byl `argv[0]`, tj. host cesta). V obou případech se
+   `AT_EXECFN` přepisuje na `g_elf_guest_exe`.
+   **Auxv se NESMÍ hledat za `elf_init_envp`** — v `--proot-compat` je to
+   heapová kopie (`proot_compat_main` ji staví `calloc`em) a „za polem
+   envp“ je heap garbage → `_dl_auxv` dostane smetí a guest glibc init
+   spadne na SIGSEGV (`ldr x0,[x0]`, x0=0). `main()` proto předává přesnou
+   adresu kernel auxv přes `elf_set_kernel_auxv()`.
+   Navíc platí: `if (ae[ag])` po smyčce `while (ae[ag])` je **vždy**
+   nepravdivé (smyčka skončila na terminátoru) — takový guard tiše nechá
+   `g_auxv == NULL`.
+
+34. **Fakeroot identity shimy musí jít přes raw syscall a chovat se jako
+   glibc funkce.** Dvě pasti, obě naměřené 2026-11-02 na Ubuntu 26.04
+   (glibc 2.43, uutils coreutils), obě se projevily jako
+   `FAULT#1 sig=11 si_addr=4`:
+   - `g_orig_*` se plní jen když `hook_install` uspěje. glibc 2.41+ má na
+     `getuid`/`getgroups` BTI prolog (`ins0=d503245f`), `hook_install` je
+     odmítne (`non-B-thunk`) → `g_orig_getgroups == NULL`. Shim, který se
+     na `g_orig_*` spoléhá, pak vrací `-1`/nesmysl. U `getuid` to
+     „fungovalo“ náhodou (NULL → `return 0` = fake uid), proto se to
+     maskovalo. **Identity shimy jdou vždy přes raw syscall** (174–177,
+     148, 150, 158) — `src/main.c`, `fr_raw()`.
+   - **`getgroups` je na aarch64 syscall 158, ne 153** (153 = `times`).
+     Špatné číslo dalo `EFAULT`; diag knob `ELF_DEBUG` + raw `write`
+     (nikdy `fprintf`, past č. 1) to vytiskl jako `[fr_raw] nr=153 rr=14`.
+   - Mapovací smyčka `app gid → fake gid` se smí dělat **jen při
+     `n > 0`**. Při `n == 0` jádro buffer ignoruje a vrací jen počet;
+     uutils `id` v tom případě posílá **nesmyslný ukazatel** (naměřeno
+     `list = 4`). Kontrola `if (list && r > 0)` ho pustila dál a smyčka
+     četla `list[0..r-1]` → SIGSEGV `si_addr=4`. Naše sonda s `NULL`
+     procházela, takže to vypadalo jako chyba v knihovně, ne v nás.
+   - `getgroups` musí na chybu vrátit **`-1` + errno** (glibc konvence),
+     ne surové `-errno`; volající si `-EINVAL` přetypoval na unsigned
+     a indexoval podle něj. Pro errno použij `shim_guest_errno_set()` —
+     `__errno_location` pod bionickým NDK buildem **neexistuje**
+     (link error `undefined symbol: __errno_location`).
+
 ## Otevřené bugy
 
 - ~~**Statický glibc ELF v rootfs končí SIGSYS** (RC=159)~~ — **vyřešeno pod

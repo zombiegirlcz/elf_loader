@@ -7456,3 +7456,51 @@ Při měření téhle opravy to na chvíli vypadalo jako „jednou jo, jednou
 ne“, ale to byl jen důsledek toho, že `ashell` a guest vidí jiné mounty.
 Skutečná chyba byla v `bind_parse_spec` (výše), ne v tom, čím se měřilo.
 Dokumentováno, aby se to znovu ne„objevovalo“.
+
+## 2026-11-02 (2) — uutils coreutils (Ubuntu 26.04) pod loaderem
+
+Nález z nezávislého Termux testu (Ubuntu 26.04.1 LTS "Resolute Raccoon",
+glibc 2.43, uutils coreutils): `echo`/`ls`/`id`/`cat` pod loaderem končily
+`Security violation: Requested utility 'elf_loader' does not match
+executable name: …/lib/cargo/bin/coreutils/echo`. Real proot to zvládal.
+
+**Příčina 1 — AT_EXECFN.** uutils odvozuje jméno utility z `AT_EXECFN`
+(nejen z `argv[0]` a `/proc/self/exe`). Naměřeno probem: `--argv0 echo`
+i reálně přejmenovaný soubor → pořád `elf_loader`; `at_execfn=[…/eltest/elf_loader]`.
+`AT_EXECFN` se do guesta dostává dvěma cestami a obě ukazovaly na loader:
+`ldso_setup()` (kopie kernel auxv do `ldso_auxv` = `_dl_auxv`, `ro[13]`,
+odkud čte `getauxval()`) a `elf_run()` (vlastní guest auxv s `argv[0]`).
+Fix: na obou místech `AT_EXECFN = g_elf_guest_exe` (guest cesta).
+
+**Příčina 2 — auxv za heapovým envp.** `proot_compat_main` staví heapovou
+kopii `envp` (`calloc`) a předává ji `run_ownall`. `ldso_setup()` hledal
+auxv „za polem envp“ → za heapovou kopií nic není → `_dl_auxv` dostal smetí
+(AT_PAGESZ/AT_PHDR/AT_ENTRY) → guest glibc init spadl: SIGSEGV,
+`ldr x0,[x0]` s x0=0 (`FAULT#1 sig=11`). Fix: `main()` předá přesnou adresu
+kernel auxv přes `elf_set_kernel_auxv()`; scan za envp zůstal jen fallback.
+Cestou vyšlo najevo, že `if (ae[ag])` po `while (ae[ag])` je vždy NULL —
+`g_auxv` se nikdy nenastavil a v `--ownall` to maskoval právě fallback.
+
+**Příčina 3 — fakeroot identity.** Po opravě auxv už `--ownall` i
+`--proot-compat` běžely, ale `-0 id` padal na `si_addr=4`. Tři dílčí chyby:
+(a) `g_orig_getgroups` je NULL, protože glibc 2.41+ má na `getgroups` BTI
+prolog (`ins0=d503245f`) a `hook_install` ho odmítne — shim vracel `-1`;
+(b) `getgroups` je syscall **158**, ne 153 (153 = `times`) — špatné číslo
+dalo `EFAULT`, odhaleno diag stopou `[fr_raw] nr=153 rr=14`;
+(c) mapovací smyčka `app gid → fake gid` běžela i při `n == 0`, kdy jádro
+buffer ignoruje a uutils posílá nesmyslný ukazatel `list = 4` → SIGSEGV.
+Naše sonda (`tg`) posílala `NULL`, proto procházela a chyba vypadala
+jako v knihovně.
+
+**Vedlejší nález — guest PATH v `--proot-compat`.** Guest dědil hostovský
+`PATH` (`/data/data/com.termux/files/usr/bin`), ale v izolaci proot-compat
+jsou host cesty neviditelné → `bash -c ls` = „command not found“.
+`run_ownall` teď guest PATH přepisuje i pod `LX_PROOT_COMPAT`, ne jen když
+obsahuje `/system/{bin,xbin}`.
+
+**Naměřeno po opravě** (Termux, Ubuntu 26.04, finální NDK build):
+`--ownall echo AOK` → `AOK`; `--proot-compat /usr/bin/echo BOK` → `BOK`;
+`--proot-compat -0 id` i `--ownall -0 id` →
+`uid=0(root) gid=0(root) groups=0(root),1077(aid_external_storage),…`;
+`--proot-compat -0 groups` → seznam skupin; `-0 stat /etc/hostname` →
+`root:root`; `bash -c 'ls /; cat /etc/os-release'` → celý guest strom.
