@@ -33,6 +33,12 @@ starship, python, uv, node and an interactive zsh. Reproduce it with
 - **Works where proot struggles** — a seccomp compat filter emulates syscalls
   that Android's app profile (kernel 4.14) kills, so glibc's legacy fallbacks
   work.
+- **Drop-in proot replacement** — `--proot-compat` takes proot's own command
+  line, and the emulation is now at parity: full fake root (`-0`), full bind
+  mounts (`-b`, including `ro`), `/proc` virtualization, and host-path
+  isolation, so a guest never sees outside its rootfs. **Existing scripts need
+  no changes — swap the `proot` binary for a symlink to the loader and they
+  keep working.**
 - **Real toolchains** — `gcc` (with `ld`/`as` via a guest `PATH`), `python3`,
   `uv`, `git`, `gh`, `fzf`, Node.js, `tmux`, and a full interactive zsh with a
   starship prompt.
@@ -139,13 +145,26 @@ elf_loader <elf>                                introspect (no execution)
 
 ### Replacing proot
 
-`--proot-compat` (or simply calling the loader through a symlink named `proot`)
-accepts proot's own command line, so existing scripts keep working:
+**You do not have to rewrite anything.** `--proot-compat` (or simply calling the
+loader through a symlink named `proot`) accepts proot's own command line, so
+already-working scripts keep working after you replace the binary:
+
+```sh
+# before
+proot -0 -r "$ROOTFS" -b /dev -b /proc -b /sys -w / -- /bin/bash
+
+# after — same arguments, different binary (symlink or --proot-compat)
+ln -sf /path/to/elf_loader /path/to/proot      # then: proot -0 -r …
+# or explicitly
+elf_loader --proot-compat -0 -r "$ROOTFS" -b /dev -b /proc -b /sys -w / -- /bin/bash
+```
+
+Supported options:
 
 | proot option | effect |
 |---|---|
 | `-r`, `--rootfs DIR` | guest rootfs → `ROOTFS` |
-| `-b`, `--bind H:G[:ro]` | bind mount, repeatable → `LX_BINDS` |
+| `-b`, `--bind H:G[:ro]` | bind mount, repeatable → `LX_BINDS`; `-b /path` without a colon is an **identity bind** (host == guest), exactly like proot |
 | `-w`, `--cwd DIR` | start cwd inside the rootfs |
 | `-0`, `--root-id` | fake uid/gid 0 → `LX_FAKEROOT=1` |
 | `-l`, `--link2symlink` | hardlinks as symlinks → `LX_L2S=1` |
@@ -162,6 +181,67 @@ line to the real proot binary (`$LX_PROOT_BIN`, otherwise the first existing of
 The same fallback covers foreign-architecture binaries (run under
 `proot -q qemu-<arch>-static`) and anything whose basename is listed in
 `$ROOTFS/etc/lx-force-proot`.
+
+#### Parity with proot (measured)
+
+Both worlds were run through the same 30-point matrix
+([`tools/parity-proot.sh`](tools/parity-proot.sh)) — loader
+`--proot-compat -0` vs. the real `proot -0` — with identical arguments:
+
+| | loader `--proot-compat -0` | real proot `-0` |
+|---|---|---|
+| `id` | `0:0`, 8 supplementary groups | same |
+| `chown 1234:5678` → `stat` | `1234:5678` | `1234:5678` |
+| `chgrp 999` → `stat` | `0:999` | `0:999` |
+| `chmod 4755 / 2750 / 1777` | OK | OK |
+| `mknod c 1 3` / `b 7 0` | char/block `1:3`, `7:0` | same |
+| `mount --bind` + write | source sees the change | same |
+| `mount --bind -o ro` + write | `Read-only file system` | same |
+| `rm -rf` on a mountpoint | `Device or resource busy` | same |
+| `findmnt` / `/proc/mounts` / `/etc/mtab` | virtualized, 6 lines | same |
+| `ls /data`, `ls /system/bin` | `Permission denied` / empty | same |
+| `/proc/self/status` Uid | `10323` (the real app uid) | `10323` |
+
+The single remaining difference is deliberate: a `chown` to a foreign uid is
+reported **exactly** (`1234:5678`) where proot's `fake_id0` collapses
+everything to `0:0`. The loader is a superset here, not a shortfall.
+
+#### What guest-side `mount` can do
+
+`mount(2)` is `ENOSYS` in the Android app domain (seccomp), so the loader
+emulates bind mounts through a shared table (`$LX_LOG/binds.*.tab`, or
+`$ROOTFS/tmp/.lxbind*`) that is cross-process and inherited by children:
+
+- `mount --bind SRC DST` / `-o ro` / `mount -o remount,ro` work,
+- `umount` works, and a mountpoint cannot be removed while mounted,
+- `util-linux` `findmnt` / `mount` / `umount` see a virtualized
+  `/proc/self/mountinfo` and `/etc/mtab`.
+
+#### ⚠️ Changing the user does **not** work from inside the guest
+
+Identity can only be chosen **before boot**. The kernel still runs the process
+as the Android app uid, and two things make a mid-session switch impossible:
+
+- `PR_SET_NO_NEW_PRIVS=1` is irreversible and inherited across `execve`, so the
+  kernel ignores setuid bits — a `su`/`sudo` binary in the rootfs cannot raise
+  privileges;
+- the loader *own-loads* the guest binary instead of `execve`-ing it, which
+  means the kernel never even sees the setuid bit.
+
+Measured: `su.orig <user> -c id` under the loader ends in
+`su.orig: System error`, PAM complains, and `getuid()` stays `10323`.
+`setpriv --reuid=…` fails with `Operation not permitted`.
+
+What *does* work is choosing the identity up front:
+
+```sh
+elf_loader --proot-compat -r "$ROOTFS" -0 -- id        # uid/gid 0 in the guest
+LX_FAKEROOT=1 ROOTFS=$ROOTFS elf_loader --ownall /bin/sh -c id
+```
+
+Real root is available only through a privileged helper outside the guest
+(a root daemon over a unix socket, a Magisk-style `su`), never by a setuid
+binary inside the rootfs.
 
 Installing packages needs **both** `-0` and `-l` — dpkg backs files up with
 hardlinks and wants to own them as root:
@@ -225,6 +305,10 @@ shell-side ones for you.
 | `LX_BINDS`, `LX_BINDS_FILE` | bind table (`host:guest[:ro],…`) and its shared file |
 | `LX_FAKEROOT` | `proot -0` equivalent (uid/gid → 0, xattr-backed chown) |
 | `LX_L2S`, `LX_L2S_DIR` | `proot -l` equivalent (hardlinks as symlinks) |
+| `LX_PROOT_COMPAT` | set automatically by `--proot-compat`; host-path isolation (only `/proc`, `/dev`, `/sys` are bound) |
+| `LX_PROOT_NO_ISOLATE` | `1` = keep the default identity binds even in proot mode (needed for bionic binaries under `/system`) |
+| `LX_PROOT_BIN` | which real proot the unimplemented options fall back to |
+| `LX_PROOT_SYSVIPC` | `strict` = never emulate `--sysvipc`, always use the real proot |
 
 `elf_loader --help` prints a shorter version; the full list lives here.
 
