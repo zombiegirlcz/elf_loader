@@ -334,6 +334,38 @@ seccomp compat filter. Full write-up: [`docs/how-it-works.md`](docs/how-it-works
 
 Regression suite: `test-all.sh` — see [Testing](#testing).
 
+### Tested against
+
+Measured on **one physical device** (Android 11, aarch64, 4 KB pages),
+kernel `4.14.190-perf-g7da93debc0ee`:
+
+| rootfs | glibc | loader | status |
+|---|---|---|---|
+| Parrot Security 7.4 (echo) | 2.41 (`Debian GLIBC 2.41-12+deb13u4`) | 0.9.33 | full regression suite: 220 PASS / 2 FAIL / 31 SKIP |
+| Kali GNU/Linux Rolling 2026.2 | 2.43 (`Debian GLIBC 2.43-6`) | 0.9.33 | destructive tests (`l2s`, `fakeroot`, `binds`, `--ownall` over a tree) |
+| Ubuntu 26.04.1 LTS (Resolute Raccoon) | 2.43 (`Ubuntu GLIBC 2.43-2ubuntu2.4`) | 0.9.33 | `uutils coreutils`, `fakeroot -0`, `--proot-compat`, zsh |
+
+Notes:
+
+- The two FAILs in the Parrot run are unrelated to the loader (`staticexec`
+  had no `gcc` in that run; `binds` GC table count is timing-sensitive).
+- **Ubuntu 26.04** is the only combination that exposed the `uutils coreutils`
+  identity check (`AT_EXECFN`) — fixed in `0.9.33`, see AGENTS.md pitfall 33.
+- **Kali** is used for destructive tests because nobody uses it; Parrot is the
+  live environment and is only read in tests.
+- **glibc 2.42** support is derived (the `_rtld_global` layout is taken from
+  2.43), not verified. Re-measure on the next glibc release.
+
+### Termux setup
+
+A complete Termux walkthrough (including a setup script that turns `proot`
+into `elf_loader` and points starship/zoxide at the rootfs) lives in
+[`TERMUX.md`](TERMUX.md):
+
+```sh
+bash termux-setup.sh            # idempotent; asks for ROOTFS if not found
+```
+
 ## Known issues / help wanted
 
 This project is developed against a small number of devices, so **bug reports
@@ -395,6 +427,8 @@ The result is a bionic binary with `PT_INTERP /system/bin/linker64`.
 | `tools/demo-env.zsh` | scripted demo (env -i → glibc guest) |
 | `magisk-module/` | Magisk module (universal rootfs detection, bundles a bionic-native zsh host shell — `bzsh`) |
 | `docs/` | English docs |
+| `TERMUX.md` | Termux setup guide (proot → elf_loader, starship/zoxide from rootfs) |
+| `termux-setup.sh` | idempotent setup script for Termux (see `TERMUX.md`) |
 | `postup.md` | full development diary (Czech) |
 
 ## License
