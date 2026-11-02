@@ -1891,8 +1891,15 @@ static int shim_fr_getresgid(unsigned int *rg, unsigned int *eg, unsigned int *s
     }
     return r;
 }
+/* Docasny debug: shim bezi pod guest TP, takze jen raw write na fd 2. */
 static int shim_fr_getgroups(int n, unsigned int *list) {
+    /* Tohle je glibc FUNKCE, ne syscall: na chybu se vraci -1 (a nastavi
+     * errno), nikdy surove -errno. Namerene 2026-11-02 (Termux, Ubuntu
+     * 26.04, uutils id): vraceni -EINVAL jako "pocet skupin" rozbilo
+     * volajiciho (pretypoval na unsigned a indexoval do pole):
+     * SIGSEGV si_addr=4. F2_SKIP=getgroups to maskovalo. */
     long rr = fr_raw(158, (long)n, (long)(unsigned long)list, 0);
+    if (rr < 0) return -1;
     int r = (int)rr;
     /* Proot fake_id0 mapuje kazdou skupinu rovnou app gid na fake gid a
      * ostatni necha (proot -0: groups=0,1077,3001,...). */
