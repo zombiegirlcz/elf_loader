@@ -151,51 +151,123 @@ else
 fi
 
 # ─── 5. ~/.elfrc ───────────────────────────────────────────────────────────
+# ~/.elfrc je JEDINÁ uživatelská vrstva. Obsahuje všechno, co má platit
+# v obou světech (Termux bionic i guest glibc pod elf_loaderem): loader,
+# ROOTFS, PATH, lx/lxwhich, aliasy, helpery, starship/zoxide/fzf.
+# ~/.zshrc obsahuje jen zsh-specifické věci a na konci .elfrc sourcuje.
 say "Píšu ~/.elfrc"
 backup "$HOME/.elfrc"
 cat > "$HOME/.elfrc" <<'LXEOF'
-# ~/.elfrc — uživatelská konfigurace pro host shell (zsh i bash).
-# Načítá se z ~/.zshrc (ELF_RC=... přepíše, LX_NO_RC=1 vypne).
+# ~/.elfrc — uživatelská konfigurace, společná pro zsh i bash.
+# Načítá ho `elf_loader init zsh|bash` (na konci svého výstupu) a v guestu
+# ~/.zshrc / ~/.bashrc přímo. ELF_RC=... přepíše, LX_NO_RC=1 vypne.
+# NEPATŘÍ sem `init` — init .elfrc sám sourcuje (byla by to rekurze).
 #
 # PRAVIDLO: starship a zoxide se berou Z ROOTFS (guest glibc binárky pod
 # elf_loader), ne z Termuxu. Proto `lxwhich` (najde cestu v rootfs) a `lx`
 # (spustí ji pod loaderem) — nikdy `command -v`.
 
+# .elfrc se načítá DVĚMA způsoby:
+#   1. `elf_loader init zsh|bash` ho sourcuje na konci svého výstupu (host)
+#   2. guest shell (pod loaderem) ho sourcuje z ~/.zshrc přímo
+# V obou případech už jsou ROOTFS/R/L/LX_PATH nastavené — tady se jen
+# dopočítá guest varianta lx/lxwhich, protože bionický loader v guestu
+# nespustíme.
+if [ -z "${PREFIX:-}" ] && ! command -v lxwhich >/dev/null 2>&1 && [ -n "${L:-}" ]; then
+  lxwhich() {
+    _c=$1
+    case $_c in
+      "$ROOTFS"/*) [ -e "$_c" ] && { printf '%s\n' "$_c"; return 0; }; return 1 ;;
+      /*) [ -e "$ROOTFS$_c" ] && { printf '%s\n' "$ROOTFS$_c"; return 0; }; return 1 ;;
+    esac
+    for _d in "$ROOTFS/usr/local/sbin" "$ROOTFS/usr/local/bin" \
+              "$ROOTFS/usr/sbin" "$ROOTFS/usr/bin" \
+              "$ROOTFS/sbin" "$ROOTFS/bin"; do
+      [ -x "$_d/$_c" ] && [ ! -d "$_d/$_c" ] && { printf '%s\n' "$_d/$_c"; return 0; }
+    done
+    return 1
+  }
+  lx() { _c=$1; shift; _p=$(lxwhich "$_c") || _p=$_c; "$L" --ownall "$_p" "$@"; }
+fi
+
+# --- který shell? (volby --cmd/init generují zsh nebo bash variantu) ---
+# Musí být tady: `init` sice exportuje spoustu věcí, ale $_LX_SHELL ne.
+# Bez toho se cache ukládá jako "starship-init." (prázdná přípona) a nenačte se.
+if [ -n "${ZSH_VERSION:-}" ]; then _LX_SHELL=zsh; else _LX_SHELL=bash; fi
+
+# --- po přepsání ROOTFS znovu odvodit R a LX_PATH ---
+# `init` autodetekuje rootfs (default LX_DISTRO=parrot) a spočítá R/LX_PATH
+# z něj. Až POTOM sourcuje .elfrc, kde je správný ROOTFS. Bez přepočtu by
+# R ukazoval na neexistující rootfs a `lx` by hlásil "not found".
+if [ -n "${ROOTFS:-}" ] && [ "${R:-}" != "$ROOTFS" ]; then
+  R=$ROOTFS
+  LX_PATH="$R/usr/local/sbin $R/usr/local/bin $R/usr/sbin $R/usr/bin $R/sbin $R/bin"
+  for _nvm in "$R${LX_GUEST_HOME:-/root}/.nvm/versions/node"/*/bin; do
+    [ -d "$_nvm" ] && LX_PATH="$LX_PATH $_nvm"
+  done
+  unset _nvm
+  [ -d "$R${LX_GUEST_HOME:-/root}/.local/bin" ] && LX_PATH="$LX_PATH $R${LX_GUEST_HOME:-/root}/.local/bin"
+fi
+export ROOTFS R LX_PATH
+
+# --- aliasy a helpery (platí v obou světech) ---
+if [ -t 1 ]; then
+  alias grep='grep --color=auto'
+  alias fgrep='fgrep --color=auto'
+  alias egrep='egrep --color=auto'
+  alias diff='diff --color=auto'
+  alias ip='ip --color=auto'
+fi
+mkcd() { mkdir -p "$1" && cd "$1"; }
+fnd() {
+  if command -v rg >/dev/null 2>&1; then rg --files | rg "$1"
+  else find . -type f -name "*$1*" 2>/dev/null; fi
+}
+
+# Bez lx/lxwhich (chybí loader) nemá zbytek smysl.
 command -v lxwhich >/dev/null 2>&1 || return 0 2>/dev/null || exit 0
 
 # --- zoxide (z = cd s pamětí; data v hostím HOME) ---
 if lxwhich zoxide >/dev/null 2>&1; then
   zoxide() { lx zoxide "$@" 2> >(grep -v '^\[MMAP\]' >&2); }
   export _ZO_DATA_DIR="${_ZO_DATA_DIR:-$HOME/.local/share/zoxide}"
-  if [ -n "$ZSH_VERSION" ]; then
-    _zocache=$HOME/.cache/zoxide-init.zsh
-    if [ ! -s "$_zocache" ] || [ "$_zocache" -ot "$(lxwhich zoxide)" ]; then
-      lx zoxide init zsh --cmd z | sed 's/\bcommand zoxide\b/zoxide/g' > "$_zocache"
-    fi
-  else
-    _zocache=$HOME/.cache/zoxide-init.bash
-    if [ ! -s "$_zocache" ] || [ "$_zocache" -ot "$(lxwhich zoxide)" ]; then
-      lx zoxide init bash --cmd z | sed 's/\bcommand zoxide\b/zoxide/g' > "$_zocache"
-    fi
+  _zocache=$HOME/.cache/zoxide-init.$_LX_SHELL
+  if [ ! -s "$_zocache" ] || [ "$_zocache" -ot "$(lxwhich zoxide)" ]; then
+    lx zoxide init "$_LX_SHELL" --cmd z | sed 's/\bcommand zoxide\b/zoxide/g' > "$_zocache"
   fi
   [ -r "$_zocache" ] && . "$_zocache"
   unset _zocache
 fi
 
-# --- starship (POSLEDNÍ blok: přepisuje PS1/PROMPT) ---
+# --- fzf (klávesové zkratky; binárka z rootfs) ---
+if lxwhich fzf >/dev/null 2>&1; then
+  fzf() { lx fzf "$@" 2> >(grep -v '^\[MMAP\]' >&2); }
+  _fz=$HOME/.cache/fzf-init.$_LX_SHELL
+  if [ ! -s "$_fz" ] || [ "$_fz" -ot "$(lxwhich fzf)" ]; then
+    if [ "$_LX_SHELL" = zsh ]; then
+      lx fzf --zsh 2>/dev/null | sed -e "s|$R/usr/bin/fzf|fzf|g" -e "s|$L |fzf |g" > "$_fz"
+    else
+      lx fzf --bash 2>/dev/null | sed -e "s|$R/usr/bin/fzf|fzf|g" -e "s|$L |fzf |g" > "$_fz"
+    fi
+  fi
+  [ -r "$_fz" ] && . "$_fz"
+  unset _fz
+fi
+
+# --- starship (POSLEDNÍ: přepisuje PS1/PROMPT) ---
 if lxwhich starship >/dev/null 2>&1; then
   export STARSHIP_CONFIG="${STARSHIP_CONFIG:-$HOME/.config/starship.toml}"
   export STARSHIP_CACHE="${STARSHIP_CACHE:-$HOME/.cache/starship}"
   starship() {
     if [ "$1" = prompt ]; then
       _ssnow=$(date +%s)
-      if [ -n "$_STARSHIP_PROMPT_CACHE" ] && [ $((_ssnow - ${_STARSHIP_PROMPT_TIME:-0})) -lt 2 ]; then
+      if [ -n "${_STARSHIP_PROMPT_CACHE:-}" ] && [ $((_ssnow - ${_STARSHIP_PROMPT_TIME:-0})) -lt 2 ]; then
         printf '%s' "$_STARSHIP_PROMPT_CACHE"
         return 0
       fi
       _ssout=$(lx starship "$@" 2> >(grep -v '^\[MMAP\]' >&2))
       if [ -n "$_ssout" ]; then
-        if [ -n "$ZSH_VERSION" ]; then
+        if [ -n "${ZSH_VERSION:-}" ]; then
           typeset -g _STARSHIP_PROMPT_CACHE="$_ssout" _STARSHIP_PROMPT_TIME=$_ssnow
         else
           declare -g _STARSHIP_PROMPT_CACHE="$_ssout" _STARSHIP_PROMPT_TIME=$_ssnow
@@ -206,16 +278,10 @@ if lxwhich starship >/dev/null 2>&1; then
     fi
     lx starship "$@"
   }
-  if [ -n "$ZSH_VERSION" ]; then
-    _sscache=$HOME/.cache/starship-init.zsh
-    if [ ! -s "$_sscache" ] || [ "$_sscache" -ot "$(lxwhich starship)" ]; then
-      lx starship init zsh | sed -e "s|$L|starship|g" -e "s|$R/usr/bin/starship|starship|g" > "$_sscache"
-    fi
-  else
-    _sscache=$HOME/.cache/starship-init.bash
-    if [ ! -s "$_sscache" ] || [ "$_sscache" -ot "$(lxwhich starship)" ]; then
-      lx starship init bash | sed -e "s|$L|starship|g" -e "s|$R/usr/bin/starship|starship|g" > "$_sscache"
-    fi
+  _sscache=$HOME/.cache/starship-init.$_LX_SHELL
+  if [ ! -s "$_sscache" ] || [ "$_sscache" -ot "$(lxwhich starship)" ]; then
+    lx starship init "$_LX_SHELL" 2>/dev/null \
+      | sed -e "s|$R/usr/bin/starship|starship|g" -e "s|$L|starship|g" > "$_sscache"
   fi
   [ -r "$_sscache" ] && . "$_sscache"
   unset _sscache
@@ -245,13 +311,15 @@ mv "$HOME/.elfrc.new" "$HOME/.elfrc"
 chmod 600 "$HOME/.elfrc"
 ok "$HOME/.elfrc ($(wc -l < "$HOME/.elfrc") řádků)"
 
-# ─── 6. ~/.zshrc ──────────────────────────────────────────────────────────
+# ─── 6. ~/.zshrc — JEN zsh vrstva ──────────────────────────────────────────
+# Tady nesmí být nic, co patří do .elfrc (PATH, lx, starship, aliasy).
 say "Píšu ~/.zshrc"
 backup "$HOME/.zshrc"
 cat > "$HOME/.zshrc" <<'LXEOF'
-# ~/.zshrc — Termux (bionic zsh) + guest glibc zsh pod elf_loader.
+# ~/.zshrc — POUZE zsh vrstva (setopt, bindkey, completion, pluginy)
+# + jeden `init zsh`, který nastaví proměnné, lx/lxwhich a načte ~/.elfrc.
+# Všechno ostatní (ROOTFS, PATH, aliasy, starship, zoxide, fzf) je v ~/.elfrc.
 # Jeden rc pro oba světy: žádné /root/... natvrdo, vždy $HOME.
-# Všechno, co může chybět, je za `command -v` — rc nesmí spadnout.
 
 # ─── základní chování ──────────────────────────────────────────────────────
 setopt autocd correct interactivecomments magicequalsubst nonomatch notify
@@ -292,61 +360,27 @@ zstyle ':completion:*' use-compctl false
 zstyle ':completion:*' verbose true
 zstyle ':completion:*' menu select
 
-# ─── elf_loader: loader + rootfs + lx/lxwhich ─────────────────────────────
-# ROOTFS/ELF_LOADER jsou v ~/.elfrc (spravovaný blok). Když tam nejsou,
-# zkusíme obvyklá místa.
+# ─── elf_loader: L/ROOTFS/lx/lxwhich + uživatelská vrstva ─────────────────
+# HOST: `init zsh` nastaví proměnné, definuje lx/lxwhich a NA KONCI SVÉHO
+#       VÝSTUPU sám načte ~/.elfrc. Proto se .elfrc tady nesourcuje ručně
+#       (načetl by se dvakrát, starship by se inicializoval 2×).
+# GUEST: jsme pod loaderem, bionický loader nespustíme -> .elfrc načteme přímo.
 if [ -z "${L:-}" ]; then
   for _lc in "${ELF_LOADER:-}" "$HOME/eltest/elf_loader" "$PREFIX/bin/elf_loader" "$HOME/usr/bin/elf_loader"; do
     [ -n "$_lc" ] && [ -x "$_lc" ] && { L=$_lc; break }
   done
   unset _lc
 fi
-LX_LOADER="${L:-}"
-if [ -x "$LX_LOADER" ]; then
-  eval "$("$LX_LOADER" init zsh 2>/dev/null)" 2>/dev/null
-fi
-unset LX_LOADER
-
-# proot-distro >= 4 drží rootfs v containers/<distro>/rootfs
-if [ -n "${ROOTFS:-}" ] && [ -d "$ROOTFS/rootfs/usr/bin" ]; then ROOTFS=$ROOTFS/rootfs; fi
-# kanonizace (loader porovnává cesty textově)
-if [ -n "${ROOTFS:-}" ] && [ -d "$ROOTFS" ]; then
-  _canon=$(cd "$ROOTFS" 2>/dev/null && pwd -P) && ROOTFS=$_canon; unset _canon
-fi
-if [ -n "${R:-}" ] && [ -d "$R" ]; then
-  _canon=$(cd "$R" 2>/dev/null && pwd -P) && R=$_canon; unset _canon
-fi
-if [ ! -d "${R:-/nonexistent}/usr/bin" ] && [ -d "${ROOTFS:-/nonexistent}/usr/bin" ]; then R=$ROOTFS; fi
-# init sestavil LX_PATH z nekanonické cesty -> přepočítat
-if [ -n "${R:-}" ]; then
-  LX_PATH="$R/usr/local/sbin $R/usr/local/bin $R/usr/sbin $R/usr/bin $R/sbin $R/bin"
-  for _nvm in "$R${LX_GUEST_HOME:-/root}/.nvm/versions/node"/*/bin; do [ -d "$_nvm" ] && LX_PATH="$LX_PATH $_nvm"; done
-  unset _nvm
-  [ -d "$R${LX_GUEST_HOME:-/root}/.local/bin" ] && LX_PATH="$LX_PATH $R${LX_GUEST_HOME:-/root}/.local/bin"
-fi
-export ROOTFS R LX_PATH
-
-# ─── uživatelská konfigurace (starship/zoxide/aliasy) ─────────────────────
-if [ -z "${LX_NO_RC:-}" ]; then
-  [ -r "${ELF_RC:-$HOME/.elfrc}" ] && . "${ELF_RC:-$HOME/.elfrc}"
+if [ -n "${PREFIX:-}" ] && [ -x "${L:-/nonexistent}" ] && [ -z "${LX_NO_RC:-}" ]; then
+  eval "$("$L" init zsh 2>/dev/null)" 2>/dev/null
+elif [ -z "${LX_NO_RC:-}" ] && [ -r "${ELF_RC:-$HOME/.elfrc}" ]; then
+  . "${ELF_RC:-$HOME/.elfrc}"
 fi
 
-# ─── barevný výstup ───────────────────────────────────────────────────────
-if [ -t 1 ]; then
-  alias grep='grep --color=auto'
-  alias fgrep='fgrep --color=auto'
-  alias egrep='egrep --color=auto'
-  alias diff='diff --color=auto'
-  alias ip='ip --color=auto'
-fi
-mkcd() { mkdir -p "$1" && cd "$1"; }
+# ─── pomocníci specifictí pro zsh ─────────────────────────────────────────
 reload() { source "$HOME/.zshrc"; }
 zshrc() { ${EDITOR:-nano} "$HOME/.zshrc"; }
 elfrc() { ${EDITOR:-nano} "${ELF_RC:-$HOME/.elfrc}"; }
-fnd() {
-  if command -v rg >/dev/null 2>&1; then rg --files | rg "$1"
-  else find . -type f -name "*$1*" 2>/dev/null; fi
-}
 
 # ─── pluginy, pokud jsou ──────────────────────────────────────────────────
 for _f in "$PREFIX/share/zsh/plugins/zsh-syntax-highlighting/zsh-syntax-highlighting.zsh" \
@@ -367,43 +401,17 @@ done
 unset _f
 [ -n "${ZSH_AUTOSUGGEST_HIGHLIGHT_STYLE:-}" ] && ZSH_AUTOSUGGEST_HIGHLIGHT_STYLE='fg=244'
 [ -f /etc/zsh_command_not_found ] && . /etc/zsh_command_not_found
-
-# ─── fzf / zoxide / starship: VŠE Z ROOTFS ────────────────────────────────
-# Na zařízení se berou z rootfs (guest glibc pod elf_loader), ne z Termuxu.
-# Když v rootfs nejsou, blok se přeskočí.
-if command -v lxwhich >/dev/null 2>&1 && lxwhich fzf >/dev/null 2>&1; then
-  fzf() { lx fzf "$@" 2> >(grep -v '^\[MMAP\]' >&2); }
-  _fz=$HOME/.cache/fzf-init.zsh
-  if [ ! -s "$_fz" ] || [ "$_fz" -ot "$(lxwhich fzf)" ]; then
-    lx fzf --zsh 2>/dev/null | sed -e "s|$L |fzf |g" -e "s|$R/usr/bin/fzf|fzf|g" > "$_fz"
-  fi
-  [ -r "$_fz" ] && . "$_fz"
-  unset _fz
-fi
-
-# zoxide a starship inicializuje ~/.elfrc (POSLEDNÍ blok přepisuje PROMPT).
-# Tady jen fallback, kdyby .elfrc chyběl nebo byl vypnutý přes LX_NO_RC=1.
-if [ -z "${_LX_STARSHIP_DONE:-}" ] && command -v lxwhich >/dev/null 2>&1 && lxwhich starship >/dev/null 2>&1; then
-  export STARSHIP_CONFIG="${STARSHIP_CONFIG:-$HOME/.config/starship.toml}"
-  export STARSHIP_CACHE="${STARSHIP_CACHE:-$HOME/.cache/starship}"
-  starship() { lx starship "$@" 2> >(grep -v '^\[MMAP\]' >&2); }
-  _sscache=$HOME/.cache/starship-init.zsh
-  if [ ! -s "$_sscache" ] || [ "$_sscache" -ot "$(lxwhich starship)" ]; then
-    lx starship init zsh 2>/dev/null | sed -e "s|$L|starship|g" -e "s|$R/usr/bin/starship|starship|g" > "$_sscache"
-  fi
-  [ -r "$_sscache" ] && . "$_sscache"
-  unset _sscache
-fi
 LXEOF
 chmod 600 "$HOME/.zshrc"
-zsh -n "$HOME/.zshrc" && ok "$HOME/.zshrc (syntaxe OK)"
+zsh -n "$HOME/.zshrc" && ok "$HOME/.zshrc (jen zsh vrstva, syntaxe OK)"
 
 # ─── 7. ~/.bashrc ─────────────────────────────────────────────────────────
 say "Píšu ~/.bashrc"
 backup "$HOME/.bashrc"
 cat > "$HOME/.bashrc" <<'LXEOF'
 # ~/.bashrc — Termux. Interaktivní shell předá zsh (viz ~/.zshrc).
-# Neinteraktivní shelly (skripty, `ssh host cmd`) zůstávají bash.
+# Neinteraktivní shelly (skripty, `ssh host cmd`) zůstávají bash, ale dostanou
+# stejnou uživatelskou vrstvu (.elfrc) jako zsh.
 case $- in
   *i*)
     if [ -x "$PREFIX/bin/zsh" ] && [ -z "${LX_NO_ZSH:-}" ]; then
@@ -411,6 +419,22 @@ case $- in
     fi
     ;;
 esac
+# stejna logika jako ~/.zshrc: host jde pres `init bash` (ten na konci
+# sam nacte ~/.elfrc), guest sourcuje .elfrc primo
+if [ -z "${LX_NO_RC:-}" ]; then
+  if [ -z "${L:-}" ]; then
+    for _lc in "${ELF_LOADER:-}" "$HOME/eltest/elf_loader" "$PREFIX/bin/elf_loader" \
+               "$HOME/usr/bin/elf_loader"; do
+      [ -n "$_lc" ] && [ -x "$_lc" ] && { L=$_lc; break; }
+    done
+    unset _lc
+  fi
+  if [ -n "${PREFIX:-}" ] && [ -x "${L:-/nonexistent}" ]; then
+    eval "$("$L" init bash 2>/dev/null)" 2>/dev/null
+  elif [ -r "${ELF_RC:-$HOME/.elfrc}" ]; then
+    . "${ELF_RC:-$HOME/.elfrc}"
+  fi
+fi
 [ -t 1 ] && alias ls='ls --color=auto'
 PS1='\w \$ '
 LXEOF
@@ -428,40 +452,35 @@ chmod 600 "$HOME/.config/starship.toml"
 ok "$HOME/.config/starship.toml"
 
 # ─── 9. guest rc do rootfs (volitelně) ────────────────────────────────────
+# Guest dostane STEJNÉ soubory (jeden rc pro oba světy). `.elfrc` sám pozná
+# kontext podle $PREFIX: host spouští `init` + `lx` pod loaderem, guest
+# (pod loaderem, bez PREFIX) používá guest PATH a volá binárky přímo.
 say "Guest rc v rootfs"
 GH=${LX_GUEST_HOME:-/root}
 if [ -d "$ROOTFS_VAL$GH" ]; then
   if [ "$ASSUME_YES" = 0 ]; then
-    ans=$(ask "  Nakopírovat .zshrc do $ROOTFS_VAL$GH? [A/n] " "A")
+    ans=$(ask "  Nakopírovat rc do $ROOTFS_VAL$GH? [A/n] " "A")
   else
     ans=A
   fi
   case "$ans" in
     [Aa]*)
       backup "$ROOTFS_VAL$GH/.zshrc"
-      # guest varianta: bez `init` (uz jsme pod loaderem), s lx/lxwhich
-      sed -e '/^# ─── elf_loader: loader + rootfs/,/^unset LX_LOADER$/c\
-# ─── elf_loader: uz jsme POD loaderem, init nema smysl ───────────────────\
-if [ -z "${L:-}" ] && [ -x "$PREFIX/bin/elf_loader" ]; then L=$PREFIX/bin/elf_loader; fi\
-if [ -n "${L:-}" ] && [ -n "${ROOTFS:-}" ]; then\
-  lxwhich() {\
-    local c=$1 d\
-    if [[ $c == */* ]]; then\
-      [[ $c == /* && $c != $ROOTFS/* ]] && c=$ROOTFS$c\
-      [[ -e $c ]] && { print -r -- $c; return 0 }\
-      return 1\
-    fi\
-    for d in "$ROOTFS/usr/local/sbin" "$ROOTFS/usr/local/bin" "$ROOTFS/usr/sbin" \\\
-             "$ROOTFS/usr/bin" "$ROOTFS/sbin" "$ROOTFS/bin"; do\
-      [[ -x $d/$c && ! -d $d/$c ]] && { print -r -- $d/$c; return 0 }\
-    done\
-    return 1\
-  }\
-  lx() { local c=$1; shift; local p; p=$(lxwhich "$c") || p=$c; "$L" --ownall "$p" "$@"; }\
-fi' \
-        "$HOME/.zshrc" > "$ROOTFS_VAL$GH/.zshrc"
+      backup "$ROOTFS_VAL$GH/.elfrc"
+      cp -f "$HOME/.zshrc" "$ROOTFS_VAL$GH/.zshrc"
       chmod 600 "$ROOTFS_VAL$GH/.zshrc"
+      ok "guest .zshrc (kopie)"
+
+      # guest .elfrc = stejný soubor; `.elfrc` sám pozná, že už jsme
+      # POD loaderem (lxwhich chybí -> postaví si ho ručně, init nespouští).
+      cp -f "$HOME/.elfrc" "$ROOTFS_VAL$GH/.elfrc"
+      chmod 600 "$ROOTFS_VAL$GH/.elfrc"
       zsh -n "$ROOTFS_VAL$GH/.zshrc" && ok "guest .zshrc (syntaxe OK)"
+      if ( unset LD_PRELOAD; zsh -n "$ROOTFS_VAL$GH/.elfrc" ) 2>/dev/null; then
+        ok "guest .elfrc (syntaxe OK)"
+      else
+        warn "guest .elfrc se nepodařilo ověřit"
+      fi
       ;;
     *) warn "guest rc přeskočen" ;;
   esac
