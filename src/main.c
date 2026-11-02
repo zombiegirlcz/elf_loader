@@ -4026,6 +4026,13 @@ static void go_fakeroot_post(long nr, const long *a, long rr) {
                 fakeroot_fix_stat((const char *)a[1], follow, (struct stat *)a[2]);
         }
         if ((int)a[0] == -100) l2s_fix_stat((const char *)a[1], follow, (struct stat *)a[2]);
+    } else if (nr == 80) {   /* fstat(fd, st) — nema cestu, jen fd */
+        /* Bun/Node (claude) ho volá raw syscallem, takze jmenny hook
+         * `shim_fr_fstat` (PLT) se neuplatni. Namerene: openat(/tmp/claude-0)
+         * = 11, fstat(11) -> uid 10323 misto 0 -> claude "Temp directory ...
+         * owned by uid 10323, expected 0". Oprava jde pres xattr na fd
+         * (fgetxattr), stejna logika jako jmenny hook. */
+        if (g_fakeroot_on) fakeroot_fix_stat_fd((int)a[0], (struct stat *)a[1]);
     } else if (nr == 291) {  /* statx(dirfd, path, flags, mask, stx) */
         int follow = !((int)a[2] & 0x100);
         if (g_fakeroot_on)

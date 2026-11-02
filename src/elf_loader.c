@@ -6350,8 +6350,14 @@ static int l2_install_range_filter(unsigned long lo, unsigned long hi, const cha
     /* 17=getcwd (fixup vysledku), 49=chdir, 34/35/48/53/54/56/78/79/88/291/439
      * =path (439=faccessat2, glibc 2.33+ ho pouziva misto 48!),
      * 36=symlinkat, 37=linkat, 38/276=renameat, 221=execve, 135/134=sig. */
-    static const unsigned nrs_path[] = { 17, 56, 79, 48, 439, 78, 291, 221, 49, 34, 35, 38,
+    static const unsigned nrs_path[] = { 17, 56, 79, 80, 48, 439, 78, 291, 221, 49, 34, 35, 38,
                                          276, 53, 54, 88, 37, 36, 135 };
+    /* 80 = fstat: nema cestu, ale je to clen stat rodiny. Bez nej v seznamu
+     * ho L2 filtr vubec nepusti do go_handle a `go_fakeroot_post` ho nikdy
+     * neopravi -> syrovy fstat vracel skutecne app uid. Namerene na Bunu
+     * (claude): openat(/tmp/claude-0) = 11, fstat(11) -> uid 10323 misto 0,
+     * takze claude spadl na "Temp directory ... owned by uid 10323,
+     * expected 0". Proot to ma (fake_id0 sedi na hranici syscallu). */
     /* Pod LX_FAKEROOT i identitni cisla: staticka a Go binarka nema PLT vazbu
      * do nasi libc, takze jmenny hook `getuid`/`set*id` ji nema kde zachytit
      * a bez tohohle videla skutecne app uid (namereno 2026-10-29). Proot to
