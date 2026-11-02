@@ -7443,8 +7443,16 @@ do `binds_acc[4096]`. Boot posílá ~1577 B (roste s `NH_EXTRA_BINDS`), takže
 se to zatím vešlo — ale každý další bind by shodil **celý** `LX_BINDS`
 tichým `return` bez parsování. Zvednuto na 8192 + `[binds]` stopa.
 
-### Poznámka k `ashell -c`
+### Metodická poznámka (připomenutí, ne nález)
 
-`ashell -c 'ls /product'` **není** guest — je to nativní bionic shell
-(`readlink /proc/self/exe` → `/system/bin/toybox`) a vidí **host** mounty.
-Pro měření guest pohledu je potřeba `elf_loader --proot-compat … -- /bin/ls`.
+`ashell -c` je **host-side nástroj** — nativní bionic shell mimo proot
+(`readlink /proc/self/exe` → `/system/bin/toybox`), který vidí **host**
+mounty. **Tak je navržen** a v projektu se přes něj dělá host-side
+validace (symlinky, permise, `find`; viz pasti č. 5 a 11 v `AGENTS.md`).
+Guest pohled se jím měřit **nedá** a nikdy nedal — na to je potřeba
+`elf_loader --proot-compat … -- /bin/ls`.
+
+Při měření téhle opravy to na chvíli vypadalo jako „jednou jo, jednou
+ne“, ale to byl jen důsledek toho, že `ashell` a guest vidí jiné mounty.
+Skutečná chyba byla v `bind_parse_spec` (výše), ne v tom, čím se měřilo.
+Dokumentováno, aby se to znovu ne„objevovalo“.

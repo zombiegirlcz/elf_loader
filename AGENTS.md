@@ -527,6 +527,12 @@ Pro bitovou shodu by stačil 6řádkový knob `LX_FAKEROOT_MAP`; uživatel
    `NH_EXTRA_BINDS`) by shodil **celý** `LX_BINDS` tichým `return`.
    Zvednuto na 8192 + `[binds]` stopa při překročení.
 
+   **Metodika (připomenutí, ne nález):** `ashell -c` je host-side nástroj
+   mimo proot a vidí **host** mounty — tak je navržen (pasti č. 5 a 11).
+   Guest pohled se měří jen `elf_loader --proot-compat … -- /bin/ls`.
+   Při hledání téhle chyby to na chvíli vypadalo jako „jednou jo, jednou
+   ne“; byl to rozdíl mountů `ashell` vs guest, ne chování loaderu.
+
 
 ## Otevřené bugy
 
