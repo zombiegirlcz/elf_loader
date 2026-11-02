@@ -4773,6 +4773,37 @@ static int run_own(const char *path, const char *mod, int argc, char **argv,
     return ret;
 }
 
+/* AT_EXECFN v auxv ukazuje na LOADER (to je skutecny obraz procesu), ne na
+ * guest binarku. uutils coreutils (Ubuntu 26.04+) z nej odvozuje jmeno utility
+ * a jinak spadne na "Security violation: Requested utility `elf_loader` does
+ * not match executable name". /proc/self/exe uz resi jmenne hooky + L2
+ * (elf_set_guest_exe), ale AT_EXECFN je jen v auxv na zasobniku.
+ *
+ * Prepisujeme na GUEST cestu (bez $ROOTFS prefixu), aby guest nevidel host
+ * cestu. Basename zustava stejny jako u spustene binarky. */
+static void patch_at_execfn(char **envp, const char *hostpath) {
+    if (!envp || !hostpath || !hostpath[0]) return;
+    const char *guest = hostpath;
+    if (g_shim_root && g_shim_root[0]) {
+        size_t rl = shim_strlen(g_shim_root);
+        if (shim_strncmp(hostpath, g_shim_root, rl) == 0 &&
+            (hostpath[rl] == '/' || hostpath[rl] == 0))
+            guest = hostpath[rl] ? hostpath + rl : "/";
+    }
+    char **e = envp;
+    unsigned guard = 0;
+    while (*e && guard++ < 65536) e++;
+    if (!*e) return;
+    unsigned long *av = (unsigned long *)(void *)(e + 1);
+    for (int i = 0; i < 512; i++) {
+        if (av[i * 2] == 0) break;                 /* AT_NULL */
+        if (av[i * 2] == 31 /* AT_EXECFN */) {
+            av[i * 2 + 1] = (unsigned long)(void *)guest;
+            return;
+        }
+    }
+}
+
 static int run_ownall(const char *path, int argc, char **argv, char **envp) {
     elf_install_fault_handlers();
     elf_timing_mark("ownall_start");
@@ -5087,6 +5118,10 @@ static int run_ownall(const char *path, int argc, char **argv, char **envp) {
     /* i pro L2/seccomp: syrovy readlinkat(78) na /proc/self/exe ma vratit
      * guest cestu, ne LOADER (uutils coreutils to overuje). */
     elf_set_guest_exe(g_guest_exe_path);
+    /* AT_EXECFN v auxv ukazuje na LOADER -> uutils coreutils z nej odvodi
+     * jmeno "elf_loader" a spadne na "Security violation". Prepis na guest
+     * cestu (proot to ma spravne, jadro tam execuje guest binarku). */
+    patch_at_execfn(envp, g_guest_exe_path);
     /* L2 (prompt 05): PIE guest exe presun do pevneho okna, aby jeho text-range
      * nekolidoval s ASLR pozdeji forknute host binarky. Flag plati jen pro exe,
      * zavislosti (libc/ld.so) resi L1. */
