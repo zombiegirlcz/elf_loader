@@ -406,6 +406,87 @@ fork veneer (vfork-style clone) [#L685].
    (mezera v cíli); pod prootem `/product` v rootfs ani není — v guestu je
    jen `/usr/local/bin/su_wrapper`, takže PATH není třeba řešit.
 
+28. **`fstat` (nr 80) chyběl v L2 filtru i v `go_fakeroot_post`.** Bun/Node
+   (Claude Code = Bun 1.x) volá `fstat` **raw syscallem**, takže jmenný hook
+   `shim_fr_fstat` (PLT/GOT) se neuplatní. L2 filtr ho v `nrs_path[]` neměl,
+   takže se na něj nikdy nezeptal `go_handle` → `go_fakeroot_post` ho
+   neopravil a `fstat(11)` vrátil **skutečné app uid 10323**.
+
+   Naměřeno (guest strace, `claude -p hi`):
+   ```
+   mkdirat(AT_FDCWD, "…/files/tmp/claude-0", 0700) = 0
+   openat(AT_FDCWD, "/tmp/claude-0", …O_DIRECTORY) = 11
+   fstat(11, {st_mode=S_IFDIR|0700, …})           = 0   ← uid 10323
+   ```
+   → `Temp directory /tmp/claude-0 is owned by uid 10323, expected 0.
+   Refusing to use it`.
+
+   Fix (`4fd619e`): `80` do `nrs_path[]` v `l2_install_range_filter`
+   (`src/elf_loader.c`) + větev `nr == 80` v `go_fakeroot_post`
+   (`src/main.c`) → `fakeroot_fix_stat_fd(fd, st)` (přes `fgetxattr`).
+   Po fixu `claude -p` pod `--proot-compat -0` s `ELF_LOADER_L2=1`
+   doběhne `rc=0` bez té chyby.
+
+   **Obecné pravidlo:** každý člen `stat` rodiny, který jde raw syscallem
+   (`fstat` 80, `newfstatat` 79, `statx` 291), musí být v `nrs_path[]`
+   **i** v `go_fakeroot_post`, jinak fakeroot pro statické/Go/Bun binárky
+   děraví. Proot to má (`fake_id0` sedí na hranici syscallu u všech členů).
+
+29. **`--proot-compat` musí být izolovaný jako proot — jinak si guest myslí,
+   že je venku.** Default identity bindy (`binds_fill_defaults`) obsahují
+   `/data`, `/system`, `/apex`, `/linkerconfig`, `/storage`, …; v normálním
+   režimu je potřebujeme (app žije pod `/data`, bionické binárky pod
+   `/system`, past 21), ale **proot žádné takové nemá** — guest vidí jen
+   rootfs + explicitní `-b`. Naměřeno 2026-11-02: `ls /data` pod loaderem
+   prošlo, pod prootem `Permission denied`; `/system/bin` vidět, pod prootem
+   ne. Fix: `proot_compat_parse` nastaví `LX_PROOT_COMPAT=1` a
+   `binds_fill_defaults` pak přidá **jen pseudofs** `/proc`, `/dev`, `/sys`.
+   `LX_PROOT_NO_ISOLATE=1` vrátí původní chování (nutné pro ne-proot režim).
+
+   Důsledek: bionická binárka v `$ROOTFS` (su_wrapper, ashell) už pod
+   `--proot-compat` nevidí host `/system`, takže jde přes reálné `execve`
+   jen tehdy, je-li celá statická. To je **správně** — proot se chová stejně
+   (`'/system/bin/id' not found`).
+
+30. **`chgrp` posílá `(unsigned)-1` jako „tuhle složku neměnit“.**
+   `chown(path, -1, 999)` znamená „uid nech, gid nastav“ (kernelová
+   konvence). `fakeroot_xattr_merge` to ukládal doslova → `stat` pak hlásil
+   `4294967295:999`. Naměřeno 2026-11-02 (B3 v paritní matici). Fix: `-1`
+   v uid/gid se ignoruje. Proot to měl správně.
+
+31. **`getgroups` pod fakerootem musí mapovat, ne vracet jen `[0]`.**
+   Proot `-0` dá `groups=0,1077,3001,3002,3003,9997,20323,50323` (app gid
+   → fake gid, ostatní beze změny); loader vracel jen `[0]`. Fix:
+   `shim_fr_getgroups` zavolá originál a přepíše `g_fakeroot_app_gid` →
+   `g_fakeroot_gid`. `getgroups(0,NULL)` dál vrací skutečný počet.
+
+### Parita `--proot-compat` vs skutečný proot (naměřeno 2026-11-02)
+
+`parity.sh` (v repu) puštěný identicky pod oběma světy dal **stejný výstup**
+ve všech bodech (A1–A4 identita, B1–B10 fakeroot, C1–C10 bind mount,
+D1–D4 mountinfo, E1–E8 „nevypadat venku“). Klíčové:
+
+| | loader `--proot-compat -0` | real proot `-0` |
+|---|---|---|
+| `id` | `0:0`, groups 8 položek | totéž |
+| `chown 1234:5678` → stat | `1234:5678` | `1234:5678` |
+| `chgrp 999` → stat | `0:999` | `0:999` |
+| `chmod 4755/2750/1777` | OK | OK |
+| `mknod c 1 3` / `b 7 0` | char/block 1:3, 7:0 | totéž |
+| `mount --bind` + zápis | zdroj vidí změnu | totéž |
+| `mount --bind -o ro` + zápis | `Read-only file system` | totéž |
+| `rm -rf` na mountpoint | `Device or resource busy` | totéž |
+| `findmnt`/`/proc/mounts` | virtualizované, 6 řádků | totéž |
+| `ls /data`, `/system` | `Permission denied` / prázdné | totéž |
+| `/proc/self/status` Uid | `10323` (skutečné) | `10323` |
+
+Jediný funkční rozdíl, který zůstává **záměrně**: `chown` na cizí uid se
+v `stat` hlásí **přesně** (`1234:5678`), kdežto proot `fake_id0` mapuje
+všechno na `0:0`. Loader je v tom nadmnožina (přesnější), ne nedostatek.
+Pro bitovou shodu by stačil 6řádkový knob `LX_FAKEROOT_MAP`; uživatel
+2026-11-02 rozhodl **nechat přesnější chování**.
+
+
 ## Otevřené bugy
 
 - ~~**Statický glibc ELF v rootfs končí SIGSYS** (RC=159)~~ — **vyřešeno pod

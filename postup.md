@@ -7321,3 +7321,68 @@ xattr necim spolehlivym. Pokud proot ma `cap_dac_read_search` nebo
 obdoba, je otazka, proc ho loader nema (stejny deployment, jina binarka).
 
 Do te doby: `ipc 711` je funkcni workaround, ale neni to „spravne chovani".
+
+## 2026-11-02 — parita `--proot-compat` se skutečným prootem
+
+Uživatel: „je důležité, aby si nic nemyslelo, že je venku, pokud je použit
+mód proot — všechny schopnosti co má proot: full fakeroot a full mount bind."
+
+Srovnávací matice `tools/parity-proot.sh` (30 bodů: identita, fakeroot,
+bind mount, mountinfo, „nevypadat venku") puštěná identicky pod
+`elf_loader --proot-compat -0 -r $R -b …` a pod skutečným
+`$R/usr/bin/proot -0 -r $R -b …`. Před opravami 4 rozdíly, po opravách
+už jen jeden záměrný.
+
+### Nalezené a opravené rozdíly
+
+1. **Izolace host cest** (`src/binds.h`, `binds_fill_defaults`). Default
+   identity bindy obsahovaly `/data`, `/system`, `/apex`, `/linkerconfig`,
+   `/storage`, … → pod loaderem guest viděl host `/data` a `/system/bin`,
+   pod prootem ne (`ls /data` = Permission denied, `/system` prázdný).
+   Fix: `proot_compat_parse` nastaví `LX_PROOT_COMPAT=1`; v tom režimu se
+   přidají jen pseudofs `/proc`, `/dev`, `/sys`. `LX_PROOT_NO_ISOLATE=1`
+   vrátí původní chování (nutné pro ne-proot režim — app žije pod `/data`,
+   bionické binárky pod `/system`, past 21).
+
+2. **`chgrp` a `(unsigned)-1`** (`src/fakeroot.h`). `chown(p, -1, 999)`
+   znamená „uid nech". `fakeroot_xattr_merge`/`-fmerge` to ukládaly
+   doslova → `stat` hlásil `4294967295:999`. Fix: `-1` v uid/gid se
+   ignoruje (kernelová konvence). Proot to měl správně.
+
+3. **`getgroups`** (`src/main.c`, `shim_fr_getgroups`). Loader vracel
+   jen `[0]`; proot `-0` vrací `0,1077,3001,3002,3003,9997,20323,50323`
+   (app gid → fake gid, ostatní beze změny). Fix: zavolat originál
+   a přemapovat `g_fakeroot_app_gid` → `g_fakeroot_gid`.
+
+### Naměřená parita (po opravách, `tools/parity-proot.sh`)
+
+| | loader `--proot-compat -0` | real proot `-0` |
+|---|---|---|
+| `id` | `0:0`, groups 8 položek | totéž |
+| `chown 1234:5678` → stat | `1234:5678` | `1234:5678` |
+| `chgrp 999` → stat | `0:999` | `0:999` |
+| `chmod 4755/2750/1777` | OK | OK |
+| `mknod c 1 3` / `b 7 0` | char/block 1:3, 7:0 | totéž |
+| `mount --bind` + zápis | zdroj vidí změnu | totéž |
+| `mount --bind -o ro` + zápis | `Read-only file system` | totéž |
+| `rm -rf` na mountpoint | `Device or resource busy` | totéž |
+| `findmnt` / `/proc/mounts` | virtualizované, 6 řádků | totéž |
+| `ls /data`, `/system` | `Permission denied` / prázdné | totéž |
+| `/proc/self/status` Uid | `10323` (skutečné) | `10323` |
+
+Zbývající **záměrný** rozdíl: `chown` na cizí uid se v `stat` hlásí přesně
+(`1234:5678`), kdežto proot `fake_id0` mapuje všechno na `0:0`. Loader je
+nadmnožina (přesnější), ne nedostatek — uživatel 2026-11-02 rozhodl
+nechat tak. Bitovou shodu by dal 6řádkový knob `LX_FAKEROOT_MAP`.
+
+### Poznámky k měření
+
+- Testovací bind source musí být **app-owned** (`chmod -R 777` přes
+  `ashell`), jinak hostitelské `/data/user/0/…/files` mode 771 + tmp 700
+  zabrání `stat`/`mknod` a vypadá to jako chyba loaderu. Po testu vrátit
+  `$D` na 771 a `$D/tmp` na 700.
+- `LX_BINDS_FILE=` (prázdné) vynutí novou bind tabulku — jinak se dědí
+  stará session a `-b` se neprojeví.
+- Bind tabulka zůstává hostitelsky absolutní i po izolaci: `findmnt` pod
+  loaderem ukáže `src` host cestu (`/tmp/mb2`), protože tak to dělá
+  i proot (`/tmp/mb2`). Guest-absolutní je jen `guest` sloupec.
