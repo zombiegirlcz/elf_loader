@@ -5782,6 +5782,43 @@ static const char *g_f2_excl[] = {
 };
 void f2_set_root(const char *r) { g_f2_root = r; }
 
+/* Guest cesta spustene binarky (--ownall/--shim). Vlastni /proc/self/exe
+ * v own-loadovanem procesu ukazuje na LOADER; jmenne hooky to opravuji
+ * (g_guest_exe_path v main.c), ale syrovy readlinkat(78) jde mimo ne.
+ * uutils coreutils (Ubuntu 26.04) overuje /proc/self/exe -> bez tehle
+ * opravy spadne na "Security violation". */
+static const char *g_elf_guest_exe = NULL;
+void elf_set_guest_exe(const char *p) { g_elf_guest_exe = p; }
+
+/* f2_is_self_exe() nize pouziva tyhle helpery, ktere jsou definovane az
+ * za f2_set_root() - dopredu deklarovat, at se nezavadej duplicity. */
+static size_t f2_slen(const char *s);
+static int f2_sncmp(const char *a, const char *b, size_t n);
+static void f2_scpy(char *d, const char *s);
+static void f2_scat(char *d, const char *s);
+
+/* 1 = cesta je /proc/self/exe nebo /proc/<vlastni-pid>/exe */
+static int f2_is_self_exe(const char *p) {
+    if (!p) return 0;
+    if (f2_sncmp(p, "/proc/self/exe", 14) == 0 && p[14] == 0) return 1;
+    if (f2_sncmp(p, "/proc/", 6) != 0) return 0;
+    register long x8 __asm__("x8") = 172; /* getpid */
+    register long x0 __asm__("x0") = 0;
+    __asm__ volatile("svc #0" : "+r"(x0) : "r"(x8) : "memory", "cc");
+    long pid = x0;
+    char b[40]; int i = 0;
+    f2_scpy(b, "/proc/");
+    while (b[i]) i++;
+    if (pid <= 0) { b[i++] = '0'; }
+    else { char rev[16]; int ri = 0; long t = pid;
+        while (t > 0) { rev[ri++] = (char)('0' + t % 10); t /= 10; }
+        while (ri > 0) b[i++] = rev[--ri]; }
+    b[i] = 0;
+    f2_scat(b, "/exe");
+    size_t bl = f2_slen(b);
+    return f2_sncmp(p, b, bl) == 0 && p[bl] == 0;
+}
+
 static size_t f2_slen(const char *s) { size_t n = 0; if (s) while (s[n]) n++; return n; }
 static int f2_sncmp(const char *a, const char *b, size_t n) {
     for (size_t i = 0; i < n; i++) {
@@ -6241,7 +6278,7 @@ NOSP static int go_handle(long nr, ucontext_t *ctx) {
         case 435:
             r[0] = (unsigned long long)-38L;
             return 1;
-        case 56: case 79: case 48: case 78: case 291: case 34: case 35:
+        case 56: case 79: case 48: case 78: case 89: case 291: case 34: case 35:
         case 53: case 54: case 88: pa = 1; break;
         case 38: case 276: pa = 1; pb = 3; break; /* renameat(2) */
         case 37:  pa = 1; pb = 3; break;         /* linkat */
@@ -6254,6 +6291,28 @@ NOSP static int go_handle(long nr, ucontext_t *ctx) {
     }
     char ta[4096], tb[4096];
     long a[6] = { (long)r[0], (long)r[1], (long)r[2], (long)r[3], (long)r[4], (long)r[5] };
+    /* readlinkat(/proc/self/exe) v own-loadovanem procesu: kernel vraci
+     * LOADER (skutecny obraz), guest potrebuje svoji cestu. Jmenne hooky
+     * to delaji, ale raw syscall jde mimo ne (uutils coreutils si takhle
+     * overuje identitu a jinak spadne na "Security violation"). */
+    /* readlink(89) i readlinkat(78): uutils coreutils vola readlink(),
+     * takze je potreba pokryt oba tvary. */
+    {
+        const char *_rp = NULL;
+        char *_buf = NULL;
+        size_t _cap = 0;
+        if (nr == 78) { _rp = (const char *)a[1]; _buf = (char *)a[2]; _cap = (size_t)a[3]; }
+        else if (nr == 89) { _rp = (const char *)a[0]; _buf = (char *)a[1]; _cap = (size_t)a[2]; }
+        if (_rp && _buf && g_elf_guest_exe && g_elf_guest_exe[0] &&
+            f2_is_self_exe(_rp)) {
+            size_t gl = f2_slen(g_elf_guest_exe);
+            if (_cap == 0) { r[0] = (unsigned long long)-22L; return 1; }
+            if (gl > _cap) gl = _cap;
+            for (size_t i = 0; i < gl; i++) _buf[i] = g_elf_guest_exe[i];
+            r[0] = (unsigned long long)gl;
+            return 1;
+        }
+    }
     if (pa >= 0 && a[pa] && ((const char *)a[pa])[0] == '/') {
         go_translate((const char *)a[pa], ta, sizeof ta);
         a[pa] = (long)ta;
@@ -6267,8 +6326,9 @@ NOSP static int go_handle(long nr, ucontext_t *ctx) {
     if (g_go_fr_post) g_go_fr_post(nr, a, rr);
     /* readlinkat(78): cil muze byt hostove absolutni (pod $ROOTFS) -> ohlas
      * ho zpet jako guest-absolutni, aby guest nikdy nevidel host cestu. */
-    if (nr == 78 && rr > 0 && !g_f2_cwd_keep_host && g_f2_root) {
-        char *buf = (char *)a[2];      /* readlinkat(dirfd, path, BUF, sz) */
+    if ((nr == 78 || nr == 89) && rr > 0 && !g_f2_cwd_keep_host && g_f2_root) {
+        /* readlinkat(dirfd,path,BUF,sz) / readlink(path,BUF,sz) */
+        char *buf = (char *)(nr == 78 ? a[2] : a[1]);
         size_t rl = f2_slen(g_f2_root);
         if (rl && (size_t)rr > rl && f2_sncmp(buf, g_f2_root, rl) == 0 &&
             (buf[rl] == '/' || (size_t)rr == rl)) {
@@ -6350,7 +6410,7 @@ static int l2_install_range_filter(unsigned long lo, unsigned long hi, const cha
     /* 17=getcwd (fixup vysledku), 49=chdir, 34/35/48/53/54/56/78/79/88/291/439
      * =path (439=faccessat2, glibc 2.33+ ho pouziva misto 48!),
      * 36=symlinkat, 37=linkat, 38/276=renameat, 221=execve, 135/134=sig. */
-    static const unsigned nrs_path[] = { 17, 56, 79, 80, 48, 439, 78, 291, 221, 49, 34, 35, 38,
+    static const unsigned nrs_path[] = { 17, 56, 79, 80, 48, 439, 78, 89, 291, 221, 49, 34, 35, 38,
                                          276, 53, 54, 88, 37, 36, 135 };
     /* 80 = fstat: nema cestu, ale je to clen stat rodiny. Bez nej v seznamu
      * ho L2 filtr vubec nepusti do go_handle a `go_fakeroot_post` ho nikdy

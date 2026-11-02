@@ -5084,6 +5084,9 @@ static int run_ownall(const char *path, int argc, char **argv, char **envp) {
     }
     elf_timing_mark("f2_filter");
     shim_strcpy(g_guest_exe_path, sizeof(g_guest_exe_path), path);
+    /* i pro L2/seccomp: syrovy readlinkat(78) na /proc/self/exe ma vratit
+     * guest cestu, ne LOADER (uutils coreutils to overuje). */
+    elf_set_guest_exe(g_guest_exe_path);
     /* L2 (prompt 05): PIE guest exe presun do pevneho okna, aby jeho text-range
      * nekolidoval s ASLR pozdeji forknute host binarky. Flag plati jen pro exe,
      * zavislosti (libc/ld.so) resi L1. */
