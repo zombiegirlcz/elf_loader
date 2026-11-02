@@ -5682,7 +5682,7 @@ static const char LX_HELPERS_ZSH[] =
     "    [[ $ve == /* && $ve != $R/* && $ve != $D/* ]] && ve=$R$ve\n"
     "    [[ -x $ve/bin/$c && ! -d $ve/bin/$c ]] && { print -r -- $ve/bin/$c; return 0 }\n"
     "  fi\n"
-    "  for d in $LX_PATH; do\n"
+    "  for d in ${=LX_PATH}; do\n"
     "    [[ -x $d/$c && ! -d $d/$c ]] && { print -r -- $d/$c; return 0 }\n"
     "  done\n"
     "  return 1\n"
