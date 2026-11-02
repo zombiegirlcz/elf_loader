@@ -220,8 +220,12 @@ static int fakeroot_xattr_merge(const char *path, int follow,
         rec.magic = LXFR_MAGIC; rec.uid = 0; rec.gid = 0;
         rec.mode_extra = 0; rec.rdev_major = 0; rec.rdev_minor = 0;
     }
-    if (uid) rec.uid = *uid;
-    if (gid) rec.gid = *gid;
+    /* (unsigned)-1 = "tuhle slozku nemenit" (kernelova konvence chown -1).
+     * Bez toho se `chgrp 999 f` ulozil jako 4294967295:999 a stat to pak
+     * vratil - namereno 2026-11-02 (B3 chgrp -> 4294967295:999 misto 0:999).
+     * Proot to ma spravne. */
+    if (uid && *uid != 0xFFFFFFFFu) rec.uid = *uid;
+    if (gid && *gid != 0xFFFFFFFFu) rec.gid = *gid;
     if (mode_extra) rec.mode_extra = *mode_extra;
     if (rmaj) rec.rdev_major = *rmaj;
     if (rmin) rec.rdev_minor = *rmin;

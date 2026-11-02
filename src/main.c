@@ -1855,15 +1855,17 @@ static int shim_fr_getresgid(unsigned int *rg, unsigned int *eg, unsigned int *s
     return r;
 }
 static int shim_fr_getgroups(int n, unsigned int *list) {
-    if (g_fakeroot_on) {
-        /* vzdy jedna skupina (root/0) - n==0 je dotaz na pocet (glibc
-         * getgroups(0,NULL) pred alokaci bufferu), musi vratit 1, ne 0,
-         * jinak si volajici (python os.getgroups) alokuje prazdny buffer
-         * a vysledek je [] misto [0]. */
-        if (n > 0 && list) list[0] = g_fakeroot_gid;
-        return 1;
-    }
-    int (*f)(int, unsigned int *) = g_orig_getgroups; return f ? f(n, list) : -1;
+    int (*f)(int, unsigned int *) = g_orig_getgroups;
+    if (!g_fakeroot_on || !f) return f ? f(n, list) : -1;
+    /* Proot fake_id0 mapuje KAZDOU skupinu rovnou app gid na fake gid a
+     * ostatni necha (namereno: proot -0 da groups=0,1077,3001,...,20323,
+     * zatimco loader daval jen [0]). Pro paritu: zavolat orig a prepsat
+     * app gid -> fake gid; n==0 (dotaz na pocet) vrati skutecny pocet. */
+    int r = f(n, list);
+    if (r > 0 && list)
+        for (int i = 0; i < r; i++)
+            if (list[i] == g_fakeroot_app_gid) list[i] = g_fakeroot_gid;
+    return r;
 }
 static int shim_fr_fchown(int fd, unsigned int u, unsigned int g) {
     if (g_fakeroot_on) return fakeroot_xattr_fmerge(fd, &u, &g, NULL, NULL, NULL);

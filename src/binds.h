@@ -268,12 +268,23 @@ static int bind_remove(const char *guest) {
 /* ── naplneni (startup, bionic TP, libc OK) ──────────────────────────── */
 
 static void binds_fill_defaults(void) {
+    /* Identity bindy = host cesta viditelna v guestu pod stejnym jmenem.
+     * V normalnim (ne-proot) rezimu je potrebujeme: app zije pod /data a
+     * bionicke binarky pod /system (past 21). V --proot-compat rezimu ale
+     * proot zadne takove identity nema - guest vidi jen rootfs + explicitni
+     * -b. Proto se tam pridavaji jen pseudofs (/proc,/sys,/dev); vypnuti
+     * LX_PROOT_NO_ISOLATE=1 vrati puvodni chovani. */
+    int isolate = getenv("LX_PROOT_COMPAT") != NULL &&
+                  getenv("LX_PROOT_NO_ISOLATE") == NULL;
+    static const char *pseudo[] = { "/proc", "/dev", "/sys", NULL };
     static const char *excl[] = {
-        "/proc", "/dev", "/sys", "/system", "/data", "/apex", "/linkerconfig",
+        "/system", "/data", "/apex", "/linkerconfig",
         "/metadata", "/sdcard", "/storage", "/vendor", "/odm", "/product",
         "/persist", "/cache", "/config", "/debug_ramdisk", NULL
     };
-    for (int i = 0; excl[i]; i++) bind_add(excl[i], excl[i], 0);
+    for (int i = 0; pseudo[i]; i++) bind_add(pseudo[i], pseudo[i], 0);
+    if (!isolate)
+        for (int i = 0; excl[i]; i++) bind_add(excl[i], excl[i], 0);
     if (g_shim_root && g_shim_root[0]) {
         char h[LX_BIND_HLEN];
         int k = snprintf(h, sizeof h, "%s/dev/shm", g_shim_root);

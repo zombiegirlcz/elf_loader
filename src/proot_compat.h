@@ -394,6 +394,12 @@ static int proot_compat_parse(int argc, char **argv, int *cmd_start,
     if (!rootfs || !rootfs[0]) return -1;
 
     setenv("ROOTFS", rootfs, 1);
+    /* Znacka pro binds_fill_defaults: tahle session se chova jako proot,
+     * takze default identity bindy (/data,/system,/apex,...) se NEPRIDAVAJI
+     * - proot je taky nema a guest by pak videl host cesty, ktere v prootu
+     * neexistuji ("myslel by si, ze je venku"). Vypnuti:
+     * LX_PROOT_NO_ISOLATE=1. */
+    setenv("LX_PROOT_COMPAT", "1", 1);
     if (binds_len) setenv("LX_BINDS", binds_acc, 1);
     if (root_id) setenv("LX_FAKEROOT", "1", 1);
     if (l2s) setenv("LX_L2S", "1", 1);
