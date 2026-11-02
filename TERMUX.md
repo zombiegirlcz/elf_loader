@@ -234,9 +234,9 @@ Android 11, kernel:
 
 | rootfs | glibc | loader | stav |
 |---|---|---|---|
-| Parrot Security 7.4 (echo) | 2.41 (`Debian GLIBC 2.41-12+deb13u4`) | 0.9.33 | ✅ plná regresní sada 220 PASS / 2 FAIL / 31 SKIP |
-| Kali GNU/Linux Rolling 2026.2 | 2.43 (`Debian GLIBC 2.43-6`) | 0.9.33 | ✅ destruktivní testy (`test-all.sh l2s`, `fakeroot`, `binds`) |
-| Ubuntu 26.04.1 LTS (Resolute Raccoon) | 2.43 (`Ubuntu GLIBC 2.43-2ubuntu2.4`) | 0.9.33 | ✅ `uutils coreutils`, `fakeroot -0`, `--proot-compat`, zsh |
+| Parrot Security 7.4 (echo) | 2.41 (`Debian GLIBC 2.41-12+deb13u4`) | 1.0.0 | ✅ plná regresní sada 220 PASS / 2 FAIL / 31 SKIP |
+| Kali GNU/Linux Rolling 2026.2 | 2.43 (`Debian GLIBC 2.43-6`) | 1.0.0 | ✅ destruktivní testy (`test-all.sh l2s`, `fakeroot`, `binds`) |
+| Ubuntu 26.04.1 LTS (Resolute Raccoon) | 2.43 (`Ubuntu GLIBC 2.43-2ubuntu2.4`) | 1.0.0 | ✅ `uutils coreutils`, `fakeroot -0`, `--proot-compat`, zsh |
 
 Poznámky k měření:
 
@@ -244,7 +244,7 @@ Poznámky k měření:
   (`staticexec` — chybí `gcc` v daném běhu; `binds` GC tabulek — časování),
   31 SKIP (nedostupné binárky). Všechny FAIL jsou nesouvisející s loaderem.
 - **Ubuntu 26.04** je jediná kombinace, kde se projevil `uutils coreutils`
-  (`AT_EXECFN` identita) — opraveno v `0.9.33`, viz AGENTS.md past 33.
+  (`AT_EXECFN` identita) — opraveno v `1.0.0`, viz AGENTS.md past 33.
 - **Kali** se používá na destruktivní testy (`--ownall`/`--shim` nad
   adresářem, `IMGCACHE`), protože ho nikdo nepoužívá. Parrot je živý
   a v testech jen read-only.

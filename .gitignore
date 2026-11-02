@@ -42,3 +42,6 @@ test/echo
 results/
 nohup.out
 cache/
+.claude/worktrees/
+.cm*
+.cmv*

@@ -341,16 +341,16 @@ kernel `4.14.190-perf-g7da93debc0ee`:
 
 | rootfs | glibc | loader | status |
 |---|---|---|---|
-| Parrot Security 7.4 (echo) | 2.41 (`Debian GLIBC 2.41-12+deb13u4`) | 0.9.33 | full regression suite: 220 PASS / 2 FAIL / 31 SKIP |
-| Kali GNU/Linux Rolling 2026.2 | 2.43 (`Debian GLIBC 2.43-6`) | 0.9.33 | destructive tests (`l2s`, `fakeroot`, `binds`, `--ownall` over a tree) |
-| Ubuntu 26.04.1 LTS (Resolute Raccoon) | 2.43 (`Ubuntu GLIBC 2.43-2ubuntu2.4`) | 0.9.33 | `uutils coreutils`, `fakeroot -0`, `--proot-compat`, zsh |
+| Parrot Security 7.4 (echo) | 2.41 (`Debian GLIBC 2.41-12+deb13u4`) | 1.0.0 | full regression suite: 220 PASS / 2 FAIL / 31 SKIP |
+| Kali GNU/Linux Rolling 2026.2 | 2.43 (`Debian GLIBC 2.43-6`) | 1.0.0 | destructive tests (`l2s`, `fakeroot`, `binds`, `--ownall` over a tree) |
+| Ubuntu 26.04.1 LTS (Resolute Raccoon) | 2.43 (`Ubuntu GLIBC 2.43-2ubuntu2.4`) | 1.0.0 | `uutils coreutils`, `fakeroot -0`, `--proot-compat`, zsh |
 
 Notes:
 
 - The two FAILs in the Parrot run are unrelated to the loader (`staticexec`
   had no `gcc` in that run; `binds` GC table count is timing-sensitive).
 - **Ubuntu 26.04** is the only combination that exposed the `uutils coreutils`
-  identity check (`AT_EXECFN`) — fixed in `0.9.33`, see AGENTS.md pitfall 33.
+  identity check (`AT_EXECFN`) — fixed in `1.0.0`, see AGENTS.md pitfall 33.
 - **Kali** is used for destructive tests because nobody uses it; Parrot is the
   live environment and is only read in tests.
 - **glibc 2.42** support is derived (the `_rtld_global` layout is taken from

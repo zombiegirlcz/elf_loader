@@ -1,5 +1,5 @@
 #define _GNU_SOURCE 1
-#define ELF_LOADER_VERSION "0.9.33"
+#define ELF_LOADER_VERSION "1.0.0"
 #include <stdio.h>
 #include <signal.h>
 #include "../include/elf_loader.h"
