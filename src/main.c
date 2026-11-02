@@ -1830,33 +1830,57 @@ static void *g_orig_getuid, *g_orig_geteuid, *g_orig_getgid, *g_orig_getegid,
 /* get*id ctou MUTOVATELNOU identitu (g_fr_*), ne nastavenou fake identitu:
  * po `seteuid(30015)` musi `geteuid()` vratit 30015, jinak apt/dpkg nepozna,
  * ze drop privilegii prosel (viz komentar u g_fr_ruid v fakeroot.h). */
+/* POZOR: g_orig_* se plni jen kdyz hook_install uspeje. glibc 2.41+ ma na
+ * techto funkcich BTI prolog (ins0=d503245f), takze hook_install je odmitne
+ * ("non-B-thunk") a g_orig_* zustane NULL. Drive to pro getuid "fungovalo"
+ * nahodou (NULL f -> return 0 = fake uid), ale getgroups vraci -1 a volajici
+ * (uutils id) na tom spadne: si_addr=4, x1=4.
+ * Namerene na Termux Ubuntu 26.04: `--ownall id -u` bez fakerootu 10299,
+ * s fakerootem SIGSEGV; `F2_SKIP=getgroups` to opravilo.
+ * Reseni: kdyz orig neni, jdeme pres raw syscall (BEZ bionickeho TLS). */
 static unsigned int shim_fr_getuid(void) { if (g_fakeroot_on) return g_fr_ruid;
-    unsigned int (*f)(void) = (unsigned int (*)(void))g_orig_getuid; return f ? f() : 0; }
+    unsigned int (*f)(void) = (unsigned int (*)(void))g_orig_getuid;
+    return f ? f() : (unsigned int)my_raw_syscall6(174, 0,0,0,0,0, ELF_SENTINEL); }
 /* elf_loader.c (auxv) potrebuje videt, jestli je fakeroot zapnuty. */
 int elf_fakeroot_active(void) { return g_fakeroot_on; }
 unsigned int elf_fakeroot_uid(void) { return g_fakeroot_uid; }
 unsigned int elf_fakeroot_gid(void) { return g_fakeroot_gid; }
 static unsigned int shim_fr_geteuid(void) { if (g_fakeroot_on) return g_fr_euid;
-    unsigned int (*f)(void) = (unsigned int (*)(void))g_orig_geteuid; return f ? f() : 0; }
+    unsigned int (*f)(void) = (unsigned int (*)(void))g_orig_geteuid;
+    return f ? f() : (unsigned int)my_raw_syscall6(175, 0,0,0,0,0, ELF_SENTINEL); }
 static unsigned int shim_fr_getgid(void) { if (g_fakeroot_on) return g_fr_rgid;
-    unsigned int (*f)(void) = (unsigned int (*)(void))g_orig_getgid; return f ? f() : 0; }
+    unsigned int (*f)(void) = (unsigned int (*)(void))g_orig_getgid;
+    return f ? f() : (unsigned int)my_raw_syscall6(176, 0,0,0,0,0, ELF_SENTINEL); }
 static unsigned int shim_fr_getegid(void) { if (g_fakeroot_on) return g_fr_egid;
-    unsigned int (*f)(void) = (unsigned int (*)(void))g_orig_getegid; return f ? f() : 0; }
+    unsigned int (*f)(void) = (unsigned int (*)(void))g_orig_getegid;
+    return f ? f() : (unsigned int)my_raw_syscall6(177, 0,0,0,0,0, ELF_SENTINEL); }
 static int shim_fr_getresuid(unsigned int *ru, unsigned int *eu, unsigned int *su) {
     int (*f)(unsigned int *, unsigned int *, unsigned int *) = g_orig_getresuid;
-    int r = f ? f(ru, eu, su) : -1;
+    int r = f ? f(ru, eu, su)
+              : (int)my_raw_syscall6(148, (long)(unsigned long)ru,
+                                     (long)(unsigned long)eu,
+                                     (long)(unsigned long)su, 0, 0, ELF_SENTINEL);
     if (r == 0 && g_fakeroot_on) { if (ru) *ru = g_fr_ruid; if (eu) *eu = g_fr_euid; if (su) *su = g_fr_suid; }
     return r;
 }
 static int shim_fr_getresgid(unsigned int *rg, unsigned int *eg, unsigned int *sg) {
     int (*f)(unsigned int *, unsigned int *, unsigned int *) = g_orig_getresgid;
-    int r = f ? f(rg, eg, sg) : -1;
+    int r = f ? f(rg, eg, sg)
+              : (int)my_raw_syscall6(150, (long)(unsigned long)rg,
+                                     (long)(unsigned long)eg,
+                                     (long)(unsigned long)sg, 0, 0, ELF_SENTINEL);
     if (r == 0 && g_fakeroot_on) { if (rg) *rg = g_fr_rgid; if (eg) *eg = g_fr_egid; if (sg) *sg = g_fr_sgid; }
     return r;
 }
 static int shim_fr_getgroups(int n, unsigned int *list) {
     int (*f)(int, unsigned int *) = g_orig_getgroups;
-    if (!g_fakeroot_on || !f) return f ? f(n, list) : -1;
+    if (!g_fakeroot_on || !f) {
+        if (f) return f(n, list);
+        /* glibc ma BTI prolog -> hook_install selhal -> g_orig_getgroups NULL.
+         * Drive se vracelo -1 a uutils `id` na tom spadl (si_addr=4). */
+        long rr = my_raw_syscall6(153, (long)n, (long)(unsigned long)list, 0,0,0, ELF_SENTINEL);
+        return (int)rr;
+    }
     /* Proot fake_id0 mapuje KAZDOU skupinu rovnou app gid na fake gid a
      * ostatni necha (namereno: proot -0 da groups=0,1077,3001,...,20323,
      * zatimco loader daval jen [0]). Pro paritu: zavolat orig a prepsat
@@ -4964,7 +4988,19 @@ static int run_ownall(const char *path, int argc, char **argv, char **envp) {
         for (int i = 0; envp && envp[i]; i++) {
             if (strncmp(envp[i], "PATH=", 5) != 0) continue;
             const char *cur = envp[i] + 5;
-            if (!strstr(cur, "/system/bin") && !strstr(cur, "/system/xbin"))
+            /* Dve situace, kdy hostovsky PATH nema v guestu co delat:
+             * 1. obsahuje /system/{bin,xbin} - guest by spustil Androidi
+             *    toybox mimo loader (zadny fakeroot, zadny preklad cest).
+             * 2. jsme v --proot-compat: host cesty jsou v guestu NEVIDITELNE
+             *    (izolace jako u prootu), takze PATH=/data/data/com.termux/
+             *    files/usr/bin je jen seznam neexistujicich cest a
+             *    `bash -c ls` skonci "command not found". Namerene na Termux
+             *    Ubuntu 26.04: PATH=[/data/data/com.termux/files/usr/bin].
+             * PATH poskladany lx/double-world tyhle znaky nema, takze
+             * zustava nedotceny. */
+            int has_host_bins = strstr(cur, "/system/bin") || strstr(cur, "/system/xbin");
+            int proot_compat = getenv("LX_PROOT_COMPAT") != NULL;
+            if (!has_host_bins && !proot_compat)
                 break;
             static char gpath[] =
                 "PATH=/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin";
