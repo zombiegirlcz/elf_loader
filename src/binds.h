@@ -299,14 +299,26 @@ static void bind_parse_spec(const char *spec) {
     size_t sl = strlen(spec);
     if (sl >= sizeof buf) return;
     memcpy(buf, spec, sl + 1);
-    char *colon = strchr(buf, ':');
-    if (!colon) return;
-    *colon = 0;
-    char *host = buf;
-    char *guest = colon + 1;
     int ro = 0;
-    char *c2 = strchr(guest, ':');
-    if (c2) { *c2 = 0; if (strcmp(c2 + 1, "ro") == 0) ro = 1; }
+    char *host, *guest;
+    char *colon = strchr(buf, ':');
+    if (!colon) {
+        /* Proot semantika: "-b /cesta" bez dvojtecky je IDENTITY bind
+         * (host i guest pod stejnym jmenem). Boot posila presne tenhle tvar
+         * pro /product, /system, /apex, /odm, /vendor, /system_ext,
+         * /data/app, /data/dalvik-cache, /linkerconfig/ld.config.txt -
+         * drive je tenhle parser TISE ZAHODIL, takze guest nevidel nic
+         * (namereno 2026-11-02: pod prootem /product mel obsah, pod
+         * loaderem --proot-compat prazdno). */
+        host = buf;
+        guest = buf;
+    } else {
+        *colon = 0;
+        host = buf;
+        guest = colon + 1;
+        char *c2 = strchr(guest, ':');
+        if (c2) { *c2 = 0; if (strcmp(c2 + 1, "ro") == 0) ro = 1; }
+    }
     bind_add(guest, host, ro);
 }
 
@@ -333,9 +345,19 @@ static void binds_load_file(void) {
 static void binds_load_env(void) {
     const char *env = getenv("LX_BINDS");
     if (!env || !env[0]) return;
-    char buf[2048];
+    /* Buffer musi pokryt to, co umi proot_compat_parse() sesbirat
+     * (binds_acc[4096]) - driv tu bylo 2048 a boot s ~34 bindy
+     * (1577 B, roste s NH_EXTRA_BINDS) se do nej jeste vesel, ale
+     * jakykoli dalsi bind by se TISE ZAHODIL cely (return bez parsovani).
+     * 8 KiB je strop jednoho env stringu v praxi; vyssi uz nema smysl. */
+    char buf[8192];
     size_t el = strlen(env);
-    if (el >= sizeof buf) return;
+    if (el >= sizeof buf) {
+        if (elf_debug())
+            fprintf(stderr, "[binds] LX_BINDS ma %zu B > %zu B -> ignoruji\n",
+                    el, sizeof buf - 1);
+        return;
+    }
     memcpy(buf, env, el + 1);
     char *tok = strtok(buf, ",");
     while (tok) { bind_parse_spec(tok); tok = strtok(NULL, ","); }

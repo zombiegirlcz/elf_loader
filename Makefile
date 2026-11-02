@@ -6,6 +6,8 @@ TARGET = elf_loader
 SRCS = src/main.c src/elf_loader.c src/ldso_tls.c src/timing.c src/cache.c src/imgcache.c src/entry.S src/l1_common.S
 OBJS = src/main.o src/elf_loader.o src/ldso_tls.o src/timing.o src/cache.o src/imgcache.o src/entry.o src/l1_common.o
 
+HOSTCC ?= gcc
+
 all: $(TARGET)
 
 $(TARGET): $(OBJS)
@@ -50,6 +52,20 @@ test: $(TARGET) test/hello test/ifunc test/mods/libmod.so test/use_mod
 	./$(TARGET) --shim test/hello 2>&1 | tail -3
 	@echo "== execute test/hello with lazy PLT binding =="
 	./$(TARGET) --lazy test/hello foo bar 2>&1 | tail -4
+
+# Host-only unit testy (zadne zarizeni, zadny rootfs): kompiluji se hostim
+# gcc/clang a testuji cistou logiku hlavicek (binds.h, proot_compat.h).
+# Bezi v CI i lokalne: `make test-host`.
+test-host:
+	@echo "== binds: bind_parse_spec (identity bind bez dvojtecky) =="
+	$(HOSTCC) -I./src -o /tmp/bps_test test/binds_parse_spec_test.c
+	/tmp/bps_test
+	@echo "== binds: bind_reverse pred/po g_binds_ready =="
+	$(HOSTCC) -I./src -o /tmp/bg_test test/binds_gready_test.c
+	/tmp/bg_test
+	@echo "== proot_compat: parser =="
+	$(HOSTCC) -I./src -o /tmp/pc_test test/proot_compat_test.c
+	/tmp/pc_test
 
 clean:
 	rm -f $(OBJS) $(TARGET) test/hello test/ifunc test/use_mod
