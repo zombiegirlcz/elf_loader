@@ -7386,3 +7386,65 @@ nechat tak. Bitovou shodu by dal 6řádkový knob `LX_FAKEROOT_MAP`.
 - Bind tabulka zůstává hostitelsky absolutní i po izolaci: `findmnt` pod
   loaderem ukáže `src` host cestu (`/tmp/mb2`), protože tak to dělá
   i proot (`/tmp/mb2`). Guest-absolutní je jen `guest` sloupec.
+
+## 2026-11-02 (2) — `-b /cesta` bez dvojtečky: proot to bere, my jsme to zahazovali
+
+Uživatel: „proot bežel pod loaderem bo sem ho vymenil tak bind /product byl
+prazdny ale jak vidi je normalne bind". Reprodukováno přes
+`su_daemon` → `boot` → nová session.
+
+### Root cause
+
+`boot` (`$FILES_DIR/usr/bin/boot`, funkce `build_binds`) skládá bindy takto:
+
+```
+_binds="-b /dev -b /proc -b /sys"
+… -b /apex -b /odm -b /product -b /system -b /system_ext -b /vendor
+… -b /data/app -b /data/dalvik-cache
+… -b /linkerconfig/ld.config.txt
+… -b $FILES_DIR/ipc:/run/host_ipc
+```
+
+Proot čte `-b SPEC` tak, že **spec bez dvojtečky je identity bind**
+(host i guest pod stejným jménem). Náš `bind_parse_spec` v `src/binds.h`
+měl `if (!colon) return;` — tedy každý takový spec tiše zahodil.
+Důsledek: pod skutečným prootem guest `/product` viděl, pod
+`elf_loader --proot-compat` ne.
+
+### A/B (tatáž binárka, jen knob)
+
+| příkaz | `ls /product` |
+|---|---|
+| starý loader `-b /product` | prázdno |
+| nový loader `-b /product` | 15 položek |
+| nový loader `-b /product` → `ls /product/bin` | `magisk`, `su`, `resetprop`, `magiskpolicy`, … |
+| nový + plná sada boot bindů | `/product` 15, `/system` 20, `/vendor` 20, `/system_ext` 10, `/odm` 2, `/apex` 1 |
+
+`[binds]` debug výstup potvrdil, že se bindy opravdu přidaly
+(`/product -> /product` v tabulce, `count=12`).
+
+### Fix
+
+`bind_parse_spec`: spec bez `:` → `host = guest = buf` (identity).
+Nic víc, žádná změna izolace ani fakerootu.
+
+### Test
+
+`test/binds_parse_spec_test.c` — host-only, 6 případů:
+identity `/product`, 8 identity bindů z bootu, remap `host:guest`,
+`ro` flag, prázdný/komentář/NULL, identity s `ro`.
+`Makefile: test-host` pouští tenhle + `binds_gready_test` +
+`proot_compat_test` (host gcc, žádné zařízení).
+
+### Vedlejší nález
+
+`binds_load_env()` měl `char buf[2048]`, ale `proot_compat_parse()` sbírá
+do `binds_acc[4096]`. Boot posílá ~1577 B (roste s `NH_EXTRA_BINDS`), takže
+se to zatím vešlo — ale každý další bind by shodil **celý** `LX_BINDS`
+tichým `return` bez parsování. Zvednuto na 8192 + `[binds]` stopa.
+
+### Poznámka k `ashell -c`
+
+`ashell -c 'ls /product'` **není** guest — je to nativní bionic shell
+(`readlink /proc/self/exe` → `/system/bin/toybox`) a vidí **host** mounty.
+Pro měření guest pohledu je potřeba `elf_loader --proot-compat … -- /bin/ls`.

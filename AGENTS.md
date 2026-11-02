@@ -487,6 +487,47 @@ Pro bitovou shodu by stačil 6řádkový knob `LX_FAKEROOT_MAP`; uživatel
 2026-11-02 rozhodl **nechat přesnější chování**.
 
 
+32. **`-b /cesta` bez dvojtečky je v prootu IDENTITY bind — náš parser ho
+   tiše zahazoval.** `bind_parse_spec` dělal `if (!colon) return;`, takže
+   každý spec bez `:` zmizel. A přesně takhle posílá bindy `boot`
+   (`build_binds` v `$FILES_DIR/usr/bin/boot`):
+
+   ```
+   -b /dev -b /proc -b /sys
+   -b /apex -b /odm -b /product -b /system -b /system_ext -b /vendor
+   -b /data/app -b /data/dalvik-cache
+   -b /linkerconfig/ld.config.txt
+   -b $FILES_DIR/ipc:/run/host_ipc      ← tenhle jediný má dvojtečku
+   ```
+
+   **Projev:** pod skutečným prootem guest vidí `/product` (proot si
+   `-b /product` přeloží sám), pod `elf_loader --proot-compat` je
+   `/product`, `/system`, `/vendor`, `/apex`, `/odm`, `/system_ext` prázdné.
+   Uživatel to reprodukoval přes `su_daemon` → `boot` → nová session
+   (2026-11-02). Není to rozdíl izolace ani fakerootu — je to parser.
+
+   **Fix (`e1dc124`):** spec bez dvojtečky = `host == guest`. Proot
+   semantika, nic víc. Ověřeno A/B na téže binárce:
+   ```
+   starý loader  -b /product → ls /product        → (prázdno)
+   nový   loader -b /product → ls /product        → 15 položek
+   nový   loader             → ls /product/bin    → magisk, su, resetprop, …
+   nový s plnou sadou boot bindu: /product 15, /system 20, /vendor 20,
+                                  /system_ext 10, /odm 2, /apex 1
+   ```
+
+   **Test:** `test/binds_parse_spec_test.c` (6 případů: identity, 8 identity
+   bindů z bootu, remap, `ro`, prázdný/komentář/NULL, identity+`ro`).
+   `make test-host` (host gcc, žádné zařízení) pouští tenhle + `binds_gready`
+   + `proot_compat`.
+
+   **Vedlejší nález téhož dne:** `binds_load_env` měl `char buf[2048]`,
+   kdežto `proot_compat_parse` sbírá do `binds_acc[4096]`. Boot posílá
+   ~1577 B, takže se to vešlo — ale jakýkoli další bind (např.
+   `NH_EXTRA_BINDS`) by shodil **celý** `LX_BINDS` tichým `return`.
+   Zvednuto na 8192 + `[binds]` stopa při překročení.
+
+
 ## Otevřené bugy
 
 - ~~**Statický glibc ELF v rootfs končí SIGSYS** (RC=159)~~ — **vyřešeno pod
