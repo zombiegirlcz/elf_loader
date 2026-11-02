@@ -228,8 +228,8 @@ as the Android app uid, and two things make a mid-session switch impossible:
 - the loader *own-loads* the guest binary instead of `execve`-ing it, which
   means the kernel never even sees the setuid bit.
 
-Measured: `su.orig <user> -c id` under the loader ends in
-`su.orig: System error`, PAM complains, and `getuid()` stays `10323`.
+Measured with the rootfs `su` (util-linux, plain `su <user> -c id`): it
+ends in `su: System error`, PAM complains, and `getuid()` stays `10323`.
 `setpriv --reuid=…` fails with `Operation not permitted`.
 
 What *does* work is choosing the identity up front:
