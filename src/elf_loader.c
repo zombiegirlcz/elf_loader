@@ -417,6 +417,14 @@ static Elf64_auxv_t ldso_auxv[64];
  * readlink(/proc/self/exe). Bez toho uutils coreutils (Ubuntu 26.04+)
  * spadne na "Security violation: Requested utility `elf_loader`". */
 static const char *g_elf_guest_exe;
+/* Auxv, jak ho polozilo jadro. main() ho preda pres elf_set_kernel_auxv().
+ * POZOR: nelze ho hledat za elf_init_envp - v --proot-compat je envp
+ * HEAPOVA kopie (proot_compat_main ji stavi calloc-em), takze "za polem
+ * envp" je heap garbage, ne auxv. Namerene: uutils coreutils pod
+ * --proot-compat padal na SIGSEGV v guest libc init (ldr x0,[x0]),
+ * protoze _dl_auxv dostal smeti (AT_PAGESZ/AT_PHDR). */
+static const void *g_kernel_auxv;
+void elf_set_kernel_auxv(const void *p) { g_kernel_auxv = p; }
 static int ldso_setup_done;
 
 /* Minimal glibc-shaped struct link_map for the main executable.  glibc reads
@@ -864,13 +872,19 @@ static void ldso_setup(void) {
 
     memset(ldso_auxv, 0, sizeof ldso_auxv);
     int n = 0;
-    if (elf_init_envp) {
-        char **e = elf_init_envp;
-        while (*e)
-            e++;
-        Elf64_auxv_t *av = (Elf64_auxv_t *)(e + 1);
-        for (; n < 62 && av[n].a_type != AT_NULL; n++)
-            ldso_auxv[n] = av[n];
+    {
+        /* PRVNE kernel auxv (presna adresa z main()), teprve pak scan za
+         * envp - a to jen kdyz envp je stale ta kernelova oblast. */
+        const Elf64_auxv_t *av = (const Elf64_auxv_t *)g_kernel_auxv;
+        if (!av && elf_init_envp) {
+            char **e = elf_init_envp;
+            while (*e)
+                e++;
+            av = (const Elf64_auxv_t *)(e + 1);
+        }
+        if (av)
+            for (; n < 62 && av[n].a_type != AT_NULL; n++)
+                ldso_auxv[n] = av[n];
         ldso_auxv[n].a_type = AT_NULL;
         ldso_auxv[n].a_un.a_val = 0;
         /* AT_EXECFN ukazuje na LOADER (skutecny obraz procesu), ale guest

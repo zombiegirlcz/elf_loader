@@ -6720,12 +6720,19 @@ int main(int argc, char **argv, char **envp) {
         while (ae[ag] && ag < 65536) ag++;
         if (ae[ag]) g_auxv = (unsigned long *)(void *)(ae + ag + 1);
     }
+    /* TED je envp jeste kernelove pole, takze g_auxv je presna adresa auxv.
+     * ldso_setup() z nej plni _dl_auxv (getauxval). V --proot-compat si
+     * proot_compat_main envp prekopira na heap, takze pozdejsi scan za envp
+     * cte heap garbage - namerene: uutils coreutils padal na SIGSEGV v guest
+     * libc init. */
     if (argc > 0 && argv[0]) {
         char *e = argv[0];
         int i = 0;
         for (; i < argc && argv[i] == e; i++) e += strlen(argv[i]) + 1;
         if (i == argc) { g_karg_start = argv[0]; g_karg_end = e; }
     }
+    elf_set_kernel_auxv(g_auxv);
+
     /* ELF_DEBUG → unbuffered stdout, ať trace při SIGSEGV nekončí v bufferu */
     if (getenv("ELF_DEBUG"))
         setvbuf(stdout, NULL, _IONBF, 0);
