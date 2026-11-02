@@ -1838,55 +1838,64 @@ static void *g_orig_getuid, *g_orig_geteuid, *g_orig_getgid, *g_orig_getegid,
  * Namerene na Termux Ubuntu 26.04: `--ownall id -u` bez fakerootu 10299,
  * s fakerootem SIGSEGV; `F2_SKIP=getgroups` to opravilo.
  * Reseni: kdyz orig neni, jdeme pres raw syscall (BEZ bionickeho TLS). */
-static unsigned int shim_fr_getuid(void) { if (g_fakeroot_on) return g_fr_ruid;
-    unsigned int (*f)(void) = (unsigned int (*)(void))g_orig_getuid;
-    return f ? f() : (unsigned int)my_raw_syscall6(174, 0,0,0,0,0, ELF_SENTINEL); }
+/* Identity shimy jdou VZDY pres raw syscall, nikdy pres g_orig_*.
+ *
+ * Duvod (namereno 2026-11-02, Termux Ubuntu 26.04, uutils coreutils):
+ * g_orig_* se plni jen kdyz hook_install uspeje; glibc 2.41+ ma na techto
+ * funkcich BTI prolog (ins0=d503245f), takze hook_install je odmitne a
+ * g_orig_getgroups zustal NULL -> shim vratil -1 -> uutils `id` spadl na
+ * SIGSEGV (si_addr=4, x1=4). U getuid to "fungovalo" nahodou (NULL -> 0).
+ * Raw syscall zadny bionicky TLS nepotrebuje (past c. 1) a je to presne to,
+ * co dela proot ve fake_id0 - vcetne mapovani app gid -> fake gid. */
+static long fr_raw(long nr, long a0, long a1, long a2) {
+    /* POZOR: bezi pod guest TP -> zadny bionicky getenv/fprintf (past c. 1). */
+    return my_raw_syscall6(nr, a0, a1, a2, 0, 0, ELF_SENTINEL);
+}
+static unsigned int shim_fr_getuid(void) {
+    if (g_fakeroot_on) return g_fr_ruid;
+    return (unsigned int)fr_raw(174, 0, 0, 0);
+}
 /* elf_loader.c (auxv) potrebuje videt, jestli je fakeroot zapnuty. */
 int elf_fakeroot_active(void) { return g_fakeroot_on; }
 unsigned int elf_fakeroot_uid(void) { return g_fakeroot_uid; }
 unsigned int elf_fakeroot_gid(void) { return g_fakeroot_gid; }
-static unsigned int shim_fr_geteuid(void) { if (g_fakeroot_on) return g_fr_euid;
-    unsigned int (*f)(void) = (unsigned int (*)(void))g_orig_geteuid;
-    return f ? f() : (unsigned int)my_raw_syscall6(175, 0,0,0,0,0, ELF_SENTINEL); }
-static unsigned int shim_fr_getgid(void) { if (g_fakeroot_on) return g_fr_rgid;
-    unsigned int (*f)(void) = (unsigned int (*)(void))g_orig_getgid;
-    return f ? f() : (unsigned int)my_raw_syscall6(176, 0,0,0,0,0, ELF_SENTINEL); }
-static unsigned int shim_fr_getegid(void) { if (g_fakeroot_on) return g_fr_egid;
-    unsigned int (*f)(void) = (unsigned int (*)(void))g_orig_getegid;
-    return f ? f() : (unsigned int)my_raw_syscall6(177, 0,0,0,0,0, ELF_SENTINEL); }
+static unsigned int shim_fr_geteuid(void) {
+    if (g_fakeroot_on) return g_fr_euid;
+    return (unsigned int)fr_raw(175, 0, 0, 0);
+}
+static unsigned int shim_fr_getgid(void) {
+    if (g_fakeroot_on) return g_fr_rgid;
+    return (unsigned int)fr_raw(176, 0, 0, 0);
+}
+static unsigned int shim_fr_getegid(void) {
+    if (g_fakeroot_on) return g_fr_egid;
+    return (unsigned int)fr_raw(177, 0, 0, 0);
+}
 static int shim_fr_getresuid(unsigned int *ru, unsigned int *eu, unsigned int *su) {
-    int (*f)(unsigned int *, unsigned int *, unsigned int *) = g_orig_getresuid;
-    int r = f ? f(ru, eu, su)
-              : (int)my_raw_syscall6(148, (long)(unsigned long)ru,
-                                     (long)(unsigned long)eu,
-                                     (long)(unsigned long)su, 0, 0, ELF_SENTINEL);
-    if (r == 0 && g_fakeroot_on) { if (ru) *ru = g_fr_ruid; if (eu) *eu = g_fr_euid; if (su) *su = g_fr_suid; }
+    int r = (int)fr_raw(148, (long)(unsigned long)ru, (long)(unsigned long)eu,
+                        (long)(unsigned long)su);
+    if (r == 0 && g_fakeroot_on) {
+        if (ru) *ru = g_fr_ruid;
+        if (eu) *eu = g_fr_euid;
+        if (su) *su = g_fr_suid;
+    }
     return r;
 }
 static int shim_fr_getresgid(unsigned int *rg, unsigned int *eg, unsigned int *sg) {
-    int (*f)(unsigned int *, unsigned int *, unsigned int *) = g_orig_getresgid;
-    int r = f ? f(rg, eg, sg)
-              : (int)my_raw_syscall6(150, (long)(unsigned long)rg,
-                                     (long)(unsigned long)eg,
-                                     (long)(unsigned long)sg, 0, 0, ELF_SENTINEL);
-    if (r == 0 && g_fakeroot_on) { if (rg) *rg = g_fr_rgid; if (eg) *eg = g_fr_egid; if (sg) *sg = g_fr_sgid; }
+    int r = (int)fr_raw(150, (long)(unsigned long)rg, (long)(unsigned long)eg,
+                        (long)(unsigned long)sg);
+    if (r == 0 && g_fakeroot_on) {
+        if (rg) *rg = g_fr_rgid;
+        if (eg) *eg = g_fr_egid;
+        if (sg) *sg = g_fr_sgid;
+    }
     return r;
 }
 static int shim_fr_getgroups(int n, unsigned int *list) {
-    int (*f)(int, unsigned int *) = g_orig_getgroups;
-    if (!g_fakeroot_on || !f) {
-        if (f) return f(n, list);
-        /* glibc ma BTI prolog -> hook_install selhal -> g_orig_getgroups NULL.
-         * Drive se vracelo -1 a uutils `id` na tom spadl (si_addr=4). */
-        long rr = my_raw_syscall6(153, (long)n, (long)(unsigned long)list, 0,0,0, ELF_SENTINEL);
-        return (int)rr;
-    }
-    /* Proot fake_id0 mapuje KAZDOU skupinu rovnou app gid na fake gid a
-     * ostatni necha (namereno: proot -0 da groups=0,1077,3001,...,20323,
-     * zatimco loader daval jen [0]). Pro paritu: zavolat orig a prepsat
-     * app gid -> fake gid; n==0 (dotaz na pocet) vrati skutecny pocet. */
-    int r = f(n, list);
-    if (r > 0 && list)
+    int r = (int)fr_raw(158, (long)n, (long)(unsigned long)list, 0);
+    /* Proot fake_id0 mapuje kazdou skupinu rovnou app gid na fake gid a
+     * ostatni necha (proot -0: groups=0,1077,3001,...). */
+    if (r > 0 && list && g_fakeroot_on)
         for (int i = 0; i < r; i++)
             if (list[i] == g_fakeroot_app_gid) list[i] = g_fakeroot_gid;
     return r;
