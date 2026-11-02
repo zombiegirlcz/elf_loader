@@ -1919,9 +1919,10 @@ static int shim_fr_getgroups(int n, unsigned int *list) {
     long rr = fr_raw(158, (long)n, (long)(unsigned long)list, 0);
     if (g_gg_dbg) gg_put("[GG raw] rr,n=", rr, n);
     if (rr < 0) {
-        /* raw syscall vraci -errno; glibc konvence je -1 + errno. */
-        extern int *__errno_location(void);
-        *__errno_location() = (int)-rr;
+        /* raw syscall vraci -errno; glibc konvence je -1 + errno.
+         * __errno_location NEEXISTUJE pod bionickym NDK buildem - pouzivame
+         * vlastni shim_guest_errno_set (bezi pod guest TP, zadny TLS). */
+        shim_guest_errno_set((int)-rr);
         return -1;
     }
     int r = (int)rr;
