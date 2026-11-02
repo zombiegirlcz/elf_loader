@@ -4773,16 +4773,23 @@ static int run_own(const char *path, const char *mod, int argc, char **argv,
     return ret;
 }
 
-/* AT_EXECFN v auxv ukazuje na LOADER (to je skutecny obraz procesu), ne na
- * guest binarku. uutils coreutils (Ubuntu 26.04+) z nej odvozuje jmeno utility
- * a jinak spadne na "Security violation: Requested utility `elf_loader` does
+/* AT_EXECFN v auxv ukazuje na LOADER (skutecny obraz procesu), ne na guest
+ * binarku. uutils coreutils (Ubuntu 26.04+) z nej odvozuje jmeno utility a
+ * jinak spadne na "Security violation: Requested utility `elf_loader` does
  * not match executable name". /proc/self/exe uz resi jmenne hooky + L2
  * (elf_set_guest_exe), ale AT_EXECFN je jen v auxv na zasobniku.
  *
+ * POZOR: envp, ktery dostane run_ownall, muze byt PREBUDOVANY (proot-compat,
+ * ELF_LOADER_PRELOAD) a pak auxv za nim NENI. Proto hledame auxv podle
+ * KERNELOVEHO envp pole (g_kenvp, ulozeno v main()) a podle konce retezcu
+ * na zasobniku (argv/env strings lezi za sebou, pak zarovnani a auxv).
+ *
  * Prepisujeme na GUEST cestu (bez $ROOTFS prefixu), aby guest nevidel host
  * cestu. Basename zustava stejny jako u spustene binarky. */
-static void patch_at_execfn(char **envp, const char *hostpath) {
-    if (!envp || !hostpath || !hostpath[0]) return;
+static char **g_kenvp = NULL;             /* kernel envp pole (main) */
+
+static void patch_at_execfn(const char *hostpath) {
+    if (!hostpath || !hostpath[0]) return;
     const char *guest = hostpath;
     if (g_shim_root && g_shim_root[0]) {
         size_t rl = shim_strlen(g_shim_root);
@@ -4790,17 +4797,34 @@ static void patch_at_execfn(char **envp, const char *hostpath) {
             (hostpath[rl] == '/' || hostpath[rl] == 0))
             guest = hostpath[rl] ? hostpath + rl : "/";
     }
-    char **e = envp;
+    /* 1) primo: auxv hned za kernelovym envp (bezpecne jen kdyz envp neni
+     *    prebudovany - poznáme to podle toho, ze prvni string lezi na
+     *    zasobniku za g_karg_end). */
+    char **ke = g_kenvp;
+    if (!ke) return;
     unsigned guard = 0;
-    while (*e && guard++ < 65536) e++;
-    if (!*e) return;
-    unsigned long *av = (unsigned long *)(void *)(e + 1);
-    for (int i = 0; i < 512; i++) {
-        if (av[i * 2] == 0) break;                 /* AT_NULL */
-        if (av[i * 2] == 31 /* AT_EXECFN */) {
+    while (ke[guard] && guard < 65536) guard++;
+    if (!ke[guard]) return;
+    /* koncova adresa env retezcu: maximum z (char*)ke[i] + strlen + 1 */
+    unsigned long end = 0;
+    if (g_karg_end) end = (unsigned long)(void *)g_karg_end;
+    for (unsigned k = 0; k < guard; k++) {
+        unsigned long a = (unsigned long)(void *)ke[k];
+        unsigned long b = a + shim_strlen(ke[k]) + 1;
+        if (b > end) end = b;
+    }
+    if (!end) return;
+    /* 16B zarovnani (kernel na aarch64 uklada auxv 16B zarovnane) */
+    end = (end + 15UL) & ~15UL;
+    unsigned long *av = (unsigned long *)end;
+    for (int i = 0; i < 256; i++) {
+        unsigned long t = av[i * 2], v = av[i * 2 + 1];
+        if (t == 0) return;                     /* AT_NULL = konec */
+        if (t == 31 /* AT_EXECFN */ && v) {
             av[i * 2 + 1] = (unsigned long)(void *)guest;
             return;
         }
+        if (t > 60) return;                     /* nesmysl -> netrefili jsme se */
     }
 }
 
@@ -5121,7 +5145,7 @@ static int run_ownall(const char *path, int argc, char **argv, char **envp) {
     /* AT_EXECFN v auxv ukazuje na LOADER -> uutils coreutils z nej odvodi
      * jmeno "elf_loader" a spadne na "Security violation". Prepis na guest
      * cestu (proot to ma spravne, jadro tam execuje guest binarku). */
-    patch_at_execfn(envp, g_guest_exe_path);
+    patch_at_execfn(g_guest_exe_path);
     /* L2 (prompt 05): PIE guest exe presun do pevneho okna, aby jeho text-range
      * nekolidoval s ASLR pozdeji forknute host binarky. Flag plati jen pro exe,
      * zavislosti (libc/ld.so) resi L1. */
@@ -6706,6 +6730,7 @@ int main(int argc, char **argv, char **envp) {
     /* Kernelova oblast argv (arg_start..arg_end) pro procvirt_rewrite_argarea:
      * hranice ted, nez se na argv sahne (guest argv je tataz pole). Jen kdyz
      * jsou retezce souvisle za sebou, jak je jadro polozilo. */
+    g_kenvp = envp;                    /* pro patch_at_execfn (auxv hned za nim) */
     if (argc > 0 && argv[0]) {
         char *e = argv[0];
         int i = 0;
