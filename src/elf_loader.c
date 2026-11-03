@@ -5173,12 +5173,20 @@ static void install_legacy_syscall_filter_impl(void) {
         BPF_JUMP(BPF_JMP | BPF_JGE | BPF_K, 424, 0, 1);
     prog[n++] = (struct sock_filter)
         BPF_STMT(BPF_RET | BPF_K, SECCOMP_RET_ERRNO | ENOSYS);
-    /* Dalsi casto TRAPovane: statx=291, membarrier=283, userfaultfd=282.
+    /* Dalsi casto TRAPovane: membarrier=283, userfaultfd=282.
      * POZOR 1: getrandom(278) ZAMERNE NEblokujeme - node/OpenSSL CSPRNG.
      * POZOR 2: pkey_* (285-289) NEblokujeme - V8 je pouziva pro write-protect
      * code memory / cage page mprotect (pkey_mprotect=288). S ENOSYS zustanou
-     * cage stranky r--p a V8 do nich zapise -> SIGSEGV v InterpreterEntry. */
-    static const int blocked2[] = { 282, 283, 291 };
+     * cage stranky r--p a V8 do nich zapise -> SIGSEGV v InterpreterEntry.
+     * statx=291 ZDE ZAMERNE NENI (2026-11-03, Bun/claude CLI ENOSYS na
+     * active_config): RET_ERRNO ma v seccomp prioritu PRED RET_TRAP i mezi
+     * nezavislymi stackovanymi filtry, takze tahle ENOSYS mapa by statx
+     * prebila jeste pred tim, nez by TRAP dostal sanci (L2/go_handle i
+     * Androidi profil, oba vraceji TRAP pro 291). Bun na ENOSYS fallback
+     * na fstatat nema (na rozdil od glibc stat()) -> rovnou nahlasi chybu.
+     * Misto toho TRAPujeme a prelozime v sigsys_handler (nr==291 nize),
+     * stejny princip jako u openat2(437). */
+    static const int blocked2[] = { 282, 283 };
     for (size_t i = 0; i < sizeof(blocked2) / sizeof(blocked2[0]); i++) {
         prog[n++] = (struct sock_filter)
             BPF_JUMP(BPF_JMP | BPF_JEQ | BPF_K, blocked2[i], 0, 1);
@@ -6663,6 +6671,24 @@ NOSP static void sigsys_handler(int sig, siginfo_t *si, void *uc) {
         const char *use = orig;
         if (orig && orig[0] == '/') { f2_translate(orig, tr, sizeof tr); use = tr; }
         long r = raw_syscall6(56, dirfd, (long)(unsigned long)use, flags, mode, 0,
+                              (long)F2_SENTINEL);
+        ctx->uc_mcontext.regs[0] = r;
+        return;
+    }
+    /* statx(291): viz komentar u blocked2[] vyse - RET_ERRNO by prebilo
+     * TRAP i pod L2, takze preklad musi byt tady (stejny princip jako
+     * openat2). statx(int dirfd, const char *path, int flags,
+     * unsigned mask, struct statx *buf). */
+    if (nr == 291 && g_f2_root) {
+        const char *orig = (const char *)(unsigned long)ctx->uc_mcontext.regs[1];
+        long dirfd = (long)ctx->uc_mcontext.regs[0];
+        long flags = (long)ctx->uc_mcontext.regs[2];
+        long mask  = (long)ctx->uc_mcontext.regs[3];
+        long buf   = (long)ctx->uc_mcontext.regs[4];
+        char tr[4096];
+        const char *use = orig;
+        if (orig && orig[0] == '/') { f2_translate(orig, tr, sizeof tr); use = tr; }
+        long r = raw_syscall6(291, dirfd, (long)(unsigned long)use, flags, mask, buf,
                               (long)F2_SENTINEL);
         ctx->uc_mcontext.regs[0] = r;
         return;
