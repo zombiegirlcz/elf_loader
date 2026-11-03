@@ -1303,6 +1303,20 @@ static int shim_open(const char *p, int flags, ...) {
  * dereferencovalo bionic errno/TLS -> NULL. Pouzivame jen ciste operace
  * (strlen/strncmp/snprintf jsou bez TLS) a vysledek volame pres shim_real,
  * coz je parrot glibc funkce (bezi ve spravnem glibc TLS kontextu). */
+/* DOCASNA DIAGNOSTIKA (2026-11-03, openat/-100 bug): raw write na fd=2. */
+static void shim_diag(const char *tag, const char *p, long v) {
+    char b[220]; int i = 0;
+    const char *pre = "[SH] "; for (const char *q = pre; *q; q++) b[i++] = *q;
+    for (const char *q = tag; *q; q++) b[i++] = *q;
+    b[i++] = ' '; b[i++] = 'p'; b[i++] = '=';
+    if (p) { int n = 0; for (const char *q = p; *q && n < 100; q++, n++) b[i++] = *q; }
+    else { b[i++] = '0'; }
+    b[i++] = ' '; b[i++] = 'v'; b[i++] = '=';
+    static const char hx[] = "0123456789abcdef";
+    for (int sh = 60; sh >= 0; sh -= 4) b[i++] = hx[((unsigned long)v >> sh) & 0xf];
+    b[i++] = '\n';
+    shim_raw_syscall6(64, 2, (long)(unsigned long)b, i, 0, 0, 0);
+}
 static int shim_open64(const char *p, int flags, ...) {
     SHIM_PROC_OPEN(p, flags);
     if (shim_open_is_write(flags) && shim_rofail(p)) return -1;
@@ -1312,7 +1326,10 @@ static int shim_open64(const char *p, int flags, ...) {
     if (shim_resolve_symlinks(path, resolved, sizeof(resolved))) path = resolved;
     va_list ap; va_start(ap, flags); mode_t mode = va_arg(ap, mode_t); va_end(ap);
     fp_open f = (fp_open)g_orig_open64;
-    return f ? f(path, flags, mode) : -1;
+    shim_diag("open64-tr", path, (long)(g_orig_open64 != NULL));
+    int rc = f ? f(path, flags, mode) : -1;
+    shim_diag("open64-rc", path, (long)rc);
+    return rc;
 }
 static int shim_openat(int dfd, const char *p, int flags, ...) {
     SHIM_PROC_OPEN(p, flags);
@@ -1325,7 +1342,10 @@ static int shim_openat(int dfd, const char *p, int flags, ...) {
     }
     va_list ap; va_start(ap, flags); mode_t mode = va_arg(ap, mode_t); va_end(ap);
     fp_openat f = (fp_openat)g_orig_openat;
-    return f ? f(dfd, path, flags, mode) : -1;
+    shim_diag("openat-tr", path, (long)dfd);
+    int rc = f ? f(dfd, path, flags, mode) : -1;
+    shim_diag("openat-rc", path, (long)rc);
+    return rc;
 }
 static int shim_openat64(int dfd, const char *p, int flags, ...) {
     SHIM_PROC_OPEN(p, flags);
@@ -1338,7 +1358,10 @@ static int shim_openat64(int dfd, const char *p, int flags, ...) {
     }
     va_list ap; va_start(ap, flags); mode_t mode = va_arg(ap, mode_t); va_end(ap);
     fp_openat f = (fp_openat)g_orig_openat64;
-    return f ? f(dfd, path, flags, mode) : -1;
+    shim_diag("openat64-tr", path, (long)dfd);
+    int rc = f ? f(dfd, path, flags, mode) : -1;
+    shim_diag("openat64-rc", path, (long)rc);
+    return rc;
 }
 
 typedef int (*fp_stat)(const char *, struct stat *);
