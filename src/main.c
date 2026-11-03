@@ -1303,6 +1303,44 @@ static int shim_open(const char *p, int flags, ...) {
  * dereferencovalo bionic errno/TLS -> NULL. Pouzivame jen ciste operace
  * (strlen/strncmp/snprintf jsou bez TLS) a vysledek volame pres shim_real,
  * coz je parrot glibc funkce (bezi ve spravnem glibc TLS kontextu). */
+/* DIAG (gatovano ELF_LOADER_TLS_TRACE, bezpecne pro bezny provoz):
+ * zjistuje, jestli volani s "active_config" v ceste prochazi jmennymi
+ * hooky (shim_open64/openat/openat64) a s jakym rc/errno. */
+static int g_diag_ac_on = -1;
+static void shim_diag_ac(const char *tag, const char *orig, const char *path, int rc) {
+    if (g_diag_ac_on < 0)
+        g_diag_ac_on = getenv("ELF_LOADER_TLS_TRACE") ? 1 : 0;
+    if (!g_diag_ac_on || !orig) return;
+    int match = 0;
+    for (const char *q = orig; *q; q++) if (!strncmp(q, "active_config", 13)) { match = 1; break; }
+    if (!match) return;
+    char b[512]; int i = 0;
+    const char *m = tag; while (*m) b[i++] = *m++;
+    m = " orig="; while (*m) b[i++] = *m++;
+    for (const char *q = orig; *q && i < 300; q++) b[i++] = *q;
+    m = " path="; while (*m) b[i++] = *m++;
+    for (const char *q = path; q && *q && i < 400; q++) b[i++] = *q;
+    m = " rc="; while (*m) b[i++] = *m++;
+    int neg = rc < 0; unsigned v = (unsigned)(neg ? -rc : rc);
+    if (neg) b[i++] = '-';
+    char t[12]; int ti = 0;
+    if (v == 0) t[ti++] = '0';
+    while (v > 0) { t[ti++] = (char)('0' + v % 10); v /= 10; }
+    while (ti > 0) b[i++] = t[--ti];
+    m = " errno="; while (*m) b[i++] = *m++;
+    int e = errno; if (e < 0) e = -e;
+    if (e == 0) b[i++] = '0';
+    ti = 0;
+    while (e > 0) { t[ti++] = (char)('0' + e % 10); e /= 10; }
+    while (ti > 0) b[i++] = t[--ti];
+    b[i++] = '\n';
+    long fd = my_raw_syscall6(56, -100, (long)(unsigned long)diag_path_main(),
+                              0x441L, 0644L, 0, ELF_SENTINEL);
+    if (fd >= 0) {
+        my_raw_syscall6(64, fd, (long)(unsigned long)b, i, 0, 0, ELF_SENTINEL);
+        my_raw_syscall6(57, fd, 0, 0, 0, 0, ELF_SENTINEL);
+    }
+}
 static int shim_open64(const char *p, int flags, ...) {
     SHIM_PROC_OPEN(p, flags);
     if (shim_open_is_write(flags) && shim_rofail(p)) return -1;
@@ -1313,6 +1351,7 @@ static int shim_open64(const char *p, int flags, ...) {
     va_list ap; va_start(ap, flags); mode_t mode = va_arg(ap, mode_t); va_end(ap);
     fp_open f = (fp_open)g_orig_open64;
     int rc = f ? f(path, flags, mode) : -1;
+    shim_diag_ac("[open64]", p, path, rc);
     return rc;
 }
 static int shim_openat(int dfd, const char *p, int flags, ...) {
@@ -1327,6 +1366,7 @@ static int shim_openat(int dfd, const char *p, int flags, ...) {
     va_list ap; va_start(ap, flags); mode_t mode = va_arg(ap, mode_t); va_end(ap);
     fp_openat f = (fp_openat)g_orig_openat;
     int rc = f ? f(dfd, path, flags, mode) : -1;
+    shim_diag_ac("[openat]", p, path, rc);
     return rc;
 }
 static int shim_openat64(int dfd, const char *p, int flags, ...) {
@@ -1341,6 +1381,7 @@ static int shim_openat64(int dfd, const char *p, int flags, ...) {
     va_list ap; va_start(ap, flags); mode_t mode = va_arg(ap, mode_t); va_end(ap);
     fp_openat f = (fp_openat)g_orig_openat64;
     int rc = f ? f(dfd, path, flags, mode) : -1;
+    shim_diag_ac("[openat64]", p, path, rc);
     return rc;
 }
 
