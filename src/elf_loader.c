@@ -6582,6 +6582,10 @@ int elf_go_mode_setup(elf_object_t *m) {
 
 NOSP static void sigsys_handler(int sig, siginfo_t *si, void *uc) {
     (void)sig;
+    gh_diag_hex("SH-ENTRY-nr", si->si_syscall);
+    gh_diag_hex("SH-ENTRY-pc", (long)((ucontext_t *)uc)->uc_mcontext.pc);
+    gh_diag_hex("SH-ENTRY-golo", (long)g_go_lo);
+    gh_diag_hex("SH-ENTRY-gohi", (long)g_go_hi);
     /* Go mod / L2: syscall z text segmentu guest exe (pc uz ukazuje za svc).
      * Oba nastavuji g_go_lo/g_go_hi a sdili go_handle. */
     if (g_go_hi) {
