@@ -6141,8 +6141,10 @@ NOSP static int go_exists(const char *p) {
                         0, (long)F2_SENTINEL) == 0;
 }
 
+static void gh_diag_str(const char *tag, const char *s);
 /* in (guest cesta) -> out. Vraci 1, kdyz se cesta prelozila do ROOTFS. */
 NOSP static int go_translate(const char *in, char *out, size_t outsz) {
+    gh_diag_str("GT-root", g_f2_root ? g_f2_root : "(NULL)");
     if (!in || in[0] != '/' || !g_f2_root) { f2_scpy(out, in ? in : ""); return 0; }
     size_t rl = f2_slen(g_f2_root);
     if (f2_sncmp(in, g_f2_root, rl) == 0 && (in[rl] == '/' || in[rl] == 0)) {
