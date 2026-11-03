@@ -5244,6 +5244,16 @@ static int run_ownall(const char *path, int argc, char **argv, char **envp) {
      * instaluje filtr ono a Go mod se preskoci. Go binarky volaji syscally
      * napric (mimo PLT overridy) -> preklad omezeny na jejich text segment.
      * ELF_LOADER_GOMODE=0 vypne Go mod, ELF_LOADER_L2=1 zapne L2. */
+    {
+        char db[256]; int di = 0;
+        const char *m1 = "[L2SETUP] root="; for (const char *q=m1;*q;q++) db[di++]=*q;
+        const char *rv = (g_shim_root && g_shim_root[0]) ? g_shim_root : "(NULL)";
+        for (const char *q=rv;*q && di<200;q++) db[di++]=*q;
+        const char *m2 = " l2="; for (const char *q=m2;*q;q++) db[di++]=*q;
+        db[di++] = elf_l2_enabled() ? '1' : '0';
+        db[di++] = '\n';
+        write(2, db, di);
+    }
     if (g_shim_root && g_shim_root[0]) {
         f2_set_root(g_shim_root);
         f2_set_loader(g_shim_loader);
