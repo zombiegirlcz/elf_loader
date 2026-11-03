@@ -6232,31 +6232,23 @@ NOSP static long go_execve(const char *p, char *const *argv, char *const *envp) 
  * jedna radka hex, bezpecne pod guest TP (jen raw_syscall6, zadne getenv). */
 static void gh_diag_hex(const char *tag, long v) {
     char b[64]; int i = 0;
+    const char *pre = "[GH] "; for (const char *q = pre; *q; q++) b[i++] = *q;
     for (const char *q = tag; *q; q++) b[i++] = *q;
     b[i++] = '=';
     static const char hx[] = "0123456789abcdef";
     for (int sh = 60; sh >= 0; sh -= 4) b[i++] = hx[((unsigned long)v >> sh) & 0xf];
     b[i++] = '\n';
-    int fd = (int)raw_syscall6(56, (long)0xFFFFFFFFFFFFFF9CL,
-        (long)(unsigned long)diag_path(), 0x441L, 0644L, 0, (long)F2_SENTINEL);
-    if (fd >= 0) {
-        raw_syscall6(64, fd, (long)(unsigned long)b, i, 0, 0, (long)F2_SENTINEL);
-        raw_syscall6(57, fd, 0, 0, 0, 0, (long)F2_SENTINEL);
-    }
+    raw_syscall6(64, 2, (long)(unsigned long)b, i, 0, 0, (long)F2_SENTINEL);
 }
 static void gh_diag_str(const char *tag, const char *s) {
     char b[160]; int i = 0;
+    const char *pre = "[GH] "; for (const char *q = pre; *q; q++) b[i++] = *q;
     for (const char *q = tag; *q; q++) b[i++] = *q;
     b[i++] = '=';
     if (s) { int n = 0; for (const char *q = s; *q && n < 100; q++, n++) b[i++] = *q; }
     else { b[i++] = '('; b[i++] = 'n'; b[i++] = 'u'; b[i++] = 'l'; b[i++] = 'l'; b[i++] = ')'; }
     b[i++] = '\n';
-    int fd = (int)raw_syscall6(56, (long)0xFFFFFFFFFFFFFF9CL,
-        (long)(unsigned long)diag_path(), 0x441L, 0644L, 0, (long)F2_SENTINEL);
-    if (fd >= 0) {
-        raw_syscall6(64, fd, (long)(unsigned long)b, i, 0, 0, (long)F2_SENTINEL);
-        raw_syscall6(57, fd, 0, 0, 0, 0, (long)F2_SENTINEL);
-    }
+    raw_syscall6(64, 2, (long)(unsigned long)b, i, 0, 0, (long)F2_SENTINEL);
 }
 
 NOSP static int go_handle(long nr, ucontext_t *ctx) {
