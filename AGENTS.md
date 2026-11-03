@@ -584,6 +584,51 @@ Pro bitovou shodu by stačil 6řádkový knob `LX_FAKEROOT_MAP`; uživatel
 
 ## Otevřené bugy
 
+- **Bun/Claude Code pod `ELF_LOADER_L2=1`: `ENOSYS: function not implemented,
+  open '/root/.config/anthropic/active_config'`.** Jen s `ELF_LOADER_L2=1`
+  (fakeroot není potřeba). Bez L2 stejný `claude -p` dojde o kus dál (jiná,
+  očekávaná chyba — trust dialog, pak `ENOENT` na `/tmp/claude-<uid>`), tedy
+  L2 je prokazatelně relevantní, ale přesný mechanismus **se nepodařilo
+  zachytit** 2026-11-03 přes 8 cílených hypotéz a nasazení (každé ověřené
+  hashem binárky): nepodmíněná i gatovaná (`ELF_LOADER_TLS_TRACE`)
+  diagnostika na **úplném vstupu** `sigsys_handler` (před `go_handle`
+  dispatchem), uvnitř `go_handle` case 56 (před i po `go_translate`+reálném
+  syscallu), v named-hookách `shim_openat`/`shim_openat64`/`shim_open64` —
+  **nikdy ani jednou nenaběhly**, a to i pro cesty (`managed-settings.d`),
+  o kterých `strace -f` ve stejném běhu potvrzuje reálné kernelové
+  `SIGSYS`/`SECCOMP` trapy a úspěšný překlad. Zároveň: **přímý běh (bez
+  `strace`)** padá na tuto hlášku téměř okamžitě (7 řádků LDSO/TLSRES
+  diagnostiky a konec), kdežto **pod `strace -f`** proběhnou tisíce
+  syscallů (desítky úspěšných překladů) než se dojde ke stejné hlášce —
+  silná indicie, že přímý běh se vůbec nedostane tak daleko jako běh pod
+  stracem, a že řetězec `open()`→ENOSYS v hlášce nemusí odpovídat
+  syscallu, který skutečně selhal (Bun/Claude Code může report
+  generalizovat). Vedlejší, samostatně platné nálezy a fixy z této
+  investigace (zůstávají v master): `openat2`(437) musí TRAPnout
+  (ne přímo ENOSYS) před genrickým `>=424` pravidlem v
+  `install_legacy_syscall_filter_impl()`, jinak se cesta nepřeloží;
+  totéž nově platí pro `statx`(291) (vyňat z `blocked2[]`, explicitní
+  TRAP+překlad v `sigsys_handler`) — `SECCOMP_RET_ERRNO` má přes nezávislé
+  stackované filtry vyšší prioritu než `SECCOMP_RET_TRAP`, takže
+  nepodmíněná ENOSYS mapa v jednom filtru umí přebít TRAP i z JINÉHO
+  filtru (L2) dřív, než dostane šanci. Oba fixy jsou funkční a bezpečné,
+  ale aktivní bug nevyřešily. **Bezpečnostní poznámka k téhle investigaci:**
+  nepodmíněná (negatovaná) diagnostika uvnitř `sigsys_handler` jednou
+  způsobila regresi (`ab87333` — poškozený starship prompt, protože
+  psala na stderr/do diag souboru při KAŽDÉM SIGSYS trapu, i běžných
+  rseq/clone3 compat trapech) — jakákoli další diagnostika v
+  `sigsys_handler`/`go_handle` MUSÍ být gatovaná (`ELF_LOADER_TLS_TRACE`
+  nebo podobně) a ověřená i na obyčejném interaktivním shellu, ne jen na
+  repro scénáři. Zbylé bezpečné (gatované) sondy: `SH0-nr=` na vstupu
+  `sigsys_handler`, `shim_diag_ac()` v `main.c` (loguje jmenné open-hooky
+  pro cestu obsahující libovolný substring — zatím `active_config`).
+  **Další krok:** ověřit, kam přímý (ne-strace) běh skutečně dojde —
+  např. přidat gatovanou stopu co nejblíž Bunovu vlastnímu `main`/prvním
+  instrukcím (mimo loader úplně), nebo zkusit `ELF_LOADER_EXEC_TRACE`
+  případně vlastní minimální timing probe, abychom zjistili, jestli
+  strace jen zpomaluje běh (a tím "opraví" timing-dependentní problém)
+  nebo jestli naopak aktivně mění chování přes ptrace-seccomp interakci.
+
 - ~~**Statický glibc ELF v rootfs končí SIGSYS** (RC=159)~~ — **vyřešeno pod
   L2** (prompt 05, 2026-10-21 (3)): `ELF_LOADER_L2=1` dá statické binárce
   filtr na její text-range, cestové syscally se přeloží a doběhne (RC=0, vidí
