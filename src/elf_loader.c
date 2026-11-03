@@ -6596,6 +6596,28 @@ NOSP static void sigsys_handler(int sig, siginfo_t *si, void *uc) {
       _b[_i++] = '\n';
       int _fd = (int)raw_syscall6(56, (long)0xFFFFFFFFFFFFFF9CL, (long)(unsigned long)diag_path(), 0x441L, 0644L, 0, (long)F2_SENTINEL);
       if (_fd >= 0) { raw_syscall6(64, _fd, (long)(unsigned long)_b, _i, 0, 0, (long)F2_SENTINEL); raw_syscall6(57, _fd, 0, 0, 0, 0, (long)F2_SENTINEL); } }
+    /* DOCASNA DIAGNOSTIKA (2026-11-03, openat/ENOSYS pod Bun): kam pres
+     * diag_path() (prokazane funkcni per-pid mechanismus, na rozdil od
+     * primeho write(2)). Zapisuje VZDY pro nr==56, aby se potvrdilo/vyvratilo
+     * g_f2_root==NULL v okamziku teto konkretni SIGSYS. */
+    if (nr == 56) {
+        char b[256]; int i = 0;
+        const char *m1 = "OPENAT56 root=";
+        for (const char *q = m1; *q; q++) b[i++] = *q;
+        const char *rv = g_f2_root ? g_f2_root : "(NULL)";
+        for (const char *q = rv; *q && i < 200; q++) b[i++] = *q;
+        const char *m2 = " path=";
+        for (const char *q = m2; *q; q++) b[i++] = *q;
+        const char *op = (const char *)(unsigned long)ctx->uc_mcontext.regs[1];
+        if (op) { int n = 0; for (const char *q = op; *q && n < 120 && i < 250; q++, n++) b[i++] = *q; }
+        b[i++] = '\n';
+        int _fd = (int)raw_syscall6(56, -100L, (long)(unsigned long)diag_path(),
+                                     0x441L, 0644L, 0, (long)F2_SENTINEL);
+        if (_fd >= 0) {
+            raw_syscall6(64, _fd, (long)(unsigned long)b, i, 0, 0, (long)F2_SENTINEL);
+            raw_syscall6(57, _fd, 0, 0, 0, 0, (long)F2_SENTINEL);
+        }
+    }
     /* F2 seccomp path-translation: prelozime cestu (x1) a zemulujeme syscall
      * raw svc s SENTINEL v x5 (filtr ho pusti). Chyti i glibc-interni open. */
     /* stejna sada jako install_f2_path_filter_impl: openat=56 statx=291
