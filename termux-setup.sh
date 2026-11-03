@@ -81,14 +81,32 @@ ask() {  # ask <prompt> <default>
 say "Hledám elf_loader"
 ELF=""
 for c in "${ELF_LOADER:-}" "$HOME/eltest/elf_loader" "$PREFIX/bin/elf_loader" "$HOME/usr/bin/elf_loader"; do
-  if [ -n "$c" ] && [ -x "$c" ]; then ELF=$c; break; fi
+  # -f, ne -x: soubor z GitHub release má často mode 660 (rw-rw----)
+  # a bez +x by ho tenhle skript přehlédl. Právo spuštění doplníme níž.
+  if [ -n "$c" ] && [ -f "$c" ]; then ELF=$c; break; fi
 done
 if [ -z "$ELF" ]; then
   c=$(command -v elf_loader 2>/dev/null || true)
   [ -n "$c" ] && ELF=$c
 fi
 [ -n "$ELF" ] || die "elf_loader nenalezen. Zkopíruj ho do \$PREFIX/bin/elf_loader a spusť znovu."
-ok "loader: $ELF ($("$ELF" --version 2>/dev/null | head -1))"
+
+# Soubor bez práva spuštění (typicky rozbalený artefakt z GitHub Actions,
+# který má rw-rw---- a skupinu everybody). Bez tohohle by `proot` symlink
+# ukazoval na binárku, kterou jádro odmítne spustit (Permission denied)
+# a všechno další by hlásilo nesouvisející chyby.
+if [ ! -x "$ELF" ]; then
+  warn "loader nemá právo spuštění ($(ls -ld "$ELF" 2>/dev/null | awk '{print $1}')), doplňuji"
+  chmod u+x "$ELF" 2>/dev/null || die "nelze chmod u+x $ELF — spusť skript jako vlastník souboru"
+  [ -x "$ELF" ] || die "$ELF po chmod stále není spustitelný"
+fi
+
+if VER=$("$ELF" --version 2>/dev/null | head -1) && [ -n "$VER" ]; then
+  ok "loader: $ELF ($VER)"
+else
+  warn "loader: $ELF — --version selhalo (chybí interpreter /system/bin/linker64?)"
+  warn "       spusť \`$ELF --version\` ručně, ať vidíš skutečnou chybu"
+fi
 
 # ─── 2. ROOTFS ────────────────────────────────────────────────────────────
 say "Zjistuji rootfs"
@@ -238,9 +256,14 @@ fi
 
 # starship: config i cache jsou V ROOTFS (guest cesty, loader je přeloží).
 # Setup sám žádný starship.toml nepíše ani nepřepisuje.
+#
+# POZOR: přiřazení je BEZ `:-`. Kdyby tu bylo `${STARSHIP_CONFIG:-…}`,
+# vyhrála by hodnota, kterou někdo nastavil dřív (typicky starý rc s host
+# cestou) a starship by pak četl config z hostu, ne z rootfs. Kdo chce
+# jinam, přepíše to POD tímto blokem.
 if [ "$_LX_SHELL" = zsh ] && lxwhich starship >/dev/null 2>&1; then
-  export STARSHIP_CONFIG="${STARSHIP_CONFIG:-/root/.config/starship.toml}"
-  export STARSHIP_CACHE="${STARSHIP_CACHE:-/root/.cache/starship}"
+  export STARSHIP_CONFIG=/root/.config/starship.toml
+  export STARSHIP_CACHE=/root/.cache/starship
   starship() { lx starship "$@"; }
   _ssc=$HOME/.cache/starship-init.zsh
   if [ ! -s "$_ssc" ] || [ "$_ssc" -ot "$(lxwhich starship)" ]; then
@@ -294,7 +317,9 @@ bash -n "$HOME/.bashrc" && ok "$HOME/.bashrc (blok aktualizován)"
 
 # ─── 8. ověření ───────────────────────────────────────────────────────────
 say "Ověřuji"
-DIAG=$( ( unset LD_PRELOAD; zsh -i -c 'echo "L=$L"; echo "R=$R"; echo "PATH_OK=$([ -n "$LX_PATH" ] && echo yes || echo no)"; command -v lxwhich >/dev/null && echo "lxwhich=yes" || echo "lxwhich=no"; lxwhich starship 2>/dev/null || echo "starship=none"' ) 2>&1 | tail -6 )
+# env -u STARSHIP_CONFIG: kdyby uživatel měl v prostředí host cestu,
+# ukázalo by se to jako „config je špatně“, i když .elfrc je v pořádku.
+DIAG=$( ( unset LD_PRELOAD; env -u STARSHIP_CONFIG -u STARSHIP_CACHE zsh -i -c 'echo "L=$L"; echo "R=$R"; echo "PATH_OK=$([ -n "$LX_PATH" ] && echo yes || echo no)"; command -v lxwhich >/dev/null && echo "lxwhich=yes" || echo "lxwhich=no"; lxwhich starship 2>/dev/null || echo "starship=none"; echo "CFG=$STARSHIP_CONFIG"' ) 2>&1 | tail -7 )
 printf '%s\n' "$DIAG" | sed 's/^/     /'
 
 if printf '%s\n' "$DIAG" | grep -q '^lxwhich=yes'; then
@@ -302,6 +327,24 @@ if printf '%s\n' "$DIAG" | grep -q '^lxwhich=yes'; then
 else
   warn "lxwhich NENÍ definované — .elfrc se nenačetl nebo init selhal"
 fi
+
+CFG=$(printf '%s\n' "$DIAG" | sed -n 's/^CFG=\(.*\)$/\1/p')
+case $CFG in
+  "$HOME"/*)
+    warn "STARSHIP_CONFIG míří do hostu ($CFG) — .elfrc ho nepřepsal."
+    warn "       nejspíš je STARSHIP_CONFIG exportované dřív, než se načte .elfrc;"
+    warn "       v .elfrc musí být přiřazení bez \${VAR:-…}. Zkontroluj:\n       grep -n STARSHIP_CONFIG ~/.elfrc"
+    ;;
+  /root/*)
+    ok "starship config v rootfs: $CFG"
+    ;;
+  "")
+    warn "STARSHIP_CONFIG není nastavené — starship použije výchozí cestu"
+    ;;
+  *)
+    warn "STARSHIP_CONFIG je $CFG (očekáváno /root/...)"
+    ;;
+esac
 
 SS=$(printf '%s\n' "$DIAG" | sed -n 's/^\(.*\/starship\)$/\1/p')
 if [ -n "$SS" ]; then

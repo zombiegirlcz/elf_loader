@@ -50,8 +50,8 @@ proot-distro install ubuntu         # nebo debian/kali/parrot
 # 2) elf_loader — z GitHub Actions artefaktu, nebo si ho zbuildit
 #    (viz README → Build). Musí to být NDK build s /system/bin/linker64.
 cp elf_loader_ndk "$PREFIX/bin/elf_loader"
-chmod 755 "$PREFIX/bin/elf_loader"
-"$PREFIX/bin/elf_loader" --version
+chmod 755 "$PREFIX/bin/elf_loader"   # setup +x doplní sám, ale bez něj
+"$PREFIX/bin/elf_loader" --version   # `--version` selže na Permission denied
 
 # 3) setup
 bash termux-setup.sh
@@ -114,6 +114,11 @@ Co skript **nedělá** (a je to tak správně):
   (`/root/.config/starship.toml`), takže host soubor vůbec nepoužívá
 - **nekopíruje nic do rootfs** — guest shell si `.elfrc` nenastavuje
 - **nepíše zsh kosmetiku** (setopt, bindkey, compinit, pluginy)
+- **nedělá zálohy** `.bak.<timestamp>` — do rc souborů jen vkládá blok
+- **nekopíruje rc do `$ROOTFS`**
+- **nenastavuje `STARSHIP_CONFIG` na host** — míří do rootfs
+  (`/root/.config/starship.toml`), takže `~/.config/starship.toml`
+  na hostu se vůbec nepoužívá
 
 ## Struktura souborů
 
