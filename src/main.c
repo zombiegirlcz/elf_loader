@@ -1329,6 +1329,7 @@ static int shim_open64(const char *p, int flags, ...) {
     shim_diag("open64-tr", path, (long)(g_orig_open64 != NULL));
     int rc = f ? f(path, flags, mode) : -1;
     shim_diag("open64-rc", path, (long)rc);
+    if (rc == -1) shim_diag("open64-errno", path, (long)*shim_guest_errno());
     return rc;
 }
 static int shim_openat(int dfd, const char *p, int flags, ...) {
