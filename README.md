@@ -366,6 +366,12 @@ into `elf_loader` and points starship/zoxide at the rootfs) lives in
 bash termux-setup.sh            # idempotent; asks for ROOTFS if not found
 ```
 
+The script never overwrites your rc files: it only inserts (or updates) a
+block between `# >>> elf_loader (termux-setup.sh) >>>` markers in
+`~/.elfrc`, `~/.zshrc` and `~/.bashrc`. It does not create
+`~/.config/starship.toml`, does not touch the rootfs, and creates no `.bak`
+files.
+
 ## Known issues / help wanted
 
 This project is developed against a small number of devices, so **bug reports

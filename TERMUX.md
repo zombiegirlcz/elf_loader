@@ -7,6 +7,12 @@ zoxide / fzf se berou **z rootfs**, ne z Termuxu.
 > **Rychlá cesta:** `bash termux-setup.sh` (viz [Instalace](#instalace)).
 > Co dělá a proč: zbytek tohoto souboru.
 
+**Skript nic nepřepisuje a nic needituje mimo svůj blok.** Do `~/.elfrc`,
+`~/.zshrc` a `~/.bashrc` vloží (nebo aktualizuje) sekci mezi markery
+`# >>> elf_loader (termux-setup.sh) >>>` a `# <<< … <<<`. Zbytek rc souborů
+je tvůj. Žádné `.bak` zálohy, žádný `~/.config/starship.toml`, nic se
+nekopíruje do rootfs.
+
 ## Obsah
 
 - [Co se tím získá](#co-se-tím-získá)
@@ -78,24 +84,36 @@ exec zsh -l
 5. **Přejmenuje `proot` → `proot.orig`** a udělá `proot` symlinkem na
    `elf_loader`. Idempotentní: když už symlink je, jen zkontroluje cíl;
    když `proot.orig` existuje, nic nepřepisuje.
-6. **Napíše `~/.config/lx/zshrc`** — zsh-only nastavení (`setopt`,
-   `bindkey`, `compinit`/`zstyle`, pluginy). Bash tuhle syntaxi neumí
-   naparsovat, ani uvnitř `if`, proto je v samostatném souboru.
-7. **Napíše `~/.elfrc`** — **jediný rc**: proměnné pro loader
-   (`ROOTFS`/`LX_DISTRO`/`ELF_LOADER`/`L`/`D`), rekurzní guard,
-   volání `elf_loader init`, načtení `~/.config/lx/zshrc` a nástroje
-   z rootfs (zoxide, fzf, starship — přes `lxwhich`/`lx`).
-8. **Napíše `~/.zshrc`** — **jen `source ~/.elfrc`**, nic víc.
-9. **Napíše `~/.bashrc`** — interaktivní bash `exec zsh -l`;
-   neinteraktivní zůstává bash a načte `. ~/.elfrc`.
-10. **Napíše `~/.config/starship.toml`** (`command_timeout = 1000`).
-11. **Volitelně nakopíruje rc do guesta** — `$ROOTFS/root/.zshrc`
-    a `$ROOTFS/root/.elfrc` (stejné soubory; `.elfrc` pozná guest podle
-    chybějícího `$PREFIX`).
-12. **Ověří** — `zsh -i`, `lxwhich starship`, `lx /bin/true`,
-    `proot -r rootfs /usr/bin/true`.
+6. **Do `~/.elfrc` vloží blok** s proměnnými pro loader
+   (`ROOTFS`/`LX_DISTRO`/`ELF_LOADER`/`L`/`D`), rekurzním guardem,
+   voláním `elf_loader init` a inicializací nástrojů z rootfs
+   (zoxide, fzf, starship — přes `lxwhich`/`lx`).
+7. **Do `~/.zshrc` vloží** jen `source ~/.elfrc`. Nic víc — žádné
+   `setopt`, `bindkey`, `compinit`. Kosmetiku si uživatel píše sám.
+8. **Do `~/.bashrc` vloží** `exec zsh -l` pro interaktivní shell
+   a `source ~/.elfrc` pro neinteraktivní.
+9. **Ověří** — vypíše `L`, `R`, jestli je `lxwhich` definované, kde
+   v rootfs je starship a jestli se skutečně spustí, a `lx /bin/true`.
 
-Všechny existující soubory se zálohují jako `<soubor>.bak.<timestamp>`.
+**Skript nic nepřepisuje.** Do rc souborů jen vkládá (nebo aktualizuje)
+svůj blok mezi markery:
+
+```sh
+# >>> elf_loader (termux-setup.sh) >>>
+…
+# <<< elf_loader (termux-setup.sh) <<<
+```
+
+Zbytek souboru zůstane nedotčený, žádné `.bak` soubory nevznikají.
+Druhý běh skriptu obsah bloku **nahradí**, nezdvojí ho.
+
+Co skript **nedělá** (a je to tak správně):
+
+- **nepíše ani nemění `~/.config/starship.toml`** — konfigurace promptu
+  je uživatelova věc; `STARSHIP_CONFIG` v `.elfrc` ukazuje do rootfs
+  (`/root/.config/starship.toml`), takže host soubor vůbec nepoužívá
+- **nekopíruje nic do rootfs** — guest shell si `.elfrc` nenastavuje
+- **nepíše zsh kosmetiku** (setopt, bindkey, compinit, pluginy)
 
 ## Struktura souborů
 
@@ -104,17 +122,17 @@ $PREFIX/bin/elf_loader      NDK build (bionic, /system/bin/linker64)
 $PREFIX/bin/proot           → symlink na elf_loader
 $PREFIX/bin/proot.orig      původní proot (kdyby bylo potřeba se vrátit)
 
-~/.elfrc                    JEDINÝ rc — proměnné pro loader, guard,
+~/.elfrc                    spravovaný blok: proměnné pro loader, guard,
                             elf_loader init, nástroje z rootfs
-                            (zoxide, fzf, starship)
-~/.zshrc                    jen `source ~/.elfrc`
-~/.bashrc                   interaktivní → exec zsh, jinak source .elfrc
-~/.config/lx/zshrc          zsh-only: setopt, bindkey, compinit, pluginy
-~/.config/starship.toml     command_timeout = 1000
-~/.cache/{starship,fzf,zoxide}-init.zsh   generované cache
+                            (zoxide, fzf, starship) — zbytek je uživatelův
+~/.zshrc                    spravovaný blok: source ~/.elfrc
+~/.bashrc                   spravovaný blok: exec zsh / source ~/.elfrc
+~/.cache/{starship,fzf,zoxide}-init.zsh   generované cache (host)
 
-$ROOTFS/root/.zshrc         guest rc (kopie ~/.zshrc)
-$ROOTFS/root/.elfrc         guest rc (kopie ~/.elfrc)
+$ROOTFS/root/.config/starship.toml        config promptu (guest, mimo setup)
+~/.config/starship.toml                   NEdotčený — používá se jen
+                                          když si uživatel přepne
+                                          STARSHIP_CONFIG do hostu
 ```
 
 ## Jak to funguje
@@ -123,16 +141,31 @@ $ROOTFS/root/.elfrc         guest rc (kopie ~/.elfrc)
 
 | soubor | obsah |
 |---|---|
-| `~/.zshrc` | jediný řádek: `source ~/.elfrc` |
+| `~/.zshrc` | jen `source ~/.elfrc` — žádné `setopt`/`bindkey`/`compinit` |
 | `~/.elfrc` | proměnné pro loader, guard, `elf_loader init`, nástroje z rootfs |
 | `~/.bashrc` | interaktivní → `exec zsh -l`, jinak `source ~/.elfrc` |
-| `~/.config/lx/zshrc` | zsh-only: `setopt`, `bindkey`, `compinit`, pluginy |
 
-Proč zsh-only věci v samostatném souboru: **bash nedokáže naparsovat zsh
-syntaxi, ani uvnitř `if`** — `(( ${#x} ))`, `${+VAR}`, `zstyle`, `typeset -g`
-skončí `syntax error near unexpected token` a bash pak `.elfrc` vůbec
-nedokončí (`lxwhich` se nedefinuje). Proto se `~/.config/lx/zshrc` načítá
-podmíněně na `${ZSH_VERSION:+}`.
+Kosmetiku shellu (prompt, aliasy, completion, pluginy) setup **neřeší** —
+patří uživateli. Když si chceš `setopt`/`bindkey`/`compinit`, přidej si je
+do `~/.zshrc` **nad** blok elf_loaderu (blok je na konci souboru).
+
+`.elfrc` je psaný **POSIXově**, aby ho zvládl i bash: žádné `(( ))`,
+`${+VAR}`, `typeset -g` ani process substitution. Kdyby tam zsh syntaxe
+byla, bash by `.elfrc` nedokončil (`lxwhich` by se nedefinoval).
+
+### Markery: setup nic nepřepisuje
+
+Každý rc soubor dostane blok mezi markery:
+
+```sh
+# >>> elf_loader (termux-setup.sh) >>>
+…
+# <<< elf_loader (termux-setup.sh) <<<
+```
+
+- obsah **mimo** markery zůstává nedotčený
+- druhý běh obsah bloku **nahradí**, nezdvojí
+- odinstalace = smazat řádky mezi markery (`sed` v sekci Odinstalace)
 
 ### ⚠️ `.elfrc` volá `init` jen s rekurzním guardem
 
@@ -308,35 +341,46 @@ echo "$ROOTFS"; ls "$ROOTFS/usr/bin/X"
 zsh -i -c 'echo $LX_PATH' | tr ' ' '\n' | while read d; do ls -d "$d" 2>/dev/null; done
 ```
 
+### Setup hlásí „starship v rootfs není“, ale podle `ls` tam je
+
+Nejdřív si přečti, co setup vypsal v sekci `Ověřuji`:
+
+```
+L=…              ← musí být cesta k elf_loaderu
+R=…              ← musí být tvůj rootfs, ne parrot
+PATH_OK=yes      ← LX_PATH musí být nastavené
+lxwhich=yes      ← bez toho se .elfrc nenačetl
+starship=…       ← hledaná cesta, nebo starship=none
+```
+
+Nejčastější příčiny, v tomto pořadí:
+
+1. **`lxwhich=no`** — `.elfrc` se nenačetl nebo `init` selhal. Zkontroluj
+   `zsh -i -c 'echo $L; $L init zsh | tail -5'`.
+2. **`R` ukazuje jinam než `ROOTFS`** — v `.elfrc` chybí `export L`
+   (init čte `$L`, ne `$ELF_LOADER`) nebo je `init` volaný před exportem
+   `ROOTFS`.
+3. **starship v rootfs opravdu není** — `ls "$R/usr/bin/starship"`.
+   Doinstaluj: `lx apt-get install -y starship` (nebo přes proot).
+4. **Je tam, ale nespustí se** — setup to pozná a vypíše „nalezen, ale
+   nespustí se“. Zkus `lx starship --version`; chybějící knihovna se
+   projeví jako `error while loading shared libraries`.
+
 ### Prompt je prázdný nebo `%`
 
-Cache se nevygenerovala. Smaž ji a nech znovu vzniknout:
+Cache se nevygenerovala (starship v rootfs chybí nebo se nespustí).
+Smaž ji a nech znovu vzniknout:
 
 ```sh
 rm -f ~/.cache/starship-init.zsh ~/.cache/fzf-init.zsh ~/.cache/zoxide-init.zsh
 exec zsh -l
 ```
 
-Když ani potom nic, `lxwhich starship` v rootfs nic nenajde → nainstaluj
-starship v rootfs (viz [Závislosti](#závislosti-v-rootfs)).
-
-### Prompt je prázdný a v `~/.cache` je soubor `starship-init.`
-
-Chybí `$_LX_SHELL`. Cache se pak uloží jako `starship-init.` (prázdná
-přípona) místo `starship-init.zsh`, načte se 0 bajtů a `PROMPT` zůstane
-`%# `. Kontrola:
-
-```sh
-ls ~/.cache/*-init.*        # nesmí být soubor končící tečkou
-```
-
-`.elfrc` detekuje shell na začátku (`ZSH_VERSION` → `zsh`, jinak `bash`).
-
-### `no such file or directory: .../rootfs/usr/bin/starship`
-
-Cache obsahuje absolutní cestu, kterou guest neumí přeložit. Znamená to, že
-`sed` pravidlo v `.elfrc` chybí nebo je stará cache. Řešení: smazat cache
-(viz výše) a zkontrolovat, že `.elfrc` má **obě** `sed -e` pravidla.
+V `.elfrc` je `STARSHIP_CONFIG=/root/.config/starship.toml` a
+`STARSHIP_CACHE=/root/.cache/starship` — tedy **guest cesty uvnitř rootfs**,
+které loader přeloží. Setup `~/.config/starship.toml` na hostu **nevytváří
+ani nemění**; když si chceš vlastní config, patří do
+`$ROOTFS/root/.config/starship.toml`.
 
 ### `proot: command not found`
 
@@ -377,16 +421,18 @@ bug loaderu; viz README → Known issues.
 # vrátit proot
 mv -f "$PREFIX/bin/proot.orig" "$PREFIX/bin/proot"
 
-# odstranit rc soubory (zálohy zůstanou jako .bak.*)
-rm -f ~/.zshrc ~/.bashrc ~/.elfrc ~/.config/starship.toml
-rm -f ~/.cache/starship-init.zsh ~/.cache/fzf-init.zsh ~/.cache/zoxide-init.zsh
+# odstranit blok z rc souborů (zbytek souborů zůstane)
+for f in ~/.elfrc ~/.zshrc ~/.bashrc; do
+  [ -f "$f" ] && sed -i '/^# >>> elf_loader (termux-setup.sh) >>>$/,/^# <<< elf_loader (termux-setup.sh) <<<$/d' "$f"
+done
 
-# volitelně guest rc
-rm -f "$ROOTFS/root/.zshrc" "$ROOTFS/root/.config/starship.toml"
+# vyčistit cache, kterou blok vygeneroval
+rm -f ~/.cache/starship-init.zsh ~/.cache/fzf-init.zsh ~/.cache/zoxide-init.zsh
 
 # loader
 rm -f "$PREFIX/bin/elf_loader"
 ```
 
-Rootfs ani Termux balíčky se nemažou — skript do nich nezasahuje kromě
-volitelného guest rc a `zsh`.
+Rootfs ani Termux balíčky se nemažou — skript do nich vůbec nezasahuje
+(kromě `pkg install zsh`). Nic se nekopíruje do rootfs, `~/.config/starship.toml`
+se netvoří ani nemění.
