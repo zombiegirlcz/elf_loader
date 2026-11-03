@@ -6621,6 +6621,8 @@ NOSP static void sigsys_handler(int sig, siginfo_t *si, void *uc) {
         long a2 = (long)ctx->uc_mcontext.regs[2];
         long a3 = (long)ctx->uc_mcontext.regs[3];
         long a4 = (long)ctx->uc_mcontext.regs[4];
+        gh_diag_str("IS_RC-orig", orig);
+        gh_diag_hex("IS_RC-dirfd", dirfd);
         /* Preklad jen pro /etc/resolv.conf (DNS). Ostatni cesty posli na
          * kernel BEZE ZMENY - TRAP+emulace vsech openatu rozbiji glibc
          * interni cesty (NSS/dlopen/dl_iterate_phdr) -> segfault v id/zsh. */
@@ -6640,6 +6642,7 @@ NOSP static void sigsys_handler(int sig, siginfo_t *si, void *uc) {
         }
         long r = raw_syscall6(56, dirfd, (long)(unsigned long)use, a2, a3, a4,
                               (long)F2_SENTINEL);
+        gh_diag_hex("IS_RC-r", r);
         ctx->uc_mcontext.regs[0] = r;
         return;
     }
