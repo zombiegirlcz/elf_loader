@@ -6312,6 +6312,7 @@ NOSP static int go_handle(long nr, ucontext_t *ctx) {
             return 1;
         case 56: case 79: case 48: case 78: case 89: case 291: case 34: case 35:
         case 53: case 54: case 88: pa = 1; break;
+        case 80: break;                          /* fstat: nema cestu, jen fd -> go_fr_post */
         case 38: case 276: pa = 1; pb = 3; break; /* renameat(2) */
         case 37:  pa = 1; pb = 3; break;         /* linkat */
         case 36:  pa = 2; break;                 /* symlinkat: jen linkpath */
@@ -6442,20 +6443,23 @@ static int l2_install_range_filter(unsigned long lo, unsigned long hi, const cha
     /* 17=getcwd (fixup vysledku), 49=chdir, 34/35/48/53/54/56/78/79/88/291/439
      * =path (439=faccessat2, glibc 2.33+ ho pouziva misto 48!),
      * 36=symlinkat, 37=linkat, 38/276=renameat, 221=execve, 135/134=sig. */
-    static const unsigned nrs_path[] = { 17, 56, 79, 80, 48, 439, 78, 89, 291, 221, 49, 34, 35, 38,
+    static const unsigned nrs_path[] = { 17, 56, 79, 48, 439, 78, 89, 291, 221, 49, 34, 35, 38,
                                          276, 53, 54, 88, 37, 36, 135 };
-    /* 80 = fstat: nema cestu, ale je to clen stat rodiny. Bez nej v seznamu
-     * ho L2 filtr vubec nepusti do go_handle a `go_fakeroot_post` ho nikdy
-     * neopravi -> syrovy fstat vracel skutecne app uid. Namerene na Bunu
-     * (claude): openat(/tmp/claude-0) = 11, fstat(11) -> uid 10323 misto 0,
-     * takze claude spadl na "Temp directory ... owned by uid 10323,
-     * expected 0". Proot to ma (fake_id0 sedi na hranici syscallu). */
     /* Pod LX_FAKEROOT i identitni cisla: staticka a Go binarka nema PLT vazbu
      * do nasi libc, takze jmenny hook `getuid`/`set*id` ji nema kde zachytit
      * a bez tohohle videla skutecne app uid (namereno 2026-10-29). Proot to
      * resi taky na urovni syscallu (`fake_id0`). Zodpovi je `go_fakeroot_pre`
-     * pres `go_handle`. Mimo fakeroot se filtr nemeni (zadna rezie). */
-    static const unsigned nrs_id[] = { 174, 175, 176, 177,   /* get{,e}{u,g}id   */
+     * pres `go_handle`. Mimo fakeroot se filtr nemeni (zadna rezie).
+     *
+     * 80 = fstat je TADY, ne v nrs_path: nema cestu a go_handle ho
+     * obsluhuje JEN pres `go_fakeroot_pre` (case 80 v jeho switchi neni).
+     * Kdyz byl v nrs_path, trapoval se i bez fakerootu -> go_handle spadl
+     * do `default: return 0` -> fallback vratil -ENOSYS a Bun (claude/omp)
+     * umrel na "ENOSYS: function not implemented, fstat" (2026-11-03).
+     * Pod fakerootem ho `go_fakeroot_post` potrebuje, aby syrovy fstat
+     * nevracel app uid misto fake 0 (4fd619e, claude /tmp/claude-0). */
+    static const unsigned nrs_id[] = { 80,                    /* fstat (jen fakeroot) */
+                                       174, 175, 176, 177,   /* get{,e}{u,g}id   */
                                        148, 150,             /* getres{u,g}id    */
                                        158, 159,             /* get/setgroups    */
                                        146, 144, 145, 143,   /* set{u,g}id, setre*  */
