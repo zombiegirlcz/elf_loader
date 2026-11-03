@@ -5156,6 +5156,16 @@ static void install_legacy_syscall_filter_impl(void) {
     size_t n = 0;
     prog[n++] = (struct sock_filter)BPF_STMT(BPF_LD | BPF_W | BPF_ABS,
                                             offsetof(struct seccomp_data, nr));
+    /* openat2(437) MUSI TRAPnout (ne primo ENOSYS) - viz sigsys_handler case
+     * nr==437: Bun/Node ho vola primo, bez ENOSYS fallbacku na openat, ktery
+     * ma glibc, takze bez prekladu cesty pres SIGSYS handler padne natvrdo
+     * ("ENOSYS: function not implemented, open ..."). Musi byt PRED
+     * genrickym ">= 424" pravidlem nize, jinak ho to pravidlo chytne prvni
+     * a cesta se nikdy neprelozi (2026-11-03, claude CLI pod fakeroot+L2). */
+    prog[n++] = (struct sock_filter)
+        BPF_JUMP(BPF_JMP | BPF_JEQ | BPF_K, 437, 0, 1);
+    prog[n++] = (struct sock_filter)
+        BPF_STMT(BPF_RET | BPF_K, SECCOMP_RET_TRAP);
     /* aarch64: vsechny novejsi syscally (pidfd/io_uring/clone3/openat2/...)
      * maji cislo >= 424. Prelozit hromadne na ENOSYS; kernel 4.14 je
      * stejne nezna a app seccomp profil pro ne vraci TRAP (SIGSYS). */
