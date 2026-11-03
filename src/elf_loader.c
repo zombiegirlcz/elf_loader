@@ -5182,7 +5182,10 @@ static void install_legacy_syscall_filter_impl(void) {
      *   435 clone3, 436 close_range, 437 openat2, 439 faccessat2
      *   440 process_madvise, 441 epoll_pwait2, 449 futex_waitv
      *   282 userfaultfd, 434 pidfd_open */
-    static const int blocked[] = { 293, 282, 434, 435, 436, 437, 439, 440, 441, 449, 283, 291 };
+    /* 437 (openat2) NENI v tomhle seznamu zamerne: viz sigsys_handler case
+     * nr==437 - musi se TRAPnout (ne rovnou ENOSYS), aby se cesta prelozila
+     * (Bun/Node na ENOSYS fallback nema, viz komentar tam). */
+    static const int blocked[] = { 293, 282, 434, 435, 436, 439, 440, 441, 449, 283, 291 };
     /* pkey_* (285-289) zamerne vynechany - viz blocked2 vyse. */
     for (size_t i = 0; i < sizeof(blocked)/sizeof(blocked[0]); i++) {
         prog[n++] = (struct sock_filter)
@@ -6649,6 +6652,26 @@ NOSP static void sigsys_handler(int sig, siginfo_t *si, void *uc) {
         long r = raw_syscall6(56, dirfd, (long)(unsigned long)use, a2, a3, a4,
                               (long)F2_SENTINEL);
         gh_diag_hex("IS_RC-r", r);
+        ctx->uc_mcontext.regs[0] = r;
+        return;
+    }
+    /* openat2(437): Bun/Node (zjistovano 2026-11-03, claude CLI pod fakeroot+L2)
+     * ho vola PRIMO (ne pres openat), bez ENOSYS fallbacku, ktery ma glibc.
+     * Nasleduje tim do install_legacy_syscall_filter_impl()'s blocked[] (-ENOSYS
+     * bez prekladu cesty) -> "ENOSYS: function not implemented, open '<guest cesta>'".
+     * Preklad cesty + prevod na obycejny openat (struct open_how { flags, mode,
+     * resolve }, prvni dve pole stejna jako openat(dirfd,path,flags,mode)). */
+    if (nr == 437 && g_f2_root) {
+        const char *orig = (const char *)(unsigned long)ctx->uc_mcontext.regs[1];
+        long dirfd = (long)ctx->uc_mcontext.regs[0];
+        const unsigned long *how = (const unsigned long *)(unsigned long)ctx->uc_mcontext.regs[2];
+        long flags = how ? (long)how[0] : 0;
+        long mode  = how ? (long)how[1] : 0;
+        char tr[4096];
+        const char *use = orig;
+        if (orig && orig[0] == '/') { f2_translate(orig, tr, sizeof tr); use = tr; }
+        long r = raw_syscall6(56, dirfd, (long)(unsigned long)use, flags, mode, 0,
+                              (long)F2_SENTINEL);
         ctx->uc_mcontext.regs[0] = r;
         return;
     }
