@@ -6367,6 +6367,7 @@ NOSP static int go_handle(long nr, ucontext_t *ctx) {
             return 1;
         }
     }
+    const char *_dbg_orig2 = (pa >= 0) ? (const char *)a[pa] : NULL;
     if (pa >= 0 && a[pa] && ((const char *)a[pa])[0] == '/') {
         go_translate((const char *)a[pa], ta, sizeof ta);
         a[pa] = (long)ta;
@@ -6375,7 +6376,42 @@ NOSP static int go_handle(long nr, ucontext_t *ctx) {
         go_translate((const char *)a[pb], tb, sizeof tb);
         a[pb] = (long)tb;
     }
+    /* DOCASNA SONDA (2026-11-03c, gatovana ELF_LOADER_TLS_TRACE): primy
+     * write(2) na stderr, bez diag_path()/open() - vylucuje hypotezu, ze
+     * diag souborovy open v tomto miste tise selhava (EMFILE apod.) a
+     * proto predchozi GH56 diagnostika nikdy nic nezapsala. */
+    if (g_tls_trace && _dbg_orig2 && nr == 56) {
+        int _m = 0;
+        for (const char *q = _dbg_orig2; *q; q++)
+            if (!strncmp(q, "active_config", 13)) { _m = 1; break; }
+        if (_m) {
+            char b[700]; int i = 0;
+            const char *m = "GH56b-orig="; while (*m) b[i++] = *m++;
+            for (const char *q = _dbg_orig2; *q && i < 400; q++) b[i++] = *q;
+            m = " tr="; while (*m) b[i++] = *m++;
+            for (const char *q = ta; *q && i < 650; q++) b[i++] = *q;
+            b[i++] = '\n';
+            raw_syscall6(64, 2, (long)(unsigned long)b, i, 0, 0, (long)F2_SENTINEL);
+        }
+    }
     long rr = raw_syscall6(nr, a[0], a[1], a[2], a[3], a[4], (long)F2_SENTINEL);
+    if (g_tls_trace && _dbg_orig2 && nr == 56) {
+        int _m = 0;
+        for (const char *q = _dbg_orig2; *q; q++)
+            if (!strncmp(q, "active_config", 13)) { _m = 1; break; }
+        if (_m) {
+            char b[64]; int i = 0;
+            const char *m = "GH56b-rr="; while (*m) b[i++] = *m++;
+            int neg = rr < 0; unsigned long v = (unsigned long)(neg ? -rr : rr);
+            if (neg) b[i++] = '-';
+            char t[24]; int ti = 0;
+            if (v == 0) t[ti++] = '0';
+            while (v > 0) { t[ti++] = (char)('0' + v % 10); v /= 10; }
+            while (ti > 0) b[i++] = t[--ti];
+            b[i++] = '\n';
+            raw_syscall6(64, 2, (long)(unsigned long)b, i, 0, 0, (long)F2_SENTINEL);
+        }
+    }
     /* fakeroot/l2s oprava vysledku stat rodiny (a[] uz jsou prelozene cesty) */
     if (g_go_fr_post) g_go_fr_post(nr, a, rr);
     /* readlinkat(78): cil muze byt hostove absolutni (pod $ROOTFS) -> ohlas
