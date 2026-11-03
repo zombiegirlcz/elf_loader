@@ -3804,24 +3804,6 @@ static int shim_pthread_getattr_np(void *th, void *attr) {
 }
 
 
-/* sigaltstack je per-thread (POSIX), ne per-proces: elf_install_fault_handlers()
- * ho nastavi jen pro hlavni vlakno. Nove vlakno (Bun/Node fs threadpool,
- * V8 workery) SA_ONSTACK handler (SIGSYS/SIGSEGV/...) dostane bez altstacku
- * -> doruceni spadne na jeho VLASTNI (moznа male/skoro vycerpane V8) zasobnik.
- * Trampolina nastavi vlastni altstack pred vstupem do `fn`. */
-struct shim_thread_start_arg { void *(*fn)(void *); void *arg; };
-static void *shim_thread_trampoline(void *p) {
-    struct shim_thread_start_arg a = *(struct shim_thread_start_arg *)p;
-    free(p);
-    static const size_t ALTSZ = 262144;
-    void *altmem = malloc(ALTSZ);
-    if (altmem) {
-        stack_t ss; ss.ss_sp = altmem; ss.ss_size = ALTSZ; ss.ss_flags = 0;
-        sigaltstack(&ss, NULL);
-    }
-    return a.fn(a.arg);
-}
-
 /* DIAG: pthread_create override - pri EINVAL vypise pole attr (stacksize,
  * guardsize, flags). V8/node vytvari vlakna s vlastnimi atributy; EINVAL
  * znamena, ze nejaka hodnota neprosla glibc validaci. */
@@ -3829,8 +3811,6 @@ typedef int (*fp_pthread_create)(void*, const void*, void *(*)(void*), void*);
 static int shim_pthread_create(void *th, const void *attr, void *(*fn)(void*), void *arg) {
     fp_pthread_create f = (fp_pthread_create)elf_scope_lookup(g_shim_scope, "pthread_create");
     if (!f) return 22;
-    struct shim_thread_start_arg *ta = malloc(sizeof *ta);
-    if (ta) { ta->fn = fn; ta->arg = arg; fn = shim_thread_trampoline; arg = ta; }
     int r = f(th, attr, fn, arg);
     /* Nase dl_tls_static_size (~1 MB) zvetsuje __pthread_get_minstack, takze
      * glibc odmitne maly stacksize (node/V8 zadá 0x20000) -> EINVAL.
