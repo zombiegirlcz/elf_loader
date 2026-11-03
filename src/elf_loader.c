@@ -6567,6 +6567,21 @@ int elf_go_mode_setup(elf_object_t *m) {
 
 NOSP static void sigsys_handler(int sig, siginfo_t *si, void *uc) {
     (void)sig;
+    /* DOCASNA DIAGNOSTIKA (2026-11-03b): raw write(2) na stderr, bez
+     * souboroveho I/O pres diag_path() - vyloucit, ze soubor/open/cache
+     * je ten, kdo tise mlci. */
+    {
+        char b2[64]; int i2 = 0;
+        const char *m2 = "STDERR0-nr=";
+        for (const char *q = m2; *q; q++) b2[i2++] = *q;
+        unsigned long _n2 = (unsigned long)si->si_syscall;
+        char tmp2[24]; int ti2 = 0;
+        if (_n2 == 0) tmp2[ti2++] = '0';
+        while (_n2 > 0) { tmp2[ti2++] = (char)('0' + (_n2 % 10)); _n2 /= 10; }
+        while (ti2 > 0) b2[i2++] = tmp2[--ti2];
+        b2[i2++] = '\n';
+        raw_syscall6(64, 2, (long)(unsigned long)b2, i2, 0, 0, (long)F2_SENTINEL);
+    }
     /* DOCASNA DIAGNOSTIKA (2026-11-03): ABSOLUTNE prvni radek, pred vsim
      * ostatnim, vcetne go_handle dispatchu - zjistit, jestli handler vubec
      * nekdy nabehne pro mystery ENOSYS pod Bun+L2. */
