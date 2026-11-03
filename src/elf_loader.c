@@ -6378,7 +6378,7 @@ NOSP static int go_handle(long nr, ucontext_t *ctx) {
     }
     if (g_tls_trace && _dbg_orig) {
         int _m = 0;
-        for (const char *q = _dbg_orig; *q; q++) if (!strncmp(q, "active_config", 13)) { _m = 1; break; }
+        for (const char *q = _dbg_orig; *q; q++) if (!strncmp(q, "active_config", 13) || !strncmp(q, "managed-settings", 16)) { _m = 1; break; }
         if (_m) {
             char b[700]; int i = 0;
             const char *m = "GH56-nr="; while (*m) b[i++] = *m++;
@@ -6402,7 +6402,7 @@ NOSP static int go_handle(long nr, ucontext_t *ctx) {
     long rr = raw_syscall6(nr, a[0], a[1], a[2], a[3], a[4], (long)F2_SENTINEL);
     if (g_tls_trace && _dbg_orig) {
         int _m = 0;
-        for (const char *q = _dbg_orig; *q; q++) if (!strncmp(q, "active_config", 13)) { _m = 1; break; }
+        for (const char *q = _dbg_orig; *q; q++) if (!strncmp(q, "active_config", 13) || !strncmp(q, "managed-settings", 16)) { _m = 1; break; }
         if (_m) {
             char b[64]; int i = 0;
             const char *m = "GH56-rr="; while (*m) b[i++] = *m++;
