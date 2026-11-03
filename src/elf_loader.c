@@ -6154,10 +6154,8 @@ NOSP static int go_exists(const char *p) {
                         0, (long)F2_SENTINEL) == 0;
 }
 
-static void gh_diag_str(const char *tag, const char *s);
 /* in (guest cesta) -> out. Vraci 1, kdyz se cesta prelozila do ROOTFS. */
 NOSP static int go_translate(const char *in, char *out, size_t outsz) {
-    gh_diag_str("GT-root", g_f2_root ? g_f2_root : "(NULL)");
     if (!in || in[0] != '/' || !g_f2_root) { f2_scpy(out, in ? in : ""); return 0; }
     size_t rl = f2_slen(g_f2_root);
     if (f2_sncmp(in, g_f2_root, rl) == 0 && (in[rl] == '/' || in[rl] == 0)) {
@@ -6243,33 +6241,9 @@ NOSP static long go_execve(const char *p, char *const *argv, char *const *envp) 
 }
 
 /* Vraci 1, kdyz syscall obslouzil (regs[0] = vysledek). */
-/* DOCASNA DIAGNOSTIKA (2026-11-03, openat/-100 bug): nepodminene raw write,
- * jedna radka hex, bezpecne pod guest TP (jen raw_syscall6, zadne getenv). */
-static void gh_diag_hex(const char *tag, long v) {
-    char b[64]; int i = 0;
-    const char *pre = "[GH] "; for (const char *q = pre; *q; q++) b[i++] = *q;
-    for (const char *q = tag; *q; q++) b[i++] = *q;
-    b[i++] = '=';
-    static const char hx[] = "0123456789abcdef";
-    for (int sh = 60; sh >= 0; sh -= 4) b[i++] = hx[((unsigned long)v >> sh) & 0xf];
-    b[i++] = '\n';
-    raw_syscall6(64, 2, (long)(unsigned long)b, i, 0, 0, (long)F2_SENTINEL);
-}
-static void gh_diag_str(const char *tag, const char *s) {
-    char b[160]; int i = 0;
-    const char *pre = "[GH] "; for (const char *q = pre; *q; q++) b[i++] = *q;
-    for (const char *q = tag; *q; q++) b[i++] = *q;
-    b[i++] = '=';
-    if (s) { int n = 0; for (const char *q = s; *q && n < 100; q++, n++) b[i++] = *q; }
-    else { b[i++] = '('; b[i++] = 'n'; b[i++] = 'u'; b[i++] = 'l'; b[i++] = 'l'; b[i++] = ')'; }
-    b[i++] = '\n';
-    raw_syscall6(64, 2, (long)(unsigned long)b, i, 0, 0, (long)F2_SENTINEL);
-}
-
 NOSP static int go_handle(long nr, ucontext_t *ctx) {
     unsigned long long *r = ctx->uc_mcontext.regs;
     int pa = -1, pb = -1;           /* indexy registru s cestou */
-    gh_diag_hex("GH-nr", nr);
     /* fakeroot: identitni syscally nemaji cestu, zodpovi se bez syscallu */
     if (g_go_fr_pre) {
         long e;
@@ -6385,19 +6359,15 @@ NOSP static int go_handle(long nr, ucontext_t *ctx) {
             return 1;
         }
     }
-    if (nr == 56) gh_diag_hex("GH56-pa", pa);
     if (pa >= 0 && a[pa] && ((const char *)a[pa])[0] == '/') {
-        if (nr == 56) gh_diag_str("GH56-orig", (const char *)a[pa]);
         go_translate((const char *)a[pa], ta, sizeof ta);
         a[pa] = (long)ta;
-        if (nr == 56) gh_diag_str("GH56-tr", (const char *)a[pa]);
     }
     if (pb >= 0 && a[pb] && ((const char *)a[pb])[0] == '/') {
         go_translate((const char *)a[pb], tb, sizeof tb);
         a[pb] = (long)tb;
     }
     long rr = raw_syscall6(nr, a[0], a[1], a[2], a[3], a[4], (long)F2_SENTINEL);
-    if (nr == 56) gh_diag_hex("GH56-rr", rr);
     /* fakeroot/l2s oprava vysledku stat rodiny (a[] uz jsou prelozene cesty) */
     if (g_go_fr_post) g_go_fr_post(nr, a, rr);
     /* readlinkat(78): cil muze byt hostove absolutni (pod $ROOTFS) -> ohlas
@@ -6597,10 +6567,6 @@ int elf_go_mode_setup(elf_object_t *m) {
 
 NOSP static void sigsys_handler(int sig, siginfo_t *si, void *uc) {
     (void)sig;
-    gh_diag_hex("SH-ENTRY-nr", si->si_syscall);
-    gh_diag_hex("SH-ENTRY-pc", (long)((ucontext_t *)uc)->uc_mcontext.pc);
-    gh_diag_hex("SH-ENTRY-golo", (long)g_go_lo);
-    gh_diag_hex("SH-ENTRY-gohi", (long)g_go_hi);
     /* Go mod / L2: syscall z text segmentu guest exe (pc uz ukazuje za svc).
      * Oba nastavuji g_go_lo/g_go_hi a sdili go_handle. */
     if (g_go_hi) {
@@ -6640,8 +6606,6 @@ NOSP static void sigsys_handler(int sig, siginfo_t *si, void *uc) {
         long a2 = (long)ctx->uc_mcontext.regs[2];
         long a3 = (long)ctx->uc_mcontext.regs[3];
         long a4 = (long)ctx->uc_mcontext.regs[4];
-        gh_diag_str("IS_RC-orig", orig);
-        gh_diag_hex("IS_RC-dirfd", dirfd);
         /* Preklad jen pro /etc/resolv.conf (DNS). Ostatni cesty posli na
          * kernel BEZE ZMENY - TRAP+emulace vsech openatu rozbiji glibc
          * interni cesty (NSS/dlopen/dl_iterate_phdr) -> segfault v id/zsh. */
@@ -6661,7 +6625,6 @@ NOSP static void sigsys_handler(int sig, siginfo_t *si, void *uc) {
         }
         long r = raw_syscall6(56, dirfd, (long)(unsigned long)use, a2, a3, a4,
                               (long)F2_SENTINEL);
-        gh_diag_hex("IS_RC-r", r);
         ctx->uc_mcontext.regs[0] = r;
         return;
     }
