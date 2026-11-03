@@ -6567,41 +6567,6 @@ int elf_go_mode_setup(elf_object_t *m) {
 
 NOSP static void sigsys_handler(int sig, siginfo_t *si, void *uc) {
     (void)sig;
-    /* DOCASNA DIAGNOSTIKA (2026-11-03b): raw write(2) na stderr, bez
-     * souboroveho I/O pres diag_path() - vyloucit, ze soubor/open/cache
-     * je ten, kdo tise mlci. */
-    {
-        char b2[64]; int i2 = 0;
-        const char *m2 = "STDERR0-nr=";
-        for (const char *q = m2; *q; q++) b2[i2++] = *q;
-        unsigned long _n2 = (unsigned long)si->si_syscall;
-        char tmp2[24]; int ti2 = 0;
-        if (_n2 == 0) tmp2[ti2++] = '0';
-        while (_n2 > 0) { tmp2[ti2++] = (char)('0' + (_n2 % 10)); _n2 /= 10; }
-        while (ti2 > 0) b2[i2++] = tmp2[--ti2];
-        b2[i2++] = '\n';
-        raw_syscall6(64, 2, (long)(unsigned long)b2, i2, 0, 0, (long)F2_SENTINEL);
-    }
-    /* DOCASNA DIAGNOSTIKA (2026-11-03): ABSOLUTNE prvni radek, pred vsim
-     * ostatnim, vcetne go_handle dispatchu - zjistit, jestli handler vubec
-     * nekdy nabehne pro mystery ENOSYS pod Bun+L2. */
-    {
-        char b[64]; int i = 0;
-        const char *m1 = "SH0-nr=";
-        for (const char *q = m1; *q; q++) b[i++] = *q;
-        unsigned long _n0 = (unsigned long)si->si_syscall;
-        char tmp0[24]; int ti0 = 0;
-        if (_n0 == 0) tmp0[ti0++] = '0';
-        while (_n0 > 0) { tmp0[ti0++] = (char)('0' + (_n0 % 10)); _n0 /= 10; }
-        while (ti0 > 0) b[i++] = tmp0[--ti0];
-        b[i++] = '\n';
-        int _fd0 = (int)raw_syscall6(56, -100L, (long)(unsigned long)diag_path(),
-                                      0x441L, 0644L, 0, (long)F2_SENTINEL);
-        if (_fd0 >= 0) {
-            raw_syscall6(64, _fd0, (long)(unsigned long)b, i, 0, 0, (long)F2_SENTINEL);
-            raw_syscall6(57, _fd0, 0, 0, 0, 0, (long)F2_SENTINEL);
-        }
-    }
     /* Go mod / L2: syscall z text segmentu guest exe (pc uz ukazuje za svc).
      * Oba nastavuji g_go_lo/g_go_hi a sdili go_handle. */
     if (g_go_hi) {
@@ -6631,27 +6596,6 @@ NOSP static void sigsys_handler(int sig, siginfo_t *si, void *uc) {
       _b[_i++] = '\n';
       int _fd = (int)raw_syscall6(56, (long)0xFFFFFFFFFFFFFF9CL, (long)(unsigned long)diag_path(), 0x441L, 0644L, 0, (long)F2_SENTINEL);
       if (_fd >= 0) { raw_syscall6(64, _fd, (long)(unsigned long)_b, _i, 0, 0, (long)F2_SENTINEL); raw_syscall6(57, _fd, 0, 0, 0, 0, (long)F2_SENTINEL); } }
-    /* DOCASNA DIAGNOSTIKA (2026-11-03, ENOSYS pod Bun): unconditionalni log
-     * KAZDE sigsys_handler invokace (vcetne go_handle-obslouzenych - diag je
-     * az PO go_handle dispatchi vys, takze tady se ukaze jen to, co go_handle
-     * NEVYRESIL). Kam pres diag_path() (prokazane funkcni). */
-    {
-        char b[64]; int i = 0;
-        const char *m1 = "SH-nr=";
-        for (const char *q = m1; *q; q++) b[i++] = *q;
-        unsigned long _n = (unsigned long)nr;
-        char tmp[24]; int ti = 0;
-        if (_n == 0) tmp[ti++] = '0';
-        while (_n > 0) { tmp[ti++] = (char)('0' + (_n % 10)); _n /= 10; }
-        while (ti > 0) b[i++] = tmp[--ti];
-        b[i++] = '\n';
-        int _fd = (int)raw_syscall6(56, -100L, (long)(unsigned long)diag_path(),
-                                     0x441L, 0644L, 0, (long)F2_SENTINEL);
-        if (_fd >= 0) {
-            raw_syscall6(64, _fd, (long)(unsigned long)b, i, 0, 0, (long)F2_SENTINEL);
-            raw_syscall6(57, _fd, 0, 0, 0, 0, (long)F2_SENTINEL);
-        }
-    }
     /* F2 seccomp path-translation: prelozime cestu (x1) a zemulujeme syscall
      * raw svc s SENTINEL v x5 (filtr ho pusti). Chyti i glibc-interni open. */
     /* stejna sada jako install_f2_path_filter_impl: openat=56 statx=291
