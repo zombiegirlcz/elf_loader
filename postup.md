@@ -7504,3 +7504,96 @@ obsahuje `/system/{bin,xbin}`.
 `uid=0(root) gid=0(root) groups=0(root),1077(aid_external_storage),…`;
 `--proot-compat -0 groups` → seznam skupin; `-0 stat /etc/hostname` →
 `root:root`; `bash -c 'ls /; cat /etc/os-release'` → celý guest strom.
+
+## 2026-11-03 — `push_bin.sh` zrušen: appka a rootfs koexistují v jedné appce
+
+Uživatel upozornil: appka a rootfs jsou svázané bind mounty v JEDNÉ appce,
+takže `tools/push_bin.sh` (gzip+base64 po 800B chuncích přes `ashell -c`,
+retry/verifikace délky) je zbytečná síťová zacyklená cesta k souboru, který
+je vidět přímo.
+
+**Ověřeno:** `mount` v tomhle (dev) prostředí ukazuje
+`/data/user/0/com.linux_core` nabindované přímo sem — cesta
+`/data/user/0/com.linux_core/files/usr/bin/elf_loader` je odtud čitelná
+i zapisovatelná bez `ashell`. Tohle prostředí navíc dělá UID mapping: tady
+se vlastník jeví jako `root:root`, ale skutečný Android (ověřeno přes
+`ashell -c stat`) vidí `10323:10323` — a **přímý `cp` tohle mapování
+respektuje**: testovací soubor zapsaný `cp`em se v `ashell` ukázal jako
+`10323:10323`, přesně jako originál. Žádný extra `chown`/UID trik není
+potřeba.
+
+**Fix:** `push_bin.sh` smazán, nahrazen `tools/deploy_bin.sh` — prostý
+`cp "$SRC" "$DST.new"`, `chmod`, atomický `mv -f` (chmod PŘED mv zůstává,
+ze stejného důvodu jako v původním push_bin.sh: okno mezi truncate a chmod
+by appku dočasně zneschopnilo — žádný příkaz v guestu by nebyl executable).
+Side-worktrees (`p12-nativni-ldso`, `proot-parita`) mají svou vlastní kopii
+`push_bin.sh` nedotčenou — nejsou součástí téhle větve práce.
+
+## 2026-11-03 (2) — 3h investigace: Bun/Claude Code `active_config` ENOSYS pod L2 (NEDOŘEŠENO) + regrese
+
+**Vstupní stav:** `claude -p` pod `elf_loader --proot-compat --ownall` s
+`ELF_LOADER_L2=1` padá na `ENOSYS: function not implemented, open
+'/root/.config/anthropic/active_config'`. Bez L2 (default) dojde dál —
+jiná, očekávaná chyba (trust dialog, pak `ENOENT` na `/tmp/claude-<uid>`).
+L2 je tedy prokazatelně relevantní, přesný mechanismus se **nepodařilo
+zachytit** navzdory 8 cíleným hypotézám, každá nasazena přes čistý cyklus
+commit → GitHub Actions build → `gh run download` → sha256 ověření shody
+→ nasazení na zařízení → repro.
+
+**Hypotézy a diagnostiky (žádná nenaběhla, přesto bug reprodukovatelný):**
+1. Nepodmíněná diagnostika `SH0-nr=`/`SH-nr=` na vstupu `sigsys_handler`
+   (přes `diag_path()`).
+2. Totéž gatované za `ELF_LOADER_TLS_TRACE`.
+3. Diagnostika uvnitř `go_handle` case 56 (openat) PŘED `go_translate`.
+4. Totéž PO `go_translate` a reálném syscallu (`GH56-nr=`/`GH56-rr=`,
+   commit `082fd77`→odstraněno `b893da8`).
+5. Rozšíření na libovolnou cestu obsahující `managed-settings` (ne jen
+   `active_config`) — ani tahle, prokazatelně skutečně SIGSYS-trapovaná
+   (potvrzeno paralelním `strace -f` ve stejném běhu), diagnostiku nespustila.
+6. Diagnostika v named-hookách `shim_openat`/`shim_openat64`/`shim_open64`
+   (`src/main.c`, `shim_diag_ac()`) — gatovaná, **zůstává v master** jako
+   bezpečná sonda, ale v repro případu nenaběhla.
+7. Podezření na tiché EMFILE v `diag_path()` (soubor na zápis diagnostiky
+   se nemusí otevřít) → varianta `GH56b` psala přímo na stderr raw
+   syscallem (`raw_syscall6(64, 2, …)`), úplně obešla `diag_path()`
+   (commit `e76d5d2`). Nasazeno (hash `862316…`), repro NEDOTAŽENO do konce
+   relace — výsledek nebyl ověřen.
+8. Oprava pořadí seccomp pravidel pro `openat2`(437) a `statx`(291)
+   (`JEQ → RET_TRAP` před genrickým `>=424 → ENOSYS`) — **objevený
+   obecný princip**: `SECCOMP_RET_ERRNO` má přes nezávislé stackované
+   BPF filtry vyšší prioritu než `SECCOMP_RET_TRAP`, takže nepodmíněná
+   ENOSYS mapa v JEDNOM filtru (`install_legacy_syscall_filter_impl`)
+   umí přebít TRAP z JINÉHO filtru (L2), bez ohledu na pořadí instalace.
+   Oba fixy jsou funkční, bezpečné, ověřené `test-all.sh`, ale **bug
+   nevyřešily** — zůstávají v master jako samostatně platné zlepšení.
+
+**Klíčové vedlejší zjištění — přímý běh vs. `strace`:** bez `strace`
+dojde k chybové hlášce téměř okamžitě (~7 řádků LDSO/TLSRES diagnostiky
+a konec). Pod `strace -f` proběhnou TISÍCE syscallů (desítky úspěšně
+přeložených `openat`) před identickou chybovou hláškou. Testováno i
+`strace -f -e trace=none` (ptrace attached, nic neloguje) — stejná
+identická reprodukce, takže to NENÍ prostě "strace to zpomalí a tím to
+spraví" — něco v samotném ptrace-seccomp interakci nebo v timing dřív
+rozhoduje jinou cestu. Silná indicie, že přímý běh se vůbec nedostane
+tak daleko jako běh pod stracem, a že `open()`→ENOSYS v Bunově hlášce
+nemusí vůbec odpovídat syscallu, který reálně selhal (Bun/Claude Code
+může chybu generalizovat/zabalit).
+
+**REGRESE (kritická, nahlášená uživatelem uprostřed investigace):**
+hypotézy 1 a 3 (nepodmíněné diagnostiky v `sigsys_handler`) firovaly při
+KAŽDÉM SIGSYS trapu, i za normálního provozu (rseq/clone3 compat trapy
+běžné i v obyčejném interaktivním shellu) → zapisovaly na stderr/do diag
+souboru a rozbily uživatelův starship prompt. Uživatel: *"zpusobil si
+regresI sesipal sem mi starship prompt"*. **Fix** (commit `ab87333`):
+okamžité odstranění VŠECH nepodmíněných diagnostik z `sigsys_handler`
+a `main.c` shim_open* funkcí, rebuild, redeploy, ověřeno hash + přímým
+capture stdout/stderr (0 B na stderr za normálního běhu) + `test-all.sh`
+(218 PASS/4 FAIL/31 SKIP, shoda s baseline). **Pravidlo do budoucna:**
+jakákoli další diagnostika v `sigsys_handler`/`go_handle` MUSÍ být
+gatovaná (`ELF_LOADER_TLS_TRACE` nebo lokální cache `getenv`) a ověřená
+i na obyčejném interaktivním shellu, ne jen na repro scénáři — ne jen
+na tom, že diagnostika sama vypadá nevinně.
+
+**Stav:** hlavní bug nevyřešen, zapsán v AGENTS.md „Otevřené bugy"
+(`active_config`); regrese opravena a ověřena; dva vedlejší fixy
+(openat2, statx pořadí) zůstávají v master jako platné zlepšení.

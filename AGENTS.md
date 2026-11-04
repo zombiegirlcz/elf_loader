@@ -140,6 +140,11 @@ review. Před synchronizací `git pull origin dev`, pak `master` ← `dev` (ff).
 
 ## Deploy na zařízení
 
+- Appka a rootfs koexistují v JEDNÉ appce (bind mounty) → nasazení binárky
+  je prostý `cp`/`tools/deploy_bin.sh`, ne síťový upload. UID appky
+  (`10323`) se u přímého `cp` zachovává samo, žádný ruční `chown` není
+  potřeba (2026-11-03). `tools/push_bin.sh` (base64 přes `ashell`) byl proto
+  zrušen.
 - Magisk modul + `elf` wrapper (bionic NDK build), namespace workaround
   `/data/adb/` [#L328]. `LD_LIBRARY_PATH` poisoning fix — `/system/lib64`
   PRVNÍ [#L406].
@@ -590,7 +595,8 @@ Pro bitovou shodu by stačil 6řádkový knob `LX_FAKEROOT_MAP`; uživatel
   očekávaná chyba — trust dialog, pak `ENOENT` na `/tmp/claude-<uid>`), tedy
   L2 je prokazatelně relevantní, ale přesný mechanismus **se nepodařilo
   zachytit** 2026-11-03 přes 8 cílených hypotéz a nasazení (každé ověřené
-  hashem binárky): nepodmíněná i gatovaná (`ELF_LOADER_TLS_TRACE`)
+  hashem binárky, plný chronologický zápis postup.md 2026-11-03 (2)
+  [#L7532]): nepodmíněná i gatovaná (`ELF_LOADER_TLS_TRACE`)
   diagnostika na **úplném vstupu** `sigsys_handler` (před `go_handle`
   dispatchem), uvnitř `go_handle` case 56 (před i po `go_translate`+reálném
   syscallu), v named-hookách `shim_openat`/`shim_openat64`/`shim_open64` —
@@ -736,6 +742,7 @@ Pro bitovou shodu by stačil 6řádkový knob `LX_FAKEROOT_MAP`; uživatel
 | tabulka mountů, bindy, incident binds testu | 2026-10-21 (4), 2026-10-22 |
 | `--argv0`, virtualizace `/proc`, comm | 2026-10-22 (2), (3) |
 | soft exec (prompt 11) | 2026-10-29 |
+| Bun `active_config` ENOSYS pod L2 (nedořešeno), regrese starship | 2026-11-03 (2) |
 | výkon: timing, cache, hash, imgcache, lazy | 2026-10-16, 2026-10-20 |
 | zátěžový test multi-runtime | L3885, L4047 |
 | otevřené nálezy exec/argv | L3939, L3973, L3988, L4029 |
