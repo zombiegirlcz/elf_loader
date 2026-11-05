@@ -6107,6 +6107,35 @@ static void sigsys_handler(int, siginfo_t *, void *);
 /* Reinstalace SIGSYS handleru KERNEL layoutem (bionic struct sigaction ma
  * jiny layout nez kernel!). Volej z handleru, aby nas handler "drzel" i kdyz
  * ho guest runtime (glibc/zsh) prebije. raw syscall = TP-independent. */
+/* Spolehlivy diagnosticky kanal (2026-11-05). Dosavadni sondy mely DVA
+ * tiche kanaly: (a) diag soubor s cestou z diag_path_info(), ktera prijde
+ * PRAZDNA (strace: openat("") = -1 ENOENT), (b) stderr, ktery si Bun
+ * presmeruje. Tahle funkce pise do KONSTANTNI cesty - zadna aritmetika,
+ * nelze ji tedy vyrobit prazdnou - a otevira si fd pri kazdem zapisu.
+ * Raw syscally, zadne TLS (past c. 1). */
+NOSP static void diag_tr(const char *msg, long n1, long n2) {
+    static const char path[] = "/data/user/0/com.linux_core/files/usr/diag.trace.txt";
+    char b[160]; int i = 0;
+    for (const char *q = msg; *q && i < 100; q++) b[i++] = *q;
+    for (int k = 0; k < 2; k++) {
+        long v = k ? n2 : n1;
+        if (v == -999999) break;
+        b[i++] = ' ';
+        if (v < 0) { b[i++] = '-'; v = -v; }
+        char t[24]; int ti = 0;
+        if (!v) t[ti++] = '0';
+        while (v > 0) { t[ti++] = (char)('0' + (v % 10)); v /= 10; }
+        while (ti > 0) b[i++] = t[--ti];
+    }
+    b[i++] = '\n';
+    long fd = raw_syscall6(56, -100L, (long)(unsigned long)path, 0x441L, 0644L, 0,
+                           (long)F2_SENTINEL);
+    if (fd >= 0) {
+        raw_syscall6(64, fd, (long)(unsigned long)b, i, 0, 0, (long)F2_SENTINEL);
+        raw_syscall6(57, fd, 0, 0, 0, 0, (long)F2_SENTINEL);
+    }
+}
+
 static void f2_reinstall_sigsys(void) {
     struct {
         void (*h)(int, void *, void *);
@@ -6276,6 +6305,7 @@ NOSP static int go_handle(long nr, ucontext_t *ctx) {
      * nr na vstupu dispatche + prvni argumenty. Odpovida na otazku, proc
      * handler u Bunu nevykona ani jeden syscall (strace: SIGSYS openat ->
      * rt_sigreturn = -38, nic mezi tim). */
+    if (g_tls_trace) diag_tr("GH nr", nr, (long)r[0]);
     if (g_tls_trace) {
         char b[96]; int i = 0;
         const char *m = "GH-nr="; while (*m) b[i++] = *m++;
@@ -6653,6 +6683,8 @@ NOSP static void sigsys_handler(int sig, siginfo_t *si, void *uc) {
     (void)sig;
     /* DIAG (gatovano ELF_LOADER_TLS_TRACE, bezpecne pro bezny provoz):
      * nr na uplnem vstupu, pred go_handle dispatchem. */
+    if (g_tls_trace) diag_tr("SH0 nr", (long)si->si_syscall,
+                             (long)((unsigned long)((ucontext_t *)uc)->uc_mcontext.pc - 4));
     if (g_tls_trace) {
         char b[64]; int i = 0;
         const char *m1 = "SH0-nr=";
@@ -6920,6 +6952,7 @@ NOSP static void sigsys_handler(int sig, siginfo_t *si, void *uc) {
                          0, 0, (long)F2_SENTINEL);
             raw_syscall6(57, _fd, 0, 0, 0, 0, (long)F2_SENTINEL);
         }
+        if (g_tls_trace) diag_tr("DENIED nr", nr, -999999);
         /* POZOR: pc uz ukazuje na svc+4 (stejne jako v emu ceste vyse).
          * Dřívější `pc += 4` preskocilo glibc error-check za svc
          * (cmn x0,#-4095; b.hi) -> glibc nezkonvertovalo -ENOSYS na
