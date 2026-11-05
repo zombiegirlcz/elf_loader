@@ -6113,7 +6113,7 @@ static void sigsys_handler(int, siginfo_t *, void *);
  * presmeruje. Tahle funkce pise do KONSTANTNI cesty - zadna aritmetika,
  * nelze ji tedy vyrobit prazdnou - a otevira si fd pri kazdem zapisu.
  * Raw syscally, zadne TLS (past c. 1). */
-NOSP static void diag_tr(const char *msg, long n1, long n2) {
+static void diag_tr(const char *msg, long n1, long n2) {
     static const char path[] = "/data/user/0/com.linux_core/files/usr/diag.trace.txt";
     char b[160]; int i = 0;
     for (const char *q = msg; *q && i < 100; q++) b[i++] = *q;
