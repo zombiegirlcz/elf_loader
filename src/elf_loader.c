@@ -5181,9 +5181,12 @@ static void install_legacy_syscall_filter_impl(void) {
      * statx=291 ZDE ZAMERNE NENI (2026-11-03, Bun/claude CLI ENOSYS na
      * active_config): RET_ERRNO ma v seccomp prioritu PRED RET_TRAP i mezi
      * nezavislymi stackovanymi filtry, takze tahle ENOSYS mapa by statx
-     * prebila jeste pred tim, nez by TRAP dostal sanci (L2/go_handle i
-     * Androidi profil, oba vraceji TRAP pro 291). Bun na ENOSYS fallback
-     * na fstatat nema (na rozdil od glibc stat()) -> rovnou nahlasi chybu.
+     * prebila jeste pred tim, nez by L2 TRAP dostal sanci (g_go_* filtr
+     * ma 291 v nrs_path) a `sigsys_handler` case nr==291 by se nespustil.
+     * App seccomp profil statx POVOLUJE (naměřeno 2026-11-05 freestanding
+     * sondou: rc=0) - drive tu bylo napsano, ze ho TRAPuje; to neplati.
+     * Bun na ENOSYS fallback na fstatat nema (na rozdil od glibc stat())
+     * -> rovnou nahlasi chybu.
      * Misto toho TRAPujeme a prelozime v sigsys_handler (nr==291 nize),
      * stejny princip jako u openat2(437). */
     static const int blocked2[] = { 282, 283 };
@@ -5203,7 +5206,14 @@ static void install_legacy_syscall_filter_impl(void) {
     /* 437 (openat2) NENI v tomhle seznamu zamerne: viz sigsys_handler case
      * nr==437 - musi se TRAPnout (ne rovnou ENOSYS), aby se cesta prelozila
      * (Bun/Node na ENOSYS fallback nema, viz komentar tam). */
-    static const int blocked[] = { 293, 282, 434, 435, 436, 439, 440, 441, 449, 283, 291 };
+    /* 291 (statx) ZDE ZAMERNE NENI - viz komentar u blocked2[] vyse.
+     * Do 2026-11-05 tu byl a tim prebijel VLASTNI TRAP+preklad: commit
+     * 0237c51 vyndal statx jen z blocked2[], takze `sigsys_handler`
+     * case nr==291 byl mrtvy kod a kazde statx vratilo ENOSYS. Naměřeno
+     * freestanding ET_EXEC sondou mimo loader (past c. 17): app seccomp
+     * profil statx NEBLOKUJE (rc=0, kernel 4.14 ho zna) - TRAPuje jen
+     * openat2(437). Blokovali jsme tedy funkcni syscall. */
+    static const int blocked[] = { 293, 282, 434, 435, 436, 439, 440, 441, 449, 283 };
     /* pkey_* (285-289) zamerne vynechany - viz blocked2 vyse. */
     for (size_t i = 0; i < sizeof(blocked)/sizeof(blocked[0]); i++) {
         prog[n++] = (struct sock_filter)
