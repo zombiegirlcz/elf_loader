@@ -1306,6 +1306,31 @@ static int shim_open(const char *p, int flags, ...) {
 /* DIAG (gatovano ELF_LOADER_TLS_TRACE, bezpecne pro bezny provoz):
  * zjistuje, jestli volani s "active_config" v ceste prochazi jmennymi
  * hooky (shim_open64/openat/openat64) a s jakym rc/errno. */
+/* Spolehlivy kanal i pro jmenne hooky: konstantni cesta (diag_path_main()
+ * prijde prazdna) a NE stderr (Bun si ho presmeruje). Viz diag_tr()
+ * v elf_loader.c. */
+static void main_diag_tr(const char *msg, const char *s1, long n1, long n2) {
+    static const char path[] = "/data/user/0/com.linux_core/files/usr/diag.trace.txt";
+    char b[600]; int i = 0;
+    for (const char *q = msg; *q && i < 60; q++) b[i++] = *q;
+    if (s1) { b[i++] = ' '; for (const char *q = s1; *q && i < 420; q++) b[i++] = *q; }
+    for (int k = 0; k < 2; k++) {
+        long v = k ? n2 : n1;
+        b[i++] = ' ';
+        if (v < 0) { b[i++] = '-'; v = -v; }
+        char t[24]; int ti = 0;
+        if (!v) t[ti++] = '0';
+        while (v > 0) { t[ti++] = (char)('0' + (v % 10)); v /= 10; }
+        while (ti > 0) b[i++] = t[--ti];
+    }
+    b[i++] = '\n';
+    long fd = my_raw_syscall6(56, -100, (long)(unsigned long)path, 0x441L, 0644L, 0,
+                              ELF_SENTINEL);
+    if (fd >= 0) {
+        my_raw_syscall6(64, fd, (long)(unsigned long)b, i, 0, 0, ELF_SENTINEL);
+        my_raw_syscall6(57, fd, 0, 0, 0, 0, ELF_SENTINEL);
+    }
+}
 static int g_diag_ac_on = -1;
 static void shim_diag_ac(const char *tag, const char *orig, const char *path, int rc) {
     if (g_diag_ac_on < 0)
@@ -1336,8 +1361,8 @@ static void shim_diag_ac(const char *tag, const char *orig, const char *path, in
     while (e > 0) { t[ti++] = (char)('0' + e % 10); e /= 10; }
     while (ti > 0) b[i++] = t[--ti];
     b[i++] = '\n';
-    /* 2026-11-05: ZAPIS I NA STDERR - zapis do diag souboru je nespolehlivy
-     * (naměřeno strace: openat("") -> ENOENT), takze sonda tise mizela. */
+    /* 2026-11-05: spolehlivy kanal (konstantni cesta) + stderr. */
+    main_diag_tr(tag, orig, rc, (long)errno);
     my_raw_syscall6(64, 2, (long)(unsigned long)b, i, 0, 0, ELF_SENTINEL);
     long fd = my_raw_syscall6(56, -100, (long)(unsigned long)diag_path_main(),
                               0x441L, 0644L, 0, ELF_SENTINEL);
@@ -5291,6 +5316,11 @@ static int run_ownall(const char *path, int argc, char **argv, char **envp) {
     if (elf_debug() && g_cwd_keep_host)
         fprintf(stderr, "[F2] getcwd: host cesta (Bun / F2_NO_CWD_STRIP)\n");
     shim_install_hooks();    /* patch glibc leaf funkci (F2 / re-exec) */
+    if (getenv("ELF_LOADER_TLS_TRACE"))
+        main_diag_tr("ORIG open/openat/open64/openat64", NULL,
+                     (g_orig_open ? 1 : 0) * 1000 + (g_orig_openat ? 1 : 0) * 100 +
+                     (g_orig_open64 ? 1 : 0) * 10 + (g_orig_openat64 ? 1 : 0),
+                     elf_l2_enabled());
     shim_resolve_fallback(); /* fallback real funkci (W^X) */
     elf_timing_mark("hooks_install");
     g_real_libc_start_main = elf_scope_lookup(scope, "__libc_start_main");
