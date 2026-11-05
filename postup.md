@@ -7597,3 +7597,113 @@ na tom, že diagnostika sama vypadá nevinně.
 **Stav:** hlavní bug nevyřešen, zapsán v AGENTS.md „Otevřené bugy"
 (`active_config`); regrese opravena a ověřena; dva vedlejší fixy
 (openat2, statx pořadí) zůstávají v master jako platné zlepšení.
+
+## 2026-11-05 — Bun/claude ≥ 2.1.317 pod L2: ENOSYS na `active_config` vyřešeno
+
+Otevřený bug z 2026-11-03 (8 hypotéz, žádná sonda „nenaběhla"). Root cause
+nalezen a opraven; cestou k němu dvě samostatné chyby a jedna metodická past.
+
+### Co to bylo
+
+**Bun 1.3 / claude ≥ 2.1.317 si přepíše náš SIGSYS handler raw
+`rt_sigaction`em.** Jeho vlastní handler vrací `-ENOSYS`, takže každý TRAP
+(kterým se překládají cesty) skončí u guesta jako ENOSYS — i na cestách, kde
+patří ENOENT (`$HOME/.config/anthropic/active_config` ani neexistuje).
+
+Obrana stála na dvou obejitelných věcech:
+1. jmenný hook `sigaction` (`diag_wrapped_sigaction`, `signum == 31 → return 0`).
+   `nm -D --undefined-only`: **2.1.314** importuje `sigaction`, `signal`,
+   `sigprocmask`, `pthread_sigmask`; **2.1.317 a 2.1.318 ani jeden** → hook
+   nemá co zachytit.
+2. IP check L2 filtru — TRAPuje jen `svc` z textu guest exe. `syscall(134,…)`
+   nebo libc-interní `svc` leží mimo, takže projdou.
+
+**A/B, které to ukázalo** (sonda `diag_tr` → `usr/diag.trace.txt`, claude pod
+`ELF_LOADER_L2=1`):
+
+| verze | zápisů z našich sond | výsledek |
+|---|---|---|
+| 2.1.314 | **1851** | doběhne (trapy chodí k nám) |
+| 2.1.317 | **0** | `ENOSYS … active_config` |
+| 2.1.318 | **0** | totéž |
+
+Nulový počet nebyl „handler neběží", ale „trapy už nám nepatří".
+
+### Fix (`05940c3`, upraveno `db76f9b`)
+
+`l2_install_range_filter` dostal prefix **před** IP checkem:
+`rt_sigaction(SIGSYS, act != NULL)` → `SECCOMP_RET_ERRNO|0` (předstíraný
+úspěch) nezávisle na IP, kromě volání s `F2_SENTINEL` v `x5` (naše
+`f2_reinstall_sigsys`). Čtení (`act == NULL`) prochází a vrací skutečnou
+dispozici. Knob `ELF_LOADER_NO_SIGSYS_LOCK=1`.
+
+**Proč ERRNO a ne TRAP:** s TRAPem padalo `bash -c 'ls /etc/hostname'` pod L2
+na „Bad system call", rc=159 (A/B knobem na téže binárce). Bionic libc
+instaluje debuggerd handlery (ABRT BUS FPE ILL SEGV STKFLT **SYS** TRAP)
+už v libc initu, tedy **před** `early_install_sigsys` (constructor 101) —
+v té chvíli je SIGSYS `SIG_DFL` a TRAP proces zabije. `RET_ERRNO` zabít
+nemůže. (Týž vzorec osmi `rt_sigaction` ve strace výpisech je bionic
+debuggerd, ne guest.)
+
+### Ověření
+
+```
+sonda syscall(134,31,&act,…) z IP mimo text range, F2_SKIP=sigaction
+   před fixem: handler=myh            → PŘEPSÁNO
+   po fixu:    handler=0x5f11381aec   → handler loaderu drží
+claude 2.1.317 pod L2:  "Hi! What can I help you with?"  (8 s)
+claude 2.1.318 / 2.1.314 pod L2:  OK
+bash -c 'ls /etc/hostname; id -u':  /etc/hostname, 10323, rc=0
+python3 -c 'print(open("/etc/hostname").read())':  TERMINATOR (= obsah souboru)
+test-all.sh all:  216 PASS / 6 FAIL / 31 SKIP
+```
+
+FAILy nejsou regrese: `staticexec` a `binds` padaly už 2026-11-03 (results/
+fail_20261103_*.txt), `curl`/`wget`/`getent`/`nmap` ručně pod loaderem
+fungují (`http=200`, `getent hosts localhost` → `127.0.0.1`) — padají na
+2s timeoutu harnessu (past č. 6). `starship` PASS.
+
+### Vedlejší nález 1: `statx(291)` byl mrtvý kód (`a3c306b`)
+
+Commit `0237c51` (2026-11-03) vyňal `statx` z `blocked2[]`, ale **nechal ho
+v `blocked[]`**, takže legacy filtr ho dál nepodmíněně mapoval na
+`RET_ERRNO|ENOSYS`. `RET_ERRNO` má přednost před `RET_TRAP` i mezi
+nezávislými stackovanými filtry → přebíjelo to vlastní L2 TRAP a
+`sigsys_handler` case `nr == 291` (překlad cesty) se **nikdy nespustil**.
+Každé `statx` v procesu vracelo ENOSYS.
+
+Navíc: komentář tvrdil, že app seccomp profil `291` TRAPuje. **Neplatí.**
+Freestanding ET_EXEC sonda mimo loader (past č. 17) dala `statx` rc=0,
+`newfstatat` rc=0 a TRAP jen na `openat2(437)`. Blokovali jsme funkční
+syscall.
+
+Po fixu: `statx` pod L2 rc=0, `size=11` (cesta přeložena do rootfs), bez L2
+ENOENT jako `newfstatat`. Ve strace běhu claude zmizelo všech 36 ENOSYS na
+statx; zbyl jen `close_range` (má fallback).
+
+### Vedlejší nález 2: proč 2026-11-03 „nenaběhla žádná sonda" (past č. 37)
+
+Diagnostika má dva kanály, které umí tiše zmizet:
+- `diag_path_info()` vrací **prázdnou cestu**, když není `ELF_LOADER_DIAG`
+  (je to gate, ne chyba) → sonda gatovaná jen `ELF_LOADER_TLS_TRACE` dělá
+  `openat("")` → ENOENT a nezapíše nic. Ve strace to je vidět přímo:
+  `openat("", O_WRONLY|O_CREAT|O_APPEND, 0644) = -1 ENOENT`.
+- stderr si guest (Bun) může přesměrovat.
+
+Proto přidán `diag_tr()` (`src/elf_loader.c`) a `main_diag_tr()`
+(`src/main.c`): konstantní cesta `usr/diag.trace.txt`, nezávislá na
+`ELF_LOADER_DIAG`, raw syscally. **Metodické pravidlo:** „sonda nic
+nevypsala" není důkaz, že kód neběží, dokud na témže běhu neprokážeš, že
+kanál funguje (A/B proti vlastní sondě — ta dala 6× `SH0 nr 56`, claude 0).
+
+### Co bylo v 2026-11-03 vyloženo špatně
+
+`strace -i` ukazoval 37 SIGSYS trapů na `openat` z Bunova textu, za každým
+hned `rt_sigreturn` s `x0 = -38` a **žádný syscall mezi tím**. Vypadalo to
+jako „náš handler vrací ENOSYS", ale byl to **Bunův** handler — náš v tom
+procesu už nebyl. Rozlišit to šlo jedině sondou se spolehlivým kanálem
+(nulový počet záznamů u 317 proti 1851 u 314).
+
+Taky: `ELF_LOADER_NO_ENOSYS_MAP=1` (nový diagnostický knob) vynechá
+nepodmíněné ENOSYS mapy, takže ty syscally projdou handlerem a jsou vidět —
+`RET_ERRNO` jinak handler obchází úplně a žádná sonda ho nezachytí.

@@ -6107,12 +6107,16 @@ static void sigsys_handler(int, siginfo_t *, void *);
 /* Reinstalace SIGSYS handleru KERNEL layoutem (bionic struct sigaction ma
  * jiny layout nez kernel!). Volej z handleru, aby nas handler "drzel" i kdyz
  * ho guest runtime (glibc/zsh) prebije. raw syscall = TP-independent. */
-/* Spolehlivy diagnosticky kanal (2026-11-05). Dosavadni sondy mely DVA
- * tiche kanaly: (a) diag soubor s cestou z diag_path_info(), ktera prijde
- * PRAZDNA (strace: openat("") = -1 ENOENT), (b) stderr, ktery si Bun
- * presmeruje. Tahle funkce pise do KONSTANTNI cesty - zadna aritmetika,
- * nelze ji tedy vyrobit prazdnou - a otevira si fd pri kazdem zapisu.
- * Raw syscally, zadne TLS (past c. 1). */
+/* Spolehlivy diagnosticky kanal (2026-11-05). Dosavadni sondy mely dva
+ * kanaly, ktere oba umi tise zmizet:
+ *  (a) diag soubor pres diag_path_info() - ta vraci PRAZDNOU cestu, kdyz
+ *      neni ELF_LOADER_DIAG (je to gate, ne chyba), takze openat("")
+ *      selze na ENOENT a sonda gatovana jen ELF_LOADER_TLS_TRACE nezapise
+ *      nic, i kdyz "bezi",
+ *  (b) stderr, ktery si guest (Bun) muze presmerovat.
+ * diag_tr() pise do KONSTANTNI cesty usr/diag.trace.txt nezavisle na
+ * ELF_LOADER_DIAG a otevira si fd pri kazdem zapisu. Raw syscally, zadne
+ * TLS (past c. 1). Volat jen gatovane (ELF_LOADER_TLS_TRACE). */
 static void diag_tr(const char *msg, long n1, long n2) {
     static const char path[] = "/data/user/0/com.linux_core/files/usr/diag.trace.txt";
     char b[160]; int i = 0;
@@ -6763,11 +6767,8 @@ NOSP static void sigsys_handler(int sig, siginfo_t *si, void *uc) {
         while (_n0 > 0) { tmp0[ti0++] = (char)('0' + (_n0 % 10)); _n0 /= 10; }
         while (ti0 > 0) b[i++] = tmp0[--ti0];
         b[i++] = '\n';
-        /* 2026-11-05: ZAPIS I NA STDERR. Diag soubor je nespolehlivy -
-         * namereno, ze cesta z diag_path_info() prijde prazdna
-         * (`openat("", O_WRONLY|O_CREAT|O_APPEND) = -1 ENOENT` ve strace),
-         * takze sonda tise nic nezapise a vypada to, jako by handler
-         * nenabehl. Raw write(2) je bezpecny i pod guest TP (past c. 1). */
+        /* 2026-11-05: zapis i na stderr (vedle diag_tr vyse). Raw write(2)
+         * je bezpecny i pod guest TP (past c. 1). */
         raw_syscall6(64, 2, (long)(unsigned long)b, i, 0, 0, (long)F2_SENTINEL);
         int _fd0 = (int)raw_syscall6(56, -100L, (long)(unsigned long)diag_path(),
                                       0x441L, 0644L, 0, (long)F2_SENTINEL);

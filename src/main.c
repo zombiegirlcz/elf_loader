@@ -1306,9 +1306,9 @@ static int shim_open(const char *p, int flags, ...) {
 /* DIAG (gatovano ELF_LOADER_TLS_TRACE, bezpecne pro bezny provoz):
  * zjistuje, jestli volani s "active_config" v ceste prochazi jmennymi
  * hooky (shim_open64/openat/openat64) a s jakym rc/errno. */
-/* Spolehlivy kanal i pro jmenne hooky: konstantni cesta (diag_path_main()
- * prijde prazdna) a NE stderr (Bun si ho presmeruje). Viz diag_tr()
- * v elf_loader.c. */
+/* Spolehlivy kanal i pro jmenne hooky: konstantni cesta, nezavisla na
+ * ELF_LOADER_DIAG, a ne jen stderr (ten si guest muze presmerovat).
+ * Viz diag_tr() v elf_loader.c. */
 static void main_diag_tr(const char *msg, const char *s1, long n1, long n2) {
     static const char path[] = "/data/user/0/com.linux_core/files/usr/diag.trace.txt";
     char b[600]; int i = 0;
@@ -1361,7 +1361,8 @@ static void shim_diag_ac(const char *tag, const char *orig, const char *path, in
     while (e > 0) { t[ti++] = (char)('0' + e % 10); e /= 10; }
     while (ti > 0) b[i++] = t[--ti];
     b[i++] = '\n';
-    /* 2026-11-05: spolehlivy kanal (konstantni cesta) + stderr. */
+    /* 2026-11-05: spolehlivy kanal (konstantni cesta, nezavisly na
+     * ELF_LOADER_DIAG) + stderr. */
     main_diag_tr(tag, orig, rc, (long)errno);
     my_raw_syscall6(64, 2, (long)(unsigned long)b, i, 0, 0, ELF_SENTINEL);
     long fd = my_raw_syscall6(56, -100, (long)(unsigned long)diag_path_main(),
