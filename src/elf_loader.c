@@ -6621,15 +6621,24 @@ static int l2_install_range_filter(unsigned long lo, unsigned long hi, const cha
      * nenabehla - trapy nam uz nepatrily.
      *
      * CTENI (act == NULL) se nechava projit: vrati skutecnou dispozici
-     * (nas handler), coz je pravda a guest si ji smi precist. Zapis TRAPne
-     * a blok `nr == 134` v sigsys_handleru ulozi guestuv handler pro
-     * chaining, vyplni oldact a predstira uspech.
+     * (nas handler), coz je pravda a guest si ji smi precist. ZAPIS dostane
+     * SECCOMP_RET_ERRNO s errnem 0 = tichy predstirany uspech bez efektu,
+     * stejna semantika jako `signum == 31 -> return 0` ve jmennem hooku.
+     *
+     * POZOR, PROC NE TRAP: bionic libc instaluje v KAZDEM novem procesu
+     * debuggerd handlery (ABRT BUS FPE ILL SEGV STKFLT SYS TRAP) a dela to
+     * v libc initu, tedy PRED konstruktorem early_install_sigsys - v te
+     * chvili je SIGSYS jeste SIG_DFL, takze TRAP proces zabije. Naměřeno
+     * 2026-11-05: s TRAPem `bash -c "ls /etc/hostname"` pod L2 skoncilo
+     * "Bad system call", rc=159 (A/B knobem na teze binarce), kdezto
+     * s ERRNO|0 projde. RET_ERRNO navic nikdy nemuze zabit.
      * Vypnuti: ELF_LOADER_NO_SIGSYS_LOCK=1. */
     int sigsys_lock = getenv("ELF_LOADER_NO_SIGSYS_LOCK") == NULL;
     size_t PRE = sigsys_lock ? 10 : 0;
     /* pozice: PRE..PRE+4 IP check, +5 LD nr, dale JEQ, 3 instr. sigaction
      * blok, ALLOW, TRAP (relativni skoky nize se posunem nemeni) */
     size_t i_allow = PRE + 6 + NN + 3, i_trap = i_allow + 1;
+    size_t i_fake = i_trap + 1;      /* RET_ERRNO|0 = predstirany uspech */
     if (sigsys_lock) {
         prog[n++] = (struct sock_filter)BPF_STMT(BPF_LD | BPF_W | BPF_ABS,
                        offsetof(struct seccomp_data, nr));
@@ -6647,13 +6656,13 @@ static int l2_install_range_filter(unsigned long lo, unsigned long hi, const cha
                        offsetof(struct seccomp_data, args[5]));
         prog[n] = (struct sock_filter)BPF_JUMP(BPF_JMP | BPF_JEQ | BPF_K,
                        (unsigned)(F2_SENTINEL & 0xffffffffUL), 0, 0);
-        prog[n].jf = (unsigned char)(i_trap - n - 1); n++;
+        prog[n].jf = (unsigned char)(i_fake - n - 1); n++;
         prog[n++] = (struct sock_filter)BPF_STMT(BPF_LD | BPF_W | BPF_ABS,
                        offsetof(struct seccomp_data, args[5]) + 4);
         prog[n] = (struct sock_filter)BPF_JUMP(BPF_JMP | BPF_JEQ | BPF_K,
                        (unsigned)(F2_SENTINEL >> 32), 0, 0);
         prog[n].jt = (unsigned char)(i_allow - n - 1);             /* nase volani */
-        prog[n].jf = (unsigned char)(i_trap - n - 1); n++;         /* cizi -> TRAP */
+        prog[n].jf = (unsigned char)(i_fake - n - 1); n++;         /* cizi -> fake OK */
         if (n != PRE) {
             fprintf(stderr, "[%s] BUG: sigsys prefix n=%zu PRE=%zu\n", tag, n, PRE);
             return 0;
@@ -6691,6 +6700,8 @@ static int l2_install_range_filter(unsigned long lo, unsigned long hi, const cha
     }
     prog[n++] = (struct sock_filter)BPF_STMT(BPF_RET | BPF_K, SECCOMP_RET_ALLOW);
     prog[n++] = (struct sock_filter)BPF_STMT(BPF_RET | BPF_K, SECCOMP_RET_TRAP);
+    if (sigsys_lock)   /* errno 0 = syscall "uspel" a neudelal nic */
+        prog[n++] = (struct sock_filter)BPF_STMT(BPF_RET | BPF_K, SECCOMP_RET_ERRNO | 0);
     struct sock_fprog fp = { .len = (unsigned short)n, .filter = prog };
     prctl(PR_SET_NO_NEW_PRIVS, 1, 0, 0, 0);
     long rs = syscall((long)277, 1UL, 0UL, &fp);
