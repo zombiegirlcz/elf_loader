@@ -6598,10 +6598,67 @@ static int l2_install_range_filter(unsigned long lo, unsigned long hi, const cha
     for (size_t k = 0; k < sizeof nrs_path / sizeof nrs_path[0]; k++) nrs[NN++] = nrs_path[k];
     if (elf_fakeroot_active())
         for (size_t k = 0; k < sizeof nrs_id / sizeof nrs_id[0]; k++) nrs[NN++] = nrs_id[k];
-    struct sock_filter prog[64];
+    struct sock_filter prog[80];
     size_t n = 0;
-    /* pozice: 0..4 IP check, 5 LD nr, 6..6+NN-1 JEQ, 3 instr. sigaction blok, ALLOW, TRAP */
-    size_t i_allow = 6 + NN + 3, i_trap = i_allow + 1;
+    /* ── PREFIX (2026-11-05): rt_sigaction(SIGSYS, act != NULL) TRAPne
+     * NEZAVISLE NA IP, krome volani se F2_SENTINEL v x5 (= nase vlastni,
+     * viz f2_reinstall_sigsys).
+     *
+     * Proc: obrana naseho SIGSYS handleru stala na dvou vecech, ktere obe
+     * daji obejit. (1) jmenny hook `sigaction` (diag_wrapped_sigaction
+     * v main.c) - Bun 1.3 / claude >= 2.1.317 uz glibc `sigaction`
+     * NEIMPORTUJE (`nm -D --undefined-only`: 2.1.314 ma sigaction/signal/
+     * sigprocmask/pthread_sigmask, 2.1.317 ani jeden), dela raw syscall.
+     * (2) IP check tohohle filtru - ten chrani jen volani z textu guest
+     * exe. Kdyz guest prebije handler, kazdy dalsi TRAP skonci v JEHO
+     * handleru; u Bunu to znamena -ENOSYS, takze guest vidi
+     * "ENOSYS: function not implemented, open '<cesta>'" na cestach,
+     * kde patri ENOENT.
+     *
+     * Naměřeno 2026-11-05 (diag_tr do usr/diag.trace.txt): claude 2.1.314
+     * pod L2 = 1851 zapisu z nasich sond (trapy chodi k nam), 2.1.317
+     * i 2.1.318 = ANI JEDEN, a presto ENOSYS. Zadna sonda proto 2026-11-03
+     * nenabehla - trapy nam uz nepatrily.
+     *
+     * CTENI (act == NULL) se nechava projit: vrati skutecnou dispozici
+     * (nas handler), coz je pravda a guest si ji smi precist. Zapis TRAPne
+     * a blok `nr == 134` v sigsys_handleru ulozi guestuv handler pro
+     * chaining, vyplni oldact a predstira uspech.
+     * Vypnuti: ELF_LOADER_NO_SIGSYS_LOCK=1. */
+    int sigsys_lock = getenv("ELF_LOADER_NO_SIGSYS_LOCK") == NULL;
+    size_t PRE = sigsys_lock ? 10 : 0;
+    /* pozice: PRE..PRE+4 IP check, +5 LD nr, dale JEQ, 3 instr. sigaction
+     * blok, ALLOW, TRAP (relativni skoky nize se posunem nemeni) */
+    size_t i_allow = PRE + 6 + NN + 3, i_trap = i_allow + 1;
+    if (sigsys_lock) {
+        prog[n++] = (struct sock_filter)BPF_STMT(BPF_LD | BPF_W | BPF_ABS,
+                       offsetof(struct seccomp_data, nr));
+        prog[n] = (struct sock_filter)BPF_JUMP(BPF_JMP | BPF_JEQ | BPF_K, 134, 0, 0);
+        prog[n].jf = (unsigned char)(PRE - n - 1); n++;            /* ne-134 -> IP check */
+        prog[n++] = (struct sock_filter)BPF_STMT(BPF_LD | BPF_W | BPF_ABS,
+                       offsetof(struct seccomp_data, args[0]));
+        prog[n] = (struct sock_filter)BPF_JUMP(BPF_JMP | BPF_JEQ | BPF_K, 31, 0, 0);
+        prog[n].jf = (unsigned char)(PRE - n - 1); n++;            /* jiny signal */
+        prog[n++] = (struct sock_filter)BPF_STMT(BPF_LD | BPF_W | BPF_ABS,
+                       offsetof(struct seccomp_data, args[1]));
+        prog[n] = (struct sock_filter)BPF_JUMP(BPF_JMP | BPF_JEQ | BPF_K, 0, 0, 0);
+        prog[n].jt = (unsigned char)(PRE - n - 1); n++;            /* act == NULL -> cteni */
+        prog[n++] = (struct sock_filter)BPF_STMT(BPF_LD | BPF_W | BPF_ABS,
+                       offsetof(struct seccomp_data, args[5]));
+        prog[n] = (struct sock_filter)BPF_JUMP(BPF_JMP | BPF_JEQ | BPF_K,
+                       (unsigned)(F2_SENTINEL & 0xffffffffUL), 0, 0);
+        prog[n].jf = (unsigned char)(i_trap - n - 1); n++;
+        prog[n++] = (struct sock_filter)BPF_STMT(BPF_LD | BPF_W | BPF_ABS,
+                       offsetof(struct seccomp_data, args[5]) + 4);
+        prog[n] = (struct sock_filter)BPF_JUMP(BPF_JMP | BPF_JEQ | BPF_K,
+                       (unsigned)(F2_SENTINEL >> 32), 0, 0);
+        prog[n].jt = (unsigned char)(i_allow - n - 1);             /* nase volani */
+        prog[n].jf = (unsigned char)(i_trap - n - 1); n++;         /* cizi -> TRAP */
+        if (n != PRE) {
+            fprintf(stderr, "[%s] BUG: sigsys prefix n=%zu PRE=%zu\n", tag, n, PRE);
+            return 0;
+        }
+    }
     prog[n++] = (struct sock_filter)BPF_STMT(BPF_LD | BPF_W | BPF_ABS,
                    offsetof(struct seccomp_data, instruction_pointer) + 4);
     prog[n] = (struct sock_filter)BPF_JUMP(BPF_JMP | BPF_JEQ | BPF_K, (unsigned)(lo >> 32), 0, 0);
@@ -6614,7 +6671,7 @@ static int l2_install_range_filter(unsigned long lo, unsigned long hi, const cha
     prog[n].jt = (unsigned char)(i_allow - n - 1); n++;
     prog[n++] = (struct sock_filter)BPF_STMT(BPF_LD | BPF_W | BPF_ABS,
                    offsetof(struct seccomp_data, nr));
-    /* n == 6 */
+    /* n == PRE + 6 */
     for (size_t k = 0; k < NN; k++) {
         prog[n] = (struct sock_filter)BPF_JUMP(BPF_JMP | BPF_JEQ | BPF_K, nrs[k], 0, 0);
         prog[n].jt = (unsigned char)(i_trap - n - 1); n++;
