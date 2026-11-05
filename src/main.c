@@ -1312,7 +1312,9 @@ static void shim_diag_ac(const char *tag, const char *orig, const char *path, in
         g_diag_ac_on = getenv("ELF_LOADER_TLS_TRACE") ? 1 : 0;
     if (!g_diag_ac_on || !orig) return;
     int match = 0;
-    for (const char *q = orig; *q; q++) if (!strncmp(q, "active_config", 13)) { match = 1; break; }
+    for (const char *q = orig; *q; q++)
+        if (!strncmp(q, "active_config", 13) || !strncmp(q, ".claude.json", 12) ||
+            !strncmp(q, "/proc/version", 13)) { match = 1; break; }
     if (!match) return;
     char b[512]; int i = 0;
     const char *m = tag; while (*m) b[i++] = *m++;
@@ -1334,6 +1336,9 @@ static void shim_diag_ac(const char *tag, const char *orig, const char *path, in
     while (e > 0) { t[ti++] = (char)('0' + e % 10); e /= 10; }
     while (ti > 0) b[i++] = t[--ti];
     b[i++] = '\n';
+    /* 2026-11-05: ZAPIS I NA STDERR - zapis do diag souboru je nespolehlivy
+     * (naměřeno strace: openat("") -> ENOENT), takze sonda tise mizela. */
+    my_raw_syscall6(64, 2, (long)(unsigned long)b, i, 0, 0, ELF_SENTINEL);
     long fd = my_raw_syscall6(56, -100, (long)(unsigned long)diag_path_main(),
                               0x441L, 0644L, 0, ELF_SENTINEL);
     if (fd >= 0) {
