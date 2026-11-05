@@ -6262,6 +6262,26 @@ NOSP static long go_execve(const char *p, char *const *argv, char *const *envp) 
 NOSP static int go_handle(long nr, ucontext_t *ctx) {
     unsigned long long *r = ctx->uc_mcontext.regs;
     int pa = -1, pb = -1;           /* indexy registru s cestou */
+    /* DIAG 2026-11-05 (gatovano ELF_LOADER_TLS_TRACE, raw write na stderr):
+     * nr na vstupu dispatche + prvni argumenty. Odpovida na otazku, proc
+     * handler u Bunu nevykona ani jeden syscall (strace: SIGSYS openat ->
+     * rt_sigreturn = -38, nic mezi tim). */
+    if (g_tls_trace) {
+        char b[96]; int i = 0;
+        const char *m = "GH-nr="; while (*m) b[i++] = *m++;
+        unsigned long v = (unsigned long)nr; char t[24]; int ti = 0;
+        if (!v) t[ti++] = '0';
+        while (v) { t[ti++] = (char)('0' + v % 10); v /= 10; }
+        while (ti) b[i++] = t[--ti];
+        m = " fr="; while (*m) b[i++] = *m++;
+        b[i++] = g_go_fr_pre ? '1' : '0';
+        m = " deny="; while (*m) b[i++] = *m++;
+        b[i++] = g_go_bind_deny ? '1' : '0';
+        m = " root="; while (*m) b[i++] = *m++;
+        b[i++] = g_f2_root ? '1' : '0';
+        b[i++] = '\n';
+        raw_syscall6(64, 2, (long)(unsigned long)b, i, 0, 0, (long)F2_SENTINEL);
+    }
     /* fakeroot: identitni syscally nemaji cestu, zodpovi se bez syscallu */
     if (g_go_fr_pre) {
         long e;
@@ -6633,6 +6653,12 @@ NOSP static void sigsys_handler(int sig, siginfo_t *si, void *uc) {
         while (_n0 > 0) { tmp0[ti0++] = (char)('0' + (_n0 % 10)); _n0 /= 10; }
         while (ti0 > 0) b[i++] = tmp0[--ti0];
         b[i++] = '\n';
+        /* 2026-11-05: ZAPIS I NA STDERR. Diag soubor je nespolehlivy -
+         * namereno, ze cesta z diag_path_info() prijde prazdna
+         * (`openat("", O_WRONLY|O_CREAT|O_APPEND) = -1 ENOENT` ve strace),
+         * takze sonda tise nic nezapise a vypada to, jako by handler
+         * nenabehl. Raw write(2) je bezpecny i pod guest TP (past c. 1). */
+        raw_syscall6(64, 2, (long)(unsigned long)b, i, 0, 0, (long)F2_SENTINEL);
         int _fd0 = (int)raw_syscall6(56, -100L, (long)(unsigned long)diag_path(),
                                       0x441L, 0644L, 0, (long)F2_SENTINEL);
         if (_fd0 >= 0) {
