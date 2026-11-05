@@ -599,6 +599,9 @@ Pro bitovou shodu by stačil 6řádkový knob `LX_FAKEROOT_MAP`; uživatel
    filtru nestačí taky — `syscall(134,…)` i libc-interní `svc` leží mimo text
    guest exe. Platné je jen pravidlo na hranici syscallu nezávislé na IP
    s výjimkou pro vlastní volání (`F2_SENTINEL` v `x5`).
+   Regresní sonda: `tools/sigsys-lock-probe.c` (staví rootfs gcc, běh přes
+   `ashell -c` s `F2_SKIP=sigaction,signal ELF_LOADER_L2=1`; čeká
+   „OCHRANENO").
 
 36. **`SECCOMP_RET_TRAP` na `rt_sigaction` zabije každý nový proces —
    bionic debuggerd si ho instaluje dřív než my.** Bionic libc v každém
