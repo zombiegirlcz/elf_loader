@@ -6162,6 +6162,58 @@ static void diag_tr(const char *msg, long n1, long n2) {
     }
 }
 
+/* Jako diag_tr(), ale se dvema cestami a jednim cislem — pro trace prekladu
+ * na hranici L2 (ELF_LOADER_L2_TRACE). Jen raw syscally, zadne TLS. */
+static void diag_trp(const char *msg, const char *s1, const char *s2, long n) {
+    static const char path[] = "/data/user/0/com.linux_core/files/usr/diag.trace.txt";
+    char b[1200]; int i = 0;
+    for (const char *q = msg; *q && i < 64; q++) b[i++] = *q;
+    for (int k = 0; k < 2; k++) {
+        const char *sv = k ? s2 : s1;
+        if (!sv) continue;
+        b[i++] = ' ';
+        const char *lbl = k ? "tr=" : "orig=";
+        while (*lbl) b[i++] = *lbl++;
+        for (const char *q = sv; *q && i < 500 + k * 550; q++) b[i++] = *q;
+    }
+    if (n != -999999) {
+        const char *lbl = " rc=";
+        while (*lbl) b[i++] = *lbl++;
+        long v = n;
+        if (v < 0) { b[i++] = '-'; v = -v; }
+        char t[24]; int ti = 0;
+        if (!v) t[ti++] = '0';
+        while (v > 0) { t[ti++] = (char)('0' + (v % 10)); v /= 10; }
+        while (ti > 0) b[i++] = t[--ti];
+    }
+    b[i++] = '\n';
+    long fd = raw_syscall6(56, -100L, (long)(unsigned long)path, 0x441L, 0644L, 0,
+                           (long)F2_SENTINEL);
+    if (fd >= 0) {
+        raw_syscall6(64, fd, (long)(unsigned long)b, i, 0, 0, (long)F2_SENTINEL);
+        raw_syscall6(57, fd, 0, 0, 0, 0, (long)F2_SENTINEL);
+    }
+}
+
+/* Substring, ktery ma trace na hranici L2 zachytit; "*" = vse. Plni se
+ * v l2_install_range_filter (host TP, getenv je tam bezpecny). */
+static const char *g_l2_trace_pat;
+
+/* Obsahuje `hay` podretezec `needle`? "*" = vzdy. Bez libc (guest TP).
+ * Bez NOSP — makro je definovane az niz v souboru (stejna past jako
+ * u diag_tr, 2026-11-05). */
+static int l2_trace_match(const char *hay) {
+    const char *pat = g_l2_trace_pat;
+    if (!pat || !hay) return 0;
+    if (pat[0] == '*' && !pat[1]) return 1;
+    for (const char *q = hay; *q; q++) {
+        size_t i = 0;
+        while (pat[i] && q[i] == pat[i]) i++;
+        if (!pat[i]) return 1;
+    }
+    return 0;
+}
+
 static void f2_reinstall_sigsys(void) {
     struct {
         void (*h)(int, void *, void *);
@@ -6472,41 +6524,23 @@ NOSP static int go_handle(long nr, ucontext_t *ctx) {
         go_translate((const char *)a[pb], tb, sizeof tb);
         a[pb] = (long)tb;
     }
-    /* DOCASNA SONDA (2026-11-03c, gatovana ELF_LOADER_TLS_TRACE): primy
-     * write(2) na stderr, bez diag_path()/open() - vylucuje hypotezu, ze
-     * diag souborovy open v tomto miste tise selhava (EMFILE apod.) a
-     * proto predchozi GH56 diagnostika nikdy nic nezapsala. */
-    if (g_tls_trace && _dbg_orig2 && nr == 56) {
-        int _m = 0;
-        for (const char *q = _dbg_orig2; *q; q++)
-            if (!strncmp(q, "active_config", 13)) { _m = 1; break; }
-        if (_m) {
-            char b[700]; int i = 0;
-            const char *m = "GH56b-orig="; while (*m) b[i++] = *m++;
-            for (const char *q = _dbg_orig2; *q && i < 400; q++) b[i++] = *q;
-            m = " tr="; while (*m) b[i++] = *m++;
-            for (const char *q = ta; *q && i < 650; q++) b[i++] = *q;
-            b[i++] = '\n';
-            raw_syscall6(64, 2, (long)(unsigned long)b, i, 0, 0, (long)F2_SENTINEL);
-        }
-    }
+    /* Trace prekladu na hranici L2 (ELF_LOADER_L2_TRACE=<podretezec> nebo `*`).
+     * Nahradil docasnou sondu zadratovanou na "active_config" (2026-11-03):
+     * guest cesty pod L2 nejsou videt ani ve strace (strace loader rozbije,
+     * past c. 17), takze bez tohohle kanalu se hypotezy jen hadaly. Pise do
+     * usr/diag.trace.txt (konstantni cesta, past c. 37). */
+    int _tr = g_l2_trace_pat && _dbg_orig2 && l2_trace_match(_dbg_orig2);
     long rr = raw_syscall6(nr, a[0], a[1], a[2], a[3], a[4], (long)F2_SENTINEL);
-    if (g_tls_trace && _dbg_orig2 && nr == 56) {
-        int _m = 0;
-        for (const char *q = _dbg_orig2; *q; q++)
-            if (!strncmp(q, "active_config", 13)) { _m = 1; break; }
-        if (_m) {
-            char b[64]; int i = 0;
-            const char *m = "GH56b-rr="; while (*m) b[i++] = *m++;
-            int neg = rr < 0; unsigned long v = (unsigned long)(neg ? -rr : rr);
-            if (neg) b[i++] = '-';
-            char t[24]; int ti = 0;
-            if (v == 0) t[ti++] = '0';
-            while (v > 0) { t[ti++] = (char)('0' + v % 10); v /= 10; }
-            while (ti > 0) b[i++] = t[--ti];
-            b[i++] = '\n';
-            raw_syscall6(64, 2, (long)(unsigned long)b, i, 0, 0, (long)F2_SENTINEL);
-        }
+    if (_tr) {
+        char nb[16]; int ni = 0; long v = nr;
+        nb[ni++] = 'L'; nb[ni++] = '2'; nb[ni++] = ' '; nb[ni++] = 'n';
+        nb[ni++] = 'r'; nb[ni++] = '=';
+        char t[8]; int ti = 0;
+        if (!v) t[ti++] = '0';
+        while (v > 0) { t[ti++] = (char)('0' + (v % 10)); v /= 10; }
+        while (ti > 0) nb[ni++] = t[--ti];
+        nb[ni] = 0;
+        diag_trp(nb, _dbg_orig2, (pa >= 0) ? ta : NULL, rr);
     }
     /* fakeroot/l2s oprava vysledku stat rodiny (a[] uz jsou prelozene cesty) */
     if (g_go_fr_post) g_go_fr_post(nr, a, rr);
@@ -6588,6 +6622,8 @@ int elf_has_verdef_prefix(const elf_object_t *m, const char *pfx) {
  * forknute HOST binarky (bionic, ASLR 0x5x/0x7x) nemaji IP v [lo,hi) ->
  * filtr se jich netkne, i kdyz ho zdedi a nejde odebrat. */
 static int l2_install_range_filter(unsigned long lo, unsigned long hi, const char *tag) {
+    if (!g_l2_trace_pat)
+        g_l2_trace_pat = getenv("ELF_LOADER_L2_TRACE");   /* host TP, bezpecne */
     if (hi <= lo || (lo >> 32) != ((hi - 1) >> 32)) {
         fprintf(stderr, "[%s] text range %lx-%lx nepodporovan (prekracuje 4GB band)\n",
                 tag, lo, hi);
