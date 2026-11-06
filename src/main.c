@@ -2344,6 +2344,8 @@ static int elf_is_static_pie(const char *path) {
     return !has_interp;
 }
 
+#include "verdef.h"   /* elf_file_has_verdef_prefix (Bun detekce pred elf_load) */
+
 /* basename bez alokace — ukazuje do stejneho bufferu jako p. */
 static const char *elf_shim_basename(const char *p) {
     const char *b = p;
@@ -5281,6 +5283,17 @@ static int run_ownall(const char *path, int argc, char **argv, char **envp) {
     /* L2 (prompt 05): PIE guest exe presun do pevneho okna, aby jeho text-range
      * nekolidoval s ASLR pozdeji forknute host binarky. Flag plati jen pro exe,
      * zavislosti (libc/ld.so) resi L1. */
+    /* Bun (claude code) dela fs operace RAW syscally ze svého textu: jmenne
+     * hooky (L3) je nevidi a bez L2 se guest cesty vubec neprelozi — program
+     * pak cte `$HOME/...` proti HOSTOVEMU korenu a tvari se, jako ze zadnou
+     * konfiguraci nema (naměřeno 2026-11-06: `claude mcp list` pod loaderem
+     * bez L2 = "No MCP servers configured", s `ELF_LOADER_L2=1` = plny seznam).
+     * Zapni L2 sam, pokud uzivatel knob nenastavil. Poradi podminek je
+     * zamerne: getenv je levny, parsovani exe az nakonec.
+     * Vypnuti: `ELF_LOADER_L2=0` nebo `ELF_LOADER_NO_AUTO_L2=1`. */
+    if (!getenv("ELF_LOADER_L2") && !getenv("ELF_LOADER_NO_AUTO_L2") &&
+        elf_file_has_verdef_prefix(path, "BUN_"))
+        elf_l2_force_on("Bun exe (raw syscally)");
     elf_l2_prepare_exe_load();
     elf_object_t *obj = elf_load(path);
     elf_l2_after_exe_load();

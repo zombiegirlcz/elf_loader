@@ -44,6 +44,19 @@ void elf_l2_prepare_exe_load(void) {
 }
 void elf_l2_after_exe_load(void) { g_l2_want_window = 0; }
 
+/* Zapni L2 z rozhodnuti loaderu (ne z env). Pouziva se pro programy, ktere
+ * BEZ L2 nevidi rootfs vubec — Bun (claude code) dela fs operace RAW
+ * syscally z vlastniho textu, takze jmenne hooky (L3) se neuplatni a
+ * `$HOME/.claude.json` se resolvuje proti HOSTOVEMU korenu (projev: "claude
+ * nenacita config ani session", HOME pritom spravne). Explicitni knob ma
+ * vzdy prednost: `ELF_LOADER_L2=0` auto-zapnuti neprebije (kontrola je u
+ * volajiciho, aby se soubor exe neparsoval zbytecne). */
+void elf_l2_force_on(const char *why) {
+    g_l2_enabled = 1;
+    if (getenv("ELF_LOADER_DIAG"))
+        fprintf(stderr, "[l2] auto-on: %s\n", why ? why : "?");
+}
+
 /* ── lazy prepis (opt-in ELF_LOADER_L2_LAZY=1) ───────────────────────────
  * Po prvnim zachyceni misto prepiseme na L1 stub (`b l1_common`), takze dalsi
  * volani uz signal nestoji (princip lazypoline). DEFAULT VYPNUTO: nahrada `svc`

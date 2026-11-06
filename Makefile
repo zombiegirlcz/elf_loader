@@ -66,6 +66,9 @@ test-host:
 	@echo "== proot_compat: parser =="
 	$(HOSTCC) -I./src -o /tmp/pc_test test/proot_compat_test.c
 	/tmp/pc_test
+	@echo "== verdef: elf_file_has_verdef_prefix (Bun detekce ze souboru) =="
+	$(HOSTCC) -I./src -o /tmp/vd_test test/verdef_file_test.c
+	/tmp/vd_test
 
 clean:
 	rm -f $(OBJS) $(TARGET) test/hello test/ifunc test/use_mod

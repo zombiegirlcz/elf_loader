@@ -3497,6 +3497,18 @@ static char *find_in_paths(const char *soname, const char *search) {
     return NULL;
 }
 
+/* Je modul s timto soname uz ve scope? elf_load_shared() to kontroluje az
+ * po nalezeni souboru, kdezto DT_NEEDED se musi rozhodnout driv — viz
+ * load_module_needed(). */
+static int scope_has_soname(const elf_scope_t *scope, const char *soname) {
+    if (!scope || !soname) return 0;
+    for (size_t i = 0; i < scope->count; i++)
+        if (scope->mods[i] && scope->mods[i]->soname &&
+            strcmp(scope->mods[i]->soname, soname) == 0)
+            return 1;
+    return 0;
+}
+
 static int load_module_needed(elf_object_t *m, elf_scope_t *scope) {
     Elf64_Dyn *dyn = find_dynamic(m);
     if (!dyn)
@@ -3547,6 +3559,16 @@ static int load_module_needed(elf_object_t *m, elf_scope_t *scope) {
                 continue;
             const char *soname = dynstr + d->d_un.d_val;
             if (is_ld_linux(soname))
+                continue;
+            /* Uz nacteny modul toho jmena: skutecne ld.so vazbu vyridi
+             * z globalniho scope a na disku nic nehleda. Typicky pripad je
+             * dlopen() z nestandardniho adresare — JVM si otevre
+             * `$JAVA_HOME/lib/server/libjvm.so`, ale `DT_NEEDED libjvm.so`
+             * v libjava.so/libjimage.so ma RPATH jen `$ORIGIN`
+             * (= `$JAVA_HOME/lib`), kde soubor NENI. Bez teto kontroly
+             * hlasil loader falesne "[-] module dep libjvm.so: not found"
+             * (4x pri kazdem startu javy, naměřeno 2026-11-06). */
+            if (scope_has_soname(scope, soname))
                 continue;
             char *cand = find_in_paths(soname, osearch);
             if (cand) {
