@@ -2356,6 +2356,8 @@ void elf_l1_force_on(const char *why) {
         fprintf(stderr, "[l1] auto-on: %s\n", why ? why : "?");
 }
 
+int elf_l1_enabled(void) { return l1_enabled(); }
+
 /* Vrati cislo syscallu, ktere je staticky videt pred `svc` (movz x8,#imm),
  * nebo -1 pro dynamicke x8. Stejna disciplina jako v elf_patch_syscall_sites:
  * zapis do x8 mezi movz a svc znamena, ze patri jinemu volani. */
