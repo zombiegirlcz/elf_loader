@@ -103,7 +103,13 @@ jmenných hooků), `F2_ONLY` (allowlist), `ELF_LOADER_L2` (`=1` záchytná síť
 `ELF_LOADER_NO_STATIC_PIE_PROOT=1` (neposílat static-PIE na reálný proot),
 `ELF_LOADER_NO_SIGSYS_LOCK=1` (vypne ochranu SIGSYS dispozice pod L2/Go,
 past č. 35), `ELF_LOADER_NO_ENOSYS_MAP=1` (diagnostický: vynechá nepodmíněné
-ENOSYS mapy, takže syscally projdou handlerem a jsou vidět v sondách).
+ENOSYS mapy, takže syscally projdou handlerem a jsou vidět v sondách),
+`ELF_LOADER_L2_TRACE=<podřetězec>` (`*` = vše — trace překladu cest na
+hranici L2 do `$D/usr/diag.trace.txt`: `nr`, původní cesta, přeložená cesta,
+návratová hodnota; jediný způsob, jak guest cesty pod L2 vidět, protože
+`strace` loader rozbije — past č. 17),
+`ELF_LOADER_NO_BUN_AUTO=1` (vypne automatické zapnutí L1+L2 pro Bun
+binárky, past č. 39).
 `ELF_LOADER_SOFTEXEC=1` (prompt 11, soft exec; `ELF_LOADER_SOFTEXEC_TRACE`
 = stderr, nebo absolutní cesta = i do souboru).
 `LX_FAKEROOT=1` (prompt 08, `src/fakeroot.h`, ekvivalent `proot -0`):
@@ -194,6 +200,9 @@ fork veneer (vfork-style clone) [#L685].
   ld.so 9), seznam míst v cache (v3, slot `CACHE_NR_L1`). Cena ~1 % na
   `find`, 0,1 % na python importu, RSS +85 KB. Mimo L1: exec, mount,
   bind/connect. `L1=2 all` = 194/0/33 [2026-10-21 (2)].
+- **Výjimka z defaultu — Bun:** u binárek s `DT_VERDEF BUN_*` (claude code)
+  si **loader zapne L1 i L2 sám**; bez obou claude nevidí config ani session
+  (past č. 39, naměřená matice tam). Vypnutí `ELF_LOADER_NO_BUN_AUTO=1`.
 - **L2** (prompt 05, `src/l2.h`): seccomp `RET_TRAP` záchytná síť pro kód,
   který L1 nepřepíše — statické binárky, Go, Bun (raw syscally), JIT. Cestové
   `svc` z **textu guest exe** TRAPnou, `sigsys_handler`→`go_handle` přeloží.
@@ -632,6 +641,59 @@ Pro bitovou shodu by stačil 6řádkový knob `LX_FAKEROOT_MAP`; uživatel
    L2 TRAP a `sigsys_handler` case `nr == 291` byl **mrtvý kód** (každé
    `statx` vracelo ENOSYS). Opraveno `a3c306b`.
 
+39. **Bun (claude code) potřebuje L1 **i** L2 — a ani jedna není default
+   zapnutá.** Jmenné hooky (L3) samy nestačí, protože Bun cestové funkce
+   z libc většinou neimportuje. Naměřená matice (2026-11-06, `claude 2.1.319`,
+   tatáž binárka, tytéž soubory):
+
+   | vrstvy | `claude mcp list` (config) | `claude -r <id>` (session) |
+   |---|---|---|
+   | žádná | `No MCP servers configured` | `No conversation found` |
+   | L1 | `No MCP servers configured` | `No conversation found` |
+   | L2 | plný seznam | `No conversation found` |
+   | **L1+L2** | plný seznam | **pokračuje** |
+
+   Projev pro uživatele: „claude nenačítá config ani session, ale `HOME`
+   je správně nastavený“ — `HOME` opravdu správně je, chybí **překlad cesty**.
+   Bez L2 se `$HOME/.claude.json` resolvuje proti HOSTOVÉMU kořeni (Bun dělá
+   fs operace raw syscally ze svého textu); bez L1 nenajde existující session,
+   protože **část práce jde přes glibc, jejíž interní `svc` leží MIMO text
+   guest exe**, na kterém je L2 filtr keyovaný na IP.
+
+   **Opraveno:** `run_ownall` detekuje `DT_VERDEF BUN_*` (`src/verdef.h`,
+   `elf_file_has_verdef_prefix` — souborová varianta, musí být **před**
+   `elf_load()`, protože L2 rezervuje okno pro PIE exe a L1 patchuje `svc`
+   už při načítání modulů) a obě vrstvy zapne sám. Vypnutí: explicitní
+   `ELF_LOADER_L1=0`/`ELF_LOADER_L2=0`, nebo `ELF_LOADER_NO_BUN_AUTO=1`.
+   Host test: `test/verdef_file_test.c` (`make test-host`).
+
+   **Metodická poznámka, která to lokalizovala:** session zapsanou
+   *loaderem* proot resumne bez problému, session zapsanou *prootem* loader
+   nenajde → rozbitá je **čtecí** strana, ne obsah souboru. A nový
+   `ELF_LOADER_L2_TRACE` ukázal, že loader ten správný `.jsonl` **otevře**
+   (fd 23) a cestu přeloží správně — tedy chyba nebyla v otevírání, ale
+   v syscallech, které L2 filtr nevidí.
+
+40. **Zapnout vrstvu nastavením cachovaného flagu nestačí — knob se čte
+   `getenv`em na víc místech.** `elf_l1_force_on()` nastavilo
+   `g_l1_enabled`, `[l1] auto-on` se vypsalo, a L1 přesto nefungovalo:
+   `l1_slots_init()` (sloty překladových bufferů, bez nich L1 stub nemá kam
+   psát) byl gatovaný přímo na `getenv("ELF_LOADER_L1")`. Při přidávání
+   „loader si vrstvu zapne sám“ je proto nutné projít **všechna** čtení
+   toho knobu (`grep -rn ELF_LOADER_L1 src/`) a převést je na jeden zdroj
+   pravdy (`elf_l1_enabled()`). Totéž platí pro pořadí: detekce musí
+   proběhnout dřív než inicializace, kterou ovlivňuje.
+
+41. **`DT_NEEDED` soname, které už je ve scope, se nesmí hledat na disku.**
+   Skutečné `ld.so` vazbu vyřídí z globálního scope a nic nehledá. JVM si
+   otevře `$JAVA_HOME/lib/server/libjvm.so` `dlopen`em, ale `DT_NEEDED
+   libjvm.so` v `libjava.so`/`libjimage.so` má `RPATH` jen `$ORIGIN`
+   (= `$JAVA_HOME/lib`), kde soubor **není** → loader hlásil falešné
+   `[-] module dep libjvm.so: not found` při každém startu javy. Opraveno
+   `scope_has_soname()` v `load_module_needed()`. Hláška byla kosmetická
+   (symboly se stejně vyřešily z už načteného modulu), ale v logu vypadala
+   jako příčina selhání Ghidry — a nebyla (viz Otevřené bugy).
+
 ## Otevřené bugy
 
 - ~~**Bun/Claude Code pod `ELF_LOADER_L2=1`: `ENOSYS: function not implemented,
@@ -669,6 +731,16 @@ Pro bitovou shodu by stačil 6řádkový knob `LX_FAKEROOT_MAP`; uživatel
   s `which cmake` uvnitř dá `/usr/bin/cmake` + rc=0. Pravděpodobně to
   spravila identity tabulka bindů (prompt 06) + větev `is_glibc_elf` mimo
   ROOTFS. Původní popis [#L4029].
+- **Ghidra GUI pod loaderem: NENÍ bug loaderu.** `ghidra` končí
+  „Exited with error. Run in foreground (fg) mode for more details.“ a ve
+  `fg` režimu „Unable to launch Ghidra GUI application in headless
+  environment“. Naměřeno A/B 2026-11-06: **stejná hláška i mimo loader**
+  (přímo v prootu, s `DISPLAY=:1` i bez něj) — sockety v `/tmp/.X11-unix`
+  jsou staré, žádný X server není dosažitelný. JVM pod loaderem je v pořádku:
+  `java -version` rc=0 a `support/analyzeHeadless` vypíše usage rc=0.
+  Jediné, co v tom strace logu patřilo loaderu, byla falešná hláška
+  `module dep libjvm.so: not found` (past č. 41, opravena).
+
 - **rustc/cargo odvozuje `sysroot` z `cwd`, ne z binárky** → `E0463: can't
   find crate for std`. Root cause neizolován. Workaround
   `--sysroot $R/root/.rustup/toolchains/stable-aarch64-unknown-linux-gnu`
@@ -760,6 +832,7 @@ Pro bitovou shodu by stačil 6řádkový knob `LX_FAKEROOT_MAP`; uživatel
 | soft exec (prompt 11) | 2026-10-29 |
 | Bun `active_config` ENOSYS pod L2 (nedořešeno), regrese starship | 2026-11-03 (2) |
 | Bun/claude 2.1.317 přepsal SIGSYS handler — root cause a fix | 2026-11-05 |
+| Bun potřebuje L1+L2 (config/session), Ghidra = chybí X, `libjvm.so` | 2026-11-06 |
 | výkon: timing, cache, hash, imgcache, lazy | 2026-10-16, 2026-10-20 |
 | zátěžový test multi-runtime | L3885, L4047 |
 | otevřené nálezy exec/argv | L3939, L3973, L3988, L4029 |

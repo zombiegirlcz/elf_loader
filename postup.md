@@ -7707,3 +7707,131 @@ procesu už nebyl. Rozlišit to šlo jedině sondou se spolehlivým kanálem
 Taky: `ELF_LOADER_NO_ENOSYS_MAP=1` (nový diagnostický knob) vynechá
 nepodmíněné ENOSYS mapy, takže ty syscally projdou handlerem a jsou vidět —
 `RET_ERRNO` jinak handler obchází úplně a žádná sonda ho nezachytí.
+
+---
+
+## 2026-11-06 — „claude nenačítá config ani session, ale HOME je správně“ + falešný `libjvm.so` v logu Ghidry
+
+**Vstup od uživatele:** `strace.log` + „objevil jsem asi další pád a claude mi
+nenačítá config ani session, ale HOME je správně nastavený“.
+
+### Co v tom logu vlastně bylo
+
+`strace.log` (127 kB, 1741 řádků) je host-side strace **Ghidry**, ne claude:
+`execve("…/usr/bin/elf_loader", [..., "--ownall", ...])` → guest `bash`
+→ `usr/bin/ghidra` → `share/ghidra/ghidraRun` → `support/launch.sh bg`.
+Končí `[-] module dep libjvm.so: not found` (4×) a
+`Exited with error. Run in foreground (fg) mode for more details.`, rc=1.
+
+Z historie (`/root/.zsh_history`) je vidět celá sekvence:
+`13:10 ghidra` → `13:26 nohup strace ghidra` → `13:29 claude -c` →
+`13:29 claude -r` → `13:31 echo $HOME` → `13:33 claude -c "@strace.log …"`.
+Oba pokusy ve 13:29 **nezapsaly nic** (žádný nový `.jsonl`, žádný backup
+`.claude.json`) — nejstarší zápis dne je 13:33:57, tedy až ta úspěšná session.
+To, že v tom shellu běžely příkazy **pod loaderem**, dokazuje právě ten
+strace: `ghidra` je v rootfs obyčejný symlink, takže `elf_loader --ownall`
+v argv je exec shim, ne nic, co by uživatel psal.
+
+### Nález 1 — Ghidra: NENÍ to bug loaderu
+
+A/B na téže binárce a téže instalaci:
+
+| | pod loaderem | přímo v prootu |
+|---|---|---|
+| `java -version` | rc=0, verze vypsána | rc=0 |
+| `support/analyzeHeadless` | usage, rc=0 | rc=0 |
+| `launch.sh fg … GhidraRun` | `Unable to launch Ghidra GUI application in headless environment` | **stejná hláška** |
+| totéž s `DISPLAY=:1` | stejná hláška | **stejná hláška** |
+
+Sockety v `/tmp/.X11-unix` (X1, X77, X100…) jsou staré; žádný X server není
+dosažitelný, takže Java hlásí headless. Mimo loader to selže identicky →
+k loaderu to nepatří. JVM pod loaderem funguje.
+
+### Nález 2 — falešné `module dep libjvm.so: not found`
+
+To jediné, co v logu loaderu patřilo. `libjava.so` a `libjimage.so` mají
+`DT_NEEDED libjvm.so` s `RPATH=$ORIGIN` (= `$JAVA_HOME/lib`), ale soubor je
+v `lib/server`. JVM si ho otevře `dlopen`em sám a skutečné `ld.so` pak vazbu
+vyřídí z globálního scope, **aniž by na disku hledalo**.
+`load_module_needed()` to nedělalo → hlásil chybu u závislosti, která už
+byla načtená. Opraveno `scope_has_soname()` (past č. 41). Hláška byla
+kosmetická, ale v logu vypadala jako příčina selhání Ghidry.
+
+### Nález 3 — claude: chyběl **překlad cesty**, ne `HOME`
+
+Reprodukováno příkazem, který se dá pustit bez interaktivního TUI:
+
+```
+elf_loader --ownall <claude> mcp list     # čte ~/.claude.json
+elf_loader --ownall <claude> -r <id> -p … # čte ~/.claude/projects/<slug>/<id>.jsonl
+```
+
+Naměřená matice (`claude 2.1.319`, tatáž binárka, tytéž soubory, knoby
+na téže binárce — ne dva buildy):
+
+| vrstvy | `mcp list` (config) | `-r <id>` (session) |
+|---|---|---|
+| žádná | `No MCP servers configured` | `No conversation found` |
+| L1 | `No MCP servers configured` | `No conversation found` |
+| L2 | plný seznam (20+ serverů) | `No conversation found` |
+| **L1+L2** | plný seznam | **pokračuje** (odpoví `BANAN`) |
+
+`HOME` přitom bylo správně (`/root`, ověřeno `echo $HOME` pod loaderem
+i přes `bash -c 'wc -c < /root/.claude.json'` = 140067 B), a i `getcwd`
+vracelo guest cestu (session se zakládala do správného slugu
+`-root-l2probe3`, ne do `-data-user-0-…`).
+
+**Příčina (dvě nezávislé části):**
+
+1. **Bez L2** se `$HOME/.claude.json` resolvuje proti HOSTOVÉMU kořeni —
+   Bun dělá fs operace raw syscally ze svého textu. Důkaz: diag sonda
+   v `shim_diag_ac` (jmenný `openat` hook) nezaznamenala při spuštění
+   claude **ani jedno** `.claude.json`, přitom `g_orig_open/openat/open64/
+   openat64` byly všechny platné (`ORIG … 1111`).
+2. **Bez L1** claude nenajde existující session. Část práce jde přes glibc,
+   jejíž interní `svc` leží **mimo text guest exe**, takže L2 filtr
+   (keyovaný na `instruction_pointer`) se jí netkne.
+
+**Co to lokalizovalo** (jinak by se to hádalo jako 2026-11-03):
+
+- **Asymetrie napříč světy:** session zapsanou *loaderem* proot resumne bez
+  problému (`-r <id>` → `BANAN`), session zapsanou *prootem* loader nenajde
+  → rozbitá je **čtecí** strana, ne obsah souboru. Formát ani metadata
+  (`cwd`, `accountUuid`, `version`, `gitBranch`) se nelišily.
+- **Nový knob `ELF_LOADER_L2_TRACE=<podřetězec>`** (`*` = vše) loguje na
+  hranici L2 `nr`, původní cestu, přeloženou cestu a návratovou hodnotu do
+  `usr/diag.trace.txt`. Ukázal, že loader ten správný `.jsonl` **otevře**
+  (fd 23) a cestu přeloží správně — tedy chyba není v otevírání souboru.
+  Nahradil dočasnou sondu zadrátovanou na `"active_config"` z 2026-11-03.
+  `strace` tuhle roli zastat nemůže: na loaderu končí
+  `Unexpected wait status 0x1f` (SIGSYS) a s `-f` ho rozbije fork veneer.
+- **Vylučovací sondy s raw `svc` z vlastního textu** (ne glibc — past č. 17):
+  `dirprobe` (openat `O_DIRECTORY` + `getdents64`) vypsal pod L2 všech
+  6 položek adresáře, `fileprobe` (openat + `fstat` + `statx` + `read`
+  + `pread64`) přečetl session soubor celý (222 748 B, `st_size` i součet
+  `read` souhlasí). Takže ani výpis adresáře, ani čtení souboru rozbité
+  nebyly — zbylo „něco, co jde přes libc“, a to potvrdil `ELF_LOADER_L1=1`.
+
+**Fix:** `run_ownall` detekuje `DT_VERDEF BUN_*` a zapne **obě** vrstvy.
+Detekce musí být ze **souboru**, ne z načteného modulu (`elf_has_verdef_prefix`
+chce `elf_object_t`), protože rozhodnutí musí padnout **před** `elf_load()`:
+L2 rezervuje okno pro PIE exe a L1 patchuje `svc` už při načítání modulů.
+Nové `src/verdef.h` (`elf_file_has_verdef_prefix`, jen `raw_*` syscally,
+TLS-safe) + host unit test `test/verdef_file_test.c` v `make test-host`
+(10 případů včetně negativních: jiná verze, ELF bez `DT_VERDEF`, ne-ELF,
+NULL, prázdný prefix).
+
+**Mezikrok, který nefungoval a proč** (past č. 40): první verze nastavila
+`g_l1_enabled = 1`, `[l1] auto-on` se vypsalo — a resume session dál
+nefungoval. `l1_slots_init()` (sloty překladových bufferů; bez nich L1 stub
+nemá kam psát) byl gatovaný **přímo** na `getenv("ELF_LOADER_L1")` a navíc
+běžel dřív než detekce. Oprava: detekce se přesunula nad něj a podmínka
+slotů je `elf_l1_enabled()` — jeden zdroj pravdy jako u patchování modulů.
+
+**Ověřeno na nasazeném buildu** (bez jakéhokoli knobu, `HOME=/root`):
+`mcp list` plný seznam; `-r <id>` → `BANAN`; dvoukrokový test
+`-p 'odpoved jen slovem MELOUN'` + `-c -p 'zopakuj posledni slovo'` →
+`MELOUN` a v projektovém adresáři **zůstal 1** `.jsonl` (tedy pokračování,
+ne nová session). Opt-outy: `ELF_LOADER_L2=0`, `ELF_LOADER_L1=0`,
+`ELF_LOADER_NO_BUN_AUTO=1` — všechny vracejí původní chování.
+Ne-Bun binárky se nemění (`/bin/ls /etc/hostname` bez `[l1]`/`[l2]` hlášek).
