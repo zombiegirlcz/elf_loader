@@ -131,6 +131,7 @@ void f2_set_fakeroot_hooks(int (*pre)(long, const unsigned long *, long *),
 int  elf_l2_enabled(void);              /* L2 (prompt 05): ELF_LOADER_L2 */
 void elf_l2_prepare_exe_load(void);     /* rezervuj okno, PIE exe do nej */
 void elf_l2_force_on(const char *why); /* zapni L2 z rozhodnuti loaderu (Bun) */
+void elf_l1_force_on(const char *why); /* zapni L1 z rozhodnuti loaderu (Bun) */
 void elf_l2_after_exe_load(void);       /* zavislosti uz do okna nechceme */
 int  elf_l2_mode_setup(elf_object_t *m);/* instaluj L2 filtr pro guest exe */
 

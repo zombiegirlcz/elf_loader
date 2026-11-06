@@ -5283,17 +5283,35 @@ static int run_ownall(const char *path, int argc, char **argv, char **envp) {
     /* L2 (prompt 05): PIE guest exe presun do pevneho okna, aby jeho text-range
      * nekolidoval s ASLR pozdeji forknute host binarky. Flag plati jen pro exe,
      * zavislosti (libc/ld.so) resi L1. */
-    /* Bun (claude code) dela fs operace RAW syscally ze svého textu: jmenne
-     * hooky (L3) je nevidi a bez L2 se guest cesty vubec neprelozi — program
-     * pak cte `$HOME/...` proti HOSTOVEMU korenu a tvari se, jako ze zadnou
-     * konfiguraci nema (naměřeno 2026-11-06: `claude mcp list` pod loaderem
-     * bez L2 = "No MCP servers configured", s `ELF_LOADER_L2=1` = plny seznam).
-     * Zapni L2 sam, pokud uzivatel knob nenastavil. Poradi podminek je
+    /* Bun (claude code) potrebuje OBE vrstvy prekladu a ani jedna neni
+     * default zapnuta — jmenne hooky (L3) same nestaci, protoze Bun cestove
+     * funkce z libc vetsinou neimportuje:
+     *   - L2 (text guest exe): Bun dela fs operace RAW syscally ze svého
+     *     textu. Bez nej se `$HOME/.claude.json` resolvuje proti HOSTOVEMU
+     *     korenu a claude se tvari, ze zadnou konfiguraci nema.
+     *   - L1 (prepis `svc` v nactenych modulech): cast operaci presto jde
+     *     pres glibc, jejiz interni `svc` lezi MIMO text guest exe, takze
+     *     L2 filtr (keyovany na IP) se jich netkne. Bez L1 claude nenajde
+     *     existujici session (`-c`/`-r` zalozi novou).
+     * Namerena matice (2026-11-06, `claude 2.1.319`, tataz binarka):
+     *   vrstvy    | `mcp list` (config) | `-r <id>` (session)
+     *   zadna     | No MCP servers      | No conversation found
+     *   L1        | No MCP servers      | No conversation found
+     *   L2        | plny seznam         | No conversation found
+     *   L1+L2     | plny seznam         | pokracuje (OK)
+     * Zapni je sam, pokud uzivatel knoby nenastavil. Poradi podminek je
      * zamerne: getenv je levny, parsovani exe az nakonec.
-     * Vypnuti: `ELF_LOADER_L2=0` nebo `ELF_LOADER_NO_AUTO_L2=1`. */
-    if (!getenv("ELF_LOADER_L2") && !getenv("ELF_LOADER_NO_AUTO_L2") &&
-        elf_file_has_verdef_prefix(path, "BUN_"))
-        elf_l2_force_on("Bun exe (raw syscally)");
+     * Vypnuti: explicitni `ELF_LOADER_L1=0` / `ELF_LOADER_L2=0`, nebo
+     * `ELF_LOADER_NO_BUN_AUTO=1` pro oboji. */
+    {
+        int l2_set = getenv("ELF_LOADER_L2") != NULL;
+        int l1_set = getenv("ELF_LOADER_L1") != NULL;
+        if ((!l2_set || !l1_set) && !getenv("ELF_LOADER_NO_BUN_AUTO") &&
+            elf_file_has_verdef_prefix(path, "BUN_")) {
+            if (!l2_set) elf_l2_force_on("Bun exe: raw syscally z vlastniho textu");
+            if (!l1_set) elf_l1_force_on("Bun exe: cestove svc uvnitr glibc");
+        }
+    }
     elf_l2_prepare_exe_load();
     elf_object_t *obj = elf_load(path);
     elf_l2_after_exe_load();

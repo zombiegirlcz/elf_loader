@@ -2335,15 +2335,25 @@ void elf_patch_syscall_sites(elf_object_t *m, long nr, long err) {
 extern void l1_common(void);      /* src/entry.S */
 unsigned l1_path_args(long nr);   /* src/l1.h (vlozeno do main.c) */
 
+static int g_l1_enabled = -1;    /* -1 = jeste nerozhodnuto (viz l1_enabled) */
+
 static int l1_enabled(void) {
-    static int v = -1;
-    if (v < 0) {
+    if (g_l1_enabled < 0) {
         /* 1 = L1 vedle jmennych hooku, 2 = L1 a hooky "jen preklad" vypnute
          * (to resi f2_only_match v main.c); patchuje se v obou pripadech */
         const char *e = getenv("ELF_LOADER_L1");
-        v = (e && e[0] && e[0] != '0') ? 1 : 0;
+        g_l1_enabled = (e && e[0] && e[0] != '0') ? 1 : 0;
     }
-    return v;
+    return g_l1_enabled;
+}
+
+/* Zapni L1 z rozhodnuti loaderu (ne z env) — stejny duvod jako
+ * elf_l2_force_on(). Volat PRED elf_load(), protoze L1 patchuje `svc` mista
+ * pri nacitani modulu. Explicitni knob ma prednost (kontrola u volajiciho). */
+void elf_l1_force_on(const char *why) {
+    g_l1_enabled = 1;
+    if (getenv("ELF_LOADER_DIAG"))
+        fprintf(stderr, "[l1] auto-on: %s\n", why ? why : "?");
 }
 
 /* Vrati cislo syscallu, ktere je staticky videt pred `svc` (movz x8,#imm),
